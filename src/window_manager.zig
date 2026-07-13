@@ -45,6 +45,7 @@ const ManagedWindow = struct {
     display_ready: bool = false,
     requested_visible: bool = true,
     pending_position: ?Scene.Position = null,
+    pending_borders: PendingBorders = .unchanged,
 };
 
 const StackOperation = union(enum) {
@@ -70,6 +71,16 @@ const PendingFocus = union(enum) {
     clear,
     window: WindowId,
 };
+
+const PendingBorders = union(enum) {
+    unchanged,
+    set: ?Scene.Borders,
+};
+
+fn protocolColorComponent(value: u32) u8 {
+    const maximum = std.math.maxInt(u32);
+    return @intCast((@as(u64, value) * 255 + maximum / 2) / maximum);
+}
 
 const Sequence = struct {
     state: State = .idle,
@@ -418,6 +429,13 @@ fn finishRender(self: *Self, manager: *river.WindowManagerV1) void {
             entry.value.xdg_id,
             if (self.focused) |id| std.meta.eql(id, entry.id) else false,
         );
+        switch (entry.value.pending_borders) {
+            .unchanged => {},
+            .set => |borders| {
+                self.xdg_shell.setWindowBorders(entry.value.xdg_id, borders);
+                entry.value.pending_borders = .unchanged;
+            },
+        }
         self.xdg_shell.setWindowVisible(
             entry.value.xdg_id,
             entry.value.display_ready and entry.value.requested_visible,
@@ -470,6 +488,7 @@ fn releaseWindows(self: *Self) void {
     var iterator = self.windows.iterator();
     while (iterator.next()) |entry| {
         self.xdg_shell.setWindowFocused(entry.value.xdg_id, false);
+        self.xdg_shell.setWindowBorders(entry.value.xdg_id, null);
         self.xdg_shell.restoreStandaloneWindow(
             entry.value.xdg_id,
             entry.value.activated,
@@ -655,9 +674,32 @@ const WindowResource = struct {
             .use_ssd => resource.getClient().postImplementationError(
                 "server-side xdg decorations are not implemented",
             ),
-            .set_borders => resource.getClient().postImplementationError(
-                "river window borders are not implemented",
-            ),
+            .set_borders => |borders| {
+                if (!self.requireRendering(manager_resource)) return;
+                const edges: u32 = @bitCast(borders.edges);
+                if (borders.width < 0 or edges & ~@as(u32, 0xf) != 0) {
+                    resource.postError(.invalid_border, "invalid window border");
+                    return;
+                }
+                window.pending_borders = .{ .set = if (borders.width == 0 or edges == 0)
+                    null
+                else
+                    .{
+                        .edges = .{
+                            .top = borders.edges.top,
+                            .bottom = borders.edges.bottom,
+                            .left = borders.edges.left,
+                            .right = borders.edges.right,
+                        },
+                        .width = @intCast(borders.width),
+                        .color = .{
+                            .red = protocolColorComponent(borders.r),
+                            .green = protocolColorComponent(borders.g),
+                            .blue = protocolColorComponent(borders.b),
+                            .alpha = protocolColorComponent(borders.a),
+                        },
+                    } };
+            },
             .get_decoration_above, .get_decoration_below => resource.getClient().postImplementationError(
                 "river decoration surfaces are not implemented",
             ),
@@ -978,4 +1020,10 @@ test "window management configure timeout advances to render" {
     try std.testing.expect(sequence.configureTimeout());
     try std.testing.expectEqual(.idle, sequence.finishRender());
     try std.testing.expect(!sequence.configureTimeout());
+}
+
+test "river color components retain full-range endpoints" {
+    try std.testing.expectEqual(@as(u8, 0), protocolColorComponent(0));
+    try std.testing.expectEqual(@as(u8, 128), protocolColorComponent(0x80808080));
+    try std.testing.expectEqual(@as(u8, 255), protocolColorComponent(std.math.maxInt(u32)));
 }

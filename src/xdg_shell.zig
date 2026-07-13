@@ -290,6 +290,11 @@ pub fn setWindowFocused(self: *Self, id: WindowId, focused: bool) void {
     self.scene.setFocused(window.scene_id, focused);
 }
 
+pub fn setWindowBorders(self: *Self, id: WindowId, borders: ?Scene.Borders) void {
+    const window = self.windows.get(id) orelse return;
+    self.scene.setBorders(window.scene_id, borders);
+}
+
 pub fn placeWindowTop(self: *Self, id: WindowId) void {
     const window = self.windows.get(id) orelse return;
     self.scene.placeTop(window.scene_id);

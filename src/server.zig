@@ -234,6 +234,7 @@ fn renderFrame(self: *Self) renderer_types.Renderer.Error!void {
             entry.window.effects.corner_radius,
             target,
         );
+        try self.renderWindowBorders(entry.window, target);
     }
 
     self.frame_time_milliseconds +%= 16;
@@ -286,6 +287,106 @@ fn renderSurfaceTree(
     };
 }
 
+fn renderWindowBorders(
+    self: *Self,
+    window: *const Scene.Window,
+    target: renderer_types.Target,
+) renderer_types.Renderer.Error!void {
+    const borders = window.borders orelse return;
+    const buffer = Surface.currentBuffer(
+        self.compositor.surfaceStore(),
+        window.surface_id,
+    ) orelse return;
+    var commands: [4]render.Command = undefined;
+    const border_commands = makeBorderCommands(
+        window.position,
+        buffer.logical_size,
+        borders,
+        &commands,
+    );
+    try self.renderer.render(
+        .{ .size = self.headless_output.size, .commands = border_commands },
+        target,
+    );
+}
+
+fn makeBorderCommands(
+    position: Scene.Position,
+    content_size: render.Size,
+    borders: Scene.Borders,
+    commands: *[4]render.Command,
+) []const render.Command {
+    const width = borders.width;
+    const width_i32: i32 = @intCast(width);
+    const content_width_i32: i32 = @intCast(@min(
+        content_size.width,
+        std.math.maxInt(i32),
+    ));
+    const content_height_i32: i32 = @intCast(@min(
+        content_size.height,
+        std.math.maxInt(i32),
+    ));
+    const vertical_y = if (borders.edges.top)
+        position.y -| width_i32
+    else
+        position.y;
+    var vertical_height = content_size.height;
+    if (borders.edges.top) vertical_height +|= width;
+    if (borders.edges.bottom) vertical_height +|= width;
+
+    var command_count: usize = 0;
+    if (borders.edges.top) {
+        commands[command_count] = .{ .solid_rect = .{
+            .rect = .{
+                .x = position.x,
+                .y = position.y -| width_i32,
+                .width = content_size.width,
+                .height = width,
+            },
+            .color = borders.color,
+        } };
+        command_count += 1;
+    }
+    if (borders.edges.bottom) {
+        commands[command_count] = .{ .solid_rect = .{
+            .rect = .{
+                .x = position.x,
+                .y = position.y +| content_height_i32,
+                .width = content_size.width,
+                .height = width,
+            },
+            .color = borders.color,
+        } };
+        command_count += 1;
+    }
+    if (borders.edges.left) {
+        commands[command_count] = .{ .solid_rect = .{
+            .rect = .{
+                .x = position.x -| width_i32,
+                .y = vertical_y,
+                .width = width,
+                .height = vertical_height,
+            },
+            .color = borders.color,
+        } };
+        command_count += 1;
+    }
+    if (borders.edges.right) {
+        commands[command_count] = .{ .solid_rect = .{
+            .rect = .{
+                .x = position.x +| content_width_i32,
+                .y = vertical_y,
+                .width = width,
+                .height = vertical_height,
+            },
+            .color = borders.color,
+        } };
+        command_count += 1;
+    }
+    std.debug.assert(command_count > 0);
+    return commands[0..command_count];
+}
+
 fn finishSurfaceTree(self: *Self, surface_id: Surface.Id) void {
     if (Surface.currentBuffer(self.compositor.surfaceStore(), surface_id) == null) return;
 
@@ -303,4 +404,40 @@ fn finishSurfaceTree(self: *Self, surface_id: Surface.Id) void {
 test "server creates and destroys protocol globals" {
     const server = try Self.create(std.testing.allocator);
     server.destroy();
+}
+
+test "window borders occupy only requested exterior edges and corners" {
+    var commands: [4]render.Command = undefined;
+    const color = render.Color.rgba(0x80, 0x40, 0x20, 0xff);
+    const result = makeBorderCommands(
+        .{ .x = 10, .y = 20 },
+        .{ .width = 100, .height = 50 },
+        .{
+            .edges = .{ .top = true, .left = true, .right = true },
+            .width = 4,
+            .color = color,
+        },
+        &commands,
+    );
+
+    try std.testing.expectEqual(@as(usize, 3), result.len);
+    try std.testing.expectEqual(render.Rect{
+        .x = 10,
+        .y = 16,
+        .width = 100,
+        .height = 4,
+    }, result[0].solid_rect.rect);
+    try std.testing.expectEqual(render.Rect{
+        .x = 6,
+        .y = 16,
+        .width = 4,
+        .height = 54,
+    }, result[1].solid_rect.rect);
+    try std.testing.expectEqual(render.Rect{
+        .x = 110,
+        .y = 16,
+        .width = 4,
+        .height = 54,
+    }, result[2].solid_rect.rect);
+    try std.testing.expectEqual(color, result[0].solid_rect.color);
 }

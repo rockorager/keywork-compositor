@@ -20,6 +20,20 @@ pub const Position = struct {
     y: i32 = 0,
 };
 
+pub const BorderEdges = packed struct(u8) {
+    top: bool = false,
+    bottom: bool = false,
+    left: bool = false,
+    right: bool = false,
+    _padding: u4 = 0,
+};
+
+pub const Borders = struct {
+    edges: BorderEdges,
+    width: u32,
+    color: render.Color,
+};
+
 pub const Blur = struct {
     radius: u32,
 };
@@ -52,6 +66,7 @@ pub const Window = struct {
     mapped: bool = false,
     focused: bool = false,
     effects: Effects = default_effects,
+    borders: ?Borders = null,
 };
 
 pub const RepaintListener = struct {
@@ -186,6 +201,18 @@ pub fn setFocused(self: *Self, id: Id, focused: bool) void {
     if (window.mapped) self.requestRepaint();
 }
 
+pub fn setBorders(self: *Self, id: Id, borders: ?Borders) void {
+    if (borders) |value| {
+        std.debug.assert(value.width > 0);
+        std.debug.assert(value.width <= std.math.maxInt(i32));
+        std.debug.assert(@as(u8, @bitCast(value.edges)) & 0x0f != 0);
+    }
+    const window = self.windows.get(id) orelse return;
+    if (std.meta.eql(window.borders, borders)) return;
+    window.borders = borders;
+    if (window.mapped) self.requestRepaint();
+}
+
 pub fn setEffects(self: *Self, id: Id, effects: Effects) void {
     const window = self.windows.get(id) orelse return;
     window.effects = effects;
@@ -218,6 +245,11 @@ test "scene keeps visual state behind generational handles" {
     scene.setPosition(id, .{ .x = 30, .y = 40 });
     scene.setFocused(id, true);
     scene.setEffects(id, .{ .corner_radius = 12 });
+    scene.setBorders(id, .{
+        .edges = .{ .top = true },
+        .width = 4,
+        .color = render.Color.rgba(0x80, 0x40, 0x20, 0xff),
+    });
     scene.setMapped(id, true);
 
     var iterator_value = scene.iterator();
@@ -228,6 +260,8 @@ test "scene keeps visual state behind generational handles" {
     try std.testing.expect(entry.window.focused);
     try std.testing.expect(entry.window.mapped);
     try std.testing.expectEqual(@as(u32, 12), entry.window.effects.corner_radius);
+    try std.testing.expectEqual(@as(u32, 4), entry.window.borders.?.width);
+    try std.testing.expect(entry.window.borders.?.edges.top);
     try std.testing.expectEqual(@as(?Iterator.Entry, null), iterator_value.next());
 
     scene.removeWindow(id);
