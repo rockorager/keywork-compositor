@@ -24,6 +24,7 @@ pub const Store = slot_map.SlotMap(State, enum { surface });
 pub const Id = Store.Id;
 
 pub const State = struct {
+    resource: *wl.Surface,
     pending_offset_x: i32,
     pending_offset_y: i32,
     current_offset_x: i32,
@@ -54,8 +55,9 @@ pub const State = struct {
     role: ?Role,
     has_committed: bool,
 
-    fn init() State {
+    fn init(resource: *wl.Surface) State {
         return .{
+            .resource = resource,
             .pending_offset_x = 0,
             .pending_offset_y = 0,
             .current_offset_x = 0,
@@ -125,7 +127,7 @@ pub fn create(
     const self = allocator.create(Self) catch return error.OutOfMemory;
     errdefer allocator.destroy(self);
 
-    var surface_state = State.init();
+    var surface_state = State.init(resource);
     errdefer surface_state.deinit(allocator);
     const state_id = store.insert(allocator, surface_state) catch return error.OutOfMemory;
 
@@ -153,6 +155,11 @@ pub fn handle(self: *const Self) Id {
 
 pub fn state(self: *Self) *State {
     return self.store.get(self.id) orelse unreachable;
+}
+
+pub fn resourceFor(store: *Store, id: Id) ?*wl.Surface {
+    const surface_state = store.get(id) orelse return null;
+    return surface_state.resource;
 }
 
 pub const RoleError = error{

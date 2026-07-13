@@ -18,6 +18,8 @@ registry: ?*wl.Registry,
 compositor: ?*wl.Compositor,
 shm: ?*wl.Shm,
 wm_base: ?*xdg.WmBase,
+seat: ?*wl.Seat,
+keyboard: ?*wl.Keyboard,
 surface: ?*wl.Surface,
 xdg_surface: ?*xdg.Surface,
 toplevel: ?*xdg.Toplevel,
@@ -35,6 +37,13 @@ pub const Listener = struct {
     context: *anyopaque,
     repaint: *const fn (*anyopaque) void,
     close: *const fn (*anyopaque) void,
+    keyboard_available: *const fn (*anyopaque, bool) void,
+    keyboard_keymap: *const fn (*anyopaque, wl.Keyboard.KeymapFormat, std.posix.fd_t, u32) void,
+    keyboard_enter: *const fn (*anyopaque, []const u32) void,
+    keyboard_leave: *const fn (*anyopaque) void,
+    keyboard_key: *const fn (*anyopaque, u32, u32, wl.Keyboard.KeyState) void,
+    keyboard_modifiers: *const fn (*anyopaque, u32, u32, u32, u32) void,
+    keyboard_repeat_info: *const fn (*anyopaque, i32, i32) void,
 };
 
 const Buffer = struct {
@@ -76,6 +85,8 @@ pub fn init(
         .compositor = null,
         .shm = null,
         .wm_base = null,
+        .seat = null,
+        .keyboard = null,
         .surface = null,
         .xdg_surface = null,
         .toplevel = null,
@@ -146,6 +157,8 @@ pub fn deinit(self: *Self) void {
     if (self.toplevel) |toplevel| toplevel.destroy();
     if (self.xdg_surface) |xdg_surface| xdg_surface.destroy();
     if (self.surface) |surface| surface.destroy();
+    if (self.keyboard) |keyboard| releaseKeyboard(keyboard);
+    if (self.seat) |seat| releaseSeat(seat);
     if (self.wm_base) |wm_base| wm_base.destroy();
     if (self.shm) |shm| shm.destroy();
     if (self.compositor) |compositor| compositor.destroy();
@@ -260,9 +273,91 @@ fn handleRegistryEvent(_: *wl.Registry, event: wl.Registry.Event, self: *Self) v
                     self.wm_base = wm_base;
                     wm_base.setListener(*Self, handleWmBaseEvent, self);
                 }
+            } else if (std.mem.eql(u8, interface, std.mem.span(wl.Seat.interface.name))) {
+                if (self.seat == null) {
+                    const seat = self.registry.?.bind(global.name, wl.Seat, global.version) catch {
+                        self.failed = true;
+                        return;
+                    };
+                    self.seat = seat;
+                    seat.setListener(*Self, handleSeatEvent, self);
+                }
             }
         },
         .global_remove => {},
+    }
+}
+
+fn handleSeatEvent(seat: *wl.Seat, event: wl.Seat.Event, self: *Self) void {
+    switch (event) {
+        .capabilities => |capabilities| {
+            if (capabilities.capabilities.keyboard and self.keyboard == null) {
+                const keyboard = seat.getKeyboard() catch {
+                    self.fail();
+                    return;
+                };
+                self.keyboard = keyboard;
+                keyboard.setListener(*Self, handleKeyboardEvent, self);
+            } else if (!capabilities.capabilities.keyboard) {
+                if (self.keyboard) |keyboard| releaseKeyboard(keyboard);
+                self.keyboard = null;
+            }
+            self.listener.keyboard_available(
+                self.listener.context,
+                capabilities.capabilities.keyboard,
+            );
+        },
+        .name => {},
+    }
+}
+
+fn handleKeyboardEvent(_: *wl.Keyboard, event: wl.Keyboard.Event, self: *Self) void {
+    switch (event) {
+        .keymap => |keymap| self.listener.keyboard_keymap(
+            self.listener.context,
+            keymap.format,
+            keymap.fd,
+            keymap.size,
+        ),
+        .enter => |enter| self.listener.keyboard_enter(
+            self.listener.context,
+            enter.keys.*.slice(u32),
+        ),
+        .leave => self.listener.keyboard_leave(self.listener.context),
+        .key => |key| self.listener.keyboard_key(
+            self.listener.context,
+            key.time,
+            key.key,
+            key.state,
+        ),
+        .modifiers => |modifiers| self.listener.keyboard_modifiers(
+            self.listener.context,
+            modifiers.mods_depressed,
+            modifiers.mods_latched,
+            modifiers.mods_locked,
+            modifiers.group,
+        ),
+        .repeat_info => |repeat| self.listener.keyboard_repeat_info(
+            self.listener.context,
+            repeat.rate,
+            repeat.delay,
+        ),
+    }
+}
+
+fn releaseKeyboard(keyboard: *wl.Keyboard) void {
+    if (keyboard.getVersion() >= wl.Keyboard.release_since_version) {
+        keyboard.release();
+    } else {
+        keyboard.destroy();
+    }
+}
+
+fn releaseSeat(seat: *wl.Seat) void {
+    if (seat.getVersion() >= wl.Seat.release_since_version) {
+        seat.release();
+    } else {
+        seat.destroy();
     }
 }
 

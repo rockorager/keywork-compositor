@@ -490,6 +490,34 @@ pub fn topFullscreen(self: *Self) ?Id {
     return null;
 }
 
+pub fn focusedSurface(self: *Self) ?Surface.Id {
+    var index = self.stack.items.len;
+    while (index > 0) {
+        index -= 1;
+        const id = switch (self.stack.items[index]) {
+            .window => |id| id,
+            .shell_surface => continue,
+        };
+        const window = self.windows.get(id) orelse continue;
+        if (window.mapped and window.focused) return window.surface_id;
+    }
+    return null;
+}
+
+pub fn topWindowSurface(self: *Self) ?Surface.Id {
+    var index = self.stack.items.len;
+    while (index > 0) {
+        index -= 1;
+        const id = switch (self.stack.items[index]) {
+            .window => |id| id,
+            .shell_surface => continue,
+        };
+        const window = self.windows.get(id) orelse continue;
+        if (window.mapped) return window.surface_id;
+    }
+    return null;
+}
+
 fn requestRepaint(self: *Self) void {
     if (self.repaint_listener) |listener| listener.request(listener.context);
 }
@@ -559,6 +587,8 @@ test "scene keeps visual state behind generational handles" {
         .size = .{ .width = 640, .height = 480 },
     });
     scene.setMapped(id, true);
+    try std.testing.expectEqual(surface_id, scene.focusedSurface().?);
+    try std.testing.expectEqual(surface_id, scene.topWindowSurface().?);
 
     var iterator_value = scene.iterator();
     const entry = iterator_value.next().?;
@@ -591,6 +621,8 @@ test "scene keeps visual state behind generational handles" {
 
     scene.removeWindow(id);
     try std.testing.expectEqual(@as(?*Window, null), scene.windows.get(id));
+    try std.testing.expectEqual(@as(?Surface.Id, null), scene.focusedSurface());
+    try std.testing.expectEqual(@as(?Surface.Id, null), scene.topWindowSurface());
 }
 
 test "scene reorders windows through handles" {

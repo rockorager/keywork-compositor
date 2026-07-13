@@ -279,6 +279,10 @@ pub fn deinit(self: *Self) void {
     self.* = undefined;
 }
 
+pub fn hasActiveManager(self: *const Self) bool {
+    return self.active != null;
+}
+
 fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
     const resource = river.WindowManagerV1.create(client, version, id) catch {
         client.postNoMemory();

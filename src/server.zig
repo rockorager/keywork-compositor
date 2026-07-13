@@ -71,19 +71,32 @@ pub fn create(
         .listening = false,
     };
     errdefer self.renderer.deinit();
+    try self.compositor.init(allocator, display);
+    errdefer self.compositor.deinit();
+    try self.seat.init(allocator, io, display, self.compositor.surfaceStore());
+    errdefer self.seat.deinit();
     try self.render_output.init(
         allocator,
         io,
         display,
         .{ .width = 1280, .height = 720 },
         output_kind,
-        .{ .context = self, .repaint = requestRepaint, .close = closeOutput },
+        .{
+            .context = self,
+            .repaint = requestRepaint,
+            .close = closeOutput,
+            .keyboard_available = keyboardAvailable,
+            .keyboard_keymap = keyboardKeymap,
+            .keyboard_enter = keyboardEnter,
+            .keyboard_leave = keyboardLeave,
+            .keyboard_key = keyboardKey,
+            .keyboard_modifiers = keyboardModifiers,
+            .keyboard_repeat_info = keyboardRepeatInfo,
+        },
     );
     errdefer self.render_output.deinit();
     try self.output.init(display, self.render_output.size());
     errdefer self.output.deinit();
-    try self.compositor.init(allocator, display);
-    errdefer self.compositor.deinit();
     try self.subcompositor.init(allocator, display, self.compositor.surfaceStore());
     errdefer self.subcompositor.deinit();
     self.scene.init(allocator);
@@ -95,8 +108,6 @@ pub fn create(
         &self.scene,
     );
     errdefer self.xdg_shell.deinit();
-    try self.seat.init(display);
-    errdefer self.seat.deinit();
     try self.data_device.init(allocator, display, &self.seat);
     errdefer self.data_device.deinit();
     try self.window_manager.init(
@@ -130,13 +141,13 @@ pub fn destroy(self: *Self) void {
     self.display.destroyClients();
     self.window_manager.deinit();
     self.data_device.deinit();
-    self.seat.deinit();
     self.xdg_shell.deinit();
     self.scene.deinit();
     self.subcompositor.deinit();
-    self.compositor.deinit();
     self.output.deinit();
     self.render_output.deinit();
+    self.seat.deinit();
+    self.compositor.deinit();
     self.renderer.deinit();
     self.display.destroy();
     allocator.destroy(self);
@@ -176,6 +187,63 @@ fn requestRepaint(context: *anyopaque) void {
 fn closeOutput(context: *anyopaque) void {
     const self: *Self = @ptrCast(@alignCast(context));
     self.terminate();
+}
+
+fn keyboardAvailable(context: *anyopaque, available: bool) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.seat.setKeyboardAvailable(available);
+}
+
+fn keyboardKeymap(
+    context: *anyopaque,
+    format: wl.Keyboard.KeymapFormat,
+    fd: std.posix.fd_t,
+    size: u32,
+) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.seat.setKeymap(format, fd, size);
+}
+
+fn keyboardEnter(context: *anyopaque, pressed_keys: []const u32) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.seat.parentKeyboardEnter(pressed_keys) catch {
+        log.err("failed to store pressed keyboard keys", .{});
+        self.terminate();
+    };
+}
+
+fn keyboardLeave(context: *anyopaque) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.seat.parentKeyboardLeave();
+}
+
+fn keyboardKey(
+    context: *anyopaque,
+    time: u32,
+    key: u32,
+    state: wl.Keyboard.KeyState,
+) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.seat.key(time, key, state) catch {
+        log.err("failed to store keyboard state", .{});
+        self.terminate();
+    };
+}
+
+fn keyboardModifiers(
+    context: *anyopaque,
+    depressed: u32,
+    latched: u32,
+    locked: u32,
+    group: u32,
+) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.seat.setModifiers(depressed, latched, locked, group);
+}
+
+fn keyboardRepeatInfo(context: *anyopaque, rate: i32, delay: i32) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.seat.setRepeatInfo(rate, delay);
 }
 
 fn handleRenderTimer(self: *Self) c_int {
@@ -246,6 +314,11 @@ fn renderFrame(self: *Self) renderer_types.Renderer.Error!void {
             self.finishSurfaceTree(shell_entry.shell_surface.surface_id);
         },
     };
+    const keyboard_focus = self.scene.focusedSurface() orelse if (!self.window_manager.hasActiveManager())
+        self.scene.topWindowSurface()
+    else
+        null;
+    self.seat.setKeyboardFocus(keyboard_focus);
 }
 
 fn renderWindow(
