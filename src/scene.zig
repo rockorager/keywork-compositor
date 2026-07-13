@@ -39,6 +39,11 @@ pub const Effects = struct {
 
 pub const default_effects: Effects = .{
     .corner_radius = 12,
+    .shadow = .{
+        .offset = .{ .y = 8 },
+        .blur_radius = 16,
+        .color = render.Color.rgba(0, 0, 0, 96),
+    },
 };
 
 pub const Window = struct {

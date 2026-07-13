@@ -76,9 +76,18 @@ pub const Image = struct {
     corner_radius: u32 = 0,
 };
 
+pub const Shadow = struct {
+    rect: Rect,
+    corner_radius: u32,
+    blur_radius: u32,
+    spread: i32,
+    color: Color,
+};
+
 pub const Command = union(enum) {
     clear: Color,
     solid_rect: SolidRect,
+    shadow: Shadow,
     image: Image,
 };
 

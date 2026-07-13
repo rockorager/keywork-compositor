@@ -43,7 +43,7 @@ test "renderer dispatches to the selected implementation" {
         .{ .clear = render_types.Color.rgba(10, 20, 30, 255) },
     };
 
-    var renderer: Renderer = .{ .cpu = CpuRenderer.init() };
+    var renderer: Renderer = .{ .cpu = CpuRenderer.init(std.testing.allocator) };
     defer renderer.deinit();
     try renderer.render(
         .{ .size = size, .commands = &commands },

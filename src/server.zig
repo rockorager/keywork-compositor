@@ -56,7 +56,7 @@ pub fn create(allocator: std.mem.Allocator) !*Self {
         .xdg_shell = undefined,
         .seat = undefined,
         .data_device = undefined,
-        .renderer = .{ .cpu = CpuRenderer.init() },
+        .renderer = .{ .cpu = CpuRenderer.init(allocator) },
         .render_timer = undefined,
         .repaint_pending = false,
         .frame_time_milliseconds = 0,
@@ -171,6 +171,32 @@ fn renderFrame(self: *Self) renderer_types.Renderer.Error!void {
     var windows = self.scene.iterator();
     while (windows.next()) |entry| {
         if (!entry.window.mapped) continue;
+        if (entry.window.effects.shadow) |shadow| {
+            const buffer = Surface.currentBuffer(
+                self.compositor.surfaceStore(),
+                entry.window.surface_id,
+            );
+            if (buffer) |root_buffer| {
+                const shadow_command = [_]render.Command{
+                    .{ .shadow = .{
+                        .rect = .{
+                            .x = entry.window.position.x +| shadow.offset.x,
+                            .y = entry.window.position.y +| shadow.offset.y,
+                            .width = root_buffer.logical_size.width,
+                            .height = root_buffer.logical_size.height,
+                        },
+                        .corner_radius = entry.window.effects.corner_radius,
+                        .blur_radius = shadow.blur_radius,
+                        .spread = shadow.spread,
+                        .color = shadow.color,
+                    } },
+                };
+                try self.renderer.render(
+                    .{ .size = output_size, .commands = &shadow_command },
+                    target,
+                );
+            }
+        }
         try self.renderSurfaceTree(
             entry.window.surface_id,
             entry.window.position.x,

@@ -10,18 +10,22 @@ const pixman = @cImport({
     @cInclude("pixman.h");
 });
 
+allocator: std.mem.Allocator,
+
 pub const Error = error{
     InvalidTarget,
     OutOfMemory,
 };
 
-pub fn init() Self {
-    return .{};
+pub fn init(allocator: std.mem.Allocator) Self {
+    return .{ .allocator = allocator };
 }
 
-pub fn deinit(_: *Self) void {}
+pub fn deinit(self: *Self) void {
+    self.* = undefined;
+}
 
-pub fn render(_: *Self, frame: render_types.Frame, target: render_types.PixelBuffer) Error!void {
+pub fn render(self: *Self, frame: render_types.Frame, target: render_types.PixelBuffer) Error!void {
     const destination = try createDestination(frame, target);
     defer _ = pixman.pixman_image_unref(destination);
 
@@ -37,6 +41,7 @@ pub fn render(_: *Self, frame: render_types.Frame, target: render_types.PixelBuf
                 const clipped = solid.rect.clipTo(frame.size) orelse continue;
                 try fill(destination, clipped, solid.color, pixman.PIXMAN_OP_OVER);
             },
+            .shadow => |shadow| try self.drawShadow(destination, frame.size, shadow),
             .image => |image| try composite(destination, frame.size, image),
         }
     }
@@ -77,6 +82,169 @@ fn createImage(buffer: render_types.PixelBuffer) Error!*pixman.pixman_image_t {
         buffer.pixels.ptr,
         @intCast(stride_bytes),
     ) orelse error.OutOfMemory;
+}
+
+fn drawShadow(
+    self: *Self,
+    destination: *pixman.pixman_image_t,
+    destination_size: render_types.Size,
+    shadow: render_types.Shadow,
+) Error!void {
+    if (shadow.rect.width == 0 or shadow.rect.height == 0 or shadow.color.alpha == 0) return;
+
+    const spread: i64 = shadow.spread;
+    const shape_x = @as(i64, shadow.rect.x) - spread;
+    const shape_y = @as(i64, shadow.rect.y) - spread;
+    const shape_width = @as(i64, shadow.rect.width) + 2 * spread;
+    const shape_height = @as(i64, shadow.rect.height) + 2 * spread;
+    if (shape_width <= 0 or shape_height <= 0) return;
+
+    const blur: i64 = shadow.blur_radius;
+    const mask_x = shape_x - blur;
+    const mask_y = shape_y - blur;
+    const mask_width = shape_width + 2 * blur;
+    const mask_height = shape_height + 2 * blur;
+    const mask_right = mask_x + mask_width;
+    const mask_bottom = mask_y + mask_height;
+    if (mask_right <= 0 or mask_bottom <= 0 or
+        mask_x >= destination_size.width or mask_y >= destination_size.height)
+    {
+        return;
+    }
+    if (mask_x < std.math.minInt(c_int) or mask_y < std.math.minInt(c_int) or
+        mask_x > std.math.maxInt(c_int) or mask_y > std.math.maxInt(c_int) or
+        mask_width > std.math.maxInt(c_int) or mask_height > std.math.maxInt(c_int))
+    {
+        return error.InvalidTarget;
+    }
+
+    const width: u32 = @intCast(mask_width);
+    const height: u32 = @intCast(mask_height);
+    const mask = pixman.pixman_image_create_bits(
+        pixman.PIXMAN_a8,
+        @intCast(width),
+        @intCast(height),
+        null,
+        0,
+    ) orelse return error.OutOfMemory;
+    defer _ = pixman.pixman_image_unref(mask);
+
+    const data: [*]u8 = @ptrCast(pixman.pixman_image_get_data(mask));
+    const stride: usize = @intCast(pixman.pixman_image_get_stride(mask));
+    const radius_value = @max(@as(i64, shadow.corner_radius) + spread, 0);
+    const radius: f32 = @floatFromInt(@min(
+        radius_value,
+        @divTrunc(@min(shape_width, shape_height), 2),
+    ));
+    const shape_left: f32 = @floatFromInt(blur);
+    const shape_top: f32 = @floatFromInt(blur);
+    const shape_size_x: f32 = @floatFromInt(shape_width);
+    const shape_size_y: f32 = @floatFromInt(shape_height);
+    for (0..height) |y| {
+        for (0..width) |x| {
+            const pixel_x: f32 = @as(f32, @floatFromInt(x)) + 0.5;
+            const pixel_y: f32 = @as(f32, @floatFromInt(y)) + 0.5;
+            const coverage = roundedRectCoverage(
+                pixel_x,
+                pixel_y,
+                shape_left,
+                shape_top,
+                shape_size_x,
+                shape_size_y,
+                radius,
+            );
+            data[y * stride + x] = @intFromFloat(coverage * 255.0);
+        }
+    }
+    if (shadow.blur_radius > 0) {
+        try blurMask(self.allocator, data, stride, width, height, shadow.blur_radius);
+    }
+
+    const color: pixman.pixman_color_t = .{
+        .red = expand(shadow.color.red),
+        .green = expand(shadow.color.green),
+        .blue = expand(shadow.color.blue),
+        .alpha = expand(shadow.color.alpha),
+    };
+    const source = pixman.pixman_image_create_solid_fill(&color) orelse
+        return error.OutOfMemory;
+    defer _ = pixman.pixman_image_unref(source);
+    pixman.pixman_image_composite32(
+        pixman.PIXMAN_OP_OVER,
+        source,
+        mask,
+        destination,
+        0,
+        0,
+        0,
+        0,
+        @intCast(mask_x),
+        @intCast(mask_y),
+        @intCast(width),
+        @intCast(height),
+    );
+}
+
+fn roundedRectCoverage(
+    pixel_x: f32,
+    pixel_y: f32,
+    left: f32,
+    top: f32,
+    width: f32,
+    height: f32,
+    radius: f32,
+) f32 {
+    const half_width = width / 2.0;
+    const half_height = height / 2.0;
+    const center_x = left + half_width;
+    const center_y = top + half_height;
+    const inner_half_width = @max(half_width - radius, 0.0);
+    const inner_half_height = @max(half_height - radius, 0.0);
+    const distance_x = @abs(pixel_x - center_x) - inner_half_width;
+    const distance_y = @abs(pixel_y - center_y) - inner_half_height;
+    const outside_x = @max(distance_x, 0.0);
+    const outside_y = @max(distance_y, 0.0);
+    const signed_distance = @sqrt(outside_x * outside_x + outside_y * outside_y) +
+        @min(@max(distance_x, distance_y), 0.0) - radius;
+    return std.math.clamp(0.5 - signed_distance, 0.0, 1.0);
+}
+
+fn blurMask(
+    allocator: std.mem.Allocator,
+    data: [*]u8,
+    stride: usize,
+    width: u32,
+    height: u32,
+    radius_value: u32,
+) Error!void {
+    const pixel_count = std.math.mul(usize, width, height) catch return error.InvalidTarget;
+    const temporary = allocator.alloc(u8, pixel_count) catch return error.OutOfMemory;
+    defer allocator.free(temporary);
+
+    const radius: usize = radius_value;
+    const kernel = std.math.add(usize, std.math.mul(usize, radius, 2) catch
+        return error.InvalidTarget, 1) catch return error.InvalidTarget;
+    for (0..height) |y| {
+        var sum: u64 = 0;
+        for (0..@min(radius + 1, width)) |x| sum += data[y * stride + x];
+        for (0..width) |x| {
+            temporary[y * width + x] = @intCast(sum / kernel);
+            if (x >= radius) sum -= data[y * stride + x - radius];
+            const added = x + radius + 1;
+            if (added < width) sum += data[y * stride + added];
+        }
+    }
+
+    for (0..width) |x| {
+        var sum: u64 = 0;
+        for (0..@min(radius + 1, height)) |y| sum += temporary[y * width + x];
+        for (0..height) |y| {
+            data[y * stride + x] = @intCast(sum / kernel);
+            if (y >= radius) sum -= temporary[(y - radius) * width + x];
+            const added = y + radius + 1;
+            if (added < height) sum += temporary[added * width + x];
+        }
+    }
 }
 
 fn composite(
@@ -233,7 +401,7 @@ test "CPU renderer draws clipped premultiplied rectangles" {
         } },
     };
 
-    var renderer = Self.init();
+    var renderer = Self.init(std.testing.allocator);
     defer renderer.deinit();
     try renderer.render(.{ .size = size, .commands = &commands }, output.target());
 
@@ -244,7 +412,7 @@ test "CPU renderer draws clipped premultiplied rectangles" {
 }
 
 test "CPU renderer rejects undersized targets" {
-    var renderer = Self.init();
+    var renderer = Self.init(std.testing.allocator);
     defer renderer.deinit();
 
     var pixels = [_]u32{0} ** 3;
@@ -283,7 +451,7 @@ test "CPU renderer composites clipped images" {
         } },
     };
 
-    var renderer = Self.init();
+    var renderer = Self.init(std.testing.allocator);
     defer renderer.deinit();
     try renderer.render(.{ .size = size, .commands = &commands }, output.target());
 
@@ -310,7 +478,7 @@ test "CPU renderer scales images to logical size" {
         } },
     };
 
-    var renderer = Self.init();
+    var renderer = Self.init(std.testing.allocator);
     defer renderer.deinit();
     try renderer.render(.{
         .size = .{ .width = 1, .height = 1 },
@@ -340,11 +508,37 @@ test "CPU renderer clips image corners with an antialiased mask" {
         } },
     };
 
-    var renderer = Self.init();
+    var renderer = Self.init(std.testing.allocator);
     defer renderer.deinit();
     try renderer.render(.{ .size = size, .commands = &commands }, output.target());
 
     const corner_alpha: u8 = @truncate(output.pixel(0, 0) >> 24);
     try std.testing.expect(corner_alpha > 0 and corner_alpha < 255);
     try std.testing.expectEqual(@as(u32, 0xffffffff), output.pixel(1, 1));
+}
+
+test "CPU renderer draws blurred rounded shadows" {
+    const size: render_types.Size = .{ .width = 9, .height = 9 };
+    var output = try headless.init(std.testing.allocator, size);
+    defer output.deinit();
+
+    const commands = [_]render_types.Command{
+        .{ .shadow = .{
+            .rect = .{ .x = 3, .y = 3, .width = 3, .height = 3 },
+            .corner_radius = 1,
+            .blur_radius = 2,
+            .spread = 0,
+            .color = render_types.Color.rgba(0, 0, 0, 255),
+        } },
+    };
+
+    var renderer = Self.init(std.testing.allocator);
+    defer renderer.deinit();
+    try renderer.render(.{ .size = size, .commands = &commands }, output.target());
+
+    const edge_alpha: u8 = @truncate(output.pixel(1, 4) >> 24);
+    const center_alpha: u8 = @truncate(output.pixel(4, 4) >> 24);
+    try std.testing.expect(edge_alpha > 0);
+    try std.testing.expect(center_alpha > edge_alpha);
+    try std.testing.expectEqual(@as(u32, 0), output.pixel(8, 8));
 }
