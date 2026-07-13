@@ -25,8 +25,8 @@ pub fn main(init: std.process.Init) !void {
     const socket_name = try server.listen();
     var buffer: [4096]u8 = undefined;
     var writer = std.Io.File.stdout().writer(init.io, &buffer);
-    defer writer.interface.flush() catch {};
     try writer.interface.print("WAYLAND_DISPLAY={s}\n", .{socket_name});
+    try writer.interface.flush();
 
     server.run();
 }
@@ -42,5 +42,6 @@ test {
     _ = @import("headless.zig");
     _ = @import("cpu_renderer.zig");
     _ = @import("region.zig");
+    _ = @import("slot_map.zig");
     _ = @import("server.zig");
 }

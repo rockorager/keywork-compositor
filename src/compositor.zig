@@ -11,17 +11,21 @@ const wl = wayland.server.wl;
 
 allocator: std.mem.Allocator,
 global: *wl.Global,
+surfaces: Surface.Store,
 
 pub fn init(self: *Self, allocator: std.mem.Allocator, display: *wl.Server) !void {
     self.* = .{
         .allocator = allocator,
         .global = undefined,
+        .surfaces = .{},
     };
+    errdefer self.surfaces.deinit(allocator);
     self.global = try wl.Global.create(display, wl.Compositor, 4, *Self, self, bind);
 }
 
 pub fn deinit(self: *Self) void {
     self.global.destroy();
+    self.surfaces.deinit(self.allocator);
     self.* = undefined;
 }
 
@@ -37,6 +41,7 @@ fn handleRequest(resource: *wl.Compositor, request: wl.Compositor.Request, self:
     switch (request) {
         .create_surface => |create| Surface.create(
             self.allocator,
+            &self.surfaces,
             resource.getClient(),
             resource.getVersion(),
             create.id,

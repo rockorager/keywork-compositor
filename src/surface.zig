@@ -6,30 +6,73 @@ const std = @import("std");
 const wayland = @import("wayland");
 const Region = @import("region.zig");
 const render_types = @import("render.zig");
+const slot_map = @import("slot_map.zig");
 const WaylandRegion = @import("wayland_region.zig");
 
 const wl = wayland.server.wl;
 
 allocator: std.mem.Allocator,
+store: *Store,
+id: Id,
 resource: *wl.Surface,
 pending_attachment: Attachment,
 has_pending_attachment: bool,
-pending_offset_x: i32,
-pending_offset_y: i32,
-current_offset_x: i32,
-current_offset_y: i32,
-pending_scale: i32,
-current_scale: i32,
-pending_transform: wl.Output.Transform,
-current_transform: wl.Output.Transform,
-pending_surface_damage: Region,
-pending_buffer_damage: Region,
-pending_opaque: Region,
-current_opaque: Region,
-pending_input: InputRegion,
-current_input: InputRegion,
-callbacks: std.ArrayList(*FrameCallback),
-current_buffer: ?BufferSnapshot,
+
+pub const Store = slot_map.SlotMap(State, enum { surface });
+pub const Id = Store.Id;
+
+pub const State = struct {
+    pending_offset_x: i32,
+    pending_offset_y: i32,
+    current_offset_x: i32,
+    current_offset_y: i32,
+    pending_scale: i32,
+    current_scale: i32,
+    pending_transform: wl.Output.Transform,
+    current_transform: wl.Output.Transform,
+    pending_surface_damage: Region,
+    pending_buffer_damage: Region,
+    pending_opaque: Region,
+    current_opaque: Region,
+    pending_input: InputRegion,
+    current_input: InputRegion,
+    callbacks: std.ArrayList(*FrameCallback),
+    current_buffer: ?BufferSnapshot,
+
+    fn init() State {
+        return .{
+            .pending_offset_x = 0,
+            .pending_offset_y = 0,
+            .current_offset_x = 0,
+            .current_offset_y = 0,
+            .pending_scale = 1,
+            .current_scale = 1,
+            .pending_transform = .normal,
+            .current_transform = .normal,
+            .pending_surface_damage = Region.init(),
+            .pending_buffer_damage = Region.init(),
+            .pending_opaque = Region.init(),
+            .current_opaque = Region.init(),
+            .pending_input = InputRegion.init(),
+            .current_input = InputRegion.init(),
+            .callbacks = .empty,
+            .current_buffer = null,
+        };
+    }
+
+    fn deinit(self: *State, allocator: std.mem.Allocator) void {
+        std.debug.assert(self.callbacks.items.len == 0);
+        self.callbacks.deinit(allocator);
+        if (self.current_buffer) |*current| current.deinit();
+        self.pending_surface_damage.deinit();
+        self.pending_buffer_damage.deinit();
+        self.pending_opaque.deinit();
+        self.current_opaque.deinit();
+        self.pending_input.deinit();
+        self.current_input.deinit();
+        self.* = undefined;
+    }
+};
 
 pub const CreateError = error{
     OutOfMemory,
@@ -38,6 +81,7 @@ pub const CreateError = error{
 
 pub fn create(
     allocator: std.mem.Allocator,
+    store: *Store,
     client: *wl.Client,
     version: u32,
     id: u32,
@@ -46,27 +90,19 @@ pub fn create(
     errdefer resource.destroy();
 
     const self = allocator.create(Self) catch return error.OutOfMemory;
+    errdefer allocator.destroy(self);
+
+    var surface_state = State.init();
+    errdefer surface_state.deinit(allocator);
+    const state_id = store.insert(allocator, surface_state) catch return error.OutOfMemory;
+
     self.* = .{
         .allocator = allocator,
+        .store = store,
+        .id = state_id,
         .resource = resource,
         .pending_attachment = .{},
         .has_pending_attachment = false,
-        .pending_offset_x = 0,
-        .pending_offset_y = 0,
-        .current_offset_x = 0,
-        .current_offset_y = 0,
-        .pending_scale = 1,
-        .current_scale = 1,
-        .pending_transform = .normal,
-        .current_transform = .normal,
-        .pending_surface_damage = Region.init(),
-        .pending_buffer_damage = Region.init(),
-        .pending_opaque = Region.init(),
-        .current_opaque = Region.init(),
-        .pending_input = InputRegion.init(),
-        .current_input = InputRegion.init(),
-        .callbacks = .empty,
-        .current_buffer = null,
     };
 
     resource.setHandler(*Self, handleRequest, handleDestroy, self);
@@ -76,9 +112,18 @@ pub fn fromResource(resource: *wl.Surface) *Self {
     return @ptrCast(@alignCast(resource.getUserData().?));
 }
 
+pub fn handle(self: *const Self) Id {
+    return self.id;
+}
+
+pub fn state(self: *Self) *State {
+    return self.store.get(self.id) orelse unreachable;
+}
+
 pub fn sendFrameDone(self: *Self, time_milliseconds: u32) void {
+    const surface_state = self.state();
     while (true) {
-        const callback = for (self.callbacks.items) |candidate| {
+        const callback = for (surface_state.callbacks.items) |candidate| {
             if (!candidate.pending) break candidate;
         } else return;
 
@@ -87,6 +132,7 @@ pub fn sendFrameDone(self: *Self, time_milliseconds: u32) void {
 }
 
 fn handleRequest(resource: *wl.Surface, request: wl.Surface.Request, self: *Self) void {
+    const surface_state = self.state();
     switch (request) {
         .destroy => resource.destroy(),
         .attach => |attach| {
@@ -95,10 +141,10 @@ fn handleRequest(resource: *wl.Surface, request: wl.Surface.Request, self: *Self
                 return;
             };
             self.has_pending_attachment = true;
-            self.pending_offset_x = attach.x;
-            self.pending_offset_y = attach.y;
+            surface_state.pending_offset_x = attach.x;
+            surface_state.pending_offset_y = attach.y;
         },
-        .damage => |damage| self.pending_surface_damage.add(
+        .damage => |damage| surface_state.pending_surface_damage.add(
             damage.x,
             damage.y,
             damage.width,
@@ -109,23 +155,23 @@ fn handleRequest(resource: *wl.Surface, request: wl.Surface.Request, self: *Self
         .set_opaque_region => |set| {
             if (set.region) |region_resource| {
                 const region = WaylandRegion.fromResource(region_resource);
-                self.pending_opaque.copyFrom(&region.value) catch {
+                surface_state.pending_opaque.copyFrom(&region.value) catch {
                     resource.postNoMemory();
                     return;
                 };
             } else {
-                self.pending_opaque.clear();
+                surface_state.pending_opaque.clear();
             }
         },
         .set_input_region => |set| {
             if (set.region) |region_resource| {
                 const region = WaylandRegion.fromResource(region_resource);
-                self.pending_input.set(&region.value) catch {
+                surface_state.pending_input.set(&region.value) catch {
                     resource.postNoMemory();
                     return;
                 };
             } else {
-                self.pending_input.setInfinite();
+                surface_state.pending_input.setInfinite();
             }
         },
         .commit => commit(self),
@@ -134,16 +180,16 @@ fn handleRequest(resource: *wl.Surface, request: wl.Surface.Request, self: *Self
                 resource.postError(.invalid_transform, "invalid buffer transform");
                 return;
             }
-            self.pending_transform = set.transform;
+            surface_state.pending_transform = set.transform;
         },
         .set_buffer_scale => |set| {
             if (set.scale <= 0) {
                 resource.postError(.invalid_scale, "buffer scale must be positive");
                 return;
             }
-            self.pending_scale = set.scale;
+            surface_state.pending_scale = set.scale;
         },
-        .damage_buffer => |damage| self.pending_buffer_damage.add(
+        .damage_buffer => |damage| surface_state.pending_buffer_damage.add(
             damage.x,
             damage.y,
             damage.width,
@@ -153,11 +199,12 @@ fn handleRequest(resource: *wl.Surface, request: wl.Surface.Request, self: *Self
 }
 
 fn commit(self: *Self) void {
-    self.current_opaque.copyFrom(&self.pending_opaque) catch {
+    const surface_state = self.state();
+    surface_state.current_opaque.copyFrom(&surface_state.pending_opaque) catch {
         self.resource.postNoMemory();
         return;
     };
-    self.current_input.copyFrom(&self.pending_input) catch {
+    surface_state.current_input.copyFrom(&surface_state.pending_input) catch {
         self.resource.postNoMemory();
         return;
     };
@@ -168,8 +215,8 @@ fn commit(self: *Self) void {
             snapshot = BufferSnapshot.copyShm(
                 self.allocator,
                 shm_buffer,
-                self.pending_scale,
-                self.pending_transform,
+                surface_state.pending_scale,
+                surface_state.pending_transform,
             ) catch |err| {
                 switch (err) {
                     error.OutOfMemory => self.resource.postNoMemory(),
@@ -185,19 +232,19 @@ fn commit(self: *Self) void {
             };
         }
 
-        if (self.current_buffer) |*current| current.deinit();
-        self.current_buffer = snapshot;
-        self.current_offset_x = self.pending_offset_x;
-        self.current_offset_y = self.pending_offset_y;
+        if (surface_state.current_buffer) |*current| current.deinit();
+        surface_state.current_buffer = snapshot;
+        surface_state.current_offset_x = surface_state.pending_offset_x;
+        surface_state.current_offset_y = surface_state.pending_offset_y;
 
         if (self.pending_attachment.resource) |buffer| buffer.sendRelease();
         self.pending_attachment.clear();
         self.has_pending_attachment = false;
-    } else if (self.current_buffer) |*current| {
+    } else if (surface_state.current_buffer) |*current| {
         current.logical_size = logicalSize(
             current.buffer_size,
-            self.pending_scale,
-            self.pending_transform,
+            surface_state.pending_scale,
+            surface_state.pending_transform,
         ) catch {
             self.resource.postError(
                 .invalid_size,
@@ -205,32 +252,27 @@ fn commit(self: *Self) void {
             );
             return;
         };
-        current.scale = self.pending_scale;
-        current.transform = self.pending_transform;
+        current.scale = surface_state.pending_scale;
+        current.transform = surface_state.pending_transform;
     }
 
-    self.current_scale = self.pending_scale;
-    self.current_transform = self.pending_transform;
-    self.pending_surface_damage.clear();
-    self.pending_buffer_damage.clear();
-    for (self.callbacks.items) |callback| callback.pending = false;
+    surface_state.current_scale = surface_state.pending_scale;
+    surface_state.current_transform = surface_state.pending_transform;
+    surface_state.pending_surface_damage.clear();
+    surface_state.pending_buffer_damage.clear();
+    for (surface_state.callbacks.items) |callback| callback.pending = false;
 }
 
 fn handleDestroy(_: *wl.Surface, self: *Self) void {
     self.pending_attachment.clear();
-    if (self.current_buffer) |*current| current.deinit();
+    const surface_state = self.state();
 
-    while (self.callbacks.items.len > 0) {
-        self.callbacks.items[self.callbacks.items.len - 1].resource.destroy();
+    while (surface_state.callbacks.items.len > 0) {
+        surface_state.callbacks.items[surface_state.callbacks.items.len - 1].resource.destroy();
     }
-    self.callbacks.deinit(self.allocator);
 
-    self.pending_surface_damage.deinit();
-    self.pending_buffer_damage.deinit();
-    self.pending_opaque.deinit();
-    self.current_opaque.deinit();
-    self.pending_input.deinit();
-    self.current_input.deinit();
+    var removed = self.store.remove(self.id) orelse unreachable;
+    removed.deinit(self.allocator);
     self.allocator.destroy(self);
 }
 
@@ -430,14 +472,16 @@ pub const BufferSnapshot = struct {
 };
 
 const FrameCallback = struct {
-    surface: *Self,
+    allocator: std.mem.Allocator,
+    store: *Store,
+    surface_id: Id,
     resource: *wl.Callback,
     pending: bool,
 
     fn handleDestroy(resource: *wl.Resource) callconv(.c) void {
         const self: *FrameCallback = @ptrCast(@alignCast(resource.getUserData().?));
-        self.surface.removeCallback(self);
-        self.surface.allocator.destroy(self);
+        removeCallback(self.store, self.surface_id, self);
+        self.allocator.destroy(self);
     }
 };
 
@@ -449,11 +493,13 @@ fn createFrameCallback(self: *Self, id: u32) error{OutOfMemory}!void {
     const callback = self.allocator.create(FrameCallback) catch return error.OutOfMemory;
     errdefer self.allocator.destroy(callback);
     callback.* = .{
-        .surface = self,
+        .allocator = self.allocator,
+        .store = self.store,
+        .surface_id = self.id,
         .resource = resource,
         .pending = true,
     };
-    try self.callbacks.append(self.allocator, callback);
+    try self.state().callbacks.append(self.allocator, callback);
 
     @as(*wl.Resource, @ptrCast(resource)).setDispatcher(
         null,
@@ -463,10 +509,11 @@ fn createFrameCallback(self: *Self, id: u32) error{OutOfMemory}!void {
     );
 }
 
-fn removeCallback(self: *Self, callback: *FrameCallback) void {
-    for (self.callbacks.items, 0..) |candidate, index| {
+fn removeCallback(store: *Store, surface_id: Id, callback: *FrameCallback) void {
+    const surface_state = store.get(surface_id) orelse unreachable;
+    for (surface_state.callbacks.items, 0..) |candidate, index| {
         if (candidate == callback) {
-            _ = self.callbacks.orderedRemove(index);
+            _ = surface_state.callbacks.orderedRemove(index);
             return;
         }
     }
