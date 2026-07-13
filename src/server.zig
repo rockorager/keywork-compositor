@@ -9,8 +9,8 @@ const Subcompositor = @import("subcompositor.zig");
 const XdgShell = @import("xdg_shell.zig");
 const Seat = @import("seat.zig");
 const DataDevice = @import("data_device.zig");
-const HeadlessOutput = @import("headless.zig");
 const Output = @import("output.zig");
+const OutputBackend = @import("output_backend.zig");
 const renderer_types = @import("renderer.zig");
 const render = @import("render.zig");
 const Scene = @import("scene.zig");
@@ -22,7 +22,7 @@ const log = std.log.scoped(.server);
 
 allocator: std.mem.Allocator,
 display: *wl.Server,
-headless_output: HeadlessOutput,
+render_output: OutputBackend,
 output: Output,
 compositor: Compositor,
 subcompositor: Subcompositor,
@@ -38,7 +38,12 @@ frame_time_milliseconds: u32,
 socket_buffer: [11]u8,
 listening: bool,
 
-pub fn create(allocator: std.mem.Allocator, renderer_kind: renderer_types.Renderer.Kind) !*Self {
+pub fn create(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    renderer_kind: renderer_types.Renderer.Kind,
+    output_kind: OutputBackend.Kind,
+) !*Self {
     const self = try allocator.create(Self);
     errdefer allocator.destroy(self);
 
@@ -49,7 +54,7 @@ pub fn create(allocator: std.mem.Allocator, renderer_kind: renderer_types.Render
     self.* = .{
         .allocator = allocator,
         .display = display,
-        .headless_output = undefined,
+        .render_output = undefined,
         .output = undefined,
         .compositor = undefined,
         .subcompositor = undefined,
@@ -66,9 +71,16 @@ pub fn create(allocator: std.mem.Allocator, renderer_kind: renderer_types.Render
         .listening = false,
     };
     errdefer self.renderer.deinit();
-    self.headless_output = try HeadlessOutput.init(allocator, .{ .width = 1280, .height = 720 });
-    errdefer self.headless_output.deinit();
-    try self.output.init(display, self.headless_output.size);
+    try self.render_output.init(
+        allocator,
+        io,
+        display,
+        .{ .width = 1280, .height = 720 },
+        output_kind,
+        .{ .context = self, .repaint = requestRepaint, .close = closeOutput },
+    );
+    errdefer self.render_output.deinit();
+    try self.output.init(display, self.render_output.size());
     errdefer self.output.deinit();
     try self.compositor.init(allocator, display);
     errdefer self.compositor.deinit();
@@ -105,6 +117,7 @@ pub fn create(allocator: std.mem.Allocator, renderer_kind: renderer_types.Render
         .context = self,
         .request = requestRepaint,
     });
+    requestRepaint(self);
 
     return self;
 }
@@ -123,7 +136,7 @@ pub fn destroy(self: *Self) void {
     self.subcompositor.deinit();
     self.compositor.deinit();
     self.output.deinit();
-    self.headless_output.deinit();
+    self.render_output.deinit();
     self.renderer.deinit();
     self.display.destroy();
     allocator.destroy(self);
@@ -160,18 +173,25 @@ fn requestRepaint(context: *anyopaque) void {
     self.repaint_pending = true;
 }
 
+fn closeOutput(context: *anyopaque) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.terminate();
+}
+
 fn handleRenderTimer(self: *Self) c_int {
     self.repaint_pending = false;
     self.renderFrame() catch |err| {
-        log.err("headless frame failed: {t}", .{err});
+        log.err("output frame failed: {t}", .{err});
         self.terminate();
     };
     return 0;
 }
 
 fn renderFrame(self: *Self) renderer_types.Renderer.Error!void {
-    const output_size = self.headless_output.size;
-    const target = self.renderer.makeTarget(self.headless_output.target());
+    const pixel_target = self.render_output.acquire() orelse return;
+    errdefer self.render_output.cancel();
+    const output_size = self.render_output.size();
+    const target = self.renderer.makeTarget(pixel_target);
     const clear_command = [_]render.Command{
         .{ .clear = render.Color.rgba(24, 24, 27, 255) },
     };
@@ -204,6 +224,8 @@ fn renderFrame(self: *Self) renderer_types.Renderer.Error!void {
             );
         },
     };
+
+    self.render_output.present() catch return error.InvalidTarget;
 
     self.frame_time_milliseconds +%= 16;
     fullscreen_reached = top_fullscreen == null;
@@ -337,7 +359,7 @@ fn renderSurfaceTree(
                 } },
             };
             try self.renderer.render(
-                .{ .size = self.headless_output.size, .commands = &image_command },
+                .{ .size = self.render_output.size(), .commands = &image_command },
                 target,
             );
         },
@@ -368,7 +390,7 @@ fn renderWindowBorders(
         &commands,
     );
     try self.renderer.render(
-        .{ .size = self.headless_output.size, .commands = border_commands },
+        .{ .size = self.render_output.size(), .commands = border_commands },
         target,
     );
 }
@@ -514,7 +536,7 @@ fn finishWindowDecorations(
 }
 
 test "server creates and destroys protocol globals" {
-    const server = try Self.create(std.testing.allocator, .cpu);
+    const server = try Self.create(std.testing.allocator, std.testing.io, .cpu, .headless);
     server.destroy();
 }
 

@@ -1,6 +1,7 @@
 //! Application entry point.
 
 const std = @import("std");
+const OutputBackend = @import("output_backend.zig");
 const Renderer = @import("renderer.zig").Renderer;
 const Server = @import("server.zig");
 
@@ -9,7 +10,11 @@ pub fn main(init: std.process.Init) !void {
         std.meta.stringToEnum(Renderer.Kind, value) orelse return error.InvalidRenderer
     else
         .cpu;
-    const server = try Server.create(init.gpa, renderer_kind);
+    const output_kind: OutputBackend.Kind = if (init.environ_map.get("KEYWORK_OUTPUT")) |value|
+        std.meta.stringToEnum(OutputBackend.Kind, value) orelse return error.InvalidOutputBackend
+    else
+        .headless;
+    const server = try Server.create(init.gpa, init.io, renderer_kind, output_kind);
     defer server.destroy();
 
     const interrupt = try server.eventLoop().addSignal(
@@ -45,6 +50,8 @@ test {
     _ = @import("render.zig");
     _ = @import("renderer.zig");
     _ = @import("headless.zig");
+    _ = @import("nested_output.zig");
+    _ = @import("output_backend.zig");
     _ = @import("output.zig");
     _ = @import("cpu_renderer.zig");
     _ = @import("vulkan_renderer.zig");
