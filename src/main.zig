@@ -1,10 +1,15 @@
 //! Application entry point.
 
 const std = @import("std");
+const Renderer = @import("renderer.zig").Renderer;
 const Server = @import("server.zig");
 
 pub fn main(init: std.process.Init) !void {
-    const server = try Server.create(init.gpa);
+    const renderer_kind: Renderer.Kind = if (init.environ_map.get("KEYWORK_RENDERER")) |value|
+        std.meta.stringToEnum(Renderer.Kind, value) orelse return error.InvalidRenderer
+    else
+        .cpu;
+    const server = try Server.create(init.gpa, renderer_kind);
     defer server.destroy();
 
     const interrupt = try server.eventLoop().addSignal(
@@ -42,6 +47,7 @@ test {
     _ = @import("headless.zig");
     _ = @import("output.zig");
     _ = @import("cpu_renderer.zig");
+    _ = @import("vulkan_renderer.zig");
     _ = @import("region.zig");
     _ = @import("scene.zig");
     _ = @import("slot_map.zig");

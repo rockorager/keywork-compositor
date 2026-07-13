@@ -11,7 +11,6 @@ const Seat = @import("seat.zig");
 const DataDevice = @import("data_device.zig");
 const HeadlessOutput = @import("headless.zig");
 const Output = @import("output.zig");
-const CpuRenderer = @import("cpu_renderer.zig");
 const renderer_types = @import("renderer.zig");
 const render = @import("render.zig");
 const Scene = @import("scene.zig");
@@ -39,7 +38,7 @@ frame_time_milliseconds: u32,
 socket_buffer: [11]u8,
 listening: bool,
 
-pub fn create(allocator: std.mem.Allocator) !*Self {
+pub fn create(allocator: std.mem.Allocator, renderer_kind: renderer_types.Renderer.Kind) !*Self {
     const self = try allocator.create(Self);
     errdefer allocator.destroy(self);
 
@@ -59,7 +58,7 @@ pub fn create(allocator: std.mem.Allocator) !*Self {
         .seat = undefined,
         .data_device = undefined,
         .window_manager = undefined,
-        .renderer = .{ .cpu = CpuRenderer.init(allocator) },
+        .renderer = try renderer_types.Renderer.init(allocator, renderer_kind),
         .render_timer = undefined,
         .repaint_pending = false,
         .frame_time_milliseconds = 0,
@@ -172,7 +171,7 @@ fn handleRenderTimer(self: *Self) c_int {
 
 fn renderFrame(self: *Self) renderer_types.Renderer.Error!void {
     const output_size = self.headless_output.size;
-    const target: renderer_types.Target = .{ .cpu = self.headless_output.target() };
+    const target = self.renderer.makeTarget(self.headless_output.target());
     const clear_command = [_]render.Command{
         .{ .clear = render.Color.rgba(24, 24, 27, 255) },
     };
@@ -515,7 +514,7 @@ fn finishWindowDecorations(
 }
 
 test "server creates and destroys protocol globals" {
-    const server = try Self.create(std.testing.allocator);
+    const server = try Self.create(std.testing.allocator, .cpu);
     server.destroy();
 }
 

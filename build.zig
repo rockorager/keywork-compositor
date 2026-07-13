@@ -7,6 +7,9 @@ pub fn build(b: *std.Build) void {
 
     const scanner = Scanner.create(b, .{});
     const river = b.dependency("river", .{});
+    const vulkan = b.dependency("vulkan", .{
+        .registry = b.dependency("vulkan_headers", .{}).path("registry/vk.xml"),
+    }).module("vulkan-zig");
     scanner.addSystemProtocol("stable/xdg-shell/xdg-shell.xml");
     scanner.addCustomProtocol(river.path("protocol/river-window-management-v1.xml"));
     scanner.generate("wl_compositor", 4);
@@ -31,6 +34,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     root_module.addImport("wayland", wayland);
+    root_module.addImport("vulkan", vulkan);
     root_module.linkSystemLibrary("pixman-1", .{});
     root_module.linkSystemLibrary("wayland-server", .{});
 
