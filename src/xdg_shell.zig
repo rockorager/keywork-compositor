@@ -221,18 +221,9 @@ pub const ResizeEdges = packed struct(u4) {
 };
 
 pub const WindowRequest = union(enum) {
-    pointer_move: struct {
-        seat: *wl.Seat,
-        serial: u32,
-    },
-    pointer_resize: struct {
-        seat: *wl.Seat,
-        serial: u32,
-        edges: ResizeEdges,
-    },
+    pointer_move,
+    pointer_resize: ResizeEdges,
     show_window_menu: struct {
-        seat: *wl.Seat,
-        serial: u32,
         x: i32,
         y: i32,
     },
@@ -1910,16 +1901,17 @@ const ToplevelResource = struct {
                 }
                 window.pending_min_size = size;
             },
-            .show_window_menu => |menu| self.forwardRequest(.{ .show_window_menu = .{
-                .seat = menu.seat,
-                .serial = menu.serial,
-                .x = menu.x,
-                .y = menu.y,
-            } }),
-            .move => |move| self.forwardRequest(.{ .pointer_move = .{
-                .seat = move.seat,
-                .serial = move.serial,
-            } }),
+            .show_window_menu => |menu| {
+                if (!self.acceptsUserAction(resource, menu.seat, menu.serial)) return;
+                self.forwardRequest(.{ .show_window_menu = .{
+                    .x = menu.x,
+                    .y = menu.y,
+                } });
+            },
+            .move => |move| {
+                if (!self.acceptsUserAction(resource, move.seat, move.serial)) return;
+                self.forwardRequest(.pointer_move);
+            },
             .resize => |resize| {
                 if (!validResizeEdge(resize.edges)) {
                     resource.postError(.invalid_resize_edge, "invalid resize edge");
@@ -1927,11 +1919,8 @@ const ToplevelResource = struct {
                 }
                 const edges = resizeEdges(resize.edges);
                 if (@as(u4, @bitCast(edges)) == 0) return;
-                self.forwardRequest(.{ .pointer_resize = .{
-                    .seat = resize.seat,
-                    .serial = resize.serial,
-                    .edges = edges,
-                } });
+                if (!self.acceptsUserAction(resource, resize.seat, resize.serial)) return;
+                self.forwardRequest(.{ .pointer_resize = edges });
             },
             .set_maximized => self.forwardRequest(.maximize),
             .unset_maximized => self.forwardRequest(.unmaximize),
@@ -1947,6 +1936,15 @@ const ToplevelResource = struct {
         if (self.shell.window_listener) |listener| {
             listener.request(listener.context, self.id, request);
         }
+    }
+
+    fn acceptsUserAction(
+        self: *ToplevelResource,
+        resource: *xdg.Toplevel,
+        seat: *wl.Seat,
+        serial: u32,
+    ) bool {
+        return self.shell.seat.acceptsUserActionSerial(seat, resource.getClient(), serial);
     }
 
     fn handleDestroy(_: *xdg.Toplevel, self: *ToplevelResource) void {

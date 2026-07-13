@@ -890,27 +890,15 @@ fn windowRequest(
         manager.postNoMemory();
         return;
     };
-    const pending: PendingWindowRequest.Request = translate: switch (request) {
-        .pointer_move => |move| {
-            if (!self.seat.ownsResource(move.seat)) return;
-            _ = move.serial;
-            break :translate .pointer_move;
-        },
-        .pointer_resize => |resize| {
-            if (!self.seat.ownsResource(resize.seat)) return;
-            _ = resize.serial;
-            break :translate .{ .pointer_resize = .{
-                .top = resize.edges.top,
-                .bottom = resize.edges.bottom,
-                .left = resize.edges.left,
-                .right = resize.edges.right,
-            } };
-        },
-        .show_window_menu => |menu| {
-            if (!self.seat.ownsResource(menu.seat)) return;
-            _ = menu.serial;
-            break :translate .{ .show_window_menu = .{ .x = menu.x, .y = menu.y } };
-        },
+    const pending: PendingWindowRequest.Request = switch (request) {
+        .pointer_move => .pointer_move,
+        .pointer_resize => |edges| .{ .pointer_resize = .{
+            .top = edges.top,
+            .bottom = edges.bottom,
+            .left = edges.left,
+            .right = edges.right,
+        } },
+        .show_window_menu => |menu| .{ .show_window_menu = .{ .x = menu.x, .y = menu.y } },
         .maximize => .maximize,
         .unmaximize => .unmaximize,
         .fullscreen => |output| .{ .fullscreen = if (output) |resource|
