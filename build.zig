@@ -1,8 +1,20 @@
 const std = @import("std");
+const Scanner = @import("wayland").Scanner;
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+
+    const scanner = Scanner.create(b, .{});
+    scanner.generate("wl_compositor", 4);
+    scanner.generate("wl_shm", 1);
+    scanner.generate("wl_output", 4);
+
+    const wayland = b.createModule(.{
+        .root_source_file = scanner.result,
+        .target = target,
+        .optimize = optimize,
+    });
 
     const root_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -10,7 +22,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    root_module.addImport("wayland", wayland);
     root_module.linkSystemLibrary("pixman-1", .{});
+    root_module.linkSystemLibrary("wayland-server", .{});
 
     const exe = b.addExecutable(.{
         .name = "keywork_compositor",

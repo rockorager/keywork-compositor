@@ -3,7 +3,12 @@
     .version = "0.0.0",
     .fingerprint = 0xc78f18def53c5576,
     .minimum_zig_version = "0.16.0",
-    .dependencies = .{},
+    .dependencies = .{
+        .wayland = .{
+            .url = "git+https://github.com/ifreund/zig-wayland#a8e10e87e5ebb49ce518ac3d2198909c87ee615a",
+            .hash = "wayland-0.7.0-dev-lQa1kjT8AQDBstL61Gy3WCMtGwVaMN1p6w5wGfdDvP15",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",
