@@ -49,5 +49,6 @@ test {
     _ = @import("seat.zig");
     _ = @import("data_device.zig");
     _ = @import("xdg_shell.zig");
+    _ = @import("window_manager.zig");
     _ = @import("server.zig");
 }

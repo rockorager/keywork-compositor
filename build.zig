@@ -6,7 +6,9 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const scanner = Scanner.create(b, .{});
+    const river = b.dependency("river", .{});
     scanner.addSystemProtocol("stable/xdg-shell/xdg-shell.xml");
+    scanner.addCustomProtocol(river.path("protocol/river-window-management-v1.xml"));
     scanner.generate("wl_compositor", 4);
     scanner.generate("wl_subcompositor", 1);
     scanner.generate("wl_shm", 1);
@@ -14,6 +16,7 @@ pub fn build(b: *std.Build) void {
     scanner.generate("wl_seat", 10);
     scanner.generate("wl_data_device_manager", 3);
     scanner.generate("xdg_wm_base", 5);
+    scanner.generate("river_window_manager_v1", 5);
 
     const wayland = b.createModule(.{
         .root_source_file = scanner.result,

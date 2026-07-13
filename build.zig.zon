@@ -8,6 +8,10 @@
             .url = "git+https://github.com/ifreund/zig-wayland#a8e10e87e5ebb49ce518ac3d2198909c87ee615a",
             .hash = "wayland-0.7.0-dev-lQa1kjT8AQDBstL61Gy3WCMtGwVaMN1p6w5wGfdDvP15",
         },
+        .river = .{
+            .url = "git+https://github.com/riverwm/river#d4fef528467974b9014b0bc9c47a9ea682cc8d4b",
+            .hash = "river-0.5.0-dev-_G6NjiblCwCr_l8sqt1L42R3cs_kvyuSV0wPwgE4fD5D",
+        },
     },
     .paths = .{
         "build.zig",

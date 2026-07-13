@@ -33,6 +33,14 @@ pub fn deinit(self: *Self) void {
     self.* = undefined;
 }
 
+pub fn globalName(self: *const Self, client: *const wl.Client) u32 {
+    return self.global.getName(client);
+}
+
+pub fn logicalSize(self: *const Self) render.Size {
+    return self.size;
+}
+
 fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
     const resource = wl.Output.create(client, version, id) catch {
         client.postNoMemory();

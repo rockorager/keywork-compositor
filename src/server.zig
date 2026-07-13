@@ -16,6 +16,7 @@ const renderer_types = @import("renderer.zig");
 const render = @import("render.zig");
 const Scene = @import("scene.zig");
 const Surface = @import("surface.zig");
+const WindowManager = @import("window_manager.zig");
 
 const wl = wayland.server.wl;
 const log = std.log.scoped(.server);
@@ -30,6 +31,7 @@ scene: Scene,
 xdg_shell: XdgShell,
 seat: Seat,
 data_device: DataDevice,
+window_manager: WindowManager,
 renderer: renderer_types.Renderer,
 render_timer: *wl.EventSource,
 repaint_pending: bool,
@@ -56,6 +58,7 @@ pub fn create(allocator: std.mem.Allocator) !*Self {
         .xdg_shell = undefined,
         .seat = undefined,
         .data_device = undefined,
+        .window_manager = undefined,
         .renderer = .{ .cpu = CpuRenderer.init(allocator) },
         .render_timer = undefined,
         .repaint_pending = false,
@@ -85,6 +88,8 @@ pub fn create(allocator: std.mem.Allocator) !*Self {
     errdefer self.seat.deinit();
     try self.data_device.init(allocator, display, &self.seat);
     errdefer self.data_device.deinit();
+    try self.window_manager.init(allocator, display, &self.output, &self.seat);
+    errdefer self.window_manager.deinit();
     self.render_timer = try display.getEventLoop().addTimer(*Self, handleRenderTimer, self);
     self.subcompositor.setRepaintListener(.{
         .context = self,
@@ -104,6 +109,7 @@ pub fn destroy(self: *Self) void {
     self.subcompositor.clearRepaintListener();
     self.render_timer.remove();
     self.display.destroyClients();
+    self.window_manager.deinit();
     self.data_device.deinit();
     self.seat.deinit();
     self.xdg_shell.deinit();

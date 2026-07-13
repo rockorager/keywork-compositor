@@ -17,6 +17,10 @@ pub fn deinit(self: *Self) void {
     self.* = undefined;
 }
 
+pub fn globalName(self: *const Self, client: *const wl.Client) u32 {
+    return self.global.getName(client);
+}
+
 pub fn ownsResource(self: *Self, resource: *wl.Seat) bool {
     return resource.getUserData() == @as(?*anyopaque, @ptrCast(self));
 }
