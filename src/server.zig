@@ -175,113 +175,130 @@ fn renderFrame(self: *Self) renderer_types.Renderer.Error!void {
     );
 
     const top_fullscreen = self.scene.topFullscreen();
-    var windows = self.scene.iterator();
-    while (windows.next()) |entry| {
-        if (!entry.window.mapped) continue;
-        if (top_fullscreen) |id| {
-            if (!std.meta.eql(entry.id, id)) continue;
-        }
-        const root_buffer = Surface.currentBuffer(
-            self.compositor.surfaceStore(),
-            entry.window.surface_id,
-        ) orelse continue;
-        const content_geometry = entry.window.content_geometry orelse Scene.ContentGeometry{
-            .size = root_buffer.logical_size,
-        };
-        const content_rect = windowContentRect(entry.window, content_geometry.size) orelse
-            continue;
-        const window_clip = if (entry.window.clip_box) |clip_box|
-            clip_box.translated(entry.window.position.x, entry.window.position.y)
-        else
-            null;
-        if (entry.window.effects.shadow) |shadow| {
-            const shadow_command = [_]render.Command{
-                .{ .shadow = .{
-                    .rect = .{
-                        .x = content_rect.x +| shadow.offset.x,
-                        .y = content_rect.y +| shadow.offset.y,
-                        .width = content_rect.width,
-                        .height = content_rect.height,
-                    },
-                    .corner_radius = entry.window.effects.corner_radius,
-                    .blur_radius = shadow.blur_radius,
-                    .spread = shadow.spread,
-                    .color = shadow.color,
-                    .clip = window_clip,
-                } },
-            };
-            try self.renderer.render(
-                .{ .size = output_size, .commands = &shadow_command },
-                target,
-            );
-        }
-        if (entry.window.effects.blur) |blur| {
-            const blur_command = [_]render.Command{
-                .{ .backdrop_blur = .{
-                    .rect = content_rect,
-                    .corner_radius = entry.window.effects.corner_radius,
-                    .radius = blur.radius,
-                    .clip = window_clip,
-                } },
-            };
-            try self.renderer.render(
-                .{ .size = output_size, .commands = &blur_command },
-                target,
-            );
-        }
-        try self.renderWindowDecorations(
-            entry.id,
-            entry.window,
-            .below,
-            window_clip,
-            target,
-        );
-        var content_visible = true;
-        var content_clip = if (entry.window.content_clip_box != null)
-            content_rect
-        else
-            null;
-        if (window_clip) |clip| {
-            if (content_clip) |current| {
-                content_clip = current.intersection(clip) orelse no_content: {
-                    content_visible = false;
-                    break :no_content null;
-                };
-            } else {
-                content_clip = clip;
+    var fullscreen_reached = top_fullscreen == null;
+    var nodes = self.scene.nodeIterator();
+    while (nodes.next()) |entry| switch (entry) {
+        .window => |window_entry| {
+            if (!window_entry.window.mapped) continue;
+            if (top_fullscreen) |id| {
+                if (!std.meta.eql(window_entry.id, id)) continue;
+                fullscreen_reached = true;
             }
-        }
-        if (content_visible) {
+            try self.renderWindow(window_entry.id, window_entry.window, output_size, target);
+        },
+        .shell_surface => |shell_entry| {
+            if (!fullscreen_reached or !shell_entry.shell_surface.mapped) continue;
             try self.renderSurfaceTree(
-                entry.window.surface_id,
-                entry.window.position.x -| content_geometry.offset.x,
-                entry.window.position.y -| content_geometry.offset.y,
-                entry.window.effects.corner_radius,
-                content_clip,
+                shell_entry.shell_surface.surface_id,
+                shell_entry.shell_surface.position.x,
+                shell_entry.shell_surface.position.y,
+                0,
+                null,
                 target,
             );
-        }
-        try self.renderWindowBorders(entry.window, content_rect, window_clip, target);
-        try self.renderWindowDecorations(
-            entry.id,
-            entry.window,
-            .above,
-            window_clip,
-            target,
-        );
-    }
+        },
+    };
 
     self.frame_time_milliseconds +%= 16;
-    windows = self.scene.iterator();
-    while (windows.next()) |entry| {
-        if (!entry.window.mapped) continue;
-        if (top_fullscreen) |id| {
-            if (!std.meta.eql(entry.id, id)) continue;
-        }
-        self.finishWindowDecorations(entry.id, .below);
-        self.finishSurfaceTree(entry.window.surface_id);
-        self.finishWindowDecorations(entry.id, .above);
+    fullscreen_reached = top_fullscreen == null;
+    nodes = self.scene.nodeIterator();
+    while (nodes.next()) |entry| switch (entry) {
+        .window => |window_entry| {
+            if (!window_entry.window.mapped) continue;
+            if (top_fullscreen) |id| {
+                if (!std.meta.eql(window_entry.id, id)) continue;
+                fullscreen_reached = true;
+            }
+            self.finishWindowDecorations(window_entry.id, .below);
+            self.finishSurfaceTree(window_entry.window.surface_id);
+            self.finishWindowDecorations(window_entry.id, .above);
+        },
+        .shell_surface => |shell_entry| {
+            if (!fullscreen_reached or !shell_entry.shell_surface.mapped) continue;
+            self.finishSurfaceTree(shell_entry.shell_surface.surface_id);
+        },
+    };
+}
+
+fn renderWindow(
+    self: *Self,
+    id: Scene.Id,
+    window: *const Scene.Window,
+    output_size: render.Size,
+    target: renderer_types.Target,
+) renderer_types.Renderer.Error!void {
+    const root_buffer = Surface.currentBuffer(
+        self.compositor.surfaceStore(),
+        window.surface_id,
+    ) orelse return;
+    const content_geometry = window.content_geometry orelse Scene.ContentGeometry{
+        .size = root_buffer.logical_size,
+    };
+    const content_rect = windowContentRect(window, content_geometry.size) orelse return;
+    const window_clip = if (window.clip_box) |clip_box|
+        clip_box.translated(window.position.x, window.position.y)
+    else
+        null;
+    if (window.effects.shadow) |shadow| {
+        const shadow_command = [_]render.Command{
+            .{ .shadow = .{
+                .rect = .{
+                    .x = content_rect.x +| shadow.offset.x,
+                    .y = content_rect.y +| shadow.offset.y,
+                    .width = content_rect.width,
+                    .height = content_rect.height,
+                },
+                .corner_radius = window.effects.corner_radius,
+                .blur_radius = shadow.blur_radius,
+                .spread = shadow.spread,
+                .color = shadow.color,
+                .clip = window_clip,
+            } },
+        };
+        try self.renderer.render(
+            .{ .size = output_size, .commands = &shadow_command },
+            target,
+        );
     }
+    if (window.effects.blur) |blur| {
+        const blur_command = [_]render.Command{
+            .{ .backdrop_blur = .{
+                .rect = content_rect,
+                .corner_radius = window.effects.corner_radius,
+                .radius = blur.radius,
+                .clip = window_clip,
+            } },
+        };
+        try self.renderer.render(
+            .{ .size = output_size, .commands = &blur_command },
+            target,
+        );
+    }
+    try self.renderWindowDecorations(id, window, .below, window_clip, target);
+    var content_visible = true;
+    var content_clip = if (window.content_clip_box != null) content_rect else null;
+    if (window_clip) |clip| {
+        if (content_clip) |current| {
+            content_clip = current.intersection(clip) orelse no_content: {
+                content_visible = false;
+                break :no_content null;
+            };
+        } else {
+            content_clip = clip;
+        }
+    }
+    if (content_visible) {
+        try self.renderSurfaceTree(
+            window.surface_id,
+            window.position.x -| content_geometry.offset.x,
+            window.position.y -| content_geometry.offset.y,
+            window.effects.corner_radius,
+            content_clip,
+            target,
+        );
+    }
+    try self.renderWindowBorders(window, content_rect, window_clip, target);
+    try self.renderWindowDecorations(id, window, .above, window_clip, target);
 }
 
 fn renderSurfaceTree(

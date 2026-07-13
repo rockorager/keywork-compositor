@@ -10,13 +10,21 @@ const Surface = @import("surface.zig");
 allocator: std.mem.Allocator,
 windows: Store,
 decorations: DecorationStore,
-stack: std.ArrayList(Id),
+shell_surfaces: ShellSurfaceStore,
+stack: std.ArrayList(NodeId),
 repaint_listener: ?RepaintListener,
 
 pub const Store = slot_map.SlotMap(Window, enum { scene_window });
 pub const Id = Store.Id;
 pub const DecorationStore = slot_map.SlotMap(Decoration, enum { scene_decoration });
 pub const DecorationId = DecorationStore.Id;
+pub const ShellSurfaceStore = slot_map.SlotMap(ShellSurface, enum { scene_shell_surface });
+pub const ShellSurfaceId = ShellSurfaceStore.Id;
+
+pub const NodeId = union(enum) {
+    window: Id,
+    shell_surface: ShellSurfaceId,
+};
 
 pub const Position = struct {
     x: i32 = 0,
@@ -96,6 +104,12 @@ pub const Decoration = struct {
     mapped: bool = false,
 };
 
+pub const ShellSurface = struct {
+    surface_id: Surface.Id,
+    position: Position = .{},
+    mapped: bool = false,
+};
+
 pub const RepaintListener = struct {
     context: *anyopaque,
     request: *const fn (*anyopaque) void,
@@ -112,10 +126,48 @@ pub const Iterator = struct {
 
     pub fn next(self: *Iterator) ?Entry {
         while (self.index < self.scene.stack.items.len) {
-            const id = self.scene.stack.items[self.index];
+            const node_id = self.scene.stack.items[self.index];
             self.index += 1;
+            const id = switch (node_id) {
+                .window => |id| id,
+                .shell_surface => continue,
+            };
             const window = self.scene.windows.get(id) orelse continue;
             return .{ .id = id, .window = window };
+        }
+        return null;
+    }
+};
+
+pub const NodeIterator = struct {
+    scene: *Self,
+    index: usize = 0,
+
+    pub const Entry = union(enum) {
+        window: Iterator.Entry,
+        shell_surface: struct {
+            id: ShellSurfaceId,
+            shell_surface: *ShellSurface,
+        },
+    };
+
+    pub fn next(self: *NodeIterator) ?Entry {
+        while (self.index < self.scene.stack.items.len) {
+            const id = self.scene.stack.items[self.index];
+            self.index += 1;
+            switch (id) {
+                .window => |window_id| {
+                    const window = self.scene.windows.get(window_id) orelse continue;
+                    return .{ .window = .{ .id = window_id, .window = window } };
+                },
+                .shell_surface => |shell_id| {
+                    const shell_surface = self.scene.shell_surfaces.get(shell_id) orelse continue;
+                    return .{ .shell_surface = .{
+                        .id = shell_id,
+                        .shell_surface = shell_surface,
+                    } };
+                },
+            }
         }
         return null;
     }
@@ -146,6 +198,7 @@ pub fn init(self: *Self, allocator: std.mem.Allocator) void {
         .allocator = allocator,
         .windows = .{},
         .decorations = .{},
+        .shell_surfaces = .{},
         .stack = .empty,
         .repaint_listener = null,
     };
@@ -154,9 +207,11 @@ pub fn init(self: *Self, allocator: std.mem.Allocator) void {
 pub fn deinit(self: *Self) void {
     std.debug.assert(self.windows.len() == 0);
     std.debug.assert(self.decorations.len() == 0);
+    std.debug.assert(self.shell_surfaces.len() == 0);
     std.debug.assert(self.stack.items.len == 0);
     self.windows.deinit(self.allocator);
     self.decorations.deinit(self.allocator);
+    self.shell_surfaces.deinit(self.allocator);
     self.stack.deinit(self.allocator);
     self.* = undefined;
 }
@@ -174,7 +229,7 @@ pub fn clearRepaintListener(self: *Self) void {
 pub fn addWindow(self: *Self, surface_id: Surface.Id) error{OutOfMemory}!Id {
     const id = try self.windows.insert(self.allocator, .{ .surface_id = surface_id });
     errdefer _ = self.windows.remove(id);
-    try self.stack.append(self.allocator, id);
+    try self.stack.append(self.allocator, .{ .window = id });
     return id;
 }
 
@@ -187,12 +242,52 @@ pub fn removeWindow(self: *Self, id: Id) void {
         }
     }
     for (self.stack.items, 0..) |candidate, index| {
-        if (std.meta.eql(candidate, id)) {
+        if (std.meta.eql(candidate, NodeId{ .window = id })) {
             _ = self.stack.orderedRemove(index);
             break;
         }
     }
     if (window.mapped) self.requestRepaint();
+}
+
+pub fn addShellSurface(
+    self: *Self,
+    surface_id: Surface.Id,
+) error{OutOfMemory}!ShellSurfaceId {
+    const id = try self.shell_surfaces.insert(self.allocator, .{ .surface_id = surface_id });
+    errdefer _ = self.shell_surfaces.remove(id);
+    try self.stack.append(self.allocator, .{ .shell_surface = id });
+    return id;
+}
+
+pub fn removeShellSurface(self: *Self, id: ShellSurfaceId) void {
+    const shell_surface = self.shell_surfaces.remove(id) orelse return;
+    for (self.stack.items, 0..) |candidate, index| {
+        if (std.meta.eql(candidate, NodeId{ .shell_surface = id })) {
+            _ = self.stack.orderedRemove(index);
+            break;
+        }
+    }
+    if (shell_surface.mapped) self.requestRepaint();
+}
+
+pub fn setShellSurfaceMapped(self: *Self, id: ShellSurfaceId, mapped: bool) void {
+    const shell_surface = self.shell_surfaces.get(id) orelse return;
+    if (shell_surface.mapped == mapped) return;
+    shell_surface.mapped = mapped;
+    self.requestRepaint();
+}
+
+pub fn setShellSurfacePosition(self: *Self, id: ShellSurfaceId, position: Position) void {
+    const shell_surface = self.shell_surfaces.get(id) orelse return;
+    if (std.meta.eql(shell_surface.position, position)) return;
+    shell_surface.position = position;
+    if (shell_surface.mapped) self.requestRepaint();
+}
+
+pub fn shellSurfaceCommitted(self: *Self, id: ShellSurfaceId) void {
+    const shell_surface = self.shell_surfaces.get(id) orelse return;
+    if (shell_surface.mapped) self.requestRepaint();
 }
 
 pub fn addDecoration(
@@ -257,39 +352,55 @@ pub fn setPosition(self: *Self, id: Id, position: Position) void {
 }
 
 pub fn placeTop(self: *Self, id: Id) void {
-    const index = self.stackIndex(id) orelse return;
-    if (index == self.stack.items.len - 1) return;
-    const moved = self.stack.orderedRemove(index);
-    self.stack.appendAssumeCapacity(moved);
-    if (self.windows.get(id).?.mapped) self.requestRepaint();
+    self.placeNodeTop(.{ .window = id });
 }
 
 pub fn placeBottom(self: *Self, id: Id) void {
-    const index = self.stackIndex(id) orelse return;
-    if (index == 0) return;
-    const moved = self.stack.orderedRemove(index);
-    self.stack.insertAssumeCapacity(0, moved);
-    if (self.windows.get(id).?.mapped) self.requestRepaint();
+    self.placeNodeBottom(.{ .window = id });
 }
 
 pub fn placeAbove(self: *Self, id: Id, other: Id) void {
-    if (std.meta.eql(id, other)) return;
-    const index = self.stackIndex(id) orelse return;
-    if (self.stackIndex(other) == null) return;
-    const moved = self.stack.orderedRemove(index);
-    const other_index = self.stackIndex(other) orelse unreachable;
-    self.stack.insertAssumeCapacity(other_index + 1, moved);
-    if (self.windows.get(id).?.mapped) self.requestRepaint();
+    self.placeNodeAbove(.{ .window = id }, .{ .window = other });
 }
 
 pub fn placeBelow(self: *Self, id: Id, other: Id) void {
-    if (std.meta.eql(id, other)) return;
-    const index = self.stackIndex(id) orelse return;
-    if (self.stackIndex(other) == null) return;
+    self.placeNodeBelow(.{ .window = id }, .{ .window = other });
+}
+
+pub fn placeNodeTop(self: *Self, id: NodeId) void {
+    const index = self.nodeIndex(id) orelse return;
+    if (index == self.stack.items.len - 1) return;
     const moved = self.stack.orderedRemove(index);
-    const other_index = self.stackIndex(other) orelse unreachable;
+    self.stack.appendAssumeCapacity(moved);
+    if (self.nodeMapped(id)) self.requestRepaint();
+}
+
+pub fn placeNodeBottom(self: *Self, id: NodeId) void {
+    const index = self.nodeIndex(id) orelse return;
+    if (index == 0) return;
+    const moved = self.stack.orderedRemove(index);
+    self.stack.insertAssumeCapacity(0, moved);
+    if (self.nodeMapped(id)) self.requestRepaint();
+}
+
+pub fn placeNodeAbove(self: *Self, id: NodeId, other: NodeId) void {
+    if (std.meta.eql(id, other)) return;
+    const index = self.nodeIndex(id) orelse return;
+    if (self.nodeIndex(other) == null) return;
+    const moved = self.stack.orderedRemove(index);
+    const other_index = self.nodeIndex(other) orelse unreachable;
+    self.stack.insertAssumeCapacity(other_index + 1, moved);
+    if (self.nodeMapped(id)) self.requestRepaint();
+}
+
+pub fn placeNodeBelow(self: *Self, id: NodeId, other: NodeId) void {
+    if (std.meta.eql(id, other)) return;
+    const index = self.nodeIndex(id) orelse return;
+    if (self.nodeIndex(other) == null) return;
+    const moved = self.stack.orderedRemove(index);
+    const other_index = self.nodeIndex(other) orelse unreachable;
     self.stack.insertAssumeCapacity(other_index, moved);
-    if (self.windows.get(id).?.mapped) self.requestRepaint();
+    if (self.nodeMapped(id)) self.requestRepaint();
 }
 
 pub fn setFocused(self: *Self, id: Id, focused: bool) void {
@@ -349,6 +460,10 @@ pub fn iterator(self: *Self) Iterator {
     return .{ .scene = self };
 }
 
+pub fn nodeIterator(self: *Self) NodeIterator {
+    return .{ .scene = self };
+}
+
 pub fn decorationIterator(
     self: *Self,
     window_id: Id,
@@ -365,7 +480,10 @@ pub fn topFullscreen(self: *Self) ?Id {
     var index = self.stack.items.len;
     while (index > 0) {
         index -= 1;
-        const id = self.stack.items[index];
+        const id = switch (self.stack.items[index]) {
+            .window => |id| id,
+            .shell_surface => continue,
+        };
         const window = self.windows.get(id) orelse continue;
         if (window.mapped and window.fullscreen) return id;
     }
@@ -390,12 +508,32 @@ fn setWindowClipBox(self: *Self, id: Id, clip_box: ?ClipBox, content_only: bool)
     if (window.mapped) self.requestRepaint();
 }
 
-fn stackIndex(self: *Self, id: Id) ?usize {
-    if (self.windows.get(id) == null) return null;
+fn nodeIndex(self: *Self, id: NodeId) ?usize {
+    if (!self.nodeExists(id)) return null;
     for (self.stack.items, 0..) |candidate, index| {
         if (std.meta.eql(candidate, id)) return index;
     }
     unreachable;
+}
+
+fn nodeExists(self: *Self, id: NodeId) bool {
+    return switch (id) {
+        .window => |window_id| self.windows.get(window_id) != null,
+        .shell_surface => |shell_id| self.shell_surfaces.get(shell_id) != null,
+    };
+}
+
+fn nodeMapped(self: *Self, id: NodeId) bool {
+    return switch (id) {
+        .window => |window_id| if (self.windows.get(window_id)) |window|
+            window.mapped
+        else
+            false,
+        .shell_surface => |shell_id| if (self.shell_surfaces.get(shell_id)) |shell_surface|
+            shell_surface.mapped
+        else
+            false,
+    };
 }
 
 test "scene keeps visual state behind generational handles" {
@@ -472,16 +610,32 @@ test "scene reorders windows through handles" {
     try std.testing.expectEqual(second, scene.topFullscreen().?);
 
     scene.placeTop(first);
-    try std.testing.expectEqualSlices(Id, &.{ second, third, first }, scene.stack.items);
+    try std.testing.expectEqualSlices(NodeId, &.{
+        .{ .window = second },
+        .{ .window = third },
+        .{ .window = first },
+    }, scene.stack.items);
     try std.testing.expectEqual(first, scene.topFullscreen().?);
     scene.placeBelow(first, third);
-    try std.testing.expectEqualSlices(Id, &.{ second, first, third }, scene.stack.items);
+    try std.testing.expectEqualSlices(NodeId, &.{
+        .{ .window = second },
+        .{ .window = first },
+        .{ .window = third },
+    }, scene.stack.items);
     try std.testing.expectEqual(first, scene.topFullscreen().?);
     scene.placeAbove(second, third);
-    try std.testing.expectEqualSlices(Id, &.{ first, third, second }, scene.stack.items);
+    try std.testing.expectEqualSlices(NodeId, &.{
+        .{ .window = first },
+        .{ .window = third },
+        .{ .window = second },
+    }, scene.stack.items);
     try std.testing.expectEqual(second, scene.topFullscreen().?);
     scene.placeBottom(second);
-    try std.testing.expectEqualSlices(Id, &.{ second, first, third }, scene.stack.items);
+    try std.testing.expectEqualSlices(NodeId, &.{
+        .{ .window = second },
+        .{ .window = first },
+        .{ .window = third },
+    }, scene.stack.items);
     try std.testing.expectEqual(first, scene.topFullscreen().?);
 
     scene.removeWindow(first);
@@ -489,6 +643,35 @@ test "scene reorders windows through handles" {
     scene.removeWindow(second);
     try std.testing.expectEqual(@as(?Id, null), scene.topFullscreen());
     scene.removeWindow(third);
+}
+
+test "scene interleaves shell surfaces and windows through node handles" {
+    var scene: Self = undefined;
+    scene.init(std.testing.allocator);
+    defer scene.deinit();
+
+    const window = try scene.addWindow(.{ .index = 1, .generation = 1 });
+    const shell_surface = try scene.addShellSurface(.{ .index = 2, .generation = 1 });
+    scene.setMapped(window, true);
+    scene.setShellSurfaceMapped(shell_surface, true);
+    scene.setShellSurfacePosition(shell_surface, .{ .x = 20, .y = 30 });
+    scene.placeNodeBelow(.{ .shell_surface = shell_surface }, .{ .window = window });
+
+    try std.testing.expectEqualSlices(NodeId, &.{
+        .{ .shell_surface = shell_surface },
+        .{ .window = window },
+    }, scene.stack.items);
+
+    var nodes = scene.nodeIterator();
+    const shell_entry = nodes.next().?.shell_surface;
+    try std.testing.expect(std.meta.eql(shell_surface, shell_entry.id));
+    try std.testing.expectEqual(Position{ .x = 20, .y = 30 }, shell_entry.shell_surface.position);
+    const window_entry = nodes.next().?.window;
+    try std.testing.expect(std.meta.eql(window, window_entry.id));
+    try std.testing.expectEqual(@as(?NodeIterator.Entry, null), nodes.next());
+
+    scene.removeShellSurface(shell_surface);
+    scene.removeWindow(window);
 }
 
 test "scene attaches decoration handles to windows" {
