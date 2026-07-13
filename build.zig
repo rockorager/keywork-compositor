@@ -11,6 +11,7 @@ pub fn build(b: *std.Build) void {
         .registry = b.dependency("vulkan_headers", .{}).path("registry/vk.xml"),
     }).module("vulkan-zig");
     scanner.addSystemProtocol("stable/xdg-shell/xdg-shell.xml");
+    scanner.addSystemProtocol("unstable/xdg-decoration/xdg-decoration-unstable-v1.xml");
     scanner.addSystemProtocol("stable/viewporter/viewporter.xml");
     scanner.addSystemProtocol("staging/fractional-scale/fractional-scale-v1.xml");
     scanner.addCustomProtocol(river.path("protocol/river-window-management-v1.xml"));
@@ -21,6 +22,7 @@ pub fn build(b: *std.Build) void {
     scanner.generate("wl_seat", 10);
     scanner.generate("wl_data_device_manager", 3);
     scanner.generate("xdg_wm_base", 5);
+    scanner.generate("zxdg_decoration_manager_v1", 2);
     scanner.generate("wp_viewporter", 1);
     scanner.generate("wp_fractional_scale_manager_v1", 1);
     scanner.generate("river_window_manager_v1", 5);

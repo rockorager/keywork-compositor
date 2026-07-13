@@ -402,7 +402,12 @@ fn sendPendingState(self: *Self, manager: *river.WindowManagerV1) !void {
             break :parent managed_parent.resource;
         } else null;
         resource.sendParent(parent_resource);
-        resource.sendDecorationHint(.only_supports_csd);
+        resource.sendDecorationHint(switch (info.decoration_preference) {
+            .only_csd => .only_supports_csd,
+            .prefers_csd => .prefers_csd,
+            .prefers_ssd => .prefers_ssd,
+            .no_preference => .no_preference,
+        });
         window.metadata_dirty = false;
     }
 
@@ -482,11 +487,16 @@ fn finishManage(self: *Self, manager: *river.WindowManagerV1) void {
         entry.value.requested_configuration.activated = activated;
         const report_dimensions = entry.value.proposed_dimensions != null or
             entry.value.fullscreen_dimensions_pending;
+        const info = self.xdg_shell.windowInfo(entry.value.xdg_id) orelse continue;
+        if (info.decoration_preference == .only_csd) {
+            entry.value.requested_configuration.decoration_mode = .client_side;
+        }
         const configuration_changed = !std.meta.eql(
             entry.value.requested_configuration,
             entry.value.sent_configuration,
         );
-        if (!report_dimensions and !configuration_changed) continue;
+        if (!report_dimensions and !configuration_changed and
+            !info.decoration_configure_requested) continue;
         const proposed_dimensions = entry.value.proposed_dimensions;
         const dimensions = if (entry.value.fullscreen_output) fullscreen: {
             const size = self.output.logicalSize();
@@ -494,9 +504,7 @@ fn finishManage(self: *Self, manager: *river.WindowManagerV1) void {
                 .width = @intCast(size.width),
                 .height = @intCast(size.height),
             };
-        } else proposed_dimensions orelse
-            (self.xdg_shell.windowInfo(entry.value.xdg_id) orelse continue).dimensions orelse
-            entry.value.requested_dimensions;
+        } else proposed_dimensions orelse info.dimensions orelse entry.value.requested_dimensions;
         const serial = self.xdg_shell.configureWindowState(
             entry.value.xdg_id,
             dimensions,
@@ -760,7 +768,8 @@ fn releaseWindows(self: *Self) void {
         self.xdg_shell.setWindowContentClipBox(entry.value.xdg_id, null);
         self.xdg_shell.restoreStandaloneWindow(
             entry.value.xdg_id,
-            entry.value.sent_configuration.activated,
+            entry.value.sent_configuration.activated or
+                entry.value.sent_configuration.decoration_mode == .server_side,
             entry.value.requested_dimensions,
         );
         _ = self.windows.remove(entry.id);
@@ -860,12 +869,14 @@ fn windowDestroyed(context: *anyopaque, xdg_id: XdgShell.WindowId) void {
     self.removeWindow(xdg_id);
 }
 
-fn windowMetadataChanged(context: *anyopaque, xdg_id: XdgShell.WindowId) void {
+fn windowMetadataChanged(context: *anyopaque, xdg_id: XdgShell.WindowId) bool {
     const self: *Self = @ptrCast(@alignCast(context));
-    const id = self.findWindow(xdg_id) orelse return;
-    const window = self.windows.get(id) orelse return;
+    if (self.active == null) return false;
+    const id = self.findWindow(xdg_id) orelse return false;
+    const window = self.windows.get(id) orelse return false;
     window.metadata_dirty = true;
     self.requestManage();
+    return true;
 }
 
 fn windowRequest(
@@ -989,7 +1000,17 @@ const WindowResource = struct {
                 if (!self.requireRendering(manager_resource)) return;
                 window.requested_visible = true;
             },
-            .use_csd, .use_ssd => _ = self.requireManage(manager_resource),
+            .use_csd => {
+                if (!self.requireManage(manager_resource)) return;
+                window.requested_configuration.decoration_mode = .client_side;
+            },
+            .use_ssd => {
+                if (!self.requireManage(manager_resource)) return;
+                const info = self.manager.xdg_shell.windowInfo(window.xdg_id) orelse return;
+                if (info.decoration_preference != .only_csd) {
+                    window.requested_configuration.decoration_mode = .server_side;
+                }
+            },
             .set_tiled => |tiled| {
                 if (!self.requireManage(manager_resource)) return;
                 window.requested_configuration.tiled = .{

@@ -12,6 +12,7 @@ const Surface = @import("surface.zig");
 
 const wl = wayland.server.wl;
 const xdg = wayland.server.xdg;
+const zxdg = wayland.server.zxdg;
 
 allocator: std.mem.Allocator,
 display: *wl.Server,
@@ -20,6 +21,7 @@ scene: *Scene,
 seat: *Seat,
 output_size: render.Size,
 global: *wl.Global,
+decoration_global: *wl.Global,
 bindings: BindingStore,
 xdg_surfaces: XdgSurfaceStore,
 windows: WindowStore,
@@ -134,6 +136,8 @@ pub const WindowState = struct {
     pending_max_size: SizeHint = .{},
     current_min_size: SizeHint = .{},
     current_max_size: SizeHint = .{},
+    decoration_preference: DecorationPreference = .only_csd,
+    decoration_configure_requested: bool = false,
     mapped: bool = false,
     ready: bool = false,
 
@@ -194,6 +198,19 @@ pub const ToplevelConfigure = struct {
     resizing: bool = false,
     tiled: TiledEdges = .{},
     capabilities: WindowCapabilities = .{},
+    decoration_mode: DecorationMode = .client_side,
+};
+
+pub const DecorationMode = enum {
+    client_side,
+    server_side,
+};
+
+pub const DecorationPreference = enum {
+    only_csd,
+    prefers_csd,
+    prefers_ssd,
+    no_preference,
 };
 
 pub const ResizeEdges = packed struct(u4) {
@@ -234,6 +251,8 @@ pub const WindowInfo = struct {
     parent: ?WindowId,
     min_size: SizeHint,
     max_size: SizeHint,
+    decoration_preference: DecorationPreference,
+    decoration_configure_requested: bool,
     dimensions: ?Dimensions,
     ready: bool,
     mapped: bool,
@@ -245,7 +264,7 @@ pub const WindowListener = struct {
     committed: *const fn (*anyopaque, WindowId, ?u32) bool,
     unmapped: *const fn (*anyopaque, WindowId) void,
     destroyed: *const fn (*anyopaque, WindowId) void,
-    metadata_changed: *const fn (*anyopaque, WindowId) void,
+    metadata_changed: *const fn (*anyopaque, WindowId) bool,
     request: *const fn (*anyopaque, WindowId, WindowRequest) void,
 };
 
@@ -275,6 +294,7 @@ pub fn init(
         .seat = seat,
         .output_size = output_size,
         .global = undefined,
+        .decoration_global = undefined,
         .bindings = .{},
         .xdg_surfaces = .{},
         .windows = .{},
@@ -287,10 +307,20 @@ pub fn init(
     errdefer self.windows.deinit(allocator);
     errdefer self.popups.deinit(allocator);
     self.global = try wl.Global.create(display, xdg.WmBase, 5, *Self, self, bind);
+    errdefer self.global.destroy();
+    self.decoration_global = try wl.Global.create(
+        display,
+        zxdg.DecorationManagerV1,
+        2,
+        *Self,
+        self,
+        bindDecorationManager,
+    );
 }
 
 pub fn deinit(self: *Self) void {
     std.debug.assert(self.window_listener == null);
+    self.decoration_global.destroy();
     self.global.destroy();
     self.bindings.deinit(self.allocator);
     self.xdg_surfaces.deinit(self.allocator);
@@ -331,6 +361,8 @@ pub fn windowInfo(self: *Self, id: WindowId) ?WindowInfo {
         .parent = window.parent,
         .min_size = window.current_min_size,
         .max_size = window.current_max_size,
+        .decoration_preference = window.decoration_preference,
+        .decoration_configure_requested = window.decoration_configure_requested,
         .dimensions = dimensions,
         .ready = window.ready,
         .mapped = window.mapped,
@@ -464,8 +496,16 @@ pub fn configureWindowState(
         toplevel.sendWmCapabilities(&capabilities_array);
         state.sent_capabilities = configuration.capabilities;
     }
-    toplevel.sendConfigure(dimensions.width, dimensions.height, &states_array);
     const adapter: *ToplevelResource = @ptrCast(@alignCast(toplevel.getUserData().?));
+    if (adapter.decoration) |decoration| {
+        decoration.resource.sendConfigure(switch (configuration.decoration_mode) {
+            .client_side => .client_side,
+            .server_side => .server_side,
+        });
+        decoration.configure_sent = true;
+        window.decoration_configure_requested = false;
+    }
+    toplevel.sendConfigure(dimensions.width, dimensions.height, &states_array);
     adapter.xdg_surface_resource.resource.sendConfigure(serial);
     state.initial_configure_sent = true;
     return serial;
@@ -816,6 +856,30 @@ fn removePopupState(self: *Self, id: PopupId) void {
 
 fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
     WmBaseResource.create(self, client, version, id) catch client.postNoMemory();
+}
+
+fn bindDecorationManager(client: *wl.Client, self: *Self, version: u32, id: u32) void {
+    const resource = zxdg.DecorationManagerV1.create(client, version, id) catch {
+        client.postNoMemory();
+        return;
+    };
+    resource.setHandler(*Self, handleDecorationManagerRequest, null, self);
+}
+
+fn handleDecorationManagerRequest(
+    resource: *zxdg.DecorationManagerV1,
+    request: zxdg.DecorationManagerV1.Request,
+    self: *Self,
+) void {
+    switch (request) {
+        .destroy => resource.destroy(),
+        .get_toplevel_decoration => |get| ToplevelDecorationResource.create(
+            self,
+            resource,
+            get.toplevel,
+            get.id,
+        ) catch resource.postNoMemory(),
+    }
 }
 
 const WmBaseResource = struct {
@@ -1210,6 +1274,20 @@ const XdgSurfaceResource = struct {
             self.resource.postError(.not_constructed, "xdg_surface committed before role creation");
             return .reject;
         }
+        if (info.has_buffer and state.toplevel_resource != null) {
+            const toplevel: *ToplevelResource = @ptrCast(@alignCast(
+                state.toplevel_resource.?.getUserData().?,
+            ));
+            if (toplevel.decoration) |decoration| {
+                if (decoration.resource.getVersion() == 1 and !decoration.configure_sent) {
+                    decoration.resource.postError(
+                        .unconfigured_buffer,
+                        "buffer committed before the initial decoration configure",
+                    );
+                    return .reject;
+                }
+            }
+        }
         if (info.has_buffer and !state.configured and state.last_acked_serial == null) {
             self.resource.postError(
                 .unconfigured_buffer,
@@ -1241,7 +1319,7 @@ const XdgSurfaceResource = struct {
         const window = self.shell.windows.get(window_id) orelse return;
         if (window.commit()) {
             if (self.shell.window_listener) |listener| {
-                listener.metadata_changed(listener.context, window_id);
+                _ = listener.metadata_changed(listener.context, window_id);
             }
         }
 
@@ -1256,6 +1334,10 @@ const XdgSurfaceResource = struct {
             state.sent_capabilities = null;
             state.last_acked_serial = null;
             state.configure_serials.clearRetainingCapacity();
+            if (state.toplevel_resource) |resource| {
+                const toplevel: *ToplevelResource = @ptrCast(@alignCast(resource.getUserData().?));
+                if (toplevel.decoration) |decoration| decoration.configure_sent = false;
+            }
             self.shell.scene.setMapped(window.scene_id, false);
             self.shell.scene.setContentGeometry(window.scene_id, null);
             window.reset(self.allocator);
@@ -1612,12 +1694,149 @@ const PopupResource = struct {
     }
 };
 
+const ToplevelDecorationResource = struct {
+    allocator: std.mem.Allocator,
+    shell: *Self,
+    resource: *zxdg.ToplevelDecorationV1,
+    toplevel: ?*ToplevelResource,
+    configure_sent: bool = false,
+
+    fn create(
+        shell: *Self,
+        manager: *zxdg.DecorationManagerV1,
+        toplevel_resource: *xdg.Toplevel,
+        id: u32,
+    ) error{ OutOfMemory, ResourceCreateFailed }!void {
+        const resource = try zxdg.ToplevelDecorationV1.create(
+            manager.getClient(),
+            manager.getVersion(),
+            id,
+        );
+        errdefer resource.destroy();
+
+        const data = toplevel_resource.getUserData() orelse {
+            resource.postError(.orphaned, "xdg_toplevel no longer exists");
+            return;
+        };
+        const toplevel: *ToplevelResource = @ptrCast(@alignCast(data));
+        if (toplevel.shell != shell or toplevel_resource.getClient() != manager.getClient()) {
+            resource.postError(.orphaned, "xdg_toplevel belongs to another client");
+            return;
+        }
+        if (toplevel.decoration != null) {
+            resource.postError(.already_constructed, "xdg_toplevel already has a decoration object");
+            return;
+        }
+        if (resource.getVersion() == 1) {
+            const surface = toplevel.xdg_surface_resource.surface;
+            if (surface == null or surface.?.hasBufferAttachedOrCommitted()) {
+                resource.postError(
+                    .unconfigured_buffer,
+                    "version 1 decoration created after a buffer was attached",
+                );
+                return;
+            }
+        }
+
+        const self = shell.allocator.create(ToplevelDecorationResource) catch
+            return error.OutOfMemory;
+        self.* = .{
+            .allocator = shell.allocator,
+            .shell = shell,
+            .resource = resource,
+            .toplevel = toplevel,
+        };
+        toplevel.decoration = self;
+        if (shell.windows.get(toplevel.id)) |window| {
+            window.decoration_preference = .no_preference;
+            window.decoration_configure_requested = true;
+        }
+        const externally_managed = self.notifyMetadataChanged();
+        if (!externally_managed) self.configureStandalone();
+        resource.setHandler(
+            *ToplevelDecorationResource,
+            handleRequest,
+            handleDestroy,
+            self,
+        );
+    }
+
+    fn handleRequest(
+        resource: *zxdg.ToplevelDecorationV1,
+        request: zxdg.ToplevelDecorationV1.Request,
+        self: *ToplevelDecorationResource,
+    ) void {
+        if (self.toplevel == null and request != .destroy) {
+            resource.postError(.orphaned, "xdg_toplevel was destroyed");
+            return;
+        }
+        switch (request) {
+            .destroy => resource.destroy(),
+            .set_mode => |set| self.setPreference(switch (set.mode) {
+                .client_side => .prefers_csd,
+                .server_side => .prefers_ssd,
+                else => {
+                    resource.postError(.invalid_mode, "invalid decoration mode");
+                    return;
+                },
+            }),
+            .unset_mode => self.setPreference(.no_preference),
+        }
+    }
+
+    fn setPreference(self: *ToplevelDecorationResource, preference: DecorationPreference) void {
+        const toplevel = self.toplevel orelse return;
+        const window = self.shell.windows.get(toplevel.id) orelse return;
+        window.decoration_preference = preference;
+        window.decoration_configure_requested = true;
+        const externally_managed = self.notifyMetadataChanged();
+        if (!externally_managed) self.configureStandalone();
+    }
+
+    fn notifyMetadataChanged(self: *ToplevelDecorationResource) bool {
+        const toplevel = self.toplevel orelse return false;
+        if (self.shell.window_listener) |listener| {
+            return listener.metadata_changed(listener.context, toplevel.id);
+        }
+        return false;
+    }
+
+    fn configureStandalone(self: *ToplevelDecorationResource) void {
+        const toplevel = self.toplevel orelse return;
+        const window = self.shell.windows.get(toplevel.id) orelse return;
+        if (!window.ready) return;
+        const state = self.shell.xdg_surfaces.get(toplevel.xdg_surface_id) orelse return;
+        if (!state.initial_configure_sent) return;
+        const dimensions: Dimensions = if (self.shell.contentGeometry(state)) |geometry| .{
+            .width = @intCast(geometry.size.width),
+            .height = @intCast(geometry.size.height),
+        } else .{ .width = 0, .height = 0 };
+        _ = self.shell.configureWindowState(toplevel.id, dimensions, .{}) catch |err| switch (err) {
+            error.OutOfMemory => self.resource.postNoMemory(),
+            error.InvalidWindow => {},
+        };
+    }
+
+    fn handleDestroy(_: *zxdg.ToplevelDecorationV1, self: *ToplevelDecorationResource) void {
+        if (self.toplevel) |toplevel| {
+            toplevel.decoration = null;
+            if (self.shell.windows.get(toplevel.id)) |window| {
+                window.decoration_preference = .only_csd;
+                window.decoration_configure_requested = false;
+            }
+            _ = self.notifyMetadataChanged();
+        }
+        self.allocator.destroy(self);
+    }
+};
+
 const ToplevelResource = struct {
     allocator: std.mem.Allocator,
     shell: *Self,
     id: WindowId,
     xdg_surface_id: XdgSurfaceId,
     xdg_surface_resource: *XdgSurfaceResource,
+    decoration: ?*ToplevelDecorationResource,
 
     fn create(
         xdg_surface: *XdgSurfaceResource,
@@ -1655,6 +1874,7 @@ const ToplevelResource = struct {
             .id = window_id,
             .xdg_surface_id = xdg_surface.id,
             .xdg_surface_resource = xdg_surface,
+            .decoration = null,
         };
         const state = xdg_surface.shell.xdg_surfaces.get(xdg_surface.id) orelse unreachable;
         state.role = .{ .toplevel = window_id };
@@ -1730,6 +1950,13 @@ const ToplevelResource = struct {
     }
 
     fn handleDestroy(_: *xdg.Toplevel, self: *ToplevelResource) void {
+        if (self.decoration) |decoration| {
+            decoration.toplevel = null;
+            decoration.resource.postError(
+                .orphaned,
+                "destroy xdg_toplevel_decoration before xdg_toplevel",
+            );
+        }
         self.shell.dismissPopupsForParent(self.xdg_surface_id);
         if (self.shell.xdg_surfaces.get(self.xdg_surface_id)) |xdg_surface| {
             xdg_surface.role = null;
@@ -1771,7 +1998,7 @@ const ToplevelResource = struct {
         if (destination.*) |old| self.allocator.free(old);
         destination.* = copy;
         if (self.shell.window_listener) |listener| {
-            listener.metadata_changed(listener.context, self.id);
+            _ = listener.metadata_changed(listener.context, self.id);
         }
     }
 
@@ -1799,7 +2026,7 @@ const ToplevelResource = struct {
         }
         window.parent = parent_id;
         if (self.shell.window_listener) |listener| {
-            listener.metadata_changed(listener.context, self.id);
+            _ = listener.metadata_changed(listener.context, self.id);
         }
     }
 
