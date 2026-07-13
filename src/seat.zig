@@ -25,6 +25,7 @@ focus: ?Surface.Id,
 pointer_focus: ?PointerFocus,
 pressed_keys: std.ArrayList(u32),
 modifiers: Modifiers,
+last_user_action: ?UserAction,
 
 const Keymap = struct {
     format: wl.Keyboard.KeymapFormat,
@@ -42,6 +43,11 @@ const Modifiers = struct {
     latched: u32 = 0,
     locked: u32 = 0,
     group: u32 = 0,
+};
+
+const UserAction = struct {
+    client: *wl.Client,
+    serial: u32,
 };
 
 pub const PointerFocus = struct {
@@ -75,6 +81,7 @@ pub fn init(
         .pointer_focus = null,
         .pressed_keys = .empty,
         .modifiers = .{},
+        .last_user_action = null,
     };
     errdefer self.seat_resources.deinit(allocator);
     errdefer self.keyboard_resources.deinit(allocator);
@@ -102,6 +109,22 @@ pub fn globalName(self: *const Self, client: *const wl.Client) u32 {
 
 pub fn ownsResource(self: *Self, resource: *wl.Seat) bool {
     return resource.getUserData() == @as(?*anyopaque, @ptrCast(self));
+}
+
+pub fn acceptsUserActionSerial(
+    self: *Self,
+    resource: *wl.Seat,
+    client: *wl.Client,
+    serial: u32,
+) bool {
+    if (!self.ownsResource(resource)) return false;
+    const action = self.last_user_action orelse return false;
+    return action.client == client and action.serial == serial;
+}
+
+pub fn pointerFocusedSurface(self: *const Self) ?Surface.Id {
+    const focus = self.pointer_focus orelse return null;
+    return focus.surface_id;
 }
 
 pub fn setKeyboardAvailable(self: *Self, available: bool) void {
@@ -193,6 +216,10 @@ pub fn key(
     const surface = self.focusedSurface() orelse return;
     if (!self.parent_focused or self.keymap == null) return;
     const serial = self.display.nextSerial();
+    if (state == .pressed) self.last_user_action = .{
+        .client = surface.getClient(),
+        .serial = serial,
+    };
     for (self.keyboard_resources.items) |resource| {
         if (resource.getClient() != surface.getClient()) continue;
         if (state == .repeated and resource.getVersion() < 10) continue;
@@ -242,6 +269,10 @@ pub fn pointerButton(
 ) void {
     const surface = self.pointerSurface() orelse return;
     const serial = self.display.nextSerial();
+    if (state == .pressed) self.last_user_action = .{
+        .client = surface.getClient(),
+        .serial = serial,
+    };
     for (self.pointer_resources.items) |resource| {
         if (resource.getClient() == surface.getClient()) {
             resource.sendButton(serial, time, button, state);

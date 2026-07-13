@@ -4,7 +4,9 @@ const Self = @This();
 
 const std = @import("std");
 const wayland = @import("wayland");
+const render = @import("render.zig");
 const Scene = @import("scene.zig");
+const Seat = @import("seat.zig");
 const slot_map = @import("slot_map.zig");
 const Surface = @import("surface.zig");
 
@@ -15,10 +17,14 @@ allocator: std.mem.Allocator,
 display: *wl.Server,
 surface_store: *Surface.Store,
 scene: *Scene,
+seat: *Seat,
+output_size: render.Size,
 global: *wl.Global,
 bindings: BindingStore,
 xdg_surfaces: XdgSurfaceStore,
 windows: WindowStore,
+popups: PopupStore,
+next_popup_order: u64,
 window_listener: ?WindowListener,
 
 const BindingStore = slot_map.SlotMap(BindingState, enum { xdg_binding });
@@ -29,6 +35,8 @@ const XdgSurfaceId = XdgSurfaceStore.Id;
 
 pub const WindowStore = slot_map.SlotMap(WindowState, enum { window });
 pub const WindowId = WindowStore.Id;
+const PopupStore = slot_map.SlotMap(PopupState, enum { popup });
+const PopupId = PopupStore.Id;
 
 const BindingState = struct {
     surface_count: usize = 0,
@@ -41,6 +49,41 @@ const Geometry = struct {
     height: i32,
 };
 
+const XdgRole = union(enum) {
+    toplevel: WindowId,
+    popup: PopupId,
+};
+
+const PositionerRules = struct {
+    size: ?Dimensions = null,
+    anchor_rect: ?Geometry = null,
+    anchor: xdg.Positioner.Anchor = .none,
+    gravity: xdg.Positioner.Gravity = .none,
+    adjustment: xdg.Positioner.ConstraintAdjustment = .{},
+    offset: Scene.Position = .{},
+    reactive: bool = false,
+    parent_size: ?Dimensions = null,
+    parent_configure: ?u32 = null,
+
+    fn complete(self: PositionerRules) bool {
+        const size = self.size orelse return false;
+        const anchor_rect = self.anchor_rect orelse return false;
+        return size.width > 0 and size.height > 0 and
+            anchor_rect.width > 0 and anchor_rect.height > 0;
+    }
+};
+
+const PopupPlacement = struct {
+    position: Scene.Position,
+    dimensions: Dimensions,
+};
+
+const PendingPopupConfigure = struct {
+    serial: u32,
+    rules: PositionerRules,
+    placement: PopupPlacement,
+};
+
 pub const SizeHint = struct {
     width: i32 = 0,
     height: i32 = 0,
@@ -48,7 +91,7 @@ pub const SizeHint = struct {
 
 const XdgSurfaceState = struct {
     surface_id: Surface.Id,
-    role: ?WindowId = null,
+    role: ?XdgRole = null,
     pending_geometry: ?Geometry = null,
     current_geometry: ?Geometry = null,
     configure_serials: std.ArrayList(u32) = .empty,
@@ -64,6 +107,20 @@ const XdgSurfaceState = struct {
         self.configure_serials.deinit(allocator);
         self.* = undefined;
     }
+};
+
+const PopupState = struct {
+    xdg_surface_id: XdgSurfaceId,
+    parent_xdg_surface_id: XdgSurfaceId,
+    scene_id: Scene.PopupId,
+    resource: *xdg.Popup,
+    rules: PositionerRules,
+    pending_configure: ?PendingPopupConfigure = null,
+    ready: bool = false,
+    mapped: bool = false,
+    grabbed: bool = false,
+    dismissed: bool = false,
+    order: u64,
 };
 
 pub const WindowState = struct {
@@ -207,21 +264,28 @@ pub fn init(
     display: *wl.Server,
     surface_store: *Surface.Store,
     scene: *Scene,
+    seat: *Seat,
+    output_size: render.Size,
 ) !void {
     self.* = .{
         .allocator = allocator,
         .display = display,
         .surface_store = surface_store,
         .scene = scene,
+        .seat = seat,
+        .output_size = output_size,
         .global = undefined,
         .bindings = .{},
         .xdg_surfaces = .{},
         .windows = .{},
+        .popups = .{},
+        .next_popup_order = 0,
         .window_listener = null,
     };
     errdefer self.bindings.deinit(allocator);
     errdefer self.xdg_surfaces.deinit(allocator);
     errdefer self.windows.deinit(allocator);
+    errdefer self.popups.deinit(allocator);
     self.global = try wl.Global.create(display, xdg.WmBase, 5, *Self, self, bind);
 }
 
@@ -231,6 +295,7 @@ pub fn deinit(self: *Self) void {
     self.bindings.deinit(self.allocator);
     self.xdg_surfaces.deinit(self.allocator);
     self.windows.deinit(self.allocator);
+    self.popups.deinit(self.allocator);
     self.* = undefined;
 }
 
@@ -434,7 +499,12 @@ pub fn setWindowVisible(self: *Self, id: WindowId, visible: bool) void {
 
 pub fn setWindowPosition(self: *Self, id: WindowId, position: Scene.Position) void {
     const window = self.windows.get(id) orelse return;
+    const changed = if (self.scene.windowPosition(window.scene_id)) |current|
+        !std.meta.eql(current, position)
+    else
+        false;
     self.scene.setPosition(window.scene_id, position);
+    if (changed) self.reconfigureReactivePopups(id);
 }
 
 pub fn setWindowFocused(self: *Self, id: WindowId, focused: bool) void {
@@ -524,6 +594,226 @@ pub fn closeWindow(self: *Self, id: WindowId) void {
     if (state.toplevel_resource) |resource| resource.sendClose();
 }
 
+pub fn hasPopupGrab(self: *Self) bool {
+    return self.topGrabbedPopup() != null;
+}
+
+pub fn popupGrabOwnsSurface(self: *Self, surface_id: Surface.Id) bool {
+    const popup_id = self.topGrabbedPopup() orelse return true;
+    const popup = self.popups.get(popup_id) orelse return true;
+    const surface = Surface.resourceFor(self.surface_store, surface_id) orelse return false;
+    return surface.getClient() == popup.resource.getClient();
+}
+
+pub fn popupKeyboardFocus(self: *Self) ?Surface.Id {
+    const popup_id = self.topGrabbedPopup() orelse return null;
+    const popup = self.popups.get(popup_id) orelse return null;
+    const xdg_surface = self.xdg_surfaces.get(popup.xdg_surface_id) orelse return null;
+    return xdg_surface.surface_id;
+}
+
+pub fn dismissPopupGrab(self: *Self) void {
+    var current = self.topGrabbedPopup();
+    while (current) |id| {
+        const popup = self.popups.get(id) orelse return;
+        const parent = self.xdg_surfaces.get(popup.parent_xdg_surface_id);
+        const parent_popup_id = if (parent) |state| switch (state.role orelse return) {
+            .toplevel => null,
+            .popup => |popup_id| popup_id,
+        } else null;
+        self.dismissPopup(id);
+        current = if (parent_popup_id) |parent_id| parent: {
+            const parent_popup = self.popups.get(parent_id) orelse break :parent null;
+            break :parent if (parent_popup.grabbed) parent_id else null;
+        } else null;
+    }
+}
+
+fn topGrabbedPopup(self: *Self) ?PopupId {
+    var result: ?PopupId = null;
+    var order: u64 = 0;
+    var iterator = self.popups.iterator();
+    while (iterator.next()) |entry| {
+        const popup = entry.value;
+        if (!popup.grabbed or !popup.mapped or popup.dismissed) continue;
+        if (result == null or popup.order > order) {
+            result = entry.id;
+            order = popup.order;
+        }
+    }
+    return result;
+}
+
+fn popupRootWindow(self: *Self, id: PopupId) ?WindowId {
+    var popup = self.popups.get(id) orelse return null;
+    var remaining = self.popups.len() + 1;
+    while (remaining > 0) : (remaining -= 1) {
+        const parent = self.xdg_surfaces.get(popup.parent_xdg_surface_id) orelse return null;
+        switch (parent.role orelse return null) {
+            .toplevel => |window_id| return window_id,
+            .popup => |popup_id| popup = self.popups.get(popup_id) orelse return null,
+        }
+    }
+    return null;
+}
+
+fn isTopmostPopup(self: *Self, id: PopupId) bool {
+    const popup = self.popups.get(id) orelse return true;
+    var iterator = self.popups.iterator();
+    while (iterator.next()) |entry| {
+        if (std.meta.eql(entry.value.parent_xdg_surface_id, popup.xdg_surface_id)) return false;
+    }
+    return true;
+}
+
+fn parentMapped(self: *Self, popup: *const PopupState) bool {
+    const parent = self.xdg_surfaces.get(popup.parent_xdg_surface_id) orelse return false;
+    return parent.mapped;
+}
+
+fn popupParentGeometry(self: *Self, popup: *const PopupState) ?struct {
+    geometry: Scene.ContentGeometry,
+    position: Scene.Position,
+} {
+    const parent = self.xdg_surfaces.get(popup.parent_xdg_surface_id) orelse return null;
+    const geometry = self.contentGeometry(parent) orelse return null;
+    const position = switch (parent.role orelse return null) {
+        .toplevel => |window_id| window: {
+            const window = self.windows.get(window_id) orelse return null;
+            break :window self.scene.windowPosition(window.scene_id) orelse return null;
+        },
+        .popup => |popup_id| parent_popup: {
+            const parent_popup = self.popups.get(popup_id) orelse return null;
+            break :parent_popup self.scene.popupPosition(parent_popup.scene_id) orelse return null;
+        },
+    };
+    return .{ .geometry = geometry, .position = position };
+}
+
+fn popupPlacement(
+    self: *Self,
+    popup: *const PopupState,
+    rules: PositionerRules,
+) error{ InvalidParent, InvalidPositioner }!PopupPlacement {
+    if (!rules.complete()) return error.InvalidPositioner;
+    const parent = self.popupParentGeometry(popup) orelse return error.InvalidParent;
+    const anchor_rect = rules.anchor_rect.?;
+    const parent_width: i64 = parent.geometry.size.width;
+    const parent_height: i64 = parent.geometry.size.height;
+    const anchor_right = @as(i64, anchor_rect.x) + anchor_rect.width;
+    const anchor_bottom = @as(i64, anchor_rect.y) + anchor_rect.height;
+    if (anchor_rect.x < 0 or anchor_rect.y < 0 or
+        anchor_right > parent_width or anchor_bottom > parent_height)
+    {
+        return error.InvalidPositioner;
+    }
+    return placePopup(rules, parent.position, self.output_size);
+}
+
+fn sendPopupConfigure(
+    self: *Self,
+    id: PopupId,
+    rules: PositionerRules,
+    reposition_token: ?u32,
+) error{ InvalidParent, InvalidPositioner, OutOfMemory }!void {
+    const popup = self.popups.get(id) orelse return error.InvalidParent;
+    const placement = try self.popupPlacement(popup, rules);
+    const xdg_surface = self.xdg_surfaces.get(popup.xdg_surface_id) orelse
+        return error.InvalidParent;
+    const serial = self.display.nextSerial();
+    try xdg_surface.configure_serials.append(self.allocator, serial);
+    popup.pending_configure = .{
+        .serial = serial,
+        .rules = rules,
+        .placement = placement,
+    };
+    if (reposition_token) |token| popup.resource.sendRepositioned(token);
+    popup.resource.sendConfigure(
+        placement.position.x,
+        placement.position.y,
+        placement.dimensions.width,
+        placement.dimensions.height,
+    );
+    const adapter: *PopupResource = @ptrCast(@alignCast(popup.resource.getUserData().?));
+    adapter.xdg_surface_resource.resource.sendConfigure(serial);
+    xdg_surface.initial_configure_sent = true;
+}
+
+fn reconfigureReactivePopups(self: *Self, window_id: WindowId) void {
+    var iterator = self.popups.iterator();
+    while (iterator.next()) |entry| {
+        const root = self.popupRootWindow(entry.id) orelse continue;
+        if (!std.meta.eql(root, window_id) or !entry.value.mapped or
+            !entry.value.rules.reactive or entry.value.dismissed) continue;
+        self.sendPopupConfigure(entry.id, entry.value.rules, null) catch |err| switch (err) {
+            error.OutOfMemory => entry.value.resource.postNoMemory(),
+            error.InvalidParent, error.InvalidPositioner => self.dismissPopup(entry.id),
+        };
+    }
+}
+
+fn dismissPopup(self: *Self, id: PopupId) void {
+    const popup = self.popups.get(id) orelse return;
+    if (popup.dismissed) return;
+    self.dismissPopupsForParent(popup.xdg_surface_id);
+    popup.dismissed = true;
+    popup.mapped = false;
+    if (self.xdg_surfaces.get(popup.xdg_surface_id)) |xdg_surface| {
+        xdg_surface.mapped = false;
+    }
+    self.scene.setPopupMapped(popup.scene_id, false);
+    popup.resource.sendPopupDone();
+}
+
+fn dismissPopupsForParent(self: *Self, parent_id: XdgSurfaceId) void {
+    while (true) {
+        var result: ?PopupId = null;
+        var order: u64 = 0;
+        var iterator = self.popups.iterator();
+        while (iterator.next()) |entry| {
+            if (entry.value.dismissed or
+                !self.popupDescendsFrom(entry.id, parent_id)) continue;
+            if (result == null or entry.value.order > order) {
+                result = entry.id;
+                order = entry.value.order;
+            }
+        }
+        self.dismissPopup(result orelse return);
+    }
+}
+
+fn popupDescendsFrom(self: *Self, id: PopupId, ancestor: XdgSurfaceId) bool {
+    var popup = self.popups.get(id) orelse return false;
+    var remaining = self.popups.len() + 1;
+    while (remaining > 0) : (remaining -= 1) {
+        if (std.meta.eql(popup.parent_xdg_surface_id, ancestor)) return true;
+        const parent = self.xdg_surfaces.get(popup.parent_xdg_surface_id) orelse return false;
+        const parent_id = switch (parent.role orelse return false) {
+            .toplevel => return false,
+            .popup => |popup_id| popup_id,
+        };
+        popup = self.popups.get(parent_id) orelse return false;
+    }
+    return false;
+}
+
+fn unmapPopup(self: *Self, id: PopupId) void {
+    const popup = self.popups.get(id) orelse return;
+    self.dismissPopupsForParent(popup.xdg_surface_id);
+    popup.mapped = false;
+    popup.ready = false;
+    popup.grabbed = false;
+    self.scene.setPopupMapped(popup.scene_id, false);
+    self.scene.setPopupContentGeometry(popup.scene_id, null);
+}
+
+fn removePopupState(self: *Self, id: PopupId) void {
+    const popup = self.popups.get(id) orelse return;
+    self.dismissPopupsForParent(popup.xdg_surface_id);
+    const removed = self.popups.remove(id) orelse return;
+    self.scene.removePopup(removed.scene_id);
+}
+
 fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
     WmBaseResource.create(self, client, version, id) catch client.postNoMemory();
 }
@@ -597,6 +887,7 @@ const WmBaseResource = struct {
 
 const Positioner = struct {
     allocator: std.mem.Allocator,
+    rules: PositionerRules,
 
     fn create(
         allocator: std.mem.Allocator,
@@ -608,46 +899,76 @@ const Positioner = struct {
         errdefer resource.destroy();
 
         const self = allocator.create(Positioner) catch return error.OutOfMemory;
-        self.* = .{ .allocator = allocator };
+        self.* = .{ .allocator = allocator, .rules = .{} };
         resource.setHandler(*Positioner, handleRequest, handleDestroy, self);
     }
 
     fn handleRequest(
         resource: *xdg.Positioner,
         request: xdg.Positioner.Request,
-        _: *Positioner,
+        self: *Positioner,
     ) void {
         switch (request) {
             .destroy => resource.destroy(),
             .set_size => |set| {
                 if (set.width <= 0 or set.height <= 0) {
                     resource.postError(.invalid_input, "positioner size must be positive");
+                    return;
                 }
+                self.rules.size = .{ .width = set.width, .height = set.height };
             },
             .set_anchor_rect => |set| {
                 if (set.width < 0 or set.height < 0) {
                     resource.postError(.invalid_input, "anchor rectangle size must not be negative");
+                    return;
                 }
+                self.rules.anchor_rect = .{
+                    .x = set.x,
+                    .y = set.y,
+                    .width = set.width,
+                    .height = set.height,
+                };
             },
-            .set_anchor => |set| if (!validAnchor(set.anchor)) {
-                resource.postError(.invalid_input, "invalid positioner anchor");
+            .set_anchor => |set| {
+                if (!validAnchor(set.anchor)) {
+                    resource.postError(.invalid_input, "invalid positioner anchor");
+                    return;
+                }
+                self.rules.anchor = set.anchor;
             },
-            .set_gravity => |set| if (!validGravity(set.gravity)) {
-                resource.postError(.invalid_input, "invalid positioner gravity");
+            .set_gravity => |set| {
+                if (!validGravity(set.gravity)) {
+                    resource.postError(.invalid_input, "invalid positioner gravity");
+                    return;
+                }
+                self.rules.gravity = set.gravity;
             },
             .set_constraint_adjustment => |set| {
                 const adjustment: u32 = @bitCast(set.constraint_adjustment);
                 if (adjustment & ~@as(u32, 0x3f) != 0) {
                     resource.postError(.invalid_input, "invalid constraint adjustment");
+                    return;
                 }
+                self.rules.adjustment = set.constraint_adjustment;
             },
-            .set_offset, .set_reactive, .set_parent_configure => {},
+            .set_offset => |set| self.rules.offset = .{ .x = set.x, .y = set.y },
+            .set_reactive => self.rules.reactive = true,
+            .set_parent_configure => |set| self.rules.parent_configure = set.serial,
             .set_parent_size => |set| {
                 if (set.parent_width <= 0 or set.parent_height <= 0) {
                     resource.postError(.invalid_input, "parent size must be positive");
+                    return;
                 }
+                self.rules.parent_size = .{
+                    .width = set.parent_width,
+                    .height = set.parent_height,
+                };
             },
         }
+    }
+
+    fn fromResource(resource: *xdg.Positioner) *Positioner {
+        return @ptrCast(@alignCast(resource.getUserData().?));
     }
 
     fn handleDestroy(_: *xdg.Positioner, self: *Positioner) void {
@@ -692,6 +1013,7 @@ const XdgSurfaceResource = struct {
     shell: *Self,
     id: XdgSurfaceId,
     binding_id: BindingId,
+    wm_base_resource: *xdg.WmBase,
     resource: *xdg.Surface,
     surface: ?*Surface,
     toplevel_resource: ?*xdg.Toplevel,
@@ -727,6 +1049,7 @@ const XdgSurfaceResource = struct {
             .shell = shell,
             .id = state_id,
             .binding_id = binding_id,
+            .wm_base_resource = wm_base_resource,
             .resource = resource,
             .surface = surface,
             .toplevel_resource = null,
@@ -793,9 +1116,16 @@ const XdgSurfaceResource = struct {
                 }
                 ToplevelResource.create(self, get.id) catch resource.postNoMemory();
             },
-            .get_popup => resource.getClient().postImplementationError(
-                "xdg_popup is not implemented",
-            ),
+            .get_popup => |get| {
+                if (state.role != null) {
+                    resource.postError(.already_constructed, "xdg_surface already has a role");
+                    return;
+                }
+                PopupResource.create(self, get.id, get.parent, get.positioner) catch |err| switch (err) {
+                    error.OutOfMemory => resource.postNoMemory(),
+                    error.ResourceCreateFailed => {},
+                };
+            },
             .set_window_geometry => |set| {
                 if (!self.requireRole()) return;
                 if (set.width <= 0 or set.height <= 0) {
@@ -828,16 +1158,19 @@ const XdgSurfaceResource = struct {
             self.allocator.destroy(self);
             return;
         };
-        if (removed.role) |window_id| {
-            if (self.shell.windows.remove(window_id)) |window_value| {
-                if (self.shell.window_listener) |listener| {
-                    listener.destroyed(listener.context, window_id);
+        if (removed.role) |role| switch (role) {
+            .toplevel => |window_id| {
+                if (self.shell.windows.remove(window_id)) |window_value| {
+                    if (self.shell.window_listener) |listener| {
+                        listener.destroyed(listener.context, window_id);
+                    }
+                    var window = window_value;
+                    self.shell.scene.removeWindow(window.scene_id);
+                    window.deinit(self.allocator);
                 }
-                var window = window_value;
-                self.shell.scene.removeWindow(window.scene_id);
-                window.deinit(self.allocator);
-            }
-        }
+            },
+            .popup => |popup_id| self.shell.removePopupState(popup_id),
+        };
         removed.deinit(self.allocator);
         self.allocator.destroy(self);
     }
@@ -892,7 +1225,19 @@ const XdgSurfaceResource = struct {
         const state = self.shell.xdg_surfaces.get(self.id) orelse return;
         state.current_geometry = state.pending_geometry;
 
-        const window_id = state.role orelse return;
+        const role = state.role orelse return;
+        switch (role) {
+            .toplevel => |window_id| self.afterToplevelCommit(state, window_id, info),
+            .popup => |popup_id| self.afterPopupCommit(state, popup_id, info),
+        }
+    }
+
+    fn afterToplevelCommit(
+        self: *XdgSurfaceResource,
+        state: *XdgSurfaceState,
+        window_id: WindowId,
+        info: Surface.CommitInfo,
+    ) void {
         const window = self.shell.windows.get(window_id) orelse return;
         if (window.commit()) {
             if (self.shell.window_listener) |listener| {
@@ -901,6 +1246,7 @@ const XdgSurfaceResource = struct {
         }
 
         if (info.had_buffer and !info.has_buffer) {
+            self.shell.dismissPopupsForParent(self.id);
             if (self.shell.window_listener) |listener| {
                 listener.unmapped(listener.context, window_id);
             }
@@ -950,25 +1296,101 @@ const XdgSurfaceResource = struct {
         }
     }
 
+    fn afterPopupCommit(
+        self: *XdgSurfaceResource,
+        state: *XdgSurfaceState,
+        popup_id: PopupId,
+        info: Surface.CommitInfo,
+    ) void {
+        const popup = self.shell.popups.get(popup_id) orelse return;
+        if (popup.dismissed) return;
+        if (info.had_buffer and !info.has_buffer) {
+            self.shell.unmapPopup(popup_id);
+            popup.dismissed = false;
+            popup.pending_configure = null;
+            state.mapped = false;
+            state.configured = false;
+            state.initial_configure_sent = false;
+            state.last_acked_serial = null;
+            state.configure_serials.clearRetainingCapacity();
+            return;
+        }
+
+        if (info.has_buffer) {
+            if (!self.shell.parentMapped(popup)) {
+                self.wm_base_resource.postError(
+                    .invalid_popup_parent,
+                    "xdg_popup parent is not mapped",
+                );
+                return;
+            }
+            const was_mapped = popup.mapped;
+            if (state.last_acked_serial) |serial| {
+                state.configured = true;
+                if (popup.pending_configure) |pending| {
+                    if (pending.serial == serial) {
+                        popup.rules = pending.rules;
+                        self.shell.scene.setPopupPosition(popup.scene_id, pending.placement.position);
+                        popup.pending_configure = null;
+                    }
+                }
+                state.last_acked_serial = null;
+            }
+            self.shell.scene.setPopupContentGeometry(
+                popup.scene_id,
+                self.shell.contentGeometry(state),
+            );
+            state.mapped = state.configured and !popup.dismissed;
+            popup.mapped = state.mapped;
+            self.shell.scene.setPopupMapped(popup.scene_id, popup.mapped);
+            if (was_mapped and popup.mapped) self.shell.scene.popupCommitted(popup.scene_id);
+            return;
+        }
+
+        if (popup.ready) return;
+        if (!self.shell.parentMapped(popup)) {
+            self.wm_base_resource.postError(
+                .invalid_popup_parent,
+                "xdg_popup parent is not mapped",
+            );
+            return;
+        }
+        popup.ready = true;
+        self.shell.sendPopupConfigure(popup_id, popup.rules, null) catch |err| switch (err) {
+            error.OutOfMemory => self.resource.postNoMemory(),
+            error.InvalidParent => self.wm_base_resource.postError(
+                .invalid_popup_parent,
+                "invalid xdg_popup parent",
+            ),
+            error.InvalidPositioner => self.wm_base_resource.postError(
+                .invalid_positioner,
+                "invalid xdg_popup positioner",
+            ),
+        };
+    }
+
     fn surfaceDestroyed(context: *anyopaque) void {
         const self: *XdgSurfaceResource = @ptrCast(@alignCast(context));
         self.surface = null;
         const state = self.shell.xdg_surfaces.get(self.id) orelse return;
         state.surface_alive = false;
         state.mapped = false;
-        if (state.role) |window_id| {
-            if (self.shell.windows.get(window_id)) |window| {
-                if (window.ready) {
-                    if (self.shell.window_listener) |listener| {
-                        listener.unmapped(listener.context, window_id);
+        if (state.role) |role| switch (role) {
+            .toplevel => |window_id| {
+                if (self.shell.windows.get(window_id)) |window| {
+                    if (window.ready) {
+                        if (self.shell.window_listener) |listener| {
+                            listener.unmapped(listener.context, window_id);
+                        }
                     }
+                    window.mapped = false;
+                    window.ready = false;
+                    self.shell.scene.setMapped(window.scene_id, false);
+                    self.shell.scene.setContentGeometry(window.scene_id, null);
                 }
-                window.mapped = false;
-                window.ready = false;
-                self.shell.scene.setMapped(window.scene_id, false);
-                self.shell.scene.setContentGeometry(window.scene_id, null);
-            }
-        }
+            },
+            .popup => |popup_id| self.shell.unmapPopup(popup_id),
+        };
     }
 
     fn sendInitialConfigure(self: *XdgSurfaceResource, window_id: WindowId) void {
@@ -976,6 +1398,217 @@ const XdgSurfaceResource = struct {
             error.OutOfMemory => self.resource.postNoMemory(),
             error.InvalidWindow => {},
         };
+    }
+};
+
+const PopupResource = struct {
+    allocator: std.mem.Allocator,
+    shell: *Self,
+    id: PopupId,
+    xdg_surface_id: XdgSurfaceId,
+    xdg_surface_resource: *XdgSurfaceResource,
+
+    fn create(
+        xdg_surface: *XdgSurfaceResource,
+        id: u32,
+        parent_resource: ?*xdg.Surface,
+        positioner_resource: *xdg.Positioner,
+    ) error{ OutOfMemory, ResourceCreateFailed }!void {
+        const surface = xdg_surface.surface orelse return error.ResourceCreateFailed;
+        const parent_xdg_resource = parent_resource orelse {
+            xdg_surface.wm_base_resource.postError(
+                .invalid_popup_parent,
+                "xdg_popup requires an xdg_surface parent",
+            );
+            return error.ResourceCreateFailed;
+        };
+        if (parent_xdg_resource.getClient() != xdg_surface.resource.getClient()) {
+            xdg_surface.wm_base_resource.postError(
+                .invalid_popup_parent,
+                "xdg_popup parent belongs to another client",
+            );
+            return error.ResourceCreateFailed;
+        }
+        const parent_adapter: *XdgSurfaceResource = @ptrCast(@alignCast(
+            parent_xdg_resource.getUserData() orelse return error.ResourceCreateFailed,
+        ));
+        if (parent_adapter.shell != xdg_surface.shell or
+            std.meta.eql(parent_adapter.id, xdg_surface.id))
+        {
+            xdg_surface.wm_base_resource.postError(
+                .invalid_popup_parent,
+                "invalid xdg_popup parent",
+            );
+            return error.ResourceCreateFailed;
+        }
+        const parent_state = xdg_surface.shell.xdg_surfaces.get(parent_adapter.id) orelse {
+            xdg_surface.wm_base_resource.postError(
+                .invalid_popup_parent,
+                "xdg_popup parent no longer exists",
+            );
+            return error.ResourceCreateFailed;
+        };
+        const scene_parent: Scene.PopupParent = switch (parent_state.role orelse {
+            xdg_surface.wm_base_resource.postError(
+                .invalid_popup_parent,
+                "xdg_popup parent has no role",
+            );
+            return error.ResourceCreateFailed;
+        }) {
+            .toplevel => |window_id| window: {
+                const window = xdg_surface.shell.windows.get(window_id) orelse
+                    return error.ResourceCreateFailed;
+                break :window .{ .window = window.scene_id };
+            },
+            .popup => |popup_id| popup: {
+                const parent_popup = xdg_surface.shell.popups.get(popup_id) orelse
+                    return error.ResourceCreateFailed;
+                break :popup .{ .popup = parent_popup.scene_id };
+            },
+        };
+        const rules = Positioner.fromResource(positioner_resource).rules;
+        if (!rules.complete()) {
+            xdg_surface.wm_base_resource.postError(
+                .invalid_positioner,
+                "incomplete xdg_positioner",
+            );
+            return error.ResourceCreateFailed;
+        }
+        surface.assignReservedRole(.xdg_popup, xdg_surface) catch {
+            xdg_surface.resource.postError(.already_constructed, "wl_surface already has a role");
+            return error.ResourceCreateFailed;
+        };
+
+        const resource = try xdg.Popup.create(
+            xdg_surface.resource.getClient(),
+            xdg_surface.resource.getVersion(),
+            id,
+        );
+        errdefer resource.destroy();
+        const self = xdg_surface.allocator.create(PopupResource) catch
+            return error.OutOfMemory;
+        errdefer xdg_surface.allocator.destroy(self);
+        const scene_id = xdg_surface.shell.scene.addPopup(surface.handle(), scene_parent) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidParent => return error.ResourceCreateFailed,
+        };
+        errdefer xdg_surface.shell.scene.removePopup(scene_id);
+        const order = xdg_surface.shell.next_popup_order;
+        xdg_surface.shell.next_popup_order +%= 1;
+        const popup_id = xdg_surface.shell.popups.insert(xdg_surface.allocator, .{
+            .xdg_surface_id = xdg_surface.id,
+            .parent_xdg_surface_id = parent_adapter.id,
+            .scene_id = scene_id,
+            .resource = resource,
+            .rules = rules,
+            .order = order,
+        }) catch return error.OutOfMemory;
+
+        self.* = .{
+            .allocator = xdg_surface.allocator,
+            .shell = xdg_surface.shell,
+            .id = popup_id,
+            .xdg_surface_id = xdg_surface.id,
+            .xdg_surface_resource = xdg_surface,
+        };
+        const state = xdg_surface.shell.xdg_surfaces.get(xdg_surface.id) orelse unreachable;
+        state.role = .{ .popup = popup_id };
+        resource.setHandler(*PopupResource, handleRequest, handleDestroy, self);
+    }
+
+    fn handleRequest(
+        resource: *xdg.Popup,
+        request: xdg.Popup.Request,
+        self: *PopupResource,
+    ) void {
+        const popup = self.shell.popups.get(self.id) orelse return;
+        switch (request) {
+            .destroy => {
+                if (!self.shell.isTopmostPopup(self.id)) {
+                    self.xdg_surface_resource.wm_base_resource.postError(
+                        .not_the_topmost_popup,
+                        "destroy the topmost xdg_popup first",
+                    );
+                    return;
+                }
+                resource.destroy();
+            },
+            .grab => |grab| {
+                if (popup.mapped) {
+                    resource.postError(.invalid_grab, "cannot grab a mapped xdg_popup");
+                    return;
+                }
+                const parent = self.shell.xdg_surfaces.get(popup.parent_xdg_surface_id) orelse {
+                    resource.postError(.invalid_grab, "xdg_popup parent no longer exists");
+                    return;
+                };
+                switch (parent.role orelse {
+                    resource.postError(.invalid_grab, "xdg_popup parent has no role");
+                    return;
+                }) {
+                    .toplevel => if (self.shell.topGrabbedPopup() != null) {
+                        resource.postError(.invalid_grab, "another xdg_popup owns the grab");
+                        return;
+                    },
+                    .popup => |parent_id| {
+                        const parent_popup = self.shell.popups.get(parent_id) orelse {
+                            resource.postError(.invalid_grab, "xdg_popup parent no longer exists");
+                            return;
+                        };
+                        const topmost = self.shell.topGrabbedPopup();
+                        if (!parent_popup.grabbed or parent_popup.dismissed or
+                            topmost == null or !std.meta.eql(topmost.?, parent_id))
+                        {
+                            resource.postError(.invalid_grab, "parent xdg_popup does not own a grab");
+                            return;
+                        }
+                    },
+                }
+                if (!self.shell.seat.acceptsUserActionSerial(
+                    grab.seat,
+                    resource.getClient(),
+                    grab.serial,
+                )) {
+                    self.shell.dismissPopup(self.id);
+                    return;
+                }
+                popup.grabbed = true;
+            },
+            .reposition => |reposition| {
+                const rules = Positioner.fromResource(reposition.positioner).rules;
+                if (!rules.complete()) {
+                    self.xdg_surface_resource.wm_base_resource.postError(
+                        .invalid_positioner,
+                        "incomplete xdg_positioner",
+                    );
+                    return;
+                }
+                self.shell.sendPopupConfigure(self.id, rules, reposition.token) catch |err| switch (err) {
+                    error.OutOfMemory => resource.postNoMemory(),
+                    error.InvalidParent => self.xdg_surface_resource.wm_base_resource.postError(
+                        .invalid_popup_parent,
+                        "invalid xdg_popup parent",
+                    ),
+                    error.InvalidPositioner => self.xdg_surface_resource.wm_base_resource.postError(
+                        .invalid_positioner,
+                        "invalid xdg_popup positioner",
+                    ),
+                };
+            },
+        }
+    }
+
+    fn handleDestroy(_: *xdg.Popup, self: *PopupResource) void {
+        if (self.shell.xdg_surfaces.get(self.xdg_surface_id)) |xdg_surface| {
+            xdg_surface.role = null;
+            xdg_surface.mapped = false;
+            xdg_surface.configured = false;
+            xdg_surface.initial_configure_sent = false;
+            xdg_surface.last_acked_serial = null;
+            xdg_surface.configure_serials.clearRetainingCapacity();
+        }
+        self.shell.removePopupState(self.id);
+        self.allocator.destroy(self);
     }
 };
 
@@ -1024,7 +1657,7 @@ const ToplevelResource = struct {
             .xdg_surface_resource = xdg_surface,
         };
         const state = xdg_surface.shell.xdg_surfaces.get(xdg_surface.id) orelse unreachable;
-        state.role = window_id;
+        state.role = .{ .toplevel = window_id };
         state.toplevel_resource = resource;
         xdg_surface.toplevel_resource = resource;
         resource.setHandler(*ToplevelResource, handleRequest, handleDestroy, self);
@@ -1097,6 +1730,7 @@ const ToplevelResource = struct {
     }
 
     fn handleDestroy(_: *xdg.Toplevel, self: *ToplevelResource) void {
+        self.shell.dismissPopupsForParent(self.xdg_surface_id);
         if (self.shell.xdg_surfaces.get(self.xdg_surface_id)) |xdg_surface| {
             xdg_surface.role = null;
             xdg_surface.mapped = false;
@@ -1223,6 +1857,171 @@ const ToplevelResource = struct {
     }
 };
 
+fn placePopup(
+    rules: PositionerRules,
+    parent_position: Scene.Position,
+    output_size: render.Size,
+) PopupPlacement {
+    const size = rules.size.?;
+    var width: i64 = size.width;
+    var height: i64 = size.height;
+    const parent_x: i64 = parent_position.x;
+    const parent_y: i64 = parent_position.y;
+    const output_width: i64 = output_size.width;
+    const output_height: i64 = output_size.height;
+    const local = popupPosition(rules, false, false);
+    var global_x = parent_x + local.x;
+    var global_y = parent_y + local.y;
+
+    if (rules.adjustment.flip_x and axisConstrained(global_x, width, output_width)) {
+        const flipped = popupPosition(rules, true, false);
+        const flipped_global = parent_x + flipped.x;
+        if (!axisConstrained(flipped_global, width, output_width)) {
+            global_x = flipped_global;
+        }
+    }
+    if (rules.adjustment.flip_y and axisConstrained(global_y, height, output_height)) {
+        const flipped = popupPosition(rules, false, true);
+        const flipped_global = parent_y + flipped.y;
+        if (!axisConstrained(flipped_global, height, output_height)) {
+            global_y = flipped_global;
+        }
+    }
+
+    if (rules.adjustment.slide_x and axisConstrained(global_x, width, output_width)) {
+        global_x = std.math.clamp(global_x, @as(i64, 0), @max(output_width - width, 0));
+    }
+    if (rules.adjustment.slide_y and axisConstrained(global_y, height, output_height)) {
+        global_y = std.math.clamp(global_y, @as(i64, 0), @max(output_height - height, 0));
+    }
+
+    if (rules.adjustment.resize_x and axisConstrained(global_x, width, output_width)) {
+        const left = std.math.clamp(global_x, @as(i64, 0), @max(output_width - 1, 0));
+        const right = std.math.clamp(global_x + width, left + 1, @max(output_width, left + 1));
+        global_x = left;
+        width = right - left;
+    }
+    if (rules.adjustment.resize_y and axisConstrained(global_y, height, output_height)) {
+        const top = std.math.clamp(global_y, @as(i64, 0), @max(output_height - 1, 0));
+        const bottom = std.math.clamp(global_y + height, top + 1, @max(output_height, top + 1));
+        global_y = top;
+        height = bottom - top;
+    }
+
+    return .{
+        .position = .{
+            .x = clampI32(global_x - parent_x),
+            .y = clampI32(global_y - parent_y),
+        },
+        .dimensions = .{
+            .width = @intCast(@min(width, std.math.maxInt(i32))),
+            .height = @intCast(@min(height, std.math.maxInt(i32))),
+        },
+    };
+}
+
+const Position64 = struct {
+    x: i64,
+    y: i64,
+};
+
+fn popupPosition(rules: PositionerRules, flip_x: bool, flip_y: bool) Position64 {
+    const anchor_rect = rules.anchor_rect.?;
+    const size = rules.size.?;
+    const anchor = flipAnchor(rules.anchor, flip_x, flip_y);
+    const gravity = flipGravity(rules.gravity, flip_x, flip_y);
+    const anchor_x = switch (anchor) {
+        .left, .top_left, .bottom_left => @as(i64, anchor_rect.x),
+        .right, .top_right, .bottom_right => @as(i64, anchor_rect.x) + anchor_rect.width,
+        else => @as(i64, anchor_rect.x) + @divTrunc(@as(i64, anchor_rect.width), 2),
+    };
+    const anchor_y = switch (anchor) {
+        .top, .top_left, .top_right => @as(i64, anchor_rect.y),
+        .bottom, .bottom_left, .bottom_right => @as(i64, anchor_rect.y) + anchor_rect.height,
+        else => @as(i64, anchor_rect.y) + @divTrunc(@as(i64, anchor_rect.height), 2),
+    };
+    const x = switch (gravity) {
+        .left, .top_left, .bottom_left => anchor_x - size.width,
+        .right, .top_right, .bottom_right => anchor_x,
+        else => anchor_x - @divTrunc(@as(i64, size.width), 2),
+    };
+    const y = switch (gravity) {
+        .top, .top_left, .top_right => anchor_y - size.height,
+        .bottom, .bottom_left, .bottom_right => anchor_y,
+        else => anchor_y - @divTrunc(@as(i64, size.height), 2),
+    };
+    return .{
+        .x = x + rules.offset.x,
+        .y = y + rules.offset.y,
+    };
+}
+
+fn flipAnchor(
+    anchor: xdg.Positioner.Anchor,
+    flip_x: bool,
+    flip_y: bool,
+) xdg.Positioner.Anchor {
+    var result = anchor;
+    if (flip_x) result = switch (result) {
+        .left => .right,
+        .right => .left,
+        .top_left => .top_right,
+        .top_right => .top_left,
+        .bottom_left => .bottom_right,
+        .bottom_right => .bottom_left,
+        else => result,
+    };
+    if (flip_y) result = switch (result) {
+        .top => .bottom,
+        .bottom => .top,
+        .top_left => .bottom_left,
+        .bottom_left => .top_left,
+        .top_right => .bottom_right,
+        .bottom_right => .top_right,
+        else => result,
+    };
+    return result;
+}
+
+fn flipGravity(
+    gravity: xdg.Positioner.Gravity,
+    flip_x: bool,
+    flip_y: bool,
+) xdg.Positioner.Gravity {
+    var result = gravity;
+    if (flip_x) result = switch (result) {
+        .left => .right,
+        .right => .left,
+        .top_left => .top_right,
+        .top_right => .top_left,
+        .bottom_left => .bottom_right,
+        .bottom_right => .bottom_left,
+        else => result,
+    };
+    if (flip_y) result = switch (result) {
+        .top => .bottom,
+        .bottom => .top,
+        .top_left => .bottom_left,
+        .bottom_left => .top_left,
+        .top_right => .bottom_right,
+        .bottom_right => .top_right,
+        else => result,
+    };
+    return result;
+}
+
+fn axisConstrained(position: i64, size: i64, boundary: i64) bool {
+    return position < 0 or position + size > boundary;
+}
+
+fn clampI32(value: i64) i32 {
+    return @intCast(std.math.clamp(
+        value,
+        @as(i64, std.math.minInt(i32)),
+        @as(i64, std.math.maxInt(i32)),
+    ));
+}
+
 test "xdg size hints reject contradictory bounds" {
     try std.testing.expect(ToplevelResource.validMaxSize(
         .{ .width = 100, .height = 100 },
@@ -1248,4 +2047,43 @@ test "xdg resize edges translate to independent River edge flags" {
         ToplevelResource.resizeEdges(.bottom_right),
     );
     try std.testing.expectEqual(ResizeEdges{}, ToplevelResource.resizeEdges(.none));
+}
+
+test "xdg positioner derives popup geometry from anchor and gravity" {
+    const placement = placePopup(.{
+        .size = .{ .width = 120, .height = 80 },
+        .anchor_rect = .{ .x = 10, .y = 20, .width = 30, .height = 40 },
+        .anchor = .bottom_left,
+        .gravity = .bottom_right,
+        .offset = .{ .x = 3, .y = 4 },
+    }, .{ .x = 100, .y = 50 }, .{ .width = 1280, .height = 720 });
+
+    try std.testing.expectEqual(Scene.Position{ .x = 13, .y = 64 }, placement.position);
+    try std.testing.expectEqual(Dimensions{ .width = 120, .height = 80 }, placement.dimensions);
+}
+
+test "xdg positioner flips before sliding constrained popups" {
+    const placement = placePopup(.{
+        .size = .{ .width = 200, .height = 100 },
+        .anchor_rect = .{ .x = 80, .y = 20, .width = 20, .height = 20 },
+        .anchor = .right,
+        .gravity = .right,
+        .adjustment = .{ .flip_x = true, .slide_y = true },
+    }, .{ .x = 1150, .y = 650 }, .{ .width = 1280, .height = 720 });
+
+    try std.testing.expectEqual(Scene.Position{ .x = -120, .y = -30 }, placement.position);
+    try std.testing.expectEqual(Dimensions{ .width = 200, .height = 100 }, placement.dimensions);
+}
+
+test "xdg positioner resizes a popup to the output boundary" {
+    const placement = placePopup(.{
+        .size = .{ .width = 400, .height = 300 },
+        .anchor_rect = .{ .x = 0, .y = 0, .width = 10, .height = 10 },
+        .anchor = .top_left,
+        .gravity = .bottom_right,
+        .adjustment = .{ .resize_x = true, .resize_y = true },
+    }, .{}, .{ .width = 320, .height = 200 });
+
+    try std.testing.expectEqual(Scene.Position{}, placement.position);
+    try std.testing.expectEqual(Dimensions{ .width = 320, .height = 200 }, placement.dimensions);
 }

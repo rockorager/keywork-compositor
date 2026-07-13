@@ -11,6 +11,8 @@ allocator: std.mem.Allocator,
 windows: Store,
 decorations: DecorationStore,
 shell_surfaces: ShellSurfaceStore,
+popups: PopupStore,
+popup_stack: std.ArrayList(PopupId),
 stack: std.ArrayList(NodeId),
 repaint_listener: ?RepaintListener,
 
@@ -20,6 +22,8 @@ pub const DecorationStore = slot_map.SlotMap(Decoration, enum { scene_decoration
 pub const DecorationId = DecorationStore.Id;
 pub const ShellSurfaceStore = slot_map.SlotMap(ShellSurface, enum { scene_shell_surface });
 pub const ShellSurfaceId = ShellSurfaceStore.Id;
+pub const PopupStore = slot_map.SlotMap(Popup, enum { scene_popup });
+pub const PopupId = PopupStore.Id;
 
 pub const NodeId = union(enum) {
     window: Id,
@@ -108,6 +112,19 @@ pub const ShellSurface = struct {
     surface_id: Surface.Id,
     position: Position = .{},
     mapped: bool = false,
+};
+
+pub const PopupParent = union(enum) {
+    window: Id,
+    popup: PopupId,
+};
+
+pub const Popup = struct {
+    surface_id: Surface.Id,
+    parent: PopupParent,
+    position: Position = .{},
+    mapped: bool = false,
+    content_geometry: ?ContentGeometry = null,
 };
 
 pub const RepaintListener = struct {
@@ -219,12 +236,58 @@ pub const DecorationIterator = struct {
     }
 };
 
+pub const PopupIterator = struct {
+    scene: *Self,
+    window_id: Id,
+    index: usize = 0,
+
+    pub const Entry = struct {
+        id: PopupId,
+        popup: *Popup,
+        position: Position,
+    };
+
+    pub fn next(self: *PopupIterator) ?Entry {
+        while (self.index < self.scene.popup_stack.items.len) {
+            const id = self.scene.popup_stack.items[self.index];
+            self.index += 1;
+            const popup = self.scene.popups.get(id) orelse continue;
+            const root = self.scene.popupRootWindow(id) orelse continue;
+            if (!std.meta.eql(root, self.window_id)) continue;
+            const position = self.scene.popupGlobalPosition(id) orelse continue;
+            return .{ .id = id, .popup = popup, .position = position };
+        }
+        return null;
+    }
+};
+
+pub const ReversePopupIterator = struct {
+    scene: *Self,
+    window_id: Id,
+    index: usize,
+
+    pub fn next(self: *ReversePopupIterator) ?PopupIterator.Entry {
+        while (self.index > 0) {
+            self.index -= 1;
+            const id = self.scene.popup_stack.items[self.index];
+            const popup = self.scene.popups.get(id) orelse continue;
+            const root = self.scene.popupRootWindow(id) orelse continue;
+            if (!std.meta.eql(root, self.window_id)) continue;
+            const position = self.scene.popupGlobalPosition(id) orelse continue;
+            return .{ .id = id, .popup = popup, .position = position };
+        }
+        return null;
+    }
+};
+
 pub fn init(self: *Self, allocator: std.mem.Allocator) void {
     self.* = .{
         .allocator = allocator,
         .windows = .{},
         .decorations = .{},
         .shell_surfaces = .{},
+        .popups = .{},
+        .popup_stack = .empty,
         .stack = .empty,
         .repaint_listener = null,
     };
@@ -234,10 +297,14 @@ pub fn deinit(self: *Self) void {
     std.debug.assert(self.windows.len() == 0);
     std.debug.assert(self.decorations.len() == 0);
     std.debug.assert(self.shell_surfaces.len() == 0);
+    std.debug.assert(self.popups.len() == 0);
+    std.debug.assert(self.popup_stack.items.len == 0);
     std.debug.assert(self.stack.items.len == 0);
     self.windows.deinit(self.allocator);
     self.decorations.deinit(self.allocator);
     self.shell_surfaces.deinit(self.allocator);
+    self.popups.deinit(self.allocator);
+    self.popup_stack.deinit(self.allocator);
     self.stack.deinit(self.allocator);
     self.* = undefined;
 }
@@ -261,6 +328,7 @@ pub fn addWindow(self: *Self, surface_id: Surface.Id) error{OutOfMemory}!Id {
 
 pub fn removeWindow(self: *Self, id: Id) void {
     const window = self.windows.remove(id) orelse return;
+    while (self.firstWindowPopup(id)) |popup_id| self.removePopup(popup_id);
     var decorations = self.decorations.iterator();
     while (decorations.next()) |entry| {
         if (std.meta.eql(entry.value.window_id, id)) {
@@ -314,6 +382,65 @@ pub fn setShellSurfacePosition(self: *Self, id: ShellSurfaceId, position: Positi
 pub fn shellSurfaceCommitted(self: *Self, id: ShellSurfaceId) void {
     const shell_surface = self.shell_surfaces.get(id) orelse return;
     if (shell_surface.mapped) self.requestRepaint();
+}
+
+pub fn addPopup(
+    self: *Self,
+    surface_id: Surface.Id,
+    parent: PopupParent,
+) error{ InvalidParent, OutOfMemory }!PopupId {
+    switch (parent) {
+        .window => |id| if (self.windows.get(id) == null) return error.InvalidParent,
+        .popup => |id| if (self.popups.get(id) == null) return error.InvalidParent,
+    }
+    const id = try self.popups.insert(self.allocator, .{
+        .surface_id = surface_id,
+        .parent = parent,
+    });
+    errdefer _ = self.popups.remove(id);
+    try self.popup_stack.append(self.allocator, id);
+    return id;
+}
+
+pub fn removePopup(self: *Self, id: PopupId) void {
+    while (self.firstChildPopup(id)) |child_id| self.removePopup(child_id);
+    const popup = self.popups.remove(id) orelse return;
+    for (self.popup_stack.items, 0..) |candidate, index| {
+        if (!std.meta.eql(candidate, id)) continue;
+        _ = self.popup_stack.orderedRemove(index);
+        break;
+    }
+    if (popup.mapped) self.requestRepaint();
+}
+
+pub fn setPopupMapped(self: *Self, id: PopupId, mapped: bool) void {
+    const popup = self.popups.get(id) orelse return;
+    if (popup.mapped == mapped) return;
+    popup.mapped = mapped;
+    self.requestRepaint();
+}
+
+pub fn setPopupPosition(self: *Self, id: PopupId, position: Position) void {
+    const popup = self.popups.get(id) orelse return;
+    if (std.meta.eql(popup.position, position)) return;
+    popup.position = position;
+    if (popup.mapped) self.requestRepaint();
+}
+
+pub fn setPopupContentGeometry(
+    self: *Self,
+    id: PopupId,
+    geometry: ?ContentGeometry,
+) void {
+    const popup = self.popups.get(id) orelse return;
+    if (std.meta.eql(popup.content_geometry, geometry)) return;
+    popup.content_geometry = geometry;
+    if (popup.mapped) self.requestRepaint();
+}
+
+pub fn popupCommitted(self: *Self, id: PopupId) void {
+    const popup = self.popups.get(id) orelse return;
+    if (popup.mapped) self.requestRepaint();
 }
 
 pub fn addDecoration(
@@ -506,6 +633,27 @@ pub fn decorationIterator(
     };
 }
 
+pub fn popupIterator(self: *Self, window_id: Id) PopupIterator {
+    return .{ .scene = self, .window_id = window_id };
+}
+
+pub fn reversePopupIterator(self: *Self, window_id: Id) ReversePopupIterator {
+    return .{
+        .scene = self,
+        .window_id = window_id,
+        .index = self.popup_stack.items.len,
+    };
+}
+
+pub fn windowPosition(self: *Self, id: Id) ?Position {
+    const window = self.windows.get(id) orelse return null;
+    return window.position;
+}
+
+pub fn popupPosition(self: *Self, id: PopupId) ?Position {
+    return self.popupGlobalPosition(id);
+}
+
 pub fn topFullscreen(self: *Self) ?Id {
     var index = self.stack.items.len;
     while (index > 0) {
@@ -550,6 +698,63 @@ pub fn topWindowSurface(self: *Self) ?Surface.Id {
 
 fn requestRepaint(self: *Self) void {
     if (self.repaint_listener) |listener| listener.request(listener.context);
+}
+
+fn firstWindowPopup(self: *Self, window_id: Id) ?PopupId {
+    for (self.popup_stack.items) |id| {
+        const popup = self.popups.get(id) orelse continue;
+        switch (popup.parent) {
+            .window => |parent_id| if (std.meta.eql(parent_id, window_id)) return id,
+            .popup => {},
+        }
+    }
+    return null;
+}
+
+fn firstChildPopup(self: *Self, popup_id: PopupId) ?PopupId {
+    for (self.popup_stack.items) |id| {
+        const popup = self.popups.get(id) orelse continue;
+        switch (popup.parent) {
+            .window => {},
+            .popup => |parent_id| if (std.meta.eql(parent_id, popup_id)) return id,
+        }
+    }
+    return null;
+}
+
+fn popupRootWindow(self: *Self, id: PopupId) ?Id {
+    var parent = (self.popups.get(id) orelse return null).parent;
+    var remaining = self.popups.len() + 1;
+    while (remaining > 0) : (remaining -= 1) switch (parent) {
+        .window => |window_id| return if (self.windows.get(window_id) != null)
+            window_id
+        else
+            null,
+        .popup => |popup_id| parent = (self.popups.get(popup_id) orelse return null).parent,
+    };
+    return null;
+}
+
+fn popupGlobalPosition(self: *Self, id: PopupId) ?Position {
+    const popup = self.popups.get(id) orelse return null;
+    var position = popup.position;
+    var parent = popup.parent;
+    var remaining = self.popups.len() + 1;
+    while (remaining > 0) : (remaining -= 1) switch (parent) {
+        .window => |window_id| {
+            const window = self.windows.get(window_id) orelse return null;
+            position.x +|= window.position.x;
+            position.y +|= window.position.y;
+            return position;
+        },
+        .popup => |popup_id| {
+            const parent_popup = self.popups.get(popup_id) orelse return null;
+            position.x +|= parent_popup.position.x;
+            position.y +|= parent_popup.position.y;
+            parent = parent_popup.parent;
+        },
+    };
+    return null;
 }
 
 fn setWindowClipBox(self: *Self, id: Id, clip_box: ?ClipBox, content_only: bool) void {
@@ -776,4 +981,43 @@ test "scene attaches decoration handles to windows" {
     scene.removeDecoration(below);
     scene.removeWindow(window);
     try std.testing.expectEqual(@as(?Decoration, null), scene.decorations.remove(above));
+}
+
+test "scene keeps nested popups relative to their root window" {
+    var scene: Self = undefined;
+    scene.init(std.testing.allocator);
+    defer scene.deinit();
+
+    const window = try scene.addWindow(.{ .index = 1, .generation = 1 });
+    scene.setPosition(window, .{ .x = 100, .y = 50 });
+    const parent = try scene.addPopup(
+        .{ .index = 2, .generation = 1 },
+        .{ .window = window },
+    );
+    scene.setPopupPosition(parent, .{ .x = 10, .y = 20 });
+    scene.setPopupMapped(parent, true);
+    const child = try scene.addPopup(
+        .{ .index = 3, .generation = 1 },
+        .{ .popup = parent },
+    );
+    scene.setPopupPosition(child, .{ .x = 5, .y = -3 });
+    scene.setPopupMapped(child, true);
+
+    var popups = scene.popupIterator(window);
+    const parent_entry = popups.next().?;
+    try std.testing.expect(std.meta.eql(parent, parent_entry.id));
+    try std.testing.expectEqual(Position{ .x = 110, .y = 70 }, parent_entry.position);
+    const child_entry = popups.next().?;
+    try std.testing.expect(std.meta.eql(child, child_entry.id));
+    try std.testing.expectEqual(Position{ .x = 115, .y = 67 }, child_entry.position);
+    try std.testing.expectEqual(@as(?PopupIterator.Entry, null), popups.next());
+
+    var reverse = scene.reversePopupIterator(window);
+    try std.testing.expect(std.meta.eql(child, reverse.next().?.id));
+    try std.testing.expect(std.meta.eql(parent, reverse.next().?.id));
+    try std.testing.expectEqual(@as(?PopupIterator.Entry, null), reverse.next());
+
+    scene.removeWindow(window);
+    try std.testing.expectEqual(@as(usize, 0), scene.popups.len());
+    try std.testing.expectEqual(@as(usize, 0), scene.popup_stack.items.len);
 }

@@ -223,6 +223,7 @@ pub fn setViewportDestination(self: *Self, destination: ?render_types.Size) void
 
 pub const Role = enum {
     xdg_toplevel,
+    xdg_popup,
     subsurface,
     river_decoration,
     river_shell_surface,

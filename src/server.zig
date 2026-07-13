@@ -140,6 +140,8 @@ pub fn create(
         display,
         self.compositor.surfaceStore(),
         &self.scene,
+        &self.seat,
+        self.render_output.size(),
     );
     errdefer self.xdg_shell.deinit();
     try self.data_device.init(allocator, display, &self.seat);
@@ -309,6 +311,12 @@ fn pointerButton(
     state: wl.Pointer.ButtonState,
 ) void {
     const self: *Self = @ptrCast(@alignCast(context));
+    if (state == .pressed and self.xdg_shell.hasPopupGrab() and
+        self.seat.pointerFocusedSurface() == null)
+    {
+        self.xdg_shell.dismissPopupGrab();
+        return;
+    }
     self.seat.pointerButton(time, button, state);
 }
 
@@ -352,15 +360,24 @@ fn pointerAxisRelativeDirection(
 }
 
 fn pointerFocus(self: *Self, x: f64, y: f64) ?Seat.PointerFocus {
+    const focus = self.scenePointerFocus(x, y);
+    if (focus) |candidate| {
+        if (self.xdg_shell.hasPopupGrab() and
+            !self.xdg_shell.popupGrabOwnsSurface(candidate.surface_id)) return null;
+    }
+    return focus;
+}
+
+fn scenePointerFocus(self: *Self, x: f64, y: f64) ?Seat.PointerFocus {
     const fullscreen = self.scene.topFullscreen();
     var nodes = self.scene.reverseNodeIterator();
     while (nodes.next()) |entry| switch (entry) {
         .window => |window_entry| {
             if (fullscreen) |fullscreen_id| {
                 if (!std.meta.eql(window_entry.id, fullscreen_id)) continue;
-                return self.hitTestWindow(window_entry.window, x, y);
+                return self.hitTestWindow(window_entry.id, window_entry.window, x, y);
             }
-            if (self.hitTestWindow(window_entry.window, x, y)) |focus| return focus;
+            if (self.hitTestWindow(window_entry.id, window_entry.window, x, y)) |focus| return focus;
         },
         .shell_surface => |shell_entry| {
             const shell_surface = shell_entry.shell_surface;
@@ -377,8 +394,37 @@ fn pointerFocus(self: *Self, x: f64, y: f64) ?Seat.PointerFocus {
     return null;
 }
 
-fn hitTestWindow(self: *Self, window: *const Scene.Window, x: f64, y: f64) ?Seat.PointerFocus {
+fn hitTestWindow(
+    self: *Self,
+    window_id: Scene.Id,
+    window: *const Scene.Window,
+    x: f64,
+    y: f64,
+) ?Seat.PointerFocus {
     if (!window.mapped) return null;
+    var popups = self.scene.reversePopupIterator(window_id);
+    while (popups.next()) |entry| {
+        const popup = entry.popup;
+        if (!popup.mapped) continue;
+        const buffer = Surface.currentBuffer(
+            self.compositor.surfaceStore(),
+            popup.surface_id,
+        ) orelse continue;
+        if (buffer.transform != .normal) continue;
+        const content_geometry = popup.content_geometry orelse Scene.ContentGeometry{
+            .size = buffer.logical_size,
+        };
+        if (hitTestSurface(
+            self.compositor.surfaceStore(),
+            popup.surface_id,
+            .{
+                .x = entry.position.x -| content_geometry.offset.x,
+                .y = entry.position.y -| content_geometry.offset.y,
+            },
+            x,
+            y,
+        )) |focus| return focus;
+    }
     const root_buffer = Surface.currentBuffer(
         self.compositor.surfaceStore(),
         window.surface_id,
@@ -493,13 +539,15 @@ fn renderFrame(self: *Self) renderer_types.Renderer.Error!void {
             self.finishWindowDecorations(window_entry.id, .below);
             self.finishSurfaceTree(window_entry.window.surface_id);
             self.finishWindowDecorations(window_entry.id, .above);
+            self.finishWindowPopups(window_entry.id);
         },
         .shell_surface => |shell_entry| {
             if (!fullscreen_reached or !shell_entry.shell_surface.mapped) continue;
             self.finishSurfaceTree(shell_entry.shell_surface.surface_id);
         },
     };
-    const keyboard_focus = self.scene.focusedSurface() orelse if (!self.window_manager.hasActiveManager())
+    const keyboard_focus = self.xdg_shell.popupKeyboardFocus() orelse
+        self.scene.focusedSurface() orelse if (!self.window_manager.hasActiveManager())
         self.scene.topWindowSurface()
     else
         null;
@@ -592,6 +640,34 @@ fn renderWindow(
     }
     try self.renderWindowBorders(window, content_rect, window_clip, target);
     try self.renderWindowDecorations(id, window, .above, window_clip, target);
+    try self.renderWindowPopups(id, target);
+}
+
+fn renderWindowPopups(
+    self: *Self,
+    window_id: Scene.Id,
+    target: renderer_types.Target,
+) renderer_types.Renderer.Error!void {
+    var popups = self.scene.popupIterator(window_id);
+    while (popups.next()) |entry| {
+        const popup = entry.popup;
+        if (!popup.mapped) continue;
+        const buffer = Surface.currentBuffer(
+            self.compositor.surfaceStore(),
+            popup.surface_id,
+        ) orelse continue;
+        const content_geometry = popup.content_geometry orelse Scene.ContentGeometry{
+            .size = buffer.logical_size,
+        };
+        try self.renderSurfaceTree(
+            popup.surface_id,
+            entry.position.x -| content_geometry.offset.x,
+            entry.position.y -| content_geometry.offset.y,
+            0,
+            null,
+            target,
+        );
+    }
 }
 
 fn renderSurfaceTree(
@@ -792,6 +868,14 @@ fn finishWindowDecorations(
     while (decorations.next()) |entry| {
         if (!entry.decoration.mapped) continue;
         self.finishSurfaceTree(entry.decoration.surface_id);
+    }
+}
+
+fn finishWindowPopups(self: *Self, window_id: Scene.Id) void {
+    var popups = self.scene.popupIterator(window_id);
+    while (popups.next()) |entry| {
+        if (!entry.popup.mapped) continue;
+        self.finishSurfaceTree(entry.popup.surface_id);
     }
 }
 
