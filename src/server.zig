@@ -7,14 +7,22 @@ const wayland = @import("wayland");
 const Compositor = @import("compositor.zig");
 const Subcompositor = @import("subcompositor.zig");
 const XdgShell = @import("xdg_shell.zig");
+const Seat = @import("seat.zig");
+const DataDevice = @import("data_device.zig");
+const HeadlessOutput = @import("headless.zig");
+const Output = @import("output.zig");
 
 const wl = wayland.server.wl;
 
 allocator: std.mem.Allocator,
 display: *wl.Server,
+headless_output: HeadlessOutput,
+output: Output,
 compositor: Compositor,
 subcompositor: Subcompositor,
 xdg_shell: XdgShell,
+seat: Seat,
+data_device: DataDevice,
 socket_buffer: [11]u8,
 listening: bool,
 
@@ -29,17 +37,29 @@ pub fn create(allocator: std.mem.Allocator) !*Self {
     self.* = .{
         .allocator = allocator,
         .display = display,
+        .headless_output = undefined,
+        .output = undefined,
         .compositor = undefined,
         .subcompositor = undefined,
         .xdg_shell = undefined,
+        .seat = undefined,
+        .data_device = undefined,
         .socket_buffer = undefined,
         .listening = false,
     };
+    self.headless_output = try HeadlessOutput.init(allocator, .{ .width = 1280, .height = 720 });
+    errdefer self.headless_output.deinit();
+    try self.output.init(display, self.headless_output.size);
+    errdefer self.output.deinit();
     try self.compositor.init(allocator, display);
     errdefer self.compositor.deinit();
     try self.subcompositor.init(allocator, display, self.compositor.surfaceStore());
     errdefer self.subcompositor.deinit();
     try self.xdg_shell.init(allocator, display, self.compositor.surfaceStore());
+    errdefer self.xdg_shell.deinit();
+    try self.seat.init(display);
+    errdefer self.seat.deinit();
+    try self.data_device.init(allocator, display, &self.seat);
 
     return self;
 }
@@ -47,9 +67,13 @@ pub fn create(allocator: std.mem.Allocator) !*Self {
 pub fn destroy(self: *Self) void {
     const allocator = self.allocator;
     self.display.destroyClients();
+    self.data_device.deinit();
+    self.seat.deinit();
     self.xdg_shell.deinit();
     self.subcompositor.deinit();
     self.compositor.deinit();
+    self.output.deinit();
+    self.headless_output.deinit();
     self.display.destroy();
     allocator.destroy(self);
 }

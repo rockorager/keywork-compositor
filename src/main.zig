@@ -40,10 +40,13 @@ test {
     _ = @import("render.zig");
     _ = @import("renderer.zig");
     _ = @import("headless.zig");
+    _ = @import("output.zig");
     _ = @import("cpu_renderer.zig");
     _ = @import("region.zig");
     _ = @import("slot_map.zig");
     _ = @import("subcompositor.zig");
+    _ = @import("seat.zig");
+    _ = @import("data_device.zig");
     _ = @import("xdg_shell.zig");
     _ = @import("server.zig");
 }
