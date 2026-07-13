@@ -23,6 +23,8 @@ session_generation: u64,
 sequence: Sequence,
 windows: WindowStore,
 stack_operations: std.ArrayList(StackOperation),
+focused: ?WindowId,
+pending_focus: PendingFocus,
 configure_timer: *wl.EventSource,
 
 const WindowStore = slot_map.SlotMap(ManagedWindow, enum { managed_window });
@@ -35,6 +37,8 @@ const ManagedWindow = struct {
     node_created: bool = false,
     metadata_dirty: bool = true,
     proposed_dimensions: ?XdgShell.Dimensions = null,
+    requested_dimensions: XdgShell.Dimensions = .{ .width = 0, .height = 0 },
+    activated: bool = false,
     configure: ConfigureState = .idle,
     dimensions_pending: bool = false,
     last_dimensions: ?XdgShell.Dimensions = null,
@@ -52,8 +56,19 @@ const StackOperation = union(enum) {
 
 const ConfigureState = union(enum) {
     idle,
-    inflight: u32,
-    timed_out: u32,
+    inflight: PendingConfigure,
+    timed_out: PendingConfigure,
+};
+
+const PendingConfigure = struct {
+    serial: u32,
+    report_dimensions: bool,
+};
+
+const PendingFocus = union(enum) {
+    unchanged,
+    clear,
+    window: WindowId,
 };
 
 const Sequence = struct {
@@ -140,6 +155,8 @@ pub fn init(
         .sequence = .{},
         .windows = .{},
         .stack_operations = .empty,
+        .focused = null,
+        .pending_focus = .unchanged,
         .configure_timer = undefined,
     };
     errdefer self.windows.deinit(allocator);
@@ -321,21 +338,43 @@ fn finishManage(self: *Self, manager: *river.WindowManagerV1) void {
         return;
     }
 
+    const focused = switch (self.pending_focus) {
+        .unchanged => self.focused,
+        .clear => null,
+        .window => |id| if (self.windows.get(id) != null) id else null,
+    };
+    self.pending_focus = .unchanged;
+
     var configure_count: u32 = 0;
     var iterator = self.windows.iterator();
     while (iterator.next()) |entry| {
-        const dimensions = entry.value.proposed_dimensions orelse continue;
-        const serial = self.xdg_shell.configureWindow(entry.value.xdg_id, dimensions) catch |err| {
+        const report_dimensions = entry.value.proposed_dimensions != null;
+        const activated = if (focused) |id| std.meta.eql(id, entry.id) else false;
+        if (!report_dimensions and activated == entry.value.activated) continue;
+        const dimensions = entry.value.proposed_dimensions orelse entry.value.requested_dimensions;
+        const serial = self.xdg_shell.configureWindowState(
+            entry.value.xdg_id,
+            dimensions,
+            activated,
+        ) catch |err| {
             switch (err) {
                 error.OutOfMemory => manager.postNoMemory(),
                 error.InvalidWindow => {},
             }
             continue;
         };
-        entry.value.proposed_dimensions = null;
-        entry.value.configure = .{ .inflight = serial };
+        if (report_dimensions) {
+            entry.value.proposed_dimensions = null;
+            entry.value.requested_dimensions = dimensions;
+        }
+        entry.value.activated = activated;
+        entry.value.configure = .{ .inflight = .{
+            .serial = serial,
+            .report_dimensions = report_dimensions,
+        } };
         configure_count += 1;
     }
+    self.focused = focused;
 
     std.debug.assert(self.sequence.finishManage(configure_count));
     if (configure_count == 0) {
@@ -375,6 +414,10 @@ fn finishRender(self: *Self, manager: *river.WindowManagerV1) void {
             self.xdg_shell.setWindowPosition(entry.value.xdg_id, position);
             entry.value.pending_position = null;
         }
+        self.xdg_shell.setWindowFocused(
+            entry.value.xdg_id,
+            if (self.focused) |id| std.meta.eql(id, entry.id) else false,
+        );
         self.xdg_shell.setWindowVisible(
             entry.value.xdg_id,
             entry.value.display_ready and entry.value.requested_visible,
@@ -418,13 +461,20 @@ fn releaseManager(self: *Self) void {
     self.active = null;
     self.sequence.reset();
     self.stack_operations.clearRetainingCapacity();
+    self.focused = null;
+    self.pending_focus = .unchanged;
     self.releaseWindows();
 }
 
 fn releaseWindows(self: *Self) void {
     var iterator = self.windows.iterator();
     while (iterator.next()) |entry| {
-        self.xdg_shell.restoreStandaloneWindow(entry.value.xdg_id);
+        self.xdg_shell.setWindowFocused(entry.value.xdg_id, false);
+        self.xdg_shell.restoreStandaloneWindow(
+            entry.value.xdg_id,
+            entry.value.activated,
+            entry.value.requested_dimensions,
+        );
         _ = self.windows.remove(entry.id);
     }
 }
@@ -433,7 +483,7 @@ fn handleConfigureTimeout(self: *Self) c_int {
     if (!self.sequence.configureTimeout()) return 0;
     var iterator = self.windows.iterator();
     while (iterator.next()) |entry| switch (entry.value.configure) {
-        .inflight => |serial| entry.value.configure = .{ .timed_out = serial },
+        .inflight => |configure| entry.value.configure = .{ .timed_out = configure },
         else => {},
     };
     if (self.active) |manager| self.startRender(manager);
@@ -476,17 +526,19 @@ fn windowCommitted(
     };
 
     switch (window.configure) {
-        .inflight => |expected| {
-            if (serial != expected) return true;
+        .inflight => |configure| {
+            if (serial != configure.serial) return true;
             window.configure = .idle;
-            window.dimensions_pending = true;
+            if (configure.report_dimensions) window.dimensions_pending = true;
             if (self.sequence.configureFinished()) self.startRender(manager);
         },
-        .timed_out => |expected| {
-            if (serial != expected) return true;
+        .timed_out => |configure| {
+            if (serial != configure.serial) return true;
             window.configure = .idle;
-            window.dimensions_pending = true;
-            self.requestManage();
+            if (configure.report_dimensions) {
+                window.dimensions_pending = true;
+                self.requestManage();
+            }
         },
         .idle => {
             if (!window.display_ready) return true;
@@ -519,6 +571,15 @@ fn removeWindow(self: *Self, xdg_id: XdgShell.WindowId) void {
     const id = self.findWindow(xdg_id) orelse return;
     const window = self.windows.get(id) orelse return;
     if (window.resource) |resource| resource.sendClosed();
+    if (self.focused) |focused| {
+        if (std.meta.eql(focused, id)) self.focused = null;
+    }
+    switch (self.pending_focus) {
+        .window => |pending| if (std.meta.eql(pending, id)) {
+            self.pending_focus = .clear;
+        },
+        else => {},
+    }
     const finish_configure = switch (window.configure) {
         .inflight => true,
         else => false,
@@ -837,15 +898,18 @@ const SeatResource = struct {
 
         switch (request) {
             .destroy => unreachable,
-            .clear_focus, .op_start_pointer, .op_end => {
-                if (self.manager.sequence.state != .manage) {
-                    manager_resource.postError(
-                        .sequence_order,
-                        "seat request outside a manage sequence",
-                    );
-                }
+            .focus_window => |focus| {
+                if (!self.requireManage(manager_resource)) return;
+                const id = self.resolveWindow(focus.window) orelse return;
+                self.manager.pending_focus = .{ .window = id };
             },
-            .focus_window,
+            .clear_focus => {
+                if (!self.requireManage(manager_resource)) return;
+                self.manager.pending_focus = .clear;
+            },
+            .op_start_pointer, .op_end => {
+                _ = self.requireManage(manager_resource);
+            },
             .focus_shell_surface,
             .get_pointer_binding,
             .set_xcursor_theme,
@@ -854,6 +918,21 @@ const SeatResource = struct {
                 "river seat operation is not implemented",
             ),
         }
+    }
+
+    fn resolveWindow(self: *SeatResource, resource: *river.WindowV1) ?WindowId {
+        const data = resource.getUserData() orelse return null;
+        const window: *WindowResource = @ptrCast(@alignCast(data));
+        if (window.manager != self.manager or
+            window.owner_generation != self.owner_generation) return null;
+        if (self.manager.windows.get(window.id) == null) return null;
+        return window.id;
+    }
+
+    fn requireManage(self: *SeatResource, manager: *river.WindowManagerV1) bool {
+        if (self.manager.sequence.state == .manage) return true;
+        manager.postError(.sequence_order, "seat request outside a manage sequence");
+        return false;
     }
 
     fn handleDestroy(_: *river.SeatV1, self: *SeatResource) void {

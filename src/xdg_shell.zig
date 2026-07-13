@@ -219,6 +219,15 @@ pub fn configureWindow(
     id: WindowId,
     dimensions: Dimensions,
 ) error{ InvalidWindow, OutOfMemory }!u32 {
+    return self.configureWindowState(id, dimensions, false);
+}
+
+pub fn configureWindowState(
+    self: *Self,
+    id: WindowId,
+    dimensions: Dimensions,
+    activated: bool,
+) error{ InvalidWindow, OutOfMemory }!u32 {
     if (dimensions.width < 0 or dimensions.height < 0) return error.InvalidWindow;
     const window = self.windows.get(id) orelse return error.InvalidWindow;
     const state = self.xdg_surfaces.get(window.xdg_surface_id) orelse
@@ -227,10 +236,16 @@ pub fn configureWindow(
     const serial = self.display.nextSerial();
     state.configure_serials.append(self.allocator, serial) catch return error.OutOfMemory;
 
-    const values: std.ArrayList(u32) = .empty;
-    var array = wl.Array.fromArrayList(u32, values);
+    var activated_value: u32 = @intCast(@intFromEnum(xdg.Toplevel.State.activated));
+    var array: wl.Array = .{
+        .size = if (activated) @sizeOf(u32) else 0,
+        .alloc = if (activated) @sizeOf(u32) else 0,
+        .data = if (activated) @ptrCast(&activated_value) else null,
+    };
     if (toplevel.getVersion() >= 5 and !state.initial_configure_sent) {
-        toplevel.sendWmCapabilities(&array);
+        const capabilities: std.ArrayList(u32) = .empty;
+        var capabilities_array = wl.Array.fromArrayList(u32, capabilities);
+        toplevel.sendWmCapabilities(&capabilities_array);
     }
     toplevel.sendConfigure(dimensions.width, dimensions.height, &array);
     const adapter: *ToplevelResource = @ptrCast(@alignCast(toplevel.getUserData().?));
@@ -239,11 +254,20 @@ pub fn configureWindow(
     return serial;
 }
 
-pub fn restoreStandaloneWindow(self: *Self, id: WindowId) void {
+pub fn restoreStandaloneWindow(
+    self: *Self,
+    id: WindowId,
+    deactivate: bool,
+    dimensions: Dimensions,
+) void {
     const window = self.windows.get(id) orelse return;
     const state = self.xdg_surfaces.get(window.xdg_surface_id) orelse return;
-    if (window.ready and !state.initial_configure_sent) {
-        _ = self.configureWindow(id, .{ .width = 0, .height = 0 }) catch |err| switch (err) {
+    if (deactivate or (window.ready and !state.initial_configure_sent)) {
+        _ = self.configureWindowState(
+            id,
+            if (deactivate) dimensions else .{ .width = 0, .height = 0 },
+            false,
+        ) catch |err| switch (err) {
             error.OutOfMemory => if (state.toplevel_resource) |resource| resource.postNoMemory(),
             error.InvalidWindow => {},
         };
@@ -259,6 +283,11 @@ pub fn setWindowVisible(self: *Self, id: WindowId, visible: bool) void {
 pub fn setWindowPosition(self: *Self, id: WindowId, position: Scene.Position) void {
     const window = self.windows.get(id) orelse return;
     self.scene.setPosition(window.scene_id, position);
+}
+
+pub fn setWindowFocused(self: *Self, id: WindowId, focused: bool) void {
+    const window = self.windows.get(id) orelse return;
+    self.scene.setFocused(window.scene_id, focused);
 }
 
 pub fn placeWindowTop(self: *Self, id: WindowId) void {
