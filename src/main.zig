@@ -43,6 +43,7 @@ test {
     _ = @import("output.zig");
     _ = @import("cpu_renderer.zig");
     _ = @import("region.zig");
+    _ = @import("scene.zig");
     _ = @import("slot_map.zig");
     _ = @import("subcompositor.zig");
     _ = @import("seat.zig");

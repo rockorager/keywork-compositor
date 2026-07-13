@@ -14,6 +14,7 @@ const Output = @import("output.zig");
 const CpuRenderer = @import("cpu_renderer.zig");
 const renderer_types = @import("renderer.zig");
 const render = @import("render.zig");
+const Scene = @import("scene.zig");
 const Surface = @import("surface.zig");
 
 const wl = wayland.server.wl;
@@ -25,6 +26,7 @@ headless_output: HeadlessOutput,
 output: Output,
 compositor: Compositor,
 subcompositor: Subcompositor,
+scene: Scene,
 xdg_shell: XdgShell,
 seat: Seat,
 data_device: DataDevice,
@@ -50,6 +52,7 @@ pub fn create(allocator: std.mem.Allocator) !*Self {
         .output = undefined,
         .compositor = undefined,
         .subcompositor = undefined,
+        .scene = undefined,
         .xdg_shell = undefined,
         .seat = undefined,
         .data_device = undefined,
@@ -69,7 +72,14 @@ pub fn create(allocator: std.mem.Allocator) !*Self {
     errdefer self.compositor.deinit();
     try self.subcompositor.init(allocator, display, self.compositor.surfaceStore());
     errdefer self.subcompositor.deinit();
-    try self.xdg_shell.init(allocator, display, self.compositor.surfaceStore());
+    self.scene.init(allocator);
+    errdefer self.scene.deinit();
+    try self.xdg_shell.init(
+        allocator,
+        display,
+        self.compositor.surfaceStore(),
+        &self.scene,
+    );
     errdefer self.xdg_shell.deinit();
     try self.seat.init(display);
     errdefer self.seat.deinit();
@@ -80,7 +90,7 @@ pub fn create(allocator: std.mem.Allocator) !*Self {
         .context = self,
         .request = requestRepaint,
     });
-    self.xdg_shell.setRepaintListener(.{
+    self.scene.setRepaintListener(.{
         .context = self,
         .request = requestRepaint,
     });
@@ -90,13 +100,14 @@ pub fn create(allocator: std.mem.Allocator) !*Self {
 
 pub fn destroy(self: *Self) void {
     const allocator = self.allocator;
-    self.xdg_shell.clearRepaintListener();
+    self.scene.clearRepaintListener();
     self.subcompositor.clearRepaintListener();
     self.render_timer.remove();
     self.display.destroyClients();
     self.data_device.deinit();
     self.seat.deinit();
     self.xdg_shell.deinit();
+    self.scene.deinit();
     self.subcompositor.deinit();
     self.compositor.deinit();
     self.output.deinit();
@@ -157,19 +168,23 @@ fn renderFrame(self: *Self) renderer_types.Renderer.Error!void {
         target,
     );
 
-    var windows = self.xdg_shell.windowIterator();
+    var windows = self.scene.iterator();
     while (windows.next()) |entry| {
-        if (!entry.value.mapped) continue;
-        const surface_id = self.xdg_shell.surfaceForWindow(entry.id) orelse continue;
-        try self.renderSurfaceTree(surface_id, 0, 0, target);
+        if (!entry.window.mapped) continue;
+        try self.renderSurfaceTree(
+            entry.window.surface_id,
+            entry.window.position.x,
+            entry.window.position.y,
+            entry.window.effects.corner_radius,
+            target,
+        );
     }
 
     self.frame_time_milliseconds +%= 16;
-    windows = self.xdg_shell.windowIterator();
+    windows = self.scene.iterator();
     while (windows.next()) |entry| {
-        if (!entry.value.mapped) continue;
-        const surface_id = self.xdg_shell.surfaceForWindow(entry.id) orelse continue;
-        self.finishSurfaceTree(surface_id);
+        if (!entry.window.mapped) continue;
+        self.finishSurfaceTree(entry.window.surface_id);
     }
 }
 
@@ -178,6 +193,7 @@ fn renderSurfaceTree(
     surface_id: Surface.Id,
     x: i32,
     y: i32,
+    corner_radius: u32,
     target: renderer_types.Target,
 ) renderer_types.Renderer.Error!void {
     if (Surface.currentBuffer(self.compositor.surfaceStore(), surface_id) == null) return;
@@ -196,6 +212,7 @@ fn renderSurfaceTree(
                     .y = y,
                     .size = buffer.logical_size,
                     .buffer = buffer.pixelBuffer(),
+                    .corner_radius = corner_radius,
                 } },
             };
             try self.renderer.render(
@@ -207,6 +224,7 @@ fn renderSurfaceTree(
             child.surface_id,
             x +| child.position.x,
             y +| child.position.y,
+            0,
             target,
         ),
     };

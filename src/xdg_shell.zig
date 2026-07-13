@@ -4,6 +4,7 @@ const Self = @This();
 
 const std = @import("std");
 const wayland = @import("wayland");
+const Scene = @import("scene.zig");
 const slot_map = @import("slot_map.zig");
 const Surface = @import("surface.zig");
 
@@ -13,11 +14,11 @@ const xdg = wayland.server.xdg;
 allocator: std.mem.Allocator,
 display: *wl.Server,
 surface_store: *Surface.Store,
+scene: *Scene,
 global: *wl.Global,
 bindings: BindingStore,
 xdg_surfaces: XdgSurfaceStore,
 windows: WindowStore,
-repaint_listener: ?RepaintListener,
 
 const BindingStore = slot_map.SlotMap(BindingState, enum { xdg_binding });
 const BindingId = BindingStore.Id;
@@ -27,11 +28,6 @@ const XdgSurfaceId = XdgSurfaceStore.Id;
 
 pub const WindowStore = slot_map.SlotMap(WindowState, enum { window });
 pub const WindowId = WindowStore.Id;
-
-pub const RepaintListener = struct {
-    context: *anyopaque,
-    request: *const fn (*anyopaque) void,
-};
 
 const BindingState = struct {
     surface_count: usize = 0,
@@ -69,6 +65,7 @@ const XdgSurfaceState = struct {
 
 pub const WindowState = struct {
     xdg_surface_id: XdgSurfaceId,
+    scene_id: Scene.Id,
     parent: ?WindowId = null,
     title: ?[:0]u8 = null,
     app_id: ?[:0]u8 = null,
@@ -108,16 +105,17 @@ pub fn init(
     allocator: std.mem.Allocator,
     display: *wl.Server,
     surface_store: *Surface.Store,
+    scene: *Scene,
 ) !void {
     self.* = .{
         .allocator = allocator,
         .display = display,
         .surface_store = surface_store,
+        .scene = scene,
         .global = undefined,
         .bindings = .{},
         .xdg_surfaces = .{},
         .windows = .{},
-        .repaint_listener = null,
     };
     errdefer self.bindings.deinit(allocator);
     errdefer self.xdg_surfaces.deinit(allocator);
@@ -131,30 +129,6 @@ pub fn deinit(self: *Self) void {
     self.xdg_surfaces.deinit(self.allocator);
     self.windows.deinit(self.allocator);
     self.* = undefined;
-}
-
-pub fn setRepaintListener(self: *Self, listener: RepaintListener) void {
-    std.debug.assert(self.repaint_listener == null);
-    self.repaint_listener = listener;
-}
-
-pub fn clearRepaintListener(self: *Self) void {
-    std.debug.assert(self.repaint_listener != null);
-    self.repaint_listener = null;
-}
-
-pub fn windowIterator(self: *Self) WindowStore.Iterator {
-    return self.windows.iterator();
-}
-
-pub fn surfaceForWindow(self: *Self, id: WindowId) ?Surface.Id {
-    const window = self.windows.get(id) orelse return null;
-    const xdg_surface = self.xdg_surfaces.get(window.xdg_surface_id) orelse return null;
-    return if (xdg_surface.surface_alive) xdg_surface.surface_id else null;
-}
-
-fn requestRepaint(self: *Self) void {
-    if (self.repaint_listener) |listener| listener.request(listener.context);
 }
 
 fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
@@ -464,6 +438,7 @@ const XdgSurfaceResource = struct {
         if (removed.role) |window_id| {
             if (self.shell.windows.remove(window_id)) |window_value| {
                 var window = window_value;
+                self.shell.scene.removeWindow(window.scene_id);
                 window.deinit(self.allocator);
             }
         }
@@ -531,19 +506,23 @@ const XdgSurfaceResource = struct {
             state.initial_configure_sent = false;
             state.last_acked_serial = null;
             state.configure_serials.clearRetainingCapacity();
+            self.shell.scene.setMapped(window.scene_id, false);
             window.reset(self.allocator);
-            self.shell.requestRepaint();
             return;
         }
 
         if (info.has_buffer) {
+            const was_mapped = window.mapped;
             if (state.last_acked_serial != null) {
                 state.configured = true;
                 state.last_acked_serial = null;
             }
             state.mapped = state.configured;
             window.mapped = state.mapped;
-            self.shell.requestRepaint();
+            self.shell.scene.setMapped(window.scene_id, state.mapped);
+            if (was_mapped and state.mapped) {
+                self.shell.scene.surfaceCommitted(window.scene_id);
+            }
             return;
         }
 
@@ -554,13 +533,14 @@ const XdgSurfaceResource = struct {
         const self: *XdgSurfaceResource = @ptrCast(@alignCast(context));
         self.surface = null;
         const state = self.shell.xdg_surfaces.get(self.id) orelse return;
-        const was_mapped = state.mapped;
         state.surface_alive = false;
         state.mapped = false;
         if (state.role) |window_id| {
-            if (self.shell.windows.get(window_id)) |window| window.mapped = false;
+            if (self.shell.windows.get(window_id)) |window| {
+                window.mapped = false;
+                self.shell.scene.setMapped(window.scene_id, false);
+            }
         }
-        if (was_mapped) self.shell.requestRepaint();
     }
 
     fn sendInitialConfigure(self: *XdgSurfaceResource) void {
@@ -609,8 +589,12 @@ const ToplevelResource = struct {
             return error.OutOfMemory;
         errdefer xdg_surface.allocator.destroy(self);
 
+        const scene_id = xdg_surface.shell.scene.addWindow(surface.handle()) catch
+            return error.OutOfMemory;
+        errdefer xdg_surface.shell.scene.removeWindow(scene_id);
         const window_id = xdg_surface.shell.windows.insert(xdg_surface.allocator, .{
             .xdg_surface_id = xdg_surface.id,
+            .scene_id = scene_id,
         }) catch return error.OutOfMemory;
 
         self.* = .{
@@ -679,9 +663,8 @@ const ToplevelResource = struct {
         }
         if (self.shell.windows.remove(self.id)) |window_value| {
             var window = window_value;
-            const was_mapped = window.mapped;
+            self.shell.scene.removeWindow(window.scene_id);
             window.deinit(self.allocator);
-            if (was_mapped) self.shell.requestRepaint();
         }
         self.allocator.destroy(self);
     }

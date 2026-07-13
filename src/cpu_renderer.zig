@@ -110,20 +110,76 @@ fn composite(
     const clipped = destination_rect.clipTo(destination_size) orelse return;
     const source_x: i32 = clipped.x - image.x;
     const source_y: i32 = clipped.y - image.y;
+    const mask = if (image.corner_radius > 0)
+        try createRoundedMask(image.size, image.corner_radius)
+    else
+        null;
+    defer if (mask) |rounded_mask| {
+        _ = pixman.pixman_image_unref(rounded_mask);
+    };
     pixman.pixman_image_composite32(
         pixman.PIXMAN_OP_OVER,
         source,
-        null,
+        mask,
         destination,
         source_x,
         source_y,
-        0,
-        0,
+        source_x,
+        source_y,
         clipped.x,
         clipped.y,
         @intCast(clipped.width),
         @intCast(clipped.height),
     );
+}
+
+fn createRoundedMask(
+    size: render_types.Size,
+    requested_radius: u32,
+) Error!*pixman.pixman_image_t {
+    const mask = pixman.pixman_image_create_bits(
+        pixman.PIXMAN_a8,
+        @intCast(size.width),
+        @intCast(size.height),
+        null,
+        0,
+    ) orelse return error.OutOfMemory;
+    errdefer _ = pixman.pixman_image_unref(mask);
+
+    const data: [*]u8 = @ptrCast(pixman.pixman_image_get_data(mask));
+    const stride: usize = @intCast(pixman.pixman_image_get_stride(mask));
+    const radius = @min(requested_radius, @min(size.width, size.height) / 2);
+    if (radius == 0) {
+        for (0..size.height) |y| @memset(data[y * stride ..][0..size.width], 255);
+        return mask;
+    }
+
+    const radius_float: f32 = @floatFromInt(radius);
+    for (0..size.height) |y| {
+        for (0..size.width) |x| {
+            const pixel_x: f32 = @as(f32, @floatFromInt(x)) + 0.5;
+            const pixel_y: f32 = @as(f32, @floatFromInt(y)) + 0.5;
+            const center_x: f32 = if (x < radius)
+                radius_float
+            else if (x >= size.width - radius)
+                @floatFromInt(size.width - radius)
+            else
+                pixel_x;
+            const center_y: f32 = if (y < radius)
+                radius_float
+            else if (y >= size.height - radius)
+                @floatFromInt(size.height - radius)
+            else
+                pixel_y;
+            const distance = @sqrt(
+                (pixel_x - center_x) * (pixel_x - center_x) +
+                    (pixel_y - center_y) * (pixel_y - center_y),
+            );
+            const coverage = std.math.clamp(radius_float + 0.5 - distance, 0.0, 1.0);
+            data[y * stride + x] = @intFromFloat(coverage * 255.0);
+        }
+    }
+    return mask;
 }
 
 fn fixedRatio(numerator: u32, denominator: u32) Error!pixman.pixman_fixed_t {
@@ -262,4 +318,33 @@ test "CPU renderer scales images to logical size" {
     }, output.target());
 
     try std.testing.expectEqual(@as(u32, 0xff336699), output.pixel(0, 0));
+}
+
+test "CPU renderer clips image corners with an antialiased mask" {
+    const size: render_types.Size = .{ .width = 4, .height = 4 };
+    var output = try headless.init(std.testing.allocator, size);
+    defer output.deinit();
+
+    var source_pixels = [_]u32{0xffffffff} ** 16;
+    const commands = [_]render_types.Command{
+        .{ .image = .{
+            .x = 0,
+            .y = 0,
+            .size = size,
+            .buffer = .{
+                .size = size,
+                .stride_pixels = size.width,
+                .pixels = &source_pixels,
+            },
+            .corner_radius = 2,
+        } },
+    };
+
+    var renderer = Self.init();
+    defer renderer.deinit();
+    try renderer.render(.{ .size = size, .commands = &commands }, output.target());
+
+    const corner_alpha: u8 = @truncate(output.pixel(0, 0) >> 24);
+    try std.testing.expect(corner_alpha > 0 and corner_alpha < 255);
+    try std.testing.expectEqual(@as(u32, 0xffffffff), output.pixel(1, 1));
 }

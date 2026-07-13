@@ -73,6 +73,7 @@ pub const Image = struct {
     y: i32,
     size: Size,
     buffer: PixelBuffer,
+    corner_radius: u32 = 0,
 };
 
 pub const Command = union(enum) {
