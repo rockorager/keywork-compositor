@@ -20,12 +20,14 @@ allocator: std.mem.Allocator,
 global: *wl.Global,
 output: *Output,
 seat: *Seat,
+scene: *Scene,
 xdg_shell: *XdgShell,
 active: ?*river.WindowManagerV1,
 session_generation: u64,
 sequence: Sequence,
 windows: WindowStore,
 decorations: DecorationStore,
+shell_surfaces: ShellSurfaceStore,
 stack_operations: std.ArrayList(StackOperation),
 focused: ?WindowId,
 pending_focus: PendingFocus,
@@ -35,6 +37,13 @@ const WindowStore = slot_map.SlotMap(ManagedWindow, enum { managed_window });
 const WindowId = WindowStore.Id;
 const DecorationStore = slot_map.SlotMap(ManagedDecoration, enum { managed_decoration });
 const DecorationId = DecorationStore.Id;
+const ShellSurfaceStore = slot_map.SlotMap(ManagedShellSurface, enum { managed_shell_surface });
+const ShellSurfaceId = ShellSurfaceStore.Id;
+
+const ManagedNodeId = union(enum) {
+    window: WindowId,
+    shell_surface: ShellSurfaceId,
+};
 
 const ManagedWindow = struct {
     xdg_id: XdgShell.WindowId,
@@ -69,11 +78,19 @@ const ManagedDecoration = struct {
     pending_offset: ?Scene.Position = null,
 };
 
+const ManagedShellSurface = struct {
+    scene_id: ?Scene.ShellSurfaceId,
+    adapter: *ShellSurfaceResource,
+    node_resource: ?*river.NodeV1 = null,
+    node_created: bool = false,
+    pending_position: ?Scene.Position = null,
+};
+
 const StackOperation = union(enum) {
-    top: WindowId,
-    bottom: WindowId,
-    above: struct { id: WindowId, other: WindowId },
-    below: struct { id: WindowId, other: WindowId },
+    top: ManagedNodeId,
+    bottom: ManagedNodeId,
+    above: struct { id: ManagedNodeId, other: ManagedNodeId },
+    below: struct { id: ManagedNodeId, other: ManagedNodeId },
 };
 
 const ConfigureState = union(enum) {
@@ -179,6 +196,7 @@ pub fn init(
     display: *wl.Server,
     output: *Output,
     seat: *Seat,
+    scene: *Scene,
     xdg_shell: *XdgShell,
 ) !void {
     self.* = .{
@@ -186,12 +204,14 @@ pub fn init(
         .global = undefined,
         .output = output,
         .seat = seat,
+        .scene = scene,
         .xdg_shell = xdg_shell,
         .active = null,
         .session_generation = 0,
         .sequence = .{},
         .windows = .{},
         .decorations = .{},
+        .shell_surfaces = .{},
         .stack_operations = .empty,
         .focused = null,
         .pending_focus = .unchanged,
@@ -199,6 +219,7 @@ pub fn init(
     };
     errdefer self.windows.deinit(allocator);
     errdefer self.decorations.deinit(allocator);
+    errdefer self.shell_surfaces.deinit(allocator);
     errdefer self.stack_operations.deinit(allocator);
     self.global = try wl.Global.create(
         display,
@@ -224,8 +245,10 @@ pub fn deinit(self: *Self) void {
     self.xdg_shell.clearWindowListener();
     self.configure_timer.remove();
     self.releaseWindows();
+    self.releaseShellSurfaces();
     self.windows.deinit(self.allocator);
     self.decorations.deinit(self.allocator);
+    self.shell_surfaces.deinit(self.allocator);
     self.stack_operations.deinit(self.allocator);
     self.global.destroy();
     self.* = undefined;
@@ -287,9 +310,12 @@ fn handleRequest(
         },
         .manage_dirty => self.requestManage(),
         .render_finish => self.finishRender(resource),
-        .get_shell_surface => resource.getClient().postImplementationError(
-            "river shell surfaces are not implemented",
-        ),
+        .get_shell_surface => |get| ShellSurfaceResource.create(
+            self,
+            resource,
+            Surface.fromResource(get.surface),
+            get.id,
+        ) catch resource.postNoMemory(),
         .exit_session => unreachable,
     }
 }
@@ -476,8 +502,9 @@ fn finishRender(self: *Self, manager: *river.WindowManagerV1) void {
         manager.postError(.sequence_order, "render_finish outside a render sequence");
         return;
     }
-    if (!self.validateDecorationCommits()) return;
+    if (!self.validateSynchronizedCommits()) return;
     self.applyDecorationState();
+    self.applyShellSurfaceState();
 
     var iterator = self.windows.iterator();
     while (iterator.next()) |entry| {
@@ -541,22 +568,22 @@ fn finishRender(self: *Self, manager: *river.WindowManagerV1) void {
     }
     for (self.stack_operations.items) |operation| switch (operation) {
         .top => |id| {
-            const window = self.windows.get(id) orelse continue;
-            self.xdg_shell.placeWindowTop(window.xdg_id);
+            const scene_id = self.sceneNodeId(id) orelse continue;
+            self.scene.placeNodeTop(scene_id);
         },
         .bottom => |id| {
-            const window = self.windows.get(id) orelse continue;
-            self.xdg_shell.placeWindowBottom(window.xdg_id);
+            const scene_id = self.sceneNodeId(id) orelse continue;
+            self.scene.placeNodeBottom(scene_id);
         },
         .above => |placement| {
-            const window = self.windows.get(placement.id) orelse continue;
-            const other = self.windows.get(placement.other) orelse continue;
-            self.xdg_shell.placeWindowAbove(window.xdg_id, other.xdg_id);
+            const scene_id = self.sceneNodeId(placement.id) orelse continue;
+            const other_scene_id = self.sceneNodeId(placement.other) orelse continue;
+            self.scene.placeNodeAbove(scene_id, other_scene_id);
         },
         .below => |placement| {
-            const window = self.windows.get(placement.id) orelse continue;
-            const other = self.windows.get(placement.other) orelse continue;
-            self.xdg_shell.placeWindowBelow(window.xdg_id, other.xdg_id);
+            const scene_id = self.sceneNodeId(placement.id) orelse continue;
+            const other_scene_id = self.sceneNodeId(placement.other) orelse continue;
+            self.scene.placeNodeBelow(scene_id, other_scene_id);
         },
     };
     self.stack_operations.clearRetainingCapacity();
@@ -573,9 +600,20 @@ fn finishRender(self: *Self, manager: *river.WindowManagerV1) void {
     }
 }
 
-fn validateDecorationCommits(self: *Self) bool {
+fn validateSynchronizedCommits(self: *Self) bool {
     var iterator = self.decorations.iterator();
     while (iterator.next()) |entry| {
+        const adapter = entry.value.adapter;
+        if (adapter.owner_generation != self.session_generation) continue;
+        if (!adapter.synchronized_commit_requested) continue;
+        adapter.resource.postError(
+            .no_commit,
+            "sync_next_commit was not followed by wl_surface.commit",
+        );
+        return false;
+    }
+    var shell_surfaces = self.shell_surfaces.iterator();
+    while (shell_surfaces.next()) |entry| {
         const adapter = entry.value.adapter;
         if (adapter.owner_generation != self.session_generation) continue;
         if (!adapter.synchronized_commit_requested) continue;
@@ -609,6 +647,42 @@ fn applyDecorationState(self: *Self) void {
     }
 }
 
+fn applyShellSurfaceState(self: *Self) void {
+    var iterator = self.shell_surfaces.iterator();
+    while (iterator.next()) |entry| {
+        const adapter = entry.value.adapter;
+        if (adapter.owner_generation != self.session_generation) continue;
+        if (entry.value.pending_position) |position| {
+            if (entry.value.scene_id) |scene_id| {
+                self.scene.setShellSurfacePosition(scene_id, position);
+            }
+            entry.value.pending_position = null;
+        }
+        if (adapter.synchronized_commit_cached) {
+            if (adapter.surface) |surface| {
+                surface.applyCachedCommit();
+                if (surface.hasCachedCommit()) surface.discardCachedCommit();
+            }
+            adapter.synchronized_commit_cached = false;
+        }
+    }
+}
+
+fn sceneNodeId(self: *Self, id: ManagedNodeId) ?Scene.NodeId {
+    return switch (id) {
+        .window => |window_id| {
+            const window = self.windows.get(window_id) orelse return null;
+            const info = self.xdg_shell.windowInfo(window.xdg_id) orelse return null;
+            return .{ .window = info.scene_id };
+        },
+        .shell_surface => |shell_id| {
+            const shell_surface = self.shell_surfaces.get(shell_id) orelse return null;
+            const scene_id = shell_surface.scene_id orelse return null;
+            return .{ .shell_surface = scene_id };
+        },
+    };
+}
+
 fn releaseManager(self: *Self) void {
     self.active = null;
     self.sequence.reset();
@@ -616,6 +690,7 @@ fn releaseManager(self: *Self) void {
     self.focused = null;
     self.pending_focus = .unchanged;
     self.releaseWindows();
+    self.releaseShellSurfaces();
 }
 
 fn releaseWindows(self: *Self) void {
@@ -642,6 +717,11 @@ fn detachDecorations(self: *Self, window_id: WindowId) void {
         if (!std.meta.eql(entry.value.window_id, window_id)) continue;
         entry.value.adapter.detach();
     }
+}
+
+fn releaseShellSurfaces(self: *Self) void {
+    var iterator = self.shell_surfaces.iterator();
+    while (iterator.next()) |entry| entry.value.adapter.detach();
 }
 
 fn handleConfigureTimeout(self: *Self) c_int {
@@ -858,7 +938,7 @@ const WindowResource = struct {
                 if (!self.requireManage(manager_resource)) return;
                 window.fullscreen_output = false;
             },
-            .get_node => |get| NodeResource.create(
+            .get_node => |get| NodeResource.createWindow(
                 self.manager,
                 self.id,
                 resource,
@@ -1170,13 +1250,188 @@ const DecorationResource = struct {
     }
 };
 
+const ShellSurfaceResource = struct {
+    allocator: std.mem.Allocator,
+    manager: *Self,
+    id: ShellSurfaceId,
+    resource: *river.ShellSurfaceV1,
+    surface: ?*Surface,
+    owner_generation: u64,
+    synchronized_commit_requested: bool,
+    synchronized_commit_cached: bool,
+
+    fn create(
+        manager: *Self,
+        manager_resource: *river.WindowManagerV1,
+        surface: *Surface,
+        protocol_id: u32,
+    ) error{ OutOfMemory, ResourceCreateFailed }!void {
+        const resource = try river.ShellSurfaceV1.create(
+            manager_resource.getClient(),
+            manager_resource.getVersion(),
+            protocol_id,
+        );
+        errdefer resource.destroy();
+        const self = manager.allocator.create(ShellSurfaceResource) catch
+            return error.OutOfMemory;
+        errdefer manager.allocator.destroy(self);
+        self.* = .{
+            .allocator = manager.allocator,
+            .manager = manager,
+            .id = undefined,
+            .resource = resource,
+            .surface = surface,
+            .owner_generation = manager.session_generation,
+            .synchronized_commit_requested = false,
+            .synchronized_commit_cached = false,
+        };
+
+        if (surface.assignedRole() != null or surface.hasBufferAttachedOrCommitted()) {
+            manager_resource.postError(
+                .role,
+                "shell wl_surface already has a role or buffer",
+            );
+            manager.allocator.destroy(self);
+            resource.destroy();
+            return;
+        }
+        surface.reserveRole(.river_shell_surface, .{
+            .context = self,
+            .before_commit = beforeSurfaceCommit,
+            .after_commit = afterSurfaceCommit,
+            .surface_destroyed = surfaceDestroyed,
+        }) catch {
+            manager_resource.postError(.role, "wl_surface is unavailable for shell role");
+            manager.allocator.destroy(self);
+            resource.destroy();
+            return;
+        };
+        errdefer surface.releaseRole(self);
+
+        const scene_id = try manager.scene.addShellSurface(surface.handle());
+        errdefer manager.scene.removeShellSurface(scene_id);
+        const id = manager.shell_surfaces.insert(manager.allocator, .{
+            .scene_id = scene_id,
+            .adapter = self,
+        }) catch return error.OutOfMemory;
+        errdefer _ = manager.shell_surfaces.remove(id);
+        self.id = id;
+
+        surface.assignReservedRole(.river_shell_surface, self) catch unreachable;
+        resource.setHandler(
+            *ShellSurfaceResource,
+            ShellSurfaceResource.handleRequest,
+            ShellSurfaceResource.handleDestroy,
+            self,
+        );
+    }
+
+    fn handleRequest(
+        resource: *river.ShellSurfaceV1,
+        request: river.ShellSurfaceV1.Request,
+        self: *ShellSurfaceResource,
+    ) void {
+        if (request == .destroy) {
+            resource.destroy();
+            return;
+        }
+        const manager_resource = self.activeManager() orelse return;
+        if (self.manager.shell_surfaces.get(self.id) == null) return;
+
+        switch (request) {
+            .destroy => unreachable,
+            .get_node => |get| NodeResource.createShellSurface(
+                self.manager,
+                self.id,
+                resource,
+                get.id,
+            ) catch resource.postNoMemory(),
+            .sync_next_commit => {
+                if (!self.requireRendering(manager_resource)) return;
+                self.synchronized_commit_requested = true;
+            },
+        }
+    }
+
+    fn beforeSurfaceCommit(
+        context: *anyopaque,
+        _: Surface.CommitInfo,
+    ) Surface.CommitAction {
+        const self: *ShellSurfaceResource = @ptrCast(@alignCast(context));
+        if (self.synchronized_commit_requested) {
+            self.synchronized_commit_requested = false;
+            self.synchronized_commit_cached = true;
+            return .cache;
+        }
+        if (self.synchronized_commit_cached) return .cache;
+        return .apply;
+    }
+
+    fn afterSurfaceCommit(context: *anyopaque, info: Surface.CommitInfo) void {
+        const self: *ShellSurfaceResource = @ptrCast(@alignCast(context));
+        const shell_surface = self.manager.shell_surfaces.get(self.id) orelse return;
+        const scene_id = shell_surface.scene_id orelse return;
+        self.manager.scene.setShellSurfaceMapped(scene_id, info.has_buffer);
+        self.manager.scene.shellSurfaceCommitted(scene_id);
+    }
+
+    fn surfaceDestroyed(context: *anyopaque) void {
+        const self: *ShellSurfaceResource = @ptrCast(@alignCast(context));
+        self.surface = null;
+        self.synchronized_commit_requested = false;
+        self.synchronized_commit_cached = false;
+        const shell_surface = self.manager.shell_surfaces.get(self.id) orelse return;
+        if (shell_surface.scene_id) |scene_id| {
+            self.manager.scene.removeShellSurface(scene_id);
+            shell_surface.scene_id = null;
+        }
+    }
+
+    fn detach(self: *ShellSurfaceResource) void {
+        const shell_surface = self.manager.shell_surfaces.get(self.id) orelse return;
+        if (shell_surface.scene_id) |scene_id| {
+            self.manager.scene.removeShellSurface(scene_id);
+            shell_surface.scene_id = null;
+        }
+        shell_surface.pending_position = null;
+        if (self.surface) |surface| surface.discardCachedCommit();
+        self.synchronized_commit_requested = false;
+        self.synchronized_commit_cached = false;
+    }
+
+    fn activeManager(self: *ShellSurfaceResource) ?*river.WindowManagerV1 {
+        if (self.manager.session_generation != self.owner_generation) return null;
+        return self.manager.active;
+    }
+
+    fn requireRendering(
+        self: *ShellSurfaceResource,
+        manager: *river.WindowManagerV1,
+    ) bool {
+        switch (self.manager.sequence.state) {
+            .manage, .inflight_configures, .render => return true,
+            .idle => {
+                manager.postError(.sequence_order, "shell request outside a render sequence");
+                return false;
+            },
+        }
+    }
+
+    fn handleDestroy(_: *river.ShellSurfaceV1, self: *ShellSurfaceResource) void {
+        self.detach();
+        if (self.surface) |surface| surface.releaseRole(self);
+        _ = self.manager.shell_surfaces.remove(self.id);
+        self.allocator.destroy(self);
+    }
+};
+
 const NodeResource = struct {
     allocator: std.mem.Allocator,
     manager: *Self,
-    id: WindowId,
+    id: ManagedNodeId,
     owner_generation: u64,
 
-    fn create(
+    fn createWindow(
         manager: *Self,
         id: WindowId,
         window_resource: *river.WindowV1,
@@ -1187,10 +1442,50 @@ const NodeResource = struct {
             window_resource.postError(.node_exists, "window already has a render node");
             return;
         }
-
-        const resource = try river.NodeV1.create(
+        const resource = try create(
+            manager,
+            .{ .window = id },
             window_resource.getClient(),
             window_resource.getVersion(),
+            protocol_id,
+        );
+        window.node_created = true;
+        window.node_resource = resource;
+    }
+
+    fn createShellSurface(
+        manager: *Self,
+        id: ShellSurfaceId,
+        shell_resource: *river.ShellSurfaceV1,
+        protocol_id: u32,
+    ) error{ OutOfMemory, ResourceCreateFailed }!void {
+        const shell_surface = manager.shell_surfaces.get(id) orelse
+            return error.ResourceCreateFailed;
+        if (shell_surface.node_created) {
+            shell_resource.postError(.node_exists, "shell surface already has a render node");
+            return;
+        }
+        const resource = try create(
+            manager,
+            .{ .shell_surface = id },
+            shell_resource.getClient(),
+            shell_resource.getVersion(),
+            protocol_id,
+        );
+        shell_surface.node_created = true;
+        shell_surface.node_resource = resource;
+    }
+
+    fn create(
+        manager: *Self,
+        id: ManagedNodeId,
+        client: *wl.Client,
+        version: u32,
+        protocol_id: u32,
+    ) error{ OutOfMemory, ResourceCreateFailed }!*river.NodeV1 {
+        const resource = try river.NodeV1.create(
+            client,
+            version,
             protocol_id,
         );
         errdefer resource.destroy();
@@ -1203,8 +1498,7 @@ const NodeResource = struct {
             .owner_generation = manager.session_generation,
         };
         resource.setHandler(*NodeResource, NodeResource.handleRequest, NodeResource.handleDestroy, self);
-        window.node_created = true;
-        window.node_resource = resource;
+        return resource;
     }
 
     fn handleRequest(
@@ -1217,14 +1511,20 @@ const NodeResource = struct {
             return;
         }
         const manager_resource = self.activeManager() orelse return;
-        const window = self.manager.windows.get(self.id) orelse return;
+        if (!self.exists()) return;
         if (!self.requireRendering(manager_resource)) return;
 
         switch (request) {
             .destroy => unreachable,
-            .set_position => |position| window.pending_position = .{
-                .x = position.x,
-                .y = position.y,
+            .set_position => |position| switch (self.id) {
+                .window => |id| {
+                    const window = self.manager.windows.get(id) orelse return;
+                    window.pending_position = .{ .x = position.x, .y = position.y };
+                },
+                .shell_surface => |id| {
+                    const shell_surface = self.manager.shell_surfaces.get(id) orelse return;
+                    shell_surface.pending_position = .{ .x = position.x, .y = position.y };
+                },
             },
             .place_top => self.appendOperation(resource, .{ .top = self.id }),
             .place_bottom => self.appendOperation(resource, .{ .bottom = self.id }),
@@ -1248,13 +1548,20 @@ const NodeResource = struct {
             resource.postNoMemory();
     }
 
-    fn resolveOther(self: *NodeResource, resource: *river.NodeV1) ?WindowId {
+    fn resolveOther(self: *NodeResource, resource: *river.NodeV1) ?ManagedNodeId {
         const data = resource.getUserData() orelse return null;
         const other: *NodeResource = @ptrCast(@alignCast(data));
         if (other.manager != self.manager or
             other.owner_generation != self.owner_generation) return null;
-        if (self.manager.windows.get(other.id) == null) return null;
+        if (!other.exists()) return null;
         return other.id;
+    }
+
+    fn exists(self: *NodeResource) bool {
+        return switch (self.id) {
+            .window => |id| self.manager.windows.get(id) != null,
+            .shell_surface => |id| self.manager.shell_surfaces.get(id) != null,
+        };
     }
 
     fn activeManager(self: *NodeResource) ?*river.WindowManagerV1 {
@@ -1274,8 +1581,13 @@ const NodeResource = struct {
 
     fn handleDestroy(resource: *river.NodeV1, self: *NodeResource) void {
         if (self.manager.session_generation == self.owner_generation) {
-            if (self.manager.windows.get(self.id)) |window| {
-                if (window.node_resource == resource) window.node_resource = null;
+            switch (self.id) {
+                .window => |id| if (self.manager.windows.get(id)) |window| {
+                    if (window.node_resource == resource) window.node_resource = null;
+                },
+                .shell_surface => |id| if (self.manager.shell_surfaces.get(id)) |shell_surface| {
+                    if (shell_surface.node_resource == resource) shell_surface.node_resource = null;
+                },
             }
         }
         self.allocator.destroy(self);
@@ -1383,12 +1695,15 @@ const SeatResource = struct {
                 if (!self.requireManage(manager_resource)) return;
                 self.manager.pending_focus = .clear;
             },
+            .focus_shell_surface => |focus| {
+                if (!self.requireManage(manager_resource)) return;
+                if (!self.resolveShellSurface(focus.shell_surface)) return;
+                self.manager.pending_focus = .clear;
+            },
             .op_start_pointer, .op_end => {
                 _ = self.requireManage(manager_resource);
             },
-            .focus_shell_surface,
-            .get_pointer_binding,
-            => resource.getClient().postImplementationError(
+            .get_pointer_binding => resource.getClient().postImplementationError(
                 "river seat operation is not implemented",
             ),
             .set_xcursor_theme => {},
@@ -1403,6 +1718,17 @@ const SeatResource = struct {
             window.owner_generation != self.owner_generation) return null;
         if (self.manager.windows.get(window.id) == null) return null;
         return window.id;
+    }
+
+    fn resolveShellSurface(
+        self: *SeatResource,
+        resource: *river.ShellSurfaceV1,
+    ) bool {
+        const data = resource.getUserData() orelse return false;
+        const shell_surface: *ShellSurfaceResource = @ptrCast(@alignCast(data));
+        if (shell_surface.manager != self.manager or
+            shell_surface.owner_generation != self.owner_generation) return false;
+        return self.manager.shell_surfaces.get(shell_surface.id) != null;
     }
 
     fn requireManage(self: *SeatResource, manager: *river.WindowManagerV1) bool {

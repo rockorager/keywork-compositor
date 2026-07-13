@@ -165,6 +165,7 @@ pub const Role = enum {
     xdg_toplevel,
     subsurface,
     river_decoration,
+    river_shell_surface,
 };
 
 pub const CommitInfo = struct {
