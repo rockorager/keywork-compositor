@@ -117,7 +117,10 @@ fn scaleCommand(command: render_types.Command, scale: render_types.Scale) render
                 .size = .{ .width = rect.width, .height = rect.height },
                 .buffer = image.buffer,
                 .source = image.source,
-                .corner_radius = scaleUnsigned(image.corner_radius, scale),
+                .rounded_clip = if (image.rounded_clip) |clip| .{
+                    .rect = scaleRect(clip.rect, scale),
+                    .radius = scaleUnsigned(clip.radius, scale),
+                } else null,
                 .clip = if (image.clip) |clip| scaleRect(clip, scale) else null,
             } };
         },
@@ -240,4 +243,30 @@ test "fractional rendering preserves an exact-scale image" {
     );
 
     try std.testing.expectEqualSlices(u32, &source_pixels, output.target().pixels);
+}
+
+test "fractional rendering scales rounded clips independently from images" {
+    var source_pixels = [_]u32{0xffffffff} ** 16;
+    const scaled = scaleCommand(.{ .image = .{
+        .x = 0,
+        .y = 0,
+        .size = .{ .width = 4, .height = 4 },
+        .buffer = .{
+            .size = .{ .width = 4, .height = 4 },
+            .stride_pixels = 4,
+            .pixels = &source_pixels,
+        },
+        .rounded_clip = .{
+            .rect = .{ .x = 1, .y = 1, .width = 2, .height = 2 },
+            .radius = 1,
+        },
+    } }, .{ .numerator = 180 });
+
+    try std.testing.expectEqual(render_types.Rect{
+        .x = 2,
+        .y = 2,
+        .width = 3,
+        .height = 3,
+    }, scaled.image.rounded_clip.?.rect);
+    try std.testing.expectEqual(@as(u32, 2), scaled.image.rounded_clip.?.radius);
 }

@@ -135,13 +135,18 @@ pub const SourceRect = struct {
     height: f64,
 };
 
+pub const RoundedClip = struct {
+    rect: Rect,
+    radius: u32,
+};
+
 pub const Image = struct {
     x: i32,
     y: i32,
     size: Size,
     buffer: PixelBuffer,
     source: ?SourceRect = null,
-    corner_radius: u32 = 0,
+    rounded_clip: ?RoundedClip = null,
     clip: ?Rect = null,
 };
 

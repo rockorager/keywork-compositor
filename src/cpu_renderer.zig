@@ -467,10 +467,14 @@ fn composite(
     };
     var clipped = destination_rect.clipTo(destination_size) orelse return;
     if (image.clip) |clip| clipped = clipped.intersection(clip) orelse return;
+    if (image.rounded_clip) |clip| clipped = clipped.intersection(clip.rect) orelse return;
     const source_x: i32 = clipped.x - image.x;
     const source_y: i32 = clipped.y - image.y;
-    const mask = if (image.corner_radius > 0)
-        try createRoundedMask(image.size, image.corner_radius)
+    const mask = if (image.rounded_clip) |clip|
+        try createRoundedMask(
+            .{ .width = clip.rect.width, .height = clip.rect.height },
+            clip.radius,
+        )
     else
         null;
     defer if (mask) |rounded_mask| {
@@ -483,8 +487,8 @@ fn composite(
         destination,
         source_x,
         source_y,
-        source_x,
-        source_y,
+        if (image.rounded_clip) |clip| clipped.x - clip.rect.x else 0,
+        if (image.rounded_clip) |clip| clipped.y - clip.rect.y else 0,
         clipped.x,
         clipped.y,
         @intCast(clipped.width),
@@ -727,7 +731,10 @@ test "CPU renderer clips image corners with an antialiased mask" {
                 .stride_pixels = size.width,
                 .pixels = &source_pixels,
             },
-            .corner_radius = 2,
+            .rounded_clip = .{
+                .rect = .{ .x = 0, .y = 0, .width = size.width, .height = size.height },
+                .radius = 2,
+            },
         } },
     };
 
@@ -738,6 +745,39 @@ test "CPU renderer clips image corners with an antialiased mask" {
     const corner_alpha: u8 = @truncate(output.pixel(0, 0) >> 24);
     try std.testing.expect(corner_alpha > 0 and corner_alpha < 255);
     try std.testing.expectEqual(@as(u32, 0xffffffff), output.pixel(1, 1));
+}
+
+test "CPU renderer positions rounded clips independently from images" {
+    const size: render_types.Size = .{ .width = 6, .height = 4 };
+    var output = try headless.init(std.testing.allocator, size);
+    defer output.deinit();
+
+    var source_pixels = [_]u32{0xffffffff} ** 24;
+    const commands = [_]render_types.Command{
+        .{ .image = .{
+            .x = 0,
+            .y = 0,
+            .size = size,
+            .buffer = .{
+                .size = size,
+                .stride_pixels = size.width,
+                .pixels = &source_pixels,
+            },
+            .rounded_clip = .{
+                .rect = .{ .x = 2, .y = 0, .width = 4, .height = 4 },
+                .radius = 2,
+            },
+        } },
+    };
+
+    var renderer = Self.init(std.testing.allocator);
+    defer renderer.deinit();
+    try renderer.render(.{ .size = size, .commands = &commands }, output.target());
+
+    try std.testing.expectEqual(@as(u32, 0), output.pixel(1, 1));
+    const corner_alpha: u8 = @truncate(output.pixel(2, 0) >> 24);
+    try std.testing.expect(corner_alpha > 0 and corner_alpha < 255);
+    try std.testing.expectEqual(@as(u32, 0xffffffff), output.pixel(3, 1));
 }
 
 test "CPU renderer draws blurred rounded shadows" {

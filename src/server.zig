@@ -517,7 +517,7 @@ fn renderFrame(self: *Self) renderer_types.Renderer.Error!void {
                 shell_entry.shell_surface.surface_id,
                 shell_entry.shell_surface.position.x,
                 shell_entry.shell_surface.position.y,
-                0,
+                null,
                 null,
                 target,
             );
@@ -629,11 +629,15 @@ fn renderWindow(
         }
     }
     if (content_visible) {
+        const rounded_clip: ?render.RoundedClip = if (window.effects.corner_radius == 0)
+            null
+        else
+            .{ .rect = content_rect, .radius = window.effects.corner_radius };
         try self.renderSurfaceTree(
             window.surface_id,
             window.position.x -| content_geometry.offset.x,
             window.position.y -| content_geometry.offset.y,
-            window.effects.corner_radius,
+            rounded_clip,
             content_clip,
             target,
         );
@@ -663,7 +667,7 @@ fn renderWindowPopups(
             popup.surface_id,
             entry.position.x -| content_geometry.offset.x,
             entry.position.y -| content_geometry.offset.y,
-            0,
+            null,
             null,
             target,
         );
@@ -675,7 +679,7 @@ fn renderSurfaceTree(
     surface_id: Surface.Id,
     x: i32,
     y: i32,
-    corner_radius: u32,
+    rounded_clip: ?render.RoundedClip,
     clip: ?render.Rect,
     target: renderer_types.Target,
 ) renderer_types.Renderer.Error!void {
@@ -696,7 +700,7 @@ fn renderSurfaceTree(
                     .size = buffer.logical_size,
                     .buffer = buffer.pixelBuffer(),
                     .source = buffer.source,
-                    .corner_radius = corner_radius,
+                    .rounded_clip = rounded_clip,
                     .clip = clip,
                 } },
             };
@@ -706,7 +710,7 @@ fn renderSurfaceTree(
             child.surface_id,
             x +| child.position.x,
             y +| child.position.y,
-            0,
+            rounded_clip,
             clip,
             target,
         ),
@@ -746,7 +750,7 @@ fn renderWindowDecorations(
             entry.decoration.surface_id,
             window.position.x +| entry.decoration.offset.x,
             window.position.y +| entry.decoration.offset.y,
-            0,
+            null,
             clip,
             target,
         );
