@@ -256,6 +256,12 @@ pub fn setWindowVisible(self: *Self, id: WindowId, visible: bool) void {
     self.scene.setMapped(window.scene_id, visible and window.mapped);
 }
 
+pub fn closeWindow(self: *Self, id: WindowId) void {
+    const window = self.windows.get(id) orelse return;
+    const state = self.xdg_surfaces.get(window.xdg_surface_id) orelse return;
+    if (state.toplevel_resource) |resource| resource.sendClose();
+}
+
 fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
     WmBaseResource.create(self, client, version, id) catch client.postNoMemory();
 }

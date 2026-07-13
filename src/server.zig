@@ -88,7 +88,7 @@ pub fn create(allocator: std.mem.Allocator) !*Self {
     errdefer self.seat.deinit();
     try self.data_device.init(allocator, display, &self.seat);
     errdefer self.data_device.deinit();
-    try self.window_manager.init(allocator, display, &self.output, &self.seat);
+    try self.window_manager.init(allocator, display, &self.output, &self.seat, &self.xdg_shell);
     errdefer self.window_manager.deinit();
     self.render_timer = try display.getEventLoop().addTimer(*Self, handleRenderTimer, self);
     self.subcompositor.setRepaintListener(.{
