@@ -84,10 +84,17 @@ pub const Shadow = struct {
     color: Color,
 };
 
+pub const BackdropBlur = struct {
+    rect: Rect,
+    corner_radius: u32,
+    radius: u32,
+};
+
 pub const Command = union(enum) {
     clear: Color,
     solid_rect: SolidRect,
     shadow: Shadow,
+    backdrop_blur: BackdropBlur,
     image: Image,
 };
 

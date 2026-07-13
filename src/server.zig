@@ -197,6 +197,30 @@ fn renderFrame(self: *Self) renderer_types.Renderer.Error!void {
                 );
             }
         }
+        if (entry.window.effects.blur) |blur| {
+            const buffer = Surface.currentBuffer(
+                self.compositor.surfaceStore(),
+                entry.window.surface_id,
+            );
+            if (buffer) |root_buffer| {
+                const blur_command = [_]render.Command{
+                    .{ .backdrop_blur = .{
+                        .rect = .{
+                            .x = entry.window.position.x,
+                            .y = entry.window.position.y,
+                            .width = root_buffer.logical_size.width,
+                            .height = root_buffer.logical_size.height,
+                        },
+                        .corner_radius = entry.window.effects.corner_radius,
+                        .radius = blur.radius,
+                    } },
+                };
+                try self.renderer.render(
+                    .{ .size = output_size, .commands = &blur_command },
+                    target,
+                );
+            }
+        }
         try self.renderSurfaceTree(
             entry.window.surface_id,
             entry.window.position.x,

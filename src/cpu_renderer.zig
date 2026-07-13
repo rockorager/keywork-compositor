@@ -42,6 +42,7 @@ pub fn render(self: *Self, frame: render_types.Frame, target: render_types.Pixel
                 try fill(destination, clipped, solid.color, pixman.PIXMAN_OP_OVER);
             },
             .shadow => |shadow| try self.drawShadow(destination, frame.size, shadow),
+            .backdrop_blur => |blur| try self.drawBackdropBlur(target, blur),
             .image => |image| try composite(destination, frame.size, image),
         }
     }
@@ -183,6 +184,160 @@ fn drawShadow(
         @intCast(width),
         @intCast(height),
     );
+}
+
+fn drawBackdropBlur(
+    self: *Self,
+    target: render_types.PixelBuffer,
+    blur: render_types.BackdropBlur,
+) Error!void {
+    if (blur.radius == 0 or blur.rect.width == 0 or blur.rect.height == 0) return;
+    const clipped = blur.rect.clipTo(target.size) orelse return;
+
+    const radius: i64 = blur.radius;
+    const sample_left: u32 = @intCast(@max(@as(i64, clipped.x) - radius, 0));
+    const sample_top: u32 = @intCast(@max(@as(i64, clipped.y) - radius, 0));
+    const sample_right: u32 = @intCast(@min(
+        @as(i64, clipped.x) + clipped.width + radius,
+        target.size.width,
+    ));
+    const sample_bottom: u32 = @intCast(@min(
+        @as(i64, clipped.y) + clipped.height + radius,
+        target.size.height,
+    ));
+    const sample_width = sample_right - sample_left;
+    const sample_height = sample_bottom - sample_top;
+    const pixel_count = std.math.mul(usize, sample_width, sample_height) catch
+        return error.InvalidTarget;
+
+    const pixels = self.allocator.alloc(u32, pixel_count) catch return error.OutOfMemory;
+    defer self.allocator.free(pixels);
+    const temporary = self.allocator.alloc(u32, pixel_count) catch return error.OutOfMemory;
+    defer self.allocator.free(temporary);
+
+    for (0..sample_height) |y| {
+        const source_offset = (@as(usize, sample_top) + y) * target.stride_pixels + sample_left;
+        const destination_offset = y * sample_width;
+        @memcpy(
+            pixels[destination_offset..][0..sample_width],
+            target.pixels[source_offset..][0..sample_width],
+        );
+    }
+    blurArgb(pixels, temporary, sample_width, sample_height, blur.radius);
+
+    const requested_corner_radius = @min(
+        blur.corner_radius,
+        @min(blur.rect.width, blur.rect.height) / 2,
+    );
+    for (0..clipped.height) |y| {
+        const output_y: u32 = @intCast(@as(i64, clipped.y) + @as(i64, @intCast(y)));
+        for (0..clipped.width) |x| {
+            const output_x: u32 = @intCast(@as(i64, clipped.x) + @as(i64, @intCast(x)));
+            const coverage: u8 = if (requested_corner_radius == 0)
+                255
+            else
+                @intFromFloat(roundedRectCoverage(
+                    @as(f32, @floatFromInt(output_x)) + 0.5,
+                    @as(f32, @floatFromInt(output_y)) + 0.5,
+                    @floatFromInt(blur.rect.x),
+                    @floatFromInt(blur.rect.y),
+                    @floatFromInt(blur.rect.width),
+                    @floatFromInt(blur.rect.height),
+                    @floatFromInt(requested_corner_radius),
+                ) * 255.0);
+            const output_index = @as(usize, output_y) * target.stride_pixels + output_x;
+            const blurred_index = @as(usize, output_y - sample_top) * sample_width +
+                output_x - sample_left;
+            target.pixels[output_index] = blendArgb(
+                pixels[blurred_index],
+                target.pixels[output_index],
+                coverage,
+            );
+        }
+    }
+}
+
+fn blurArgb(
+    pixels: []u32,
+    temporary: []u32,
+    width_value: u32,
+    height_value: u32,
+    radius_value: u32,
+) void {
+    std.debug.assert(pixels.len == temporary.len);
+    std.debug.assert(pixels.len == @as(usize, width_value) * height_value);
+
+    const width: usize = width_value;
+    const height: usize = height_value;
+    const radius: usize = radius_value;
+    for (0..height) |y| {
+        var sums: [4]u64 = @splat(0);
+        var count = @min(radius + 1, width);
+        for (0..count) |x| addPixel(&sums, pixels[y * width + x]);
+        for (0..width) |x| {
+            temporary[y * width + x] = averagePixel(sums, count);
+            if (x >= radius) {
+                subtractPixel(&sums, pixels[y * width + x - radius]);
+                count -= 1;
+            }
+            const added = x + radius + 1;
+            if (added < width) {
+                addPixel(&sums, pixels[y * width + added]);
+                count += 1;
+            }
+        }
+    }
+
+    for (0..width) |x| {
+        var sums: [4]u64 = @splat(0);
+        var count = @min(radius + 1, height);
+        for (0..count) |y| addPixel(&sums, temporary[y * width + x]);
+        for (0..height) |y| {
+            pixels[y * width + x] = averagePixel(sums, count);
+            if (y >= radius) {
+                subtractPixel(&sums, temporary[(y - radius) * width + x]);
+                count -= 1;
+            }
+            const added = y + radius + 1;
+            if (added < height) {
+                addPixel(&sums, temporary[added * width + x]);
+                count += 1;
+            }
+        }
+    }
+}
+
+fn addPixel(sums: *[4]u64, pixel: u32) void {
+    inline for (0..4) |component| sums[component] += @as(u8, @truncate(pixel >> component * 8));
+}
+
+fn subtractPixel(sums: *[4]u64, pixel: u32) void {
+    inline for (0..4) |component| sums[component] -= @as(u8, @truncate(pixel >> component * 8));
+}
+
+fn averagePixel(sums: [4]u64, count: usize) u32 {
+    std.debug.assert(count > 0);
+    var pixel: u32 = 0;
+    inline for (0..4) |component| {
+        pixel |= @as(u32, @intCast(sums[component] / count)) << component * 8;
+    }
+    return pixel;
+}
+
+fn blendArgb(source: u32, destination: u32, coverage: u8) u32 {
+    if (coverage == 255) return source;
+    if (coverage == 0) return destination;
+
+    const inverse = 255 - @as(u16, coverage);
+    var result: u32 = 0;
+    inline for (0..4) |component| {
+        const source_component: u8 = @truncate(source >> component * 8);
+        const destination_component: u8 = @truncate(destination >> component * 8);
+        const blended = (@as(u16, source_component) * coverage +
+            @as(u16, destination_component) * inverse + 127) / 255;
+        result |= @as(u32, @intCast(blended)) << component * 8;
+    }
+    return result;
 }
 
 fn roundedRectCoverage(
@@ -541,4 +696,36 @@ test "CPU renderer draws blurred rounded shadows" {
     try std.testing.expect(edge_alpha > 0);
     try std.testing.expect(center_alpha > edge_alpha);
     try std.testing.expectEqual(@as(u32, 0), output.pixel(8, 8));
+}
+
+test "CPU renderer blurs the backdrop inside a window region" {
+    const size: render_types.Size = .{ .width = 5, .height = 1 };
+    var output = try headless.init(std.testing.allocator, size);
+    defer output.deinit();
+
+    const target = output.target();
+    @memcpy(target.pixels[0..5], &[_]u32{
+        0xff000000,
+        0xff000000,
+        0xffffffff,
+        0xff000000,
+        0xff000000,
+    });
+    const commands = [_]render_types.Command{
+        .{ .backdrop_blur = .{
+            .rect = .{ .x = 1, .y = 0, .width = 3, .height = 1 },
+            .corner_radius = 0,
+            .radius = 1,
+        } },
+    };
+
+    var renderer = Self.init(std.testing.allocator);
+    defer renderer.deinit();
+    try renderer.render(.{ .size = size, .commands = &commands }, target);
+
+    try std.testing.expectEqual(@as(u32, 0xff000000), output.pixel(0, 0));
+    try std.testing.expectEqual(@as(u32, 0xff555555), output.pixel(1, 0));
+    try std.testing.expectEqual(@as(u32, 0xff555555), output.pixel(2, 0));
+    try std.testing.expectEqual(@as(u32, 0xff555555), output.pixel(3, 0));
+    try std.testing.expectEqual(@as(u32, 0xff000000), output.pixel(4, 0));
 }
