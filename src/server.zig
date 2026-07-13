@@ -164,6 +164,10 @@ pub fn create(
         .context = self,
         .request = requestRepaint,
     });
+    self.seat.setRepaintListener(.{
+        .context = self,
+        .request = requestRepaint,
+    });
     requestRepaint(self);
 
     return self;
@@ -171,6 +175,7 @@ pub fn create(
 
 pub fn destroy(self: *Self) void {
     const allocator = self.allocator;
+    self.seat.clearRepaintListener();
     self.scene.clearRepaintListener();
     self.subcompositor.clearRepaintListener();
     self.render_timer.remove();
@@ -291,7 +296,7 @@ fn pointerAvailable(context: *anyopaque, available: bool) void {
 
 fn pointerEnter(context: *anyopaque, x: f64, y: f64) void {
     const self: *Self = @ptrCast(@alignCast(context));
-    self.seat.pointerEnter(self.pointerFocus(x, y));
+    self.seat.pointerEnter(x, y, self.pointerFocus(x, y));
 }
 
 fn pointerLeave(context: *anyopaque) void {
@@ -301,7 +306,7 @@ fn pointerLeave(context: *anyopaque) void {
 
 fn pointerMotion(context: *anyopaque, time: u32, x: f64, y: f64) void {
     const self: *Self = @ptrCast(@alignCast(context));
-    self.seat.pointerMotion(time, self.pointerFocus(x, y));
+    self.seat.pointerMotion(time, x, y, self.pointerFocus(x, y));
 }
 
 fn pointerButton(
@@ -567,6 +572,18 @@ fn renderFrame(self: *Self) renderer_types.Renderer.Error!void {
         },
     };
 
+    const cursor = self.seat.cursorInfo();
+    if (cursor) |info| {
+        try self.renderSurfaceTree(
+            info.surface_id,
+            info.x,
+            info.y,
+            null,
+            null,
+            target,
+        );
+    }
+
     self.render_output.present() catch return error.InvalidTarget;
 
     self.frame_time_milliseconds +%= 16;
@@ -589,6 +606,7 @@ fn renderFrame(self: *Self) renderer_types.Renderer.Error!void {
             self.finishSurfaceTree(shell_entry.shell_surface.surface_id);
         },
     };
+    if (cursor) |info| self.finishSurfaceTree(info.surface_id);
     const keyboard_focus = self.xdg_shell.popupKeyboardFocus() orelse
         self.scene.focusedSurface() orelse if (!self.window_manager.hasActiveManager())
         self.scene.topWindowSurface()

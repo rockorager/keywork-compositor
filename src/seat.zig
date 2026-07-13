@@ -20,9 +20,14 @@ keyboard_available: bool,
 pointer_available: bool,
 keymap: ?Keymap,
 repeat_info: RepeatInfo,
+repaint_listener: ?RepaintListener,
 parent_focused: bool,
 focus: ?Surface.Id,
 pointer_focus: ?PointerFocus,
+pointer_position: ?PointerPosition,
+latest_pointer_enter: ?UserAction,
+active_cursor: ?ActiveCursor,
+cursor_surface_count: usize,
 pressed_keys: std.ArrayList(u32),
 modifiers: Modifiers,
 last_user_action: ?UserAction,
@@ -50,10 +55,32 @@ const UserAction = struct {
     serial: u32,
 };
 
+const PointerPosition = struct {
+    x: f64,
+    y: f64,
+};
+
+const ActiveCursor = struct {
+    surface_id: Surface.Id,
+    hotspot_x: i32,
+    hotspot_y: i32,
+};
+
 pub const PointerFocus = struct {
     surface_id: Surface.Id,
     x: f64,
     y: f64,
+};
+
+pub const CursorInfo = struct {
+    surface_id: Surface.Id,
+    x: i32,
+    y: i32,
+};
+
+pub const RepaintListener = struct {
+    context: *anyopaque,
+    request: *const fn (*anyopaque) void,
 };
 
 pub fn init(
@@ -76,9 +103,14 @@ pub fn init(
         .pointer_available = false,
         .keymap = null,
         .repeat_info = .{},
+        .repaint_listener = null,
         .parent_focused = false,
         .focus = null,
         .pointer_focus = null,
+        .pointer_position = null,
+        .latest_pointer_enter = null,
+        .active_cursor = null,
+        .cursor_surface_count = 0,
         .pressed_keys = .empty,
         .modifiers = .{},
         .last_user_action = null,
@@ -94,6 +126,8 @@ pub fn deinit(self: *Self) void {
     std.debug.assert(self.seat_resources.items.len == 0);
     std.debug.assert(self.keyboard_resources.items.len == 0);
     std.debug.assert(self.pointer_resources.items.len == 0);
+    std.debug.assert(self.cursor_surface_count == 0);
+    std.debug.assert(self.repaint_listener == null);
     self.global.destroy();
     if (self.keymap) |keymap| keymap.file.close(self.io);
     self.pressed_keys.deinit(self.allocator);
@@ -111,6 +145,16 @@ pub fn ownsResource(self: *Self, resource: *wl.Seat) bool {
     return resource.getUserData() == @as(?*anyopaque, @ptrCast(self));
 }
 
+pub fn setRepaintListener(self: *Self, listener: RepaintListener) void {
+    std.debug.assert(self.repaint_listener == null);
+    self.repaint_listener = listener;
+}
+
+pub fn clearRepaintListener(self: *Self) void {
+    std.debug.assert(self.repaint_listener != null);
+    self.repaint_listener = null;
+}
+
 pub fn acceptsUserActionSerial(
     self: *Self,
     resource: *wl.Seat,
@@ -125,6 +169,16 @@ pub fn acceptsUserActionSerial(
 pub fn pointerFocusedSurface(self: *const Self) ?Surface.Id {
     const focus = self.pointer_focus orelse return null;
     return focus.surface_id;
+}
+
+pub fn cursorInfo(self: *const Self) ?CursorInfo {
+    const cursor = self.active_cursor orelse return null;
+    const position = self.pointer_position orelse return null;
+    return .{
+        .surface_id = cursor.surface_id,
+        .x = cursorCoordinate(position.x, cursor.hotspot_x),
+        .y = cursorCoordinate(position.y, cursor.hotspot_y),
+    };
 }
 
 pub fn setKeyboardAvailable(self: *Self, available: bool) void {
@@ -248,17 +302,22 @@ pub fn setModifiers(
     }
 }
 
-pub fn pointerEnter(self: *Self, focus: ?PointerFocus) void {
+pub fn pointerEnter(self: *Self, x: f64, y: f64, focus: ?PointerFocus) void {
+    self.setPointerPosition(x, y);
     self.updatePointerFocus(focus, null);
 }
 
-pub fn pointerMotion(self: *Self, time: u32, focus: ?PointerFocus) void {
+pub fn pointerMotion(self: *Self, time: u32, x: f64, y: f64, focus: ?PointerFocus) void {
+    self.setPointerPosition(x, y);
     self.updatePointerFocus(focus, time);
 }
 
 pub fn pointerLeave(self: *Self) void {
+    self.clearCursor();
     self.sendPointerLeave();
     self.pointer_focus = null;
+    self.pointer_position = null;
+    self.latest_pointer_enter = null;
 }
 
 pub fn pointerButton(
@@ -428,7 +487,12 @@ fn createPointer(self: *Self, seat: *wl.Seat, id: u32) void {
     resource.setHandler(*Self, handlePointerRequest, handlePointerDestroy, self);
     const surface = self.pointerSurface() orelse return;
     if (resource.getClient() == surface.getClient()) {
-        self.sendPointerEnterTo(resource, surface, self.display.nextSerial());
+        const serial = self.display.nextSerial();
+        self.latest_pointer_enter = .{
+            .client = surface.getClient(),
+            .serial = serial,
+        };
+        self.sendPointerEnterTo(resource, surface, serial);
         if (resource.getVersion() >= wl.Pointer.frame_since_version) resource.sendFrame();
     }
 }
@@ -448,9 +512,15 @@ fn handleKeyboardDestroy(resource: *wl.Keyboard, self: *Self) void {
     unreachable;
 }
 
-fn handlePointerRequest(resource: *wl.Pointer, request: wl.Pointer.Request, _: *Self) void {
+fn handlePointerRequest(resource: *wl.Pointer, request: wl.Pointer.Request, self: *Self) void {
     switch (request) {
-        .set_cursor => {},
+        .set_cursor => |set| self.setCursor(
+            resource,
+            set.serial,
+            set.surface,
+            set.hotspot_x,
+            set.hotspot_y,
+        ),
         .release => resource.destroy(),
     }
 }
@@ -535,8 +605,10 @@ fn updatePointerFocus(self: *Self, focus: ?PointerFocus, motion_time: ?u32) void
     else
         focus != null;
     if (changed) {
+        self.clearCursor();
         self.sendPointerLeave();
         self.pointer_focus = focus;
+        self.latest_pointer_enter = null;
         self.sendPointerEnter();
         return;
     }
@@ -559,6 +631,10 @@ fn pointerSurface(self: *Self) ?*wl.Surface {
 fn sendPointerEnter(self: *Self) void {
     const surface = self.pointerSurface() orelse return;
     const serial = self.display.nextSerial();
+    self.latest_pointer_enter = .{
+        .client = surface.getClient(),
+        .serial = serial,
+    };
     for (self.pointer_resources.items) |resource| {
         if (resource.getClient() == surface.getClient()) {
             self.sendPointerEnterTo(resource, surface, serial);
@@ -586,8 +662,149 @@ fn sendPointerLeave(self: *Self) void {
     }
 }
 
+fn setPointerPosition(self: *Self, x: f64, y: f64) void {
+    std.debug.assert(std.math.isFinite(x) and std.math.isFinite(y));
+    self.pointer_position = .{ .x = x, .y = y };
+    if (self.active_cursor != null) self.requestRepaint();
+}
+
+fn setCursor(
+    self: *Self,
+    pointer: *wl.Pointer,
+    serial: u32,
+    surface_resource: ?*wl.Surface,
+    hotspot_x: i32,
+    hotspot_y: i32,
+) void {
+    const cursor_surface = if (surface_resource) |resource| cursor: {
+        const surface = Surface.fromResource(resource);
+        if (surface.assignedRole()) |role| {
+            if (role != .cursor) {
+                pointer.postError(.role, "wl_surface already has another role");
+                return;
+            }
+        } else {
+            CursorSurface.create(self, surface) catch |err| switch (err) {
+                error.OutOfMemory => {
+                    pointer.postNoMemory();
+                    return;
+                },
+                error.RoleUnavailable => {
+                    pointer.postError(.role, "wl_surface is unavailable for the cursor role");
+                    return;
+                },
+            };
+        }
+        break :cursor surface;
+    } else null;
+
+    const enter = self.latest_pointer_enter orelse return;
+    if (enter.client != pointer.getClient() or enter.serial != serial) return;
+    const focused_client = if (self.pointerSurface()) |surface|
+        surface.getClient() == pointer.getClient()
+    else
+        false;
+    const current_surface = if (self.active_cursor) |cursor|
+        if (cursor_surface) |surface| std.meta.eql(cursor.surface_id, surface.handle()) else false
+    else
+        false;
+    if (!focused_client and !current_surface) return;
+
+    self.active_cursor = if (cursor_surface) |surface| .{
+        .surface_id = surface.handle(),
+        .hotspot_x = hotspot_x,
+        .hotspot_y = hotspot_y,
+    } else null;
+    self.requestRepaint();
+}
+
+fn clearCursor(self: *Self) void {
+    if (self.active_cursor == null) return;
+    self.active_cursor = null;
+    self.requestRepaint();
+}
+
+fn cursorSurfaceCommitted(self: *Self, id: Surface.Id, info: Surface.CommitInfo) void {
+    const cursor = if (self.active_cursor) |*cursor|
+        if (std.meta.eql(cursor.surface_id, id)) cursor else return
+    else
+        return;
+    cursor.hotspot_x -|= info.offset_x;
+    cursor.hotspot_y -|= info.offset_y;
+    self.requestRepaint();
+}
+
+fn cursorSurfaceDestroyed(self: *Self, id: Surface.Id) void {
+    if (self.active_cursor) |cursor| {
+        if (std.meta.eql(cursor.surface_id, id)) self.clearCursor();
+    }
+}
+
+fn requestRepaint(self: *Self) void {
+    if (self.repaint_listener) |listener| listener.request(listener.context);
+}
+
+const CursorSurface = struct {
+    seat: *Self,
+    surface_id: Surface.Id,
+
+    fn create(seat: *Self, surface: *Surface) error{ OutOfMemory, RoleUnavailable }!void {
+        const self = seat.allocator.create(CursorSurface) catch return error.OutOfMemory;
+        errdefer seat.allocator.destroy(self);
+        self.* = .{
+            .seat = seat,
+            .surface_id = surface.handle(),
+        };
+        surface.reserveRole(.cursor, .{
+            .context = self,
+            .before_commit = beforeCommit,
+            .after_commit = afterCommit,
+            .surface_destroyed = surfaceDestroyed,
+        }) catch return error.RoleUnavailable;
+        errdefer surface.releaseRole(self);
+        surface.assignReservedRole(.cursor, self) catch return error.RoleUnavailable;
+        seat.cursor_surface_count += 1;
+    }
+
+    fn beforeCommit(_: *anyopaque, _: Surface.CommitInfo) Surface.CommitAction {
+        return .apply;
+    }
+
+    fn afterCommit(context: *anyopaque, info: Surface.CommitInfo) void {
+        const self: *CursorSurface = @ptrCast(@alignCast(context));
+        self.seat.cursorSurfaceCommitted(self.surface_id, info);
+    }
+
+    fn surfaceDestroyed(context: *anyopaque) void {
+        const self: *CursorSurface = @ptrCast(@alignCast(context));
+        const seat = self.seat;
+        seat.cursorSurfaceDestroyed(self.surface_id);
+        std.debug.assert(seat.cursor_surface_count > 0);
+        seat.cursor_surface_count -= 1;
+        seat.allocator.destroy(self);
+    }
+};
+
+fn cursorCoordinate(value: f64, hotspot: i32) i32 {
+    const coordinate: i64 = @intFromFloat(@floor(value));
+    return @intCast(std.math.clamp(
+        coordinate - @as(i64, hotspot),
+        std.math.minInt(i32),
+        std.math.maxInt(i32),
+    ));
+}
+
 fn fixed(value: f64) wl.Fixed {
     const minimum = @as(f64, @floatFromInt(std.math.minInt(i32))) / 256.0;
     const maximum = @as(f64, @floatFromInt(std.math.maxInt(i32))) / 256.0;
     return wl.Fixed.fromDouble(std.math.clamp(value, minimum, maximum));
+}
+
+test "cursor position accounts for hotspot and fractional motion" {
+    try std.testing.expectEqual(@as(i32, 8), cursorCoordinate(12.75, 4));
+    try std.testing.expectEqual(@as(i32, -5), cursorCoordinate(0.25, 5));
+    try std.testing.expectEqual(
+        std.math.minInt(i32),
+        cursorCoordinate(-0.25, std.math.maxInt(i32)),
+    );
 }

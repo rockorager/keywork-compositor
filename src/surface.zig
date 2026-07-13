@@ -225,6 +225,7 @@ pub const Role = enum {
     xdg_toplevel,
     xdg_popup,
     subsurface,
+    cursor,
     river_decoration,
     river_shell_surface,
 };
@@ -233,6 +234,8 @@ pub const CommitInfo = struct {
     attachment_changed: bool,
     had_buffer: bool,
     has_buffer: bool,
+    offset_x: i32,
+    offset_y: i32,
 };
 
 pub const CommitAction = enum {
@@ -320,6 +323,8 @@ pub fn discardCachedCommit(self: *Self) void {
     if (surface_state.cached_buffer) |*cached| cached.deinit();
     surface_state.cached_buffer = null;
     surface_state.cached_attachment_changed = false;
+    surface_state.cached_offset_x = 0;
+    surface_state.cached_offset_y = 0;
     surface_state.cached_surface_damage.clear();
     surface_state.cached_buffer_damage.clear();
     surface_state.has_cached_state = false;
@@ -476,6 +481,8 @@ fn pendingCommitInfo(self: *Self) CommitInfo {
             surface_state.cached_buffer != null
         else
             surface_state.current_buffer != null,
+        .offset_x = surface_state.pending_offset_x,
+        .offset_y = surface_state.pending_offset_y,
     };
 }
 
@@ -508,8 +515,6 @@ fn applyPending(self: *Self, commit_info: CommitInfo) void {
 
         if (surface_state.current_buffer) |*current| current.deinit();
         surface_state.current_buffer = snapshot;
-        surface_state.current_offset_x = surface_state.pending_offset_x;
-        surface_state.current_offset_y = surface_state.pending_offset_y;
 
         if (self.pending_attachment.resource) |buffer| buffer.sendRelease();
         self.pending_attachment.clear();
@@ -528,6 +533,10 @@ fn applyPending(self: *Self, commit_info: CommitInfo) void {
     surface_state.current_scale = surface_state.pending_scale;
     surface_state.current_transform = surface_state.pending_transform;
     surface_state.current_viewport = surface_state.pending_viewport;
+    surface_state.current_offset_x = surface_state.pending_offset_x;
+    surface_state.current_offset_y = surface_state.pending_offset_y;
+    surface_state.pending_offset_x = 0;
+    surface_state.pending_offset_y = 0;
     surface_state.pending_surface_damage.clear();
     surface_state.pending_buffer_damage.clear();
     surface_state.has_committed = true;
@@ -598,8 +607,6 @@ fn cachePending(self: *Self) bool {
         surface_state.cached_buffer = snapshot;
         snapshot = null;
         surface_state.cached_attachment_changed = true;
-        surface_state.cached_offset_x = surface_state.pending_offset_x;
-        surface_state.cached_offset_y = surface_state.pending_offset_y;
 
         if (self.pending_attachment.resource) |buffer| buffer.sendRelease();
         self.pending_attachment.clear();
@@ -609,6 +616,10 @@ fn cachePending(self: *Self) bool {
     surface_state.cached_scale = surface_state.pending_scale;
     surface_state.cached_transform = surface_state.pending_transform;
     surface_state.cached_viewport = surface_state.pending_viewport;
+    surface_state.cached_offset_x +|= surface_state.pending_offset_x;
+    surface_state.cached_offset_y +|= surface_state.pending_offset_y;
+    surface_state.pending_offset_x = 0;
+    surface_state.pending_offset_y = 0;
     surface_state.pending_surface_damage.clear();
     surface_state.pending_buffer_damage.clear();
     surface_state.has_cached_state = true;
@@ -629,6 +640,8 @@ fn applyCached(self: *Self) void {
             surface_state.cached_buffer != null
         else
             surface_state.current_buffer != null,
+        .offset_x = surface_state.cached_offset_x,
+        .offset_y = surface_state.cached_offset_y,
     };
 
     surface_state.current_opaque.copyFrom(&surface_state.cached_opaque) catch {
@@ -644,8 +657,6 @@ fn applyCached(self: *Self) void {
         if (surface_state.current_buffer) |*current| current.deinit();
         surface_state.current_buffer = surface_state.cached_buffer;
         surface_state.cached_buffer = null;
-        surface_state.current_offset_x = surface_state.cached_offset_x;
-        surface_state.current_offset_y = surface_state.cached_offset_y;
         surface_state.cached_attachment_changed = false;
     }
     if (surface_state.current_buffer) |*current| {
@@ -659,6 +670,10 @@ fn applyCached(self: *Self) void {
     surface_state.current_scale = surface_state.cached_scale;
     surface_state.current_transform = surface_state.cached_transform;
     surface_state.current_viewport = surface_state.cached_viewport;
+    surface_state.current_offset_x = surface_state.cached_offset_x;
+    surface_state.current_offset_y = surface_state.cached_offset_y;
+    surface_state.cached_offset_x = 0;
+    surface_state.cached_offset_y = 0;
     surface_state.cached_surface_damage.clear();
     surface_state.cached_buffer_damage.clear();
     surface_state.has_cached_state = false;

@@ -473,13 +473,16 @@ fn handleSeatEvent(seat: *wl.Seat, event: wl.Seat.Event, self: *Self) void {
     }
 }
 
-fn handlePointerEvent(_: *wl.Pointer, event: wl.Pointer.Event, self: *Self) void {
+fn handlePointerEvent(pointer: *wl.Pointer, event: wl.Pointer.Event, self: *Self) void {
     switch (event) {
-        .enter => |enter| self.listener.pointer_enter(
-            self.listener.context,
-            enter.surface_x.toDouble(),
-            enter.surface_y.toDouble(),
-        ),
+        .enter => |enter| {
+            pointer.setCursor(enter.serial, null, 0, 0);
+            self.listener.pointer_enter(
+                self.listener.context,
+                enter.surface_x.toDouble(),
+                enter.surface_y.toDouble(),
+            );
+        },
         .leave => self.listener.pointer_leave(self.listener.context),
         .motion => |motion| self.listener.pointer_motion(
             self.listener.context,
