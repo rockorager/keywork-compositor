@@ -20,6 +20,7 @@ shm: ?*wl.Shm,
 wm_base: ?*xdg.WmBase,
 seat: ?*wl.Seat,
 keyboard: ?*wl.Keyboard,
+pointer: ?*wl.Pointer,
 surface: ?*wl.Surface,
 xdg_surface: ?*xdg.Surface,
 toplevel: ?*xdg.Toplevel,
@@ -44,6 +45,22 @@ pub const Listener = struct {
     keyboard_key: *const fn (*anyopaque, u32, u32, wl.Keyboard.KeyState) void,
     keyboard_modifiers: *const fn (*anyopaque, u32, u32, u32, u32) void,
     keyboard_repeat_info: *const fn (*anyopaque, i32, i32) void,
+    pointer_available: *const fn (*anyopaque, bool) void,
+    pointer_enter: *const fn (*anyopaque, f64, f64) void,
+    pointer_leave: *const fn (*anyopaque) void,
+    pointer_motion: *const fn (*anyopaque, u32, f64, f64) void,
+    pointer_button: *const fn (*anyopaque, u32, u32, wl.Pointer.ButtonState) void,
+    pointer_axis: *const fn (*anyopaque, u32, wl.Pointer.Axis, wl.Fixed) void,
+    pointer_frame: *const fn (*anyopaque) void,
+    pointer_axis_source: *const fn (*anyopaque, wl.Pointer.AxisSource) void,
+    pointer_axis_stop: *const fn (*anyopaque, u32, wl.Pointer.Axis) void,
+    pointer_axis_discrete: *const fn (*anyopaque, wl.Pointer.Axis, i32) void,
+    pointer_axis_value120: *const fn (*anyopaque, wl.Pointer.Axis, i32) void,
+    pointer_axis_relative_direction: *const fn (
+        *anyopaque,
+        wl.Pointer.Axis,
+        wl.Pointer.AxisRelativeDirection,
+    ) void,
 };
 
 const Buffer = struct {
@@ -87,6 +104,7 @@ pub fn init(
         .wm_base = null,
         .seat = null,
         .keyboard = null,
+        .pointer = null,
         .surface = null,
         .xdg_surface = null,
         .toplevel = null,
@@ -157,6 +175,7 @@ pub fn deinit(self: *Self) void {
     if (self.toplevel) |toplevel| toplevel.destroy();
     if (self.xdg_surface) |xdg_surface| xdg_surface.destroy();
     if (self.surface) |surface| surface.destroy();
+    if (self.pointer) |pointer| releasePointer(pointer);
     if (self.keyboard) |keyboard| releaseKeyboard(keyboard);
     if (self.seat) |seat| releaseSeat(seat);
     if (self.wm_base) |wm_base| wm_base.destroy();
@@ -302,12 +321,81 @@ fn handleSeatEvent(seat: *wl.Seat, event: wl.Seat.Event, self: *Self) void {
                 if (self.keyboard) |keyboard| releaseKeyboard(keyboard);
                 self.keyboard = null;
             }
+            if (capabilities.capabilities.pointer and self.pointer == null) {
+                const pointer = seat.getPointer() catch {
+                    self.fail();
+                    return;
+                };
+                self.pointer = pointer;
+                pointer.setListener(*Self, handlePointerEvent, self);
+            } else if (!capabilities.capabilities.pointer) {
+                if (self.pointer) |pointer| releasePointer(pointer);
+                self.pointer = null;
+            }
             self.listener.keyboard_available(
                 self.listener.context,
                 capabilities.capabilities.keyboard,
             );
+            self.listener.pointer_available(
+                self.listener.context,
+                capabilities.capabilities.pointer,
+            );
         },
         .name => {},
+    }
+}
+
+fn handlePointerEvent(_: *wl.Pointer, event: wl.Pointer.Event, self: *Self) void {
+    switch (event) {
+        .enter => |enter| self.listener.pointer_enter(
+            self.listener.context,
+            enter.surface_x.toDouble(),
+            enter.surface_y.toDouble(),
+        ),
+        .leave => self.listener.pointer_leave(self.listener.context),
+        .motion => |motion| self.listener.pointer_motion(
+            self.listener.context,
+            motion.time,
+            motion.surface_x.toDouble(),
+            motion.surface_y.toDouble(),
+        ),
+        .button => |button| self.listener.pointer_button(
+            self.listener.context,
+            button.time,
+            button.button,
+            button.state,
+        ),
+        .axis => |axis| self.listener.pointer_axis(
+            self.listener.context,
+            axis.time,
+            axis.axis,
+            axis.value,
+        ),
+        .frame => self.listener.pointer_frame(self.listener.context),
+        .axis_source => |source| self.listener.pointer_axis_source(
+            self.listener.context,
+            source.axis_source,
+        ),
+        .axis_stop => |stop| self.listener.pointer_axis_stop(
+            self.listener.context,
+            stop.time,
+            stop.axis,
+        ),
+        .axis_discrete => |discrete| self.listener.pointer_axis_discrete(
+            self.listener.context,
+            discrete.axis,
+            discrete.discrete,
+        ),
+        .axis_value120 => |value| self.listener.pointer_axis_value120(
+            self.listener.context,
+            value.axis,
+            value.value120,
+        ),
+        .axis_relative_direction => |relative| self.listener.pointer_axis_relative_direction(
+            self.listener.context,
+            relative.axis,
+            relative.direction,
+        ),
     }
 }
 
@@ -350,6 +438,14 @@ fn releaseKeyboard(keyboard: *wl.Keyboard) void {
         keyboard.release();
     } else {
         keyboard.destroy();
+    }
+}
+
+fn releasePointer(pointer: *wl.Pointer) void {
+    if (pointer.getVersion() >= wl.Pointer.release_since_version) {
+        pointer.release();
+    } else {
+        pointer.destroy();
     }
 }
 

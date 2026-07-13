@@ -289,6 +289,20 @@ pub fn currentBuffer(store: *Store, id: Id) ?*BufferSnapshot {
     return if (surface_state.current_buffer) |*buffer| buffer else null;
 }
 
+pub fn acceptsInput(store: *Store, id: Id, x: f64, y: f64) bool {
+    const surface_state = store.get(id) orelse return false;
+    const buffer = if (surface_state.current_buffer) |*current| current else return false;
+    if (x < 0 or y < 0 or
+        x >= @as(f64, @floatFromInt(buffer.logical_size.width)) or
+        y >= @as(f64, @floatFromInt(buffer.logical_size.height))) return false;
+    if (surface_state.current_input.infinite) return true;
+    if (x > std.math.maxInt(i32) or y > std.math.maxInt(i32)) return false;
+    return surface_state.current_input.value.contains(
+        @intFromFloat(@floor(x)),
+        @intFromFloat(@floor(y)),
+    );
+}
+
 pub fn sendFrameDoneFor(store: *Store, id: Id, time_milliseconds: u32) void {
     const surface_state = store.get(id) orelse return;
     while (true) {

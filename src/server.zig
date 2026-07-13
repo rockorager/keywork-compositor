@@ -92,6 +92,18 @@ pub fn create(
             .keyboard_key = keyboardKey,
             .keyboard_modifiers = keyboardModifiers,
             .keyboard_repeat_info = keyboardRepeatInfo,
+            .pointer_available = pointerAvailable,
+            .pointer_enter = pointerEnter,
+            .pointer_leave = pointerLeave,
+            .pointer_motion = pointerMotion,
+            .pointer_button = pointerButton,
+            .pointer_axis = pointerAxis,
+            .pointer_frame = pointerFrame,
+            .pointer_axis_source = pointerAxisSource,
+            .pointer_axis_stop = pointerAxisStop,
+            .pointer_axis_discrete = pointerAxisDiscrete,
+            .pointer_axis_value120 = pointerAxisValue120,
+            .pointer_axis_relative_direction = pointerAxisRelativeDirection,
         },
     );
     errdefer self.render_output.deinit();
@@ -244,6 +256,158 @@ fn keyboardModifiers(
 fn keyboardRepeatInfo(context: *anyopaque, rate: i32, delay: i32) void {
     const self: *Self = @ptrCast(@alignCast(context));
     self.seat.setRepeatInfo(rate, delay);
+}
+
+fn pointerAvailable(context: *anyopaque, available: bool) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.seat.setPointerAvailable(available);
+}
+
+fn pointerEnter(context: *anyopaque, x: f64, y: f64) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.seat.pointerEnter(self.pointerFocus(x, y));
+}
+
+fn pointerLeave(context: *anyopaque) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.seat.pointerLeave();
+}
+
+fn pointerMotion(context: *anyopaque, time: u32, x: f64, y: f64) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.seat.pointerMotion(time, self.pointerFocus(x, y));
+}
+
+fn pointerButton(
+    context: *anyopaque,
+    time: u32,
+    button: u32,
+    state: wl.Pointer.ButtonState,
+) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.seat.pointerButton(time, button, state);
+}
+
+fn pointerAxis(context: *anyopaque, time: u32, axis: wl.Pointer.Axis, value: wl.Fixed) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.seat.pointerAxis(time, axis, value);
+}
+
+fn pointerFrame(context: *anyopaque) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.seat.pointerFrame();
+}
+
+fn pointerAxisSource(context: *anyopaque, source: wl.Pointer.AxisSource) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.seat.pointerAxisSource(source);
+}
+
+fn pointerAxisStop(context: *anyopaque, time: u32, axis: wl.Pointer.Axis) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.seat.pointerAxisStop(time, axis);
+}
+
+fn pointerAxisDiscrete(context: *anyopaque, axis: wl.Pointer.Axis, discrete: i32) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.seat.pointerAxisDiscrete(axis, discrete);
+}
+
+fn pointerAxisValue120(context: *anyopaque, axis: wl.Pointer.Axis, value120: i32) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.seat.pointerAxisValue120(axis, value120);
+}
+
+fn pointerAxisRelativeDirection(
+    context: *anyopaque,
+    axis: wl.Pointer.Axis,
+    direction: wl.Pointer.AxisRelativeDirection,
+) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.seat.pointerAxisRelativeDirection(axis, direction);
+}
+
+fn pointerFocus(self: *Self, x: f64, y: f64) ?Seat.PointerFocus {
+    const fullscreen = self.scene.topFullscreen();
+    var nodes = self.scene.reverseNodeIterator();
+    while (nodes.next()) |entry| switch (entry) {
+        .window => |window_entry| {
+            if (fullscreen) |fullscreen_id| {
+                if (!std.meta.eql(window_entry.id, fullscreen_id)) continue;
+                return self.hitTestWindow(window_entry.window, x, y);
+            }
+            if (self.hitTestWindow(window_entry.window, x, y)) |focus| return focus;
+        },
+        .shell_surface => |shell_entry| {
+            const shell_surface = shell_entry.shell_surface;
+            if (!shell_surface.mapped) continue;
+            if (hitTestSurface(
+                self.compositor.surfaceStore(),
+                shell_surface.surface_id,
+                shell_surface.position,
+                x,
+                y,
+            )) |focus| return focus;
+        },
+    };
+    return null;
+}
+
+fn hitTestWindow(self: *Self, window: *const Scene.Window, x: f64, y: f64) ?Seat.PointerFocus {
+    if (!window.mapped) return null;
+    const root_buffer = Surface.currentBuffer(
+        self.compositor.surfaceStore(),
+        window.surface_id,
+    ) orelse return null;
+    if (root_buffer.transform != .normal) return null;
+    const content_geometry = window.content_geometry orelse Scene.ContentGeometry{
+        .size = root_buffer.logical_size,
+    };
+    if (window.clip_box) |clip_box| {
+        if (!pointInRect(x, y, clip_box.translated(window.position.x, window.position.y))) return null;
+    }
+    if (window.content_clip_box) |clip_box| {
+        const content_rect: render.Rect = .{
+            .x = window.position.x,
+            .y = window.position.y,
+            .width = content_geometry.size.width,
+            .height = content_geometry.size.height,
+        };
+        const visible = content_rect.intersection(
+            clip_box.translated(window.position.x, window.position.y),
+        ) orelse return null;
+        if (!pointInRect(x, y, visible)) return null;
+    }
+    return hitTestSurface(
+        self.compositor.surfaceStore(),
+        window.surface_id,
+        .{
+            .x = window.position.x -| content_geometry.offset.x,
+            .y = window.position.y -| content_geometry.offset.y,
+        },
+        x,
+        y,
+    );
+}
+
+fn hitTestSurface(
+    surface_store: *Surface.Store,
+    surface_id: Surface.Id,
+    position: Scene.Position,
+    x: f64,
+    y: f64,
+) ?Seat.PointerFocus {
+    const surface_x = x - @as(f64, @floatFromInt(position.x));
+    const surface_y = y - @as(f64, @floatFromInt(position.y));
+    if (!Surface.acceptsInput(surface_store, surface_id, surface_x, surface_y)) return null;
+    return .{ .surface_id = surface_id, .x = surface_x, .y = surface_y };
+}
+
+fn pointInRect(x: f64, y: f64, rect: render.Rect) bool {
+    return x >= @as(f64, @floatFromInt(rect.x)) and
+        y >= @as(f64, @floatFromInt(rect.y)) and
+        x < @as(f64, @floatFromInt(@as(i64, rect.x) + rect.width)) and
+        y < @as(f64, @floatFromInt(@as(i64, rect.y) + rect.height));
 }
 
 fn handleRenderTimer(self: *Self) c_int {

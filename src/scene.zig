@@ -173,6 +173,32 @@ pub const NodeIterator = struct {
     }
 };
 
+pub const ReverseNodeIterator = struct {
+    scene: *Self,
+    index: usize,
+
+    pub fn next(self: *ReverseNodeIterator) ?NodeIterator.Entry {
+        while (self.index > 0) {
+            self.index -= 1;
+            const id = self.scene.stack.items[self.index];
+            switch (id) {
+                .window => |window_id| {
+                    const window = self.scene.windows.get(window_id) orelse continue;
+                    return .{ .window = .{ .id = window_id, .window = window } };
+                },
+                .shell_surface => |shell_id| {
+                    const shell_surface = self.scene.shell_surfaces.get(shell_id) orelse continue;
+                    return .{ .shell_surface = .{
+                        .id = shell_id,
+                        .shell_surface = shell_surface,
+                    } };
+                },
+            }
+        }
+        return null;
+    }
+};
+
 pub const DecorationIterator = struct {
     inner: DecorationStore.Iterator,
     window_id: Id,
@@ -464,6 +490,10 @@ pub fn nodeIterator(self: *Self) NodeIterator {
     return .{ .scene = self };
 }
 
+pub fn reverseNodeIterator(self: *Self) ReverseNodeIterator {
+    return .{ .scene = self, .index = self.stack.items.len };
+}
+
 pub fn decorationIterator(
     self: *Self,
     window_id: Id,
@@ -701,6 +731,11 @@ test "scene interleaves shell surfaces and windows through node handles" {
     const window_entry = nodes.next().?.window;
     try std.testing.expect(std.meta.eql(window, window_entry.id));
     try std.testing.expectEqual(@as(?NodeIterator.Entry, null), nodes.next());
+
+    var reverse_nodes = scene.reverseNodeIterator();
+    try std.testing.expect(std.meta.eql(window, reverse_nodes.next().?.window.id));
+    try std.testing.expect(std.meta.eql(shell_surface, reverse_nodes.next().?.shell_surface.id));
+    try std.testing.expectEqual(@as(?NodeIterator.Entry, null), reverse_nodes.next());
 
     scene.removeShellSurface(shell_surface);
     scene.removeWindow(window);
