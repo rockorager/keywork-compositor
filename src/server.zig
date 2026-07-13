@@ -177,64 +177,80 @@ fn renderFrame(self: *Self) renderer_types.Renderer.Error!void {
     var windows = self.scene.iterator();
     while (windows.next()) |entry| {
         if (!entry.window.mapped) continue;
+        const root_buffer = Surface.currentBuffer(
+            self.compositor.surfaceStore(),
+            entry.window.surface_id,
+        ) orelse continue;
+        const content_geometry = entry.window.content_geometry orelse Scene.ContentGeometry{
+            .size = root_buffer.logical_size,
+        };
+        const content_rect = windowContentRect(entry.window, content_geometry.size) orelse
+            continue;
+        const window_clip = if (entry.window.clip_box) |clip_box|
+            clip_box.translated(entry.window.position.x, entry.window.position.y)
+        else
+            null;
         if (entry.window.effects.shadow) |shadow| {
-            const buffer = Surface.currentBuffer(
-                self.compositor.surfaceStore(),
-                entry.window.surface_id,
+            const shadow_command = [_]render.Command{
+                .{ .shadow = .{
+                    .rect = .{
+                        .x = content_rect.x +| shadow.offset.x,
+                        .y = content_rect.y +| shadow.offset.y,
+                        .width = content_rect.width,
+                        .height = content_rect.height,
+                    },
+                    .corner_radius = entry.window.effects.corner_radius,
+                    .blur_radius = shadow.blur_radius,
+                    .spread = shadow.spread,
+                    .color = shadow.color,
+                    .clip = window_clip,
+                } },
+            };
+            try self.renderer.render(
+                .{ .size = output_size, .commands = &shadow_command },
+                target,
             );
-            if (buffer) |root_buffer| {
-                const shadow_command = [_]render.Command{
-                    .{ .shadow = .{
-                        .rect = .{
-                            .x = entry.window.position.x +| shadow.offset.x,
-                            .y = entry.window.position.y +| shadow.offset.y,
-                            .width = root_buffer.logical_size.width,
-                            .height = root_buffer.logical_size.height,
-                        },
-                        .corner_radius = entry.window.effects.corner_radius,
-                        .blur_radius = shadow.blur_radius,
-                        .spread = shadow.spread,
-                        .color = shadow.color,
-                    } },
-                };
-                try self.renderer.render(
-                    .{ .size = output_size, .commands = &shadow_command },
-                    target,
-                );
-            }
         }
         if (entry.window.effects.blur) |blur| {
-            const buffer = Surface.currentBuffer(
-                self.compositor.surfaceStore(),
-                entry.window.surface_id,
+            const blur_command = [_]render.Command{
+                .{ .backdrop_blur = .{
+                    .rect = content_rect,
+                    .corner_radius = entry.window.effects.corner_radius,
+                    .radius = blur.radius,
+                    .clip = window_clip,
+                } },
+            };
+            try self.renderer.render(
+                .{ .size = output_size, .commands = &blur_command },
+                target,
             );
-            if (buffer) |root_buffer| {
-                const blur_command = [_]render.Command{
-                    .{ .backdrop_blur = .{
-                        .rect = .{
-                            .x = entry.window.position.x,
-                            .y = entry.window.position.y,
-                            .width = root_buffer.logical_size.width,
-                            .height = root_buffer.logical_size.height,
-                        },
-                        .corner_radius = entry.window.effects.corner_radius,
-                        .radius = blur.radius,
-                    } },
+        }
+        var content_visible = true;
+        var content_clip = if (entry.window.content_clip_box != null)
+            content_rect
+        else
+            null;
+        if (window_clip) |clip| {
+            if (content_clip) |current| {
+                content_clip = current.intersection(clip) orelse no_content: {
+                    content_visible = false;
+                    break :no_content null;
                 };
-                try self.renderer.render(
-                    .{ .size = output_size, .commands = &blur_command },
-                    target,
-                );
+            } else {
+                content_clip = clip;
             }
         }
-        try self.renderSurfaceTree(
-            entry.window.surface_id,
-            entry.window.position.x,
-            entry.window.position.y,
-            entry.window.effects.corner_radius,
-            target,
-        );
-        try self.renderWindowBorders(entry.window, target);
+        if (content_visible) {
+            try self.renderSurfaceTree(
+                entry.window.surface_id,
+                entry.window.position.x -| content_geometry.offset.x,
+                entry.window.position.y -| content_geometry.offset.y,
+                entry.window.effects.corner_radius,
+                content_clip,
+                target,
+            );
+        }
+        try self.renderWindowBorders(entry.window, content_rect, window_clip, target);
     }
 
     self.frame_time_milliseconds +%= 16;
@@ -251,6 +267,7 @@ fn renderSurfaceTree(
     x: i32,
     y: i32,
     corner_radius: u32,
+    clip: ?render.Rect,
     target: renderer_types.Target,
 ) renderer_types.Renderer.Error!void {
     if (Surface.currentBuffer(self.compositor.surfaceStore(), surface_id) == null) return;
@@ -270,6 +287,7 @@ fn renderSurfaceTree(
                     .size = buffer.logical_size,
                     .buffer = buffer.pixelBuffer(),
                     .corner_radius = corner_radius,
+                    .clip = clip,
                 } },
             };
             try self.renderer.render(
@@ -282,6 +300,7 @@ fn renderSurfaceTree(
             x +| child.position.x,
             y +| child.position.y,
             0,
+            clip,
             target,
         ),
     };
@@ -290,18 +309,16 @@ fn renderSurfaceTree(
 fn renderWindowBorders(
     self: *Self,
     window: *const Scene.Window,
+    content_rect: render.Rect,
+    clip: ?render.Rect,
     target: renderer_types.Target,
 ) renderer_types.Renderer.Error!void {
     const borders = window.borders orelse return;
-    const buffer = Surface.currentBuffer(
-        self.compositor.surfaceStore(),
-        window.surface_id,
-    ) orelse return;
     var commands: [4]render.Command = undefined;
     const border_commands = makeBorderCommands(
-        window.position,
-        buffer.logical_size,
+        content_rect,
         borders,
+        clip,
         &commands,
     );
     try self.renderer.render(
@@ -311,26 +328,26 @@ fn renderWindowBorders(
 }
 
 fn makeBorderCommands(
-    position: Scene.Position,
-    content_size: render.Size,
+    content_rect: render.Rect,
     borders: Scene.Borders,
+    clip: ?render.Rect,
     commands: *[4]render.Command,
 ) []const render.Command {
     const width = borders.width;
     const width_i32: i32 = @intCast(width);
     const content_width_i32: i32 = @intCast(@min(
-        content_size.width,
+        content_rect.width,
         std.math.maxInt(i32),
     ));
     const content_height_i32: i32 = @intCast(@min(
-        content_size.height,
+        content_rect.height,
         std.math.maxInt(i32),
     ));
     const vertical_y = if (borders.edges.top)
-        position.y -| width_i32
+        content_rect.y -| width_i32
     else
-        position.y;
-    var vertical_height = content_size.height;
+        content_rect.y;
+    var vertical_height = content_rect.height;
     if (borders.edges.top) vertical_height +|= width;
     if (borders.edges.bottom) vertical_height +|= width;
 
@@ -338,53 +355,68 @@ fn makeBorderCommands(
     if (borders.edges.top) {
         commands[command_count] = .{ .solid_rect = .{
             .rect = .{
-                .x = position.x,
-                .y = position.y -| width_i32,
-                .width = content_size.width,
+                .x = content_rect.x,
+                .y = content_rect.y -| width_i32,
+                .width = content_rect.width,
                 .height = width,
             },
             .color = borders.color,
+            .clip = clip,
         } };
         command_count += 1;
     }
     if (borders.edges.bottom) {
         commands[command_count] = .{ .solid_rect = .{
             .rect = .{
-                .x = position.x,
-                .y = position.y +| content_height_i32,
-                .width = content_size.width,
+                .x = content_rect.x,
+                .y = content_rect.y +| content_height_i32,
+                .width = content_rect.width,
                 .height = width,
             },
             .color = borders.color,
+            .clip = clip,
         } };
         command_count += 1;
     }
     if (borders.edges.left) {
         commands[command_count] = .{ .solid_rect = .{
             .rect = .{
-                .x = position.x -| width_i32,
+                .x = content_rect.x -| width_i32,
                 .y = vertical_y,
                 .width = width,
                 .height = vertical_height,
             },
             .color = borders.color,
+            .clip = clip,
         } };
         command_count += 1;
     }
     if (borders.edges.right) {
         commands[command_count] = .{ .solid_rect = .{
             .rect = .{
-                .x = position.x +| content_width_i32,
+                .x = content_rect.x +| content_width_i32,
                 .y = vertical_y,
                 .width = width,
                 .height = vertical_height,
             },
             .color = borders.color,
+            .clip = clip,
         } };
         command_count += 1;
     }
     std.debug.assert(command_count > 0);
     return commands[0..command_count];
+}
+
+fn windowContentRect(window: *const Scene.Window, content_size: render.Size) ?render.Rect {
+    const content_rect: render.Rect = .{
+        .x = window.position.x,
+        .y = window.position.y,
+        .width = content_size.width,
+        .height = content_size.height,
+    };
+    const clip_box = window.content_clip_box orelse return content_rect;
+    return content_rect.intersection(clip_box.translated(window.position.x, window.position.y));
 }
 
 fn finishSurfaceTree(self: *Self, surface_id: Surface.Id) void {
@@ -410,13 +442,13 @@ test "window borders occupy only requested exterior edges and corners" {
     var commands: [4]render.Command = undefined;
     const color = render.Color.rgba(0x80, 0x40, 0x20, 0xff);
     const result = makeBorderCommands(
-        .{ .x = 10, .y = 20 },
-        .{ .width = 100, .height = 50 },
+        .{ .x = 10, .y = 20, .width = 100, .height = 50 },
         .{
             .edges = .{ .top = true, .left = true, .right = true },
             .width = 4,
             .color = color,
         },
+        .{ .x = 0, .y = 0, .width = 200, .height = 200 },
         &commands,
     );
 
@@ -440,4 +472,25 @@ test "window borders occupy only requested exterior edges and corners" {
         .height = 54,
     }, result[2].solid_rect.rect);
     try std.testing.expectEqual(color, result[0].solid_rect.color);
+    try std.testing.expectEqual(render.Rect{
+        .x = 0,
+        .y = 0,
+        .width = 200,
+        .height = 200,
+    }, result[0].solid_rect.clip.?);
+}
+
+test "content clip boxes intersect window dimensions in global coordinates" {
+    const window: Scene.Window = .{
+        .surface_id = .{ .index = 1, .generation = 1 },
+        .position = .{ .x = 100, .y = 50 },
+        .content_clip_box = .{ .x = -10, .y = 20, .width = 80, .height = 100 },
+    };
+
+    try std.testing.expectEqual(render.Rect{
+        .x = 100,
+        .y = 70,
+        .width = 70,
+        .height = 60,
+    }, windowContentRect(&window, .{ .width = 200, .height = 80 }).?);
 }

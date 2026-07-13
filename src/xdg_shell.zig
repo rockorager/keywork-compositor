@@ -68,6 +68,7 @@ const XdgSurfaceState = struct {
 pub const WindowState = struct {
     xdg_surface_id: XdgSurfaceId,
     scene_id: Scene.Id,
+    unreliable_pid: i32,
     parent: ?WindowId = null,
     title: ?[:0]u8 = null,
     app_id: ?[:0]u8 = null,
@@ -114,6 +115,7 @@ pub const Dimensions = struct {
 
 pub const WindowInfo = struct {
     scene_id: Scene.Id,
+    unreliable_pid: i32,
     title: ?[:0]const u8,
     app_id: ?[:0]const u8,
     parent: ?WindowId,
@@ -192,17 +194,16 @@ pub fn windowIterator(self: *Self) WindowIterator {
 pub fn windowInfo(self: *Self, id: WindowId) ?WindowInfo {
     const window = self.windows.get(id) orelse return null;
     const xdg_surface = self.xdg_surfaces.get(window.xdg_surface_id) orelse return null;
-    const dimensions: ?Dimensions = if (xdg_surface.current_geometry) |geometry|
-        .{ .width = geometry.width, .height = geometry.height }
-    else if (Surface.currentBuffer(self.surface_store, xdg_surface.surface_id)) |buffer|
+    const dimensions: ?Dimensions = if (self.contentGeometry(xdg_surface)) |geometry|
         .{
-            .width = @intCast(buffer.logical_size.width),
-            .height = @intCast(buffer.logical_size.height),
+            .width = @intCast(geometry.size.width),
+            .height = @intCast(geometry.size.height),
         }
     else
         null;
     return .{
         .scene_id = window.scene_id,
+        .unreliable_pid = window.unreliable_pid,
         .title = window.title,
         .app_id = window.app_id,
         .parent = window.parent,
@@ -212,6 +213,22 @@ pub fn windowInfo(self: *Self, id: WindowId) ?WindowInfo {
         .ready = window.ready,
         .mapped = window.mapped,
     };
+}
+
+fn contentGeometry(self: *Self, state: *const XdgSurfaceState) ?Scene.ContentGeometry {
+    if (state.current_geometry) |geometry| {
+        return .{
+            .offset = .{ .x = geometry.x, .y = geometry.y },
+            .size = .{
+                .width = @intCast(geometry.width),
+                .height = @intCast(geometry.height),
+            },
+        };
+    }
+    const buffer = Surface.currentBuffer(self.surface_store, state.surface_id) orelse return null;
+    if (buffer.logical_size.width > std.math.maxInt(i32) or
+        buffer.logical_size.height > std.math.maxInt(i32)) return null;
+    return .{ .size = buffer.logical_size };
 }
 
 pub fn configureWindow(
@@ -293,6 +310,16 @@ pub fn setWindowFocused(self: *Self, id: WindowId, focused: bool) void {
 pub fn setWindowBorders(self: *Self, id: WindowId, borders: ?Scene.Borders) void {
     const window = self.windows.get(id) orelse return;
     self.scene.setBorders(window.scene_id, borders);
+}
+
+pub fn setWindowClipBox(self: *Self, id: WindowId, clip_box: ?Scene.ClipBox) void {
+    const window = self.windows.get(id) orelse return;
+    self.scene.setClipBox(window.scene_id, clip_box);
+}
+
+pub fn setWindowContentClipBox(self: *Self, id: WindowId, clip_box: ?Scene.ClipBox) void {
+    const window = self.windows.get(id) orelse return;
+    self.scene.setContentClipBox(window.scene_id, clip_box);
 }
 
 pub fn placeWindowTop(self: *Self, id: WindowId) void {
@@ -709,11 +736,16 @@ const XdgSurfaceResource = struct {
             state.last_acked_serial = null;
             state.configure_serials.clearRetainingCapacity();
             self.shell.scene.setMapped(window.scene_id, false);
+            self.shell.scene.setContentGeometry(window.scene_id, null);
             window.reset(self.allocator);
             return;
         }
 
         if (info.has_buffer) {
+            self.shell.scene.setContentGeometry(
+                window.scene_id,
+                self.shell.contentGeometry(state),
+            );
             const was_mapped = window.mapped;
             const configure_serial = state.last_acked_serial;
             if (configure_serial != null) {
@@ -759,6 +791,7 @@ const XdgSurfaceResource = struct {
                 window.mapped = false;
                 window.ready = false;
                 self.shell.scene.setMapped(window.scene_id, false);
+                self.shell.scene.setContentGeometry(window.scene_id, null);
             }
         }
     }
@@ -805,6 +838,7 @@ const ToplevelResource = struct {
         const window_id = xdg_surface.shell.windows.insert(xdg_surface.allocator, .{
             .xdg_surface_id = xdg_surface.id,
             .scene_id = scene_id,
+            .unreliable_pid = @intCast(resource.getClient().getCredentials().pid),
         }) catch return error.OutOfMemory;
 
         self.* = .{

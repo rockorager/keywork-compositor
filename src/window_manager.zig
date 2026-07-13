@@ -13,6 +13,8 @@ const XdgShell = @import("xdg_shell.zig");
 const wl = wayland.server.wl;
 const river = wayland.server.river;
 
+const protocol_version = 3;
+
 allocator: std.mem.Allocator,
 global: *wl.Global,
 output: *Output,
@@ -46,6 +48,8 @@ const ManagedWindow = struct {
     requested_visible: bool = true,
     pending_position: ?Scene.Position = null,
     pending_borders: PendingBorders = .unchanged,
+    pending_clip_box: PendingClipBox = .unchanged,
+    pending_content_clip_box: PendingClipBox = .unchanged,
 };
 
 const StackOperation = union(enum) {
@@ -75,6 +79,11 @@ const PendingFocus = union(enum) {
 const PendingBorders = union(enum) {
     unchanged,
     set: ?Scene.Borders,
+};
+
+const PendingClipBox = union(enum) {
+    unchanged,
+    set: ?Scene.ClipBox,
 };
 
 fn protocolColorComponent(value: u32) u8 {
@@ -172,7 +181,14 @@ pub fn init(
     };
     errdefer self.windows.deinit(allocator);
     errdefer self.stack_operations.deinit(allocator);
-    self.global = try wl.Global.create(display, river.WindowManagerV1, 1, *Self, self, bind);
+    self.global = try wl.Global.create(
+        display,
+        river.WindowManagerV1,
+        protocol_version,
+        *Self,
+        self,
+        bind,
+    );
     errdefer self.global.destroy();
     self.configure_timer = try display.getEventLoop().addTimer(*Self, handleConfigureTimeout, self);
     xdg_shell.setWindowListener(.{
@@ -341,6 +357,10 @@ fn createWindowResource(
     const window = self.windows.get(id) orelse unreachable;
     window.resource = resource;
     manager.sendWindow(resource);
+    if (resource.getVersion() >= river.WindowV1.unreliable_pid_since_version) {
+        const info = self.xdg_shell.windowInfo(window.xdg_id) orelse unreachable;
+        resource.sendUnreliablePid(info.unreliable_pid);
+    }
 }
 
 fn finishManage(self: *Self, manager: *river.WindowManagerV1) void {
@@ -436,6 +456,20 @@ fn finishRender(self: *Self, manager: *river.WindowManagerV1) void {
                 entry.value.pending_borders = .unchanged;
             },
         }
+        switch (entry.value.pending_clip_box) {
+            .unchanged => {},
+            .set => |clip_box| {
+                self.xdg_shell.setWindowClipBox(entry.value.xdg_id, clip_box);
+                entry.value.pending_clip_box = .unchanged;
+            },
+        }
+        switch (entry.value.pending_content_clip_box) {
+            .unchanged => {},
+            .set => |clip_box| {
+                self.xdg_shell.setWindowContentClipBox(entry.value.xdg_id, clip_box);
+                entry.value.pending_content_clip_box = .unchanged;
+            },
+        }
         self.xdg_shell.setWindowVisible(
             entry.value.xdg_id,
             entry.value.display_ready and entry.value.requested_visible,
@@ -489,6 +523,8 @@ fn releaseWindows(self: *Self) void {
     while (iterator.next()) |entry| {
         self.xdg_shell.setWindowFocused(entry.value.xdg_id, false);
         self.xdg_shell.setWindowBorders(entry.value.xdg_id, null);
+        self.xdg_shell.setWindowClipBox(entry.value.xdg_id, null);
+        self.xdg_shell.setWindowContentClipBox(entry.value.xdg_id, null);
         self.xdg_shell.restoreStandaloneWindow(
             entry.value.xdg_id,
             entry.value.activated,
@@ -603,6 +639,10 @@ fn removeWindow(self: *Self, xdg_id: XdgShell.WindowId) void {
         .inflight => true,
         else => false,
     };
+    self.xdg_shell.setWindowFocused(window.xdg_id, false);
+    self.xdg_shell.setWindowBorders(window.xdg_id, null);
+    self.xdg_shell.setWindowClipBox(window.xdg_id, null);
+    self.xdg_shell.setWindowContentClipBox(window.xdg_id, null);
     _ = self.windows.remove(id);
     if (finish_configure and self.sequence.configureFinished()) {
         if (self.active) |manager| self.startRender(manager);
@@ -700,10 +740,36 @@ const WindowResource = struct {
                         },
                     } };
             },
+            .set_clip_box => |box| {
+                if (!self.requireRendering(manager_resource)) return;
+                if (box.width < 0 or box.height < 0) {
+                    resource.postError(.invalid_clip_box, "invalid window clip box");
+                    return;
+                }
+                window.pending_clip_box = .{ .set = protocolClipBox(
+                    box.x,
+                    box.y,
+                    box.width,
+                    box.height,
+                ) };
+            },
+            .set_content_clip_box => |box| {
+                if (!self.requireRendering(manager_resource)) return;
+                if (box.width < 0 or box.height < 0) {
+                    resource.postError(.invalid_clip_box, "invalid window content clip box");
+                    return;
+                }
+                window.pending_content_clip_box = .{ .set = protocolClipBox(
+                    box.x,
+                    box.y,
+                    box.width,
+                    box.height,
+                ) };
+            },
             .get_decoration_above, .get_decoration_below => resource.getClient().postImplementationError(
                 "river decoration surfaces are not implemented",
             ),
-            .set_clip_box, .set_content_clip_box, .set_dimension_bounds => unreachable,
+            .set_dimension_bounds => unreachable,
         }
     }
 
@@ -716,6 +782,18 @@ const WindowResource = struct {
         if (self.manager.sequence.state == .manage) return true;
         manager.postError(.sequence_order, "window request outside a manage sequence");
         return false;
+    }
+
+    fn protocolClipBox(x: i32, y: i32, width: i32, height: i32) ?Scene.ClipBox {
+        std.debug.assert(width >= 0);
+        std.debug.assert(height >= 0);
+        if (width == 0 or height == 0) return null;
+        return .{
+            .x = x,
+            .y = y,
+            .width = @intCast(width),
+            .height = @intCast(height),
+        };
     }
 
     fn requireRendering(self: *WindowResource, manager: *river.WindowManagerV1) bool {
@@ -954,11 +1032,11 @@ const SeatResource = struct {
             },
             .focus_shell_surface,
             .get_pointer_binding,
-            .set_xcursor_theme,
-            .pointer_warp,
             => resource.getClient().postImplementationError(
                 "river seat operation is not implemented",
             ),
+            .set_xcursor_theme => {},
+            .pointer_warp => _ = self.requireManage(manager_resource),
         }
     }
 

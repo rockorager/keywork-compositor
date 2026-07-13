@@ -34,6 +34,13 @@ pub const Borders = struct {
     color: render.Color,
 };
 
+pub const ClipBox = render.Rect;
+
+pub const ContentGeometry = struct {
+    offset: Position = .{},
+    size: render.Size,
+};
+
 pub const Blur = struct {
     radius: u32,
 };
@@ -67,6 +74,9 @@ pub const Window = struct {
     focused: bool = false,
     effects: Effects = default_effects,
     borders: ?Borders = null,
+    clip_box: ?ClipBox = null,
+    content_clip_box: ?ClipBox = null,
+    content_geometry: ?ContentGeometry = null,
 };
 
 pub const RepaintListener = struct {
@@ -213,6 +223,27 @@ pub fn setBorders(self: *Self, id: Id, borders: ?Borders) void {
     if (window.mapped) self.requestRepaint();
 }
 
+pub fn setClipBox(self: *Self, id: Id, clip_box: ?ClipBox) void {
+    setWindowClipBox(self, id, clip_box, false);
+}
+
+pub fn setContentClipBox(self: *Self, id: Id, clip_box: ?ClipBox) void {
+    setWindowClipBox(self, id, clip_box, true);
+}
+
+pub fn setContentGeometry(self: *Self, id: Id, geometry: ?ContentGeometry) void {
+    if (geometry) |value| {
+        std.debug.assert(value.size.width > 0);
+        std.debug.assert(value.size.height > 0);
+        std.debug.assert(value.size.width <= std.math.maxInt(i32));
+        std.debug.assert(value.size.height <= std.math.maxInt(i32));
+    }
+    const window = self.windows.get(id) orelse return;
+    if (std.meta.eql(window.content_geometry, geometry)) return;
+    window.content_geometry = geometry;
+    if (window.mapped) self.requestRepaint();
+}
+
 pub fn setEffects(self: *Self, id: Id, effects: Effects) void {
     const window = self.windows.get(id) orelse return;
     window.effects = effects;
@@ -225,6 +256,20 @@ pub fn iterator(self: *Self) Iterator {
 
 fn requestRepaint(self: *Self) void {
     if (self.repaint_listener) |listener| listener.request(listener.context);
+}
+
+fn setWindowClipBox(self: *Self, id: Id, clip_box: ?ClipBox, content_only: bool) void {
+    if (clip_box) |box| {
+        std.debug.assert(box.width > 0);
+        std.debug.assert(box.height > 0);
+        std.debug.assert(box.width <= std.math.maxInt(i32));
+        std.debug.assert(box.height <= std.math.maxInt(i32));
+    }
+    const window = self.windows.get(id) orelse return;
+    const destination = if (content_only) &window.content_clip_box else &window.clip_box;
+    if (std.meta.eql(destination.*, clip_box)) return;
+    destination.* = clip_box;
+    if (window.mapped) self.requestRepaint();
 }
 
 fn stackIndex(self: *Self, id: Id) ?usize {
@@ -250,6 +295,12 @@ test "scene keeps visual state behind generational handles" {
         .width = 4,
         .color = render.Color.rgba(0x80, 0x40, 0x20, 0xff),
     });
+    scene.setClipBox(id, .{ .x = -4, .y = 2, .width = 80, .height = 60 });
+    scene.setContentClipBox(id, .{ .x = 3, .y = 4, .width = 70, .height = 50 });
+    scene.setContentGeometry(id, .{
+        .offset = .{ .x = 2, .y = 3 },
+        .size = .{ .width = 640, .height = 480 },
+    });
     scene.setMapped(id, true);
 
     var iterator_value = scene.iterator();
@@ -262,6 +313,22 @@ test "scene keeps visual state behind generational handles" {
     try std.testing.expectEqual(@as(u32, 12), entry.window.effects.corner_radius);
     try std.testing.expectEqual(@as(u32, 4), entry.window.borders.?.width);
     try std.testing.expect(entry.window.borders.?.edges.top);
+    try std.testing.expectEqual(ClipBox{
+        .x = -4,
+        .y = 2,
+        .width = 80,
+        .height = 60,
+    }, entry.window.clip_box.?);
+    try std.testing.expectEqual(ClipBox{
+        .x = 3,
+        .y = 4,
+        .width = 70,
+        .height = 50,
+    }, entry.window.content_clip_box.?);
+    try std.testing.expectEqual(ContentGeometry{
+        .offset = .{ .x = 2, .y = 3 },
+        .size = .{ .width = 640, .height = 480 },
+    }, entry.window.content_geometry.?);
     try std.testing.expectEqual(@as(?Iterator.Entry, null), iterator_value.next());
 
     scene.removeWindow(id);
