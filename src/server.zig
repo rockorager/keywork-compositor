@@ -76,6 +76,10 @@ pub fn create(allocator: std.mem.Allocator) !*Self {
     try self.data_device.init(allocator, display, &self.seat);
     errdefer self.data_device.deinit();
     self.render_timer = try display.getEventLoop().addTimer(*Self, handleRenderTimer, self);
+    self.subcompositor.setRepaintListener(.{
+        .context = self,
+        .request = requestRepaint,
+    });
     self.xdg_shell.setRepaintListener(.{
         .context = self,
         .request = requestRepaint,
@@ -87,6 +91,7 @@ pub fn create(allocator: std.mem.Allocator) !*Self {
 pub fn destroy(self: *Self) void {
     const allocator = self.allocator;
     self.xdg_shell.clearRepaintListener();
+    self.subcompositor.clearRepaintListener();
     self.render_timer.remove();
     self.display.destroyClients();
     self.data_device.deinit();
@@ -156,22 +161,7 @@ fn renderFrame(self: *Self) renderer_types.Renderer.Error!void {
     while (windows.next()) |entry| {
         if (!entry.value.mapped) continue;
         const surface_id = self.xdg_shell.surfaceForWindow(entry.id) orelse continue;
-        const buffer = Surface.currentBuffer(self.compositor.surfaceStore(), surface_id) orelse
-            continue;
-        if (buffer.transform != .normal) continue;
-
-        const image_command = [_]render.Command{
-            .{ .image = .{
-                .x = 0,
-                .y = 0,
-                .size = buffer.logical_size,
-                .buffer = buffer.pixelBuffer(),
-            } },
-        };
-        try self.renderer.render(
-            .{ .size = output_size, .commands = &image_command },
-            target,
-        );
+        try self.renderSurfaceTree(surface_id, 0, 0, target);
     }
 
     self.frame_time_milliseconds +%= 16;
@@ -179,12 +169,61 @@ fn renderFrame(self: *Self) renderer_types.Renderer.Error!void {
     while (windows.next()) |entry| {
         if (!entry.value.mapped) continue;
         const surface_id = self.xdg_shell.surfaceForWindow(entry.id) orelse continue;
-        Surface.sendFrameDoneFor(
+        self.finishSurfaceTree(surface_id);
+    }
+}
+
+fn renderSurfaceTree(
+    self: *Self,
+    surface_id: Surface.Id,
+    x: i32,
+    y: i32,
+    target: renderer_types.Target,
+) renderer_types.Renderer.Error!void {
+    if (Surface.currentBuffer(self.compositor.surfaceStore(), surface_id) == null) return;
+
+    var stack = self.subcompositor.stackIterator(surface_id);
+    while (stack.next()) |entry| switch (entry) {
+        .parent => {
+            const buffer = Surface.currentBuffer(
+                self.compositor.surfaceStore(),
+                surface_id,
+            ) orelse continue;
+            if (buffer.transform != .normal) continue;
+            const image_command = [_]render.Command{
+                .{ .image = .{
+                    .x = x,
+                    .y = y,
+                    .size = buffer.logical_size,
+                    .buffer = buffer.pixelBuffer(),
+                } },
+            };
+            try self.renderer.render(
+                .{ .size = self.headless_output.size, .commands = &image_command },
+                target,
+            );
+        },
+        .child => |child| try self.renderSurfaceTree(
+            child.surface_id,
+            x +| child.position.x,
+            y +| child.position.y,
+            target,
+        ),
+    };
+}
+
+fn finishSurfaceTree(self: *Self, surface_id: Surface.Id) void {
+    if (Surface.currentBuffer(self.compositor.surfaceStore(), surface_id) == null) return;
+
+    var stack = self.subcompositor.stackIterator(surface_id);
+    while (stack.next()) |entry| switch (entry) {
+        .parent => Surface.sendFrameDoneFor(
             self.compositor.surfaceStore(),
             surface_id,
             self.frame_time_milliseconds,
-        );
-    }
+        ),
+        .child => |child| self.finishSurfaceTree(child.surface_id),
+    };
 }
 
 test "server creates and destroys protocol globals" {

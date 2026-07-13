@@ -16,6 +16,7 @@ subsurfaces: Store,
 by_surface: std.AutoHashMapUnmanaged(Surface.Id, Id),
 adapters: std.AutoHashMapUnmanaged(Id, *SubsurfaceResource),
 parents: std.AutoHashMapUnmanaged(Surface.Id, *Parent),
+repaint_listener: ?RepaintListener,
 
 pub const Store = slot_map.SlotMap(State, enum { subsurface });
 pub const Id = Store.Id;
@@ -23,6 +24,49 @@ pub const Id = Store.Id;
 pub const Point = struct {
     x: i32 = 0,
     y: i32 = 0,
+};
+
+pub const RepaintListener = struct {
+    context: *anyopaque,
+    request: *const fn (*anyopaque) void,
+};
+
+pub const StackEntry = union(enum) {
+    parent: void,
+    child: struct {
+        surface_id: Surface.Id,
+        position: Point,
+    },
+};
+
+pub const StackIterator = struct {
+    shell: *Self,
+    parent: ?*Parent,
+    index: usize = 0,
+
+    pub fn next(self: *StackIterator) ?StackEntry {
+        const parent = self.parent orelse {
+            if (self.index != 0) return null;
+            self.index = 1;
+            return .{ .parent = {} };
+        };
+        while (self.index < parent.current.items.len) {
+            const node = parent.current.items[self.index];
+            self.index += 1;
+            switch (node) {
+                .parent => return .{ .parent = {} },
+                .child => |id| {
+                    const state = self.shell.subsurfaces.get(id) orelse continue;
+                    if (!state.active) continue;
+                    return .{ .child = .{
+                        .surface_id = state.surface_id,
+                        .position = state.current_position,
+                    } };
+                },
+            }
+        }
+        return null;
+    }
 };
 
 pub const State = struct {
@@ -48,6 +92,7 @@ pub fn init(
         .by_surface = .empty,
         .adapters = .empty,
         .parents = .empty,
+        .repaint_listener = null,
     };
     errdefer self.subsurfaces.deinit(allocator);
     errdefer self.by_surface.deinit(allocator);
@@ -66,6 +111,27 @@ pub fn deinit(self: *Self) void {
     self.adapters.deinit(self.allocator);
     self.subsurfaces.deinit(self.allocator);
     self.* = undefined;
+}
+
+pub fn setRepaintListener(self: *Self, listener: RepaintListener) void {
+    std.debug.assert(self.repaint_listener == null);
+    self.repaint_listener = listener;
+}
+
+pub fn clearRepaintListener(self: *Self) void {
+    std.debug.assert(self.repaint_listener != null);
+    self.repaint_listener = null;
+}
+
+pub fn stackIterator(self: *Self, surface_id: Surface.Id) StackIterator {
+    return .{
+        .shell = self,
+        .parent = self.parents.get(surface_id),
+    };
+}
+
+fn requestRepaint(self: *Self) void {
+    if (self.repaint_listener) |listener| listener.request(listener.context);
 }
 
 fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
@@ -443,6 +509,10 @@ const SubsurfaceResource = struct {
     }
 
     fn handleDestroy(_: *wl.Subsurface, self: *SubsurfaceResource) void {
+        const was_active = if (self.shell.subsurfaces.get(self.id)) |state|
+            state.active
+        else
+            false;
         if (self.surface) |surface| {
             surface.discardCachedCommit();
             surface.releaseRole(self);
@@ -451,6 +521,7 @@ const SubsurfaceResource = struct {
         self.detach();
         _ = self.shell.adapters.remove(self.id);
         _ = self.shell.subsurfaces.remove(self.id);
+        if (was_active) self.shell.requestRepaint();
         self.allocator.destroy(self);
     }
 
@@ -471,14 +542,22 @@ const SubsurfaceResource = struct {
         return if (surface.hasCachedCommit()) .apply_cached else .apply;
     }
 
-    fn afterSurfaceCommit(_: *anyopaque, _: Surface.CommitInfo) void {}
+    fn afterSurfaceCommit(context: *anyopaque, _: Surface.CommitInfo) void {
+        const self: *SubsurfaceResource = @ptrCast(@alignCast(context));
+        self.shell.requestRepaint();
+    }
 
     fn surfaceDestroyed(context: *anyopaque) void {
         const self: *SubsurfaceResource = @ptrCast(@alignCast(context));
+        const was_active = if (self.shell.subsurfaces.get(self.id)) |state|
+            state.active
+        else
+            false;
         if (self.surface) |surface| _ = self.shell.by_surface.remove(surface.handle());
         self.surface = null;
         self.detach();
         _ = self.shell.subsurfaces.remove(self.id);
+        if (was_active) self.shell.requestRepaint();
     }
 };
 
@@ -486,4 +565,48 @@ test "subsurface points support negative positions" {
     const point: Point = .{ .x = -20, .y = 15 };
     try std.testing.expectEqual(@as(i32, -20), point.x);
     try std.testing.expectEqual(@as(i32, 15), point.y);
+}
+
+test "stack iterator preserves children below and above their parent" {
+    var shell: Self = undefined;
+    shell.subsurfaces = .{};
+    defer shell.subsurfaces.deinit(std.testing.allocator);
+
+    const parent_surface: Surface.Id = .{ .index = 10, .generation = 1 };
+    const below_surface: Surface.Id = .{ .index = 11, .generation = 1 };
+    const above_surface: Surface.Id = .{ .index = 12, .generation = 1 };
+    const below = try shell.subsurfaces.insert(std.testing.allocator, .{
+        .surface_id = below_surface,
+        .parent_id = parent_surface,
+        .current_position = .{ .x = -2, .y = 3 },
+        .active = true,
+    });
+    defer _ = shell.subsurfaces.remove(below);
+    const above = try shell.subsurfaces.insert(std.testing.allocator, .{
+        .surface_id = above_surface,
+        .parent_id = parent_surface,
+        .current_position = .{ .x = 5, .y = 7 },
+        .active = true,
+    });
+    defer _ = shell.subsurfaces.remove(above);
+
+    var parent: Parent = undefined;
+    parent.current = .empty;
+    defer parent.current.deinit(std.testing.allocator);
+    try parent.current.append(std.testing.allocator, .{ .child = below });
+    try parent.current.append(std.testing.allocator, .{ .parent = {} });
+    try parent.current.append(std.testing.allocator, .{ .child = above });
+
+    var iterator_value: StackIterator = .{
+        .shell = &shell,
+        .parent = &parent,
+    };
+    const below_entry = iterator_value.next().?;
+    try std.testing.expect(std.meta.eql(below_surface, below_entry.child.surface_id));
+    try std.testing.expectEqual(Point{ .x = -2, .y = 3 }, below_entry.child.position);
+    try std.testing.expect(iterator_value.next().? == .parent);
+    const above_entry = iterator_value.next().?;
+    try std.testing.expect(std.meta.eql(above_surface, above_entry.child.surface_id));
+    try std.testing.expectEqual(Point{ .x = 5, .y = 7 }, above_entry.child.position);
+    try std.testing.expectEqual(@as(?StackEntry, null), iterator_value.next());
 }
