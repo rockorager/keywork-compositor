@@ -41,6 +41,10 @@ pub fn logicalSize(self: *const Self) render.Size {
     return self.size;
 }
 
+pub fn ownsResource(self: *Self, resource: *wl.Output) bool {
+    return resource.getUserData() == @as(?*anyopaque, @ptrCast(self));
+}
+
 fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
     const resource = wl.Output.create(client, version, id) catch {
         client.postNoMemory();

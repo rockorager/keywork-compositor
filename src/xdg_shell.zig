@@ -139,6 +139,36 @@ pub const ToplevelConfigure = struct {
     capabilities: WindowCapabilities = .{},
 };
 
+pub const ResizeEdges = packed struct(u4) {
+    top: bool = false,
+    bottom: bool = false,
+    left: bool = false,
+    right: bool = false,
+};
+
+pub const WindowRequest = union(enum) {
+    pointer_move: struct {
+        seat: *wl.Seat,
+        serial: u32,
+    },
+    pointer_resize: struct {
+        seat: *wl.Seat,
+        serial: u32,
+        edges: ResizeEdges,
+    },
+    show_window_menu: struct {
+        seat: *wl.Seat,
+        serial: u32,
+        x: i32,
+        y: i32,
+    },
+    maximize,
+    unmaximize,
+    fullscreen: ?*wl.Output,
+    exit_fullscreen,
+    minimize,
+};
+
 pub const WindowInfo = struct {
     scene_id: Scene.Id,
     unreliable_pid: i32,
@@ -159,6 +189,7 @@ pub const WindowListener = struct {
     unmapped: *const fn (*anyopaque, WindowId) void,
     destroyed: *const fn (*anyopaque, WindowId) void,
     metadata_changed: *const fn (*anyopaque, WindowId) void,
+    request: *const fn (*anyopaque, WindowId, WindowRequest) void,
 };
 
 pub const WindowIterator = struct {
@@ -1026,17 +1057,42 @@ const ToplevelResource = struct {
                 }
                 window.pending_min_size = size;
             },
-            .resize => |resize| if (!validResizeEdge(resize.edges)) {
-                resource.postError(.invalid_resize_edge, "invalid resize edge");
+            .show_window_menu => |menu| self.forwardRequest(.{ .show_window_menu = .{
+                .seat = menu.seat,
+                .serial = menu.serial,
+                .x = menu.x,
+                .y = menu.y,
+            } }),
+            .move => |move| self.forwardRequest(.{ .pointer_move = .{
+                .seat = move.seat,
+                .serial = move.serial,
+            } }),
+            .resize => |resize| {
+                if (!validResizeEdge(resize.edges)) {
+                    resource.postError(.invalid_resize_edge, "invalid resize edge");
+                    return;
+                }
+                const edges = resizeEdges(resize.edges);
+                if (@as(u4, @bitCast(edges)) == 0) return;
+                self.forwardRequest(.{ .pointer_resize = .{
+                    .seat = resize.seat,
+                    .serial = resize.serial,
+                    .edges = edges,
+                } });
             },
-            .show_window_menu,
-            .move,
-            .set_maximized,
-            .unset_maximized,
-            .set_fullscreen,
-            .unset_fullscreen,
-            .set_minimized,
-            => {},
+            .set_maximized => self.forwardRequest(.maximize),
+            .unset_maximized => self.forwardRequest(.unmaximize),
+            .set_fullscreen => |fullscreen| self.forwardRequest(.{
+                .fullscreen = fullscreen.output,
+            }),
+            .unset_fullscreen => self.forwardRequest(.exit_fullscreen),
+            .set_minimized => self.forwardRequest(.minimize),
+        }
+    }
+
+    fn forwardRequest(self: *ToplevelResource, request: WindowRequest) void {
+        if (self.shell.window_listener) |listener| {
+            listener.request(listener.context, self.id, request);
         }
     }
 
@@ -1150,6 +1206,21 @@ const ToplevelResource = struct {
             else => false,
         };
     }
+
+    fn resizeEdges(edge: xdg.Toplevel.ResizeEdge) ResizeEdges {
+        return switch (edge) {
+            .none => .{},
+            .top => .{ .top = true },
+            .bottom => .{ .bottom = true },
+            .left => .{ .left = true },
+            .top_left => .{ .top = true, .left = true },
+            .bottom_left => .{ .bottom = true, .left = true },
+            .right => .{ .right = true },
+            .top_right => .{ .top = true, .right = true },
+            .bottom_right => .{ .bottom = true, .right = true },
+            else => unreachable,
+        };
+    }
 };
 
 test "xdg size hints reject contradictory bounds" {
@@ -1165,4 +1236,16 @@ test "xdg size hints reject contradictory bounds" {
         .{ .width = -1, .height = 0 },
         .{},
     ));
+}
+
+test "xdg resize edges translate to independent River edge flags" {
+    try std.testing.expectEqual(
+        ResizeEdges{ .top = true, .left = true },
+        ToplevelResource.resizeEdges(.top_left),
+    );
+    try std.testing.expectEqual(
+        ResizeEdges{ .bottom = true, .right = true },
+        ToplevelResource.resizeEdges(.bottom_right),
+    );
+    try std.testing.expectEqual(ResizeEdges{}, ToplevelResource.resizeEdges(.none));
 }

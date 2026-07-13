@@ -23,11 +23,14 @@ seat: *Seat,
 scene: *Scene,
 xdg_shell: *XdgShell,
 active: ?*river.WindowManagerV1,
+output_resource: ?*river.OutputV1,
+seat_resource: ?*river.SeatV1,
 session_generation: u64,
 sequence: Sequence,
 windows: WindowStore,
 decorations: DecorationStore,
 shell_surfaces: ShellSurfaceStore,
+window_requests: std.ArrayList(PendingWindowRequest),
 stack_operations: std.ArrayList(StackOperation),
 focused: ?WindowId,
 pending_focus: PendingFocus,
@@ -91,6 +94,22 @@ const StackOperation = union(enum) {
     bottom: ManagedNodeId,
     above: struct { id: ManagedNodeId, other: ManagedNodeId },
     below: struct { id: ManagedNodeId, other: ManagedNodeId },
+};
+
+const PendingWindowRequest = struct {
+    id: WindowId,
+    request: Request,
+
+    const Request = union(enum) {
+        pointer_move,
+        pointer_resize: river.WindowV1.Edges,
+        show_window_menu: struct { x: i32, y: i32 },
+        maximize,
+        unmaximize,
+        fullscreen: bool,
+        exit_fullscreen,
+        minimize,
+    };
 };
 
 const ConfigureState = union(enum) {
@@ -207,11 +226,14 @@ pub fn init(
         .scene = scene,
         .xdg_shell = xdg_shell,
         .active = null,
+        .output_resource = null,
+        .seat_resource = null,
         .session_generation = 0,
         .sequence = .{},
         .windows = .{},
         .decorations = .{},
         .shell_surfaces = .{},
+        .window_requests = .empty,
         .stack_operations = .empty,
         .focused = null,
         .pending_focus = .unchanged,
@@ -220,6 +242,7 @@ pub fn init(
     errdefer self.windows.deinit(allocator);
     errdefer self.decorations.deinit(allocator);
     errdefer self.shell_surfaces.deinit(allocator);
+    errdefer self.window_requests.deinit(allocator);
     errdefer self.stack_operations.deinit(allocator);
     self.global = try wl.Global.create(
         display,
@@ -238,6 +261,7 @@ pub fn init(
         .unmapped = windowUnmapped,
         .destroyed = windowDestroyed,
         .metadata_changed = windowMetadataChanged,
+        .request = windowRequest,
     });
 }
 
@@ -249,6 +273,7 @@ pub fn deinit(self: *Self) void {
     self.windows.deinit(self.allocator);
     self.decorations.deinit(self.allocator);
     self.shell_surfaces.deinit(self.allocator);
+    self.window_requests.deinit(self.allocator);
     self.stack_operations.deinit(self.allocator);
     self.global.destroy();
     self.* = undefined;
@@ -376,6 +401,30 @@ fn sendPendingState(self: *Self, manager: *river.WindowManagerV1) !void {
         resource.sendDecorationHint(.only_supports_csd);
         window.metadata_dirty = false;
     }
+
+    for (self.window_requests.items) |pending| {
+        const window = self.windows.get(pending.id) orelse continue;
+        const resource = window.resource orelse continue;
+        switch (pending.request) {
+            .pointer_move => if (self.seat_resource) |seat| {
+                resource.sendPointerMoveRequested(seat);
+            },
+            .pointer_resize => |edges| if (self.seat_resource) |seat| {
+                resource.sendPointerResizeRequested(seat, edges);
+            },
+            .show_window_menu => |menu| {
+                resource.sendShowWindowMenuRequested(menu.x, menu.y);
+            },
+            .maximize => resource.sendMaximizeRequested(),
+            .unmaximize => resource.sendUnmaximizeRequested(),
+            .fullscreen => |preferred_output| resource.sendFullscreenRequested(
+                if (preferred_output) self.output_resource else null,
+            ),
+            .exit_fullscreen => resource.sendExitFullscreenRequested(),
+            .minimize => resource.sendMinimizeRequested(),
+        }
+    }
+    self.window_requests.clearRetainingCapacity();
 }
 
 fn createWindowResource(
@@ -685,7 +734,10 @@ fn sceneNodeId(self: *Self, id: ManagedNodeId) ?Scene.NodeId {
 
 fn releaseManager(self: *Self) void {
     self.active = null;
+    self.output_resource = null;
+    self.seat_resource = null;
     self.sequence.reset();
+    self.window_requests.clearRetainingCapacity();
     self.stack_operations.clearRetainingCapacity();
     self.focused = null;
     self.pending_focus = .unchanged;
@@ -809,6 +861,54 @@ fn windowMetadataChanged(context: *anyopaque, xdg_id: XdgShell.WindowId) void {
     const id = self.findWindow(xdg_id) orelse return;
     const window = self.windows.get(id) orelse return;
     window.metadata_dirty = true;
+    self.requestManage();
+}
+
+fn windowRequest(
+    context: *anyopaque,
+    xdg_id: XdgShell.WindowId,
+    request: XdgShell.WindowRequest,
+) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const manager = self.active orelse return;
+    const id = self.ensureWindow(xdg_id) catch {
+        manager.postNoMemory();
+        return;
+    };
+    const pending: PendingWindowRequest.Request = translate: switch (request) {
+        .pointer_move => |move| {
+            if (!self.seat.ownsResource(move.seat)) return;
+            _ = move.serial;
+            break :translate .pointer_move;
+        },
+        .pointer_resize => |resize| {
+            if (!self.seat.ownsResource(resize.seat)) return;
+            _ = resize.serial;
+            break :translate .{ .pointer_resize = .{
+                .top = resize.edges.top,
+                .bottom = resize.edges.bottom,
+                .left = resize.edges.left,
+                .right = resize.edges.right,
+            } };
+        },
+        .show_window_menu => |menu| {
+            if (!self.seat.ownsResource(menu.seat)) return;
+            _ = menu.serial;
+            break :translate .{ .show_window_menu = .{ .x = menu.x, .y = menu.y } };
+        },
+        .maximize => .maximize,
+        .unmaximize => .unmaximize,
+        .fullscreen => |output| .{ .fullscreen = if (output) |resource|
+            self.output.ownsResource(resource)
+        else
+            false },
+        .exit_fullscreen => .exit_fullscreen,
+        .minimize => .minimize,
+    };
+    self.window_requests.append(self.allocator, .{ .id = id, .request = pending }) catch {
+        manager.postNoMemory();
+        return;
+    };
     self.requestManage();
 }
 
@@ -1611,6 +1711,7 @@ fn createOutput(self: *Self, manager: *river.WindowManagerV1) !void {
     };
     resource.setHandler(*OutputResource, OutputResource.handleRequest, OutputResource.handleDestroy, adapter);
 
+    self.output_resource = resource;
     manager.sendOutput(resource);
     resource.sendWlOutput(self.output.globalName(manager.getClient()));
     resource.sendPosition(0, 0);
@@ -1635,6 +1736,7 @@ fn createSeat(self: *Self, manager: *river.WindowManagerV1) !void {
     };
     resource.setHandler(*SeatResource, SeatResource.handleRequest, SeatResource.handleDestroy, adapter);
 
+    self.seat_resource = resource;
     manager.sendSeat(resource);
     resource.sendWlSeat(self.seat.globalName(manager.getClient()));
 }
@@ -1661,7 +1763,8 @@ const OutputResource = struct {
         }
     }
 
-    fn handleDestroy(_: *river.OutputV1, self: *OutputResource) void {
+    fn handleDestroy(resource: *river.OutputV1, self: *OutputResource) void {
+        if (self.manager.output_resource == resource) self.manager.output_resource = null;
         self.allocator.destroy(self);
     }
 };
@@ -1737,7 +1840,8 @@ const SeatResource = struct {
         return false;
     }
 
-    fn handleDestroy(_: *river.SeatV1, self: *SeatResource) void {
+    fn handleDestroy(resource: *river.SeatV1, self: *SeatResource) void {
+        if (self.manager.seat_resource == resource) self.manager.seat_resource = null;
         self.allocator.destroy(self);
     }
 };
