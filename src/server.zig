@@ -382,8 +382,7 @@ fn scenePointerFocus(self: *Self, x: f64, y: f64) ?Seat.PointerFocus {
         .shell_surface => |shell_entry| {
             const shell_surface = shell_entry.shell_surface;
             if (!shell_surface.mapped) continue;
-            if (hitTestSurface(
-                self.compositor.surfaceStore(),
+            if (self.hitTestSurface(
                 shell_surface.surface_id,
                 shell_surface.position,
                 x,
@@ -414,8 +413,7 @@ fn hitTestWindow(
         const content_geometry = popup.content_geometry orelse Scene.ContentGeometry{
             .size = buffer.logical_size,
         };
-        if (hitTestSurface(
-            self.compositor.surfaceStore(),
+        if (self.hitTestSurface(
             popup.surface_id,
             .{
                 .x = entry.position.x -| content_geometry.offset.x,
@@ -448,8 +446,11 @@ fn hitTestWindow(
         ) orelse return null;
         if (!pointInRect(x, y, visible)) return null;
     }
-    return hitTestSurface(
-        self.compositor.surfaceStore(),
+    if (window.effects.corner_radius > 0) {
+        const visible = windowContentRect(window, content_geometry.size) orelse return null;
+        if (!pointInRoundedRect(x, y, visible, window.effects.corner_radius)) return null;
+    }
+    return self.hitTestSurface(
         window.surface_id,
         .{
             .x = window.position.x -| content_geometry.offset.x,
@@ -461,16 +462,39 @@ fn hitTestWindow(
 }
 
 fn hitTestSurface(
-    surface_store: *Surface.Store,
+    self: *Self,
     surface_id: Surface.Id,
     position: Scene.Position,
     x: f64,
     y: f64,
 ) ?Seat.PointerFocus {
-    const surface_x = x - @as(f64, @floatFromInt(position.x));
-    const surface_y = y - @as(f64, @floatFromInt(position.y));
-    if (!Surface.acceptsInput(surface_store, surface_id, surface_x, surface_y)) return null;
-    return .{ .surface_id = surface_id, .x = surface_x, .y = surface_y };
+    if (Surface.currentBuffer(self.compositor.surfaceStore(), surface_id) == null) return null;
+
+    var stack = self.subcompositor.reverseStackIterator(surface_id);
+    while (stack.next()) |entry| switch (entry) {
+        .parent => {
+            const surface_x = x - @as(f64, @floatFromInt(position.x));
+            const surface_y = y - @as(f64, @floatFromInt(position.y));
+            if (Surface.acceptsInput(
+                self.compositor.surfaceStore(),
+                surface_id,
+                surface_x,
+                surface_y,
+            )) {
+                return .{ .surface_id = surface_id, .x = surface_x, .y = surface_y };
+            }
+        },
+        .child => |child| if (self.hitTestSurface(
+            child.surface_id,
+            .{
+                .x = position.x +| child.position.x,
+                .y = position.y +| child.position.y,
+            },
+            x,
+            y,
+        )) |focus| return focus,
+    };
+    return null;
 }
 
 fn pointInRect(x: f64, y: f64, rect: render.Rect) bool {
@@ -478,6 +502,25 @@ fn pointInRect(x: f64, y: f64, rect: render.Rect) bool {
         y >= @as(f64, @floatFromInt(rect.y)) and
         x < @as(f64, @floatFromInt(@as(i64, rect.x) + rect.width)) and
         y < @as(f64, @floatFromInt(@as(i64, rect.y) + rect.height));
+}
+
+fn pointInRoundedRect(x: f64, y: f64, rect: render.Rect, requested_radius: u32) bool {
+    if (!pointInRect(x, y, rect)) return false;
+    const radius: f64 = @floatFromInt(@min(
+        requested_radius,
+        @min(rect.width, rect.height) / 2,
+    ));
+    if (radius == 0) return true;
+
+    const left: f64 = @floatFromInt(rect.x);
+    const top: f64 = @floatFromInt(rect.y);
+    const right: f64 = @floatFromInt(@as(i64, rect.x) + rect.width);
+    const bottom: f64 = @floatFromInt(@as(i64, rect.y) + rect.height);
+    const center_x = std.math.clamp(x, left + radius, right - radius);
+    const center_y = std.math.clamp(y, top + radius, bottom - radius);
+    const distance_x = x - center_x;
+    const distance_y = y - center_y;
+    return distance_x * distance_x + distance_y * distance_y <= radius * radius;
 }
 
 fn handleRenderTimer(self: *Self) c_int {
@@ -943,4 +986,13 @@ test "content clip boxes intersect window dimensions in global coordinates" {
         .width = 70,
         .height = 60,
     }, windowContentRect(&window, .{ .width = 200, .height = 80 }).?);
+}
+
+test "rounded window corners reject points outside visible content" {
+    const rect: render.Rect = .{ .x = 10, .y = 20, .width = 20, .height = 20 };
+
+    try std.testing.expect(!pointInRoundedRect(10.5, 20.5, rect, 8));
+    try std.testing.expect(pointInRoundedRect(14.5, 24.5, rect, 8));
+    try std.testing.expect(pointInRoundedRect(20, 20.5, rect, 8));
+    try std.testing.expect(!pointInRoundedRect(30, 30, rect, 8));
 }

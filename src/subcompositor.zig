@@ -69,6 +69,36 @@ pub const StackIterator = struct {
     }
 };
 
+pub const ReverseStackIterator = struct {
+    shell: *Self,
+    parent: ?*Parent,
+    index: usize,
+
+    pub fn next(self: *ReverseStackIterator) ?StackEntry {
+        const parent = self.parent orelse {
+            if (self.index == 0) return null;
+            self.index = 0;
+            return .{ .parent = {} };
+        };
+        while (self.index > 0) {
+            self.index -= 1;
+            const node = parent.current.items[self.index];
+            switch (node) {
+                .parent => return .{ .parent = {} },
+                .child => |id| {
+                    const state = self.shell.subsurfaces.get(id) orelse continue;
+                    if (!state.active) continue;
+                    return .{ .child = .{
+                        .surface_id = state.surface_id,
+                        .position = state.current_position,
+                    } };
+                },
+            }
+        }
+        return null;
+    }
+};
+
 pub const State = struct {
     surface_id: Surface.Id,
     parent_id: Surface.Id,
@@ -127,6 +157,15 @@ pub fn stackIterator(self: *Self, surface_id: Surface.Id) StackIterator {
     return .{
         .shell = self,
         .parent = self.parents.get(surface_id),
+    };
+}
+
+pub fn reverseStackIterator(self: *Self, surface_id: Surface.Id) ReverseStackIterator {
+    const parent = self.parents.get(surface_id);
+    return .{
+        .shell = self,
+        .parent = parent,
+        .index = if (parent) |value| value.current.items.len else 1,
     };
 }
 
@@ -609,4 +648,16 @@ test "stack iterator preserves children below and above their parent" {
     try std.testing.expect(std.meta.eql(above_surface, above_entry.child.surface_id));
     try std.testing.expectEqual(Point{ .x = 5, .y = 7 }, above_entry.child.position);
     try std.testing.expectEqual(@as(?StackEntry, null), iterator_value.next());
+
+    var reverse_iterator: ReverseStackIterator = .{
+        .shell = &shell,
+        .parent = &parent,
+        .index = parent.current.items.len,
+    };
+    const reverse_above = reverse_iterator.next().?;
+    try std.testing.expect(std.meta.eql(above_surface, reverse_above.child.surface_id));
+    try std.testing.expect(reverse_iterator.next().? == .parent);
+    const reverse_below = reverse_iterator.next().?;
+    try std.testing.expect(std.meta.eql(below_surface, reverse_below.child.surface_id));
+    try std.testing.expectEqual(@as(?StackEntry, null), reverse_iterator.next());
 }
