@@ -68,9 +68,17 @@ pub const SolidRect = struct {
     color: Color,
 };
 
+pub const Image = struct {
+    x: i32,
+    y: i32,
+    size: Size,
+    buffer: PixelBuffer,
+};
+
 pub const Command = union(enum) {
     clear: Color,
     solid_rect: SolidRect,
+    image: Image,
 };
 
 pub const Frame = struct {

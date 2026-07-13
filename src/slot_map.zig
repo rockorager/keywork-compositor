@@ -85,6 +85,37 @@ pub fn SlotMap(comptime Value: type, comptime Tag: type) type {
             return self.count;
         }
 
+        pub const Entry = struct {
+            id: Id,
+            value: *Value,
+        };
+
+        pub const Iterator = struct {
+            map: *Self,
+            index: usize = 0,
+
+            /// The returned value pointer follows the same invalidation rules as get().
+            pub fn next(self: *Iterator) ?Entry {
+                while (self.index < self.map.slots.items.len) {
+                    const index = self.index;
+                    self.index += 1;
+                    const slot = &self.map.slots.items[index];
+                    if (slot.value) |*value| return .{
+                        .id = .{
+                            .index = @intCast(index),
+                            .generation = slot.generation,
+                        },
+                        .value = value,
+                    };
+                }
+                return null;
+            }
+        };
+
+        pub fn iterator(self: *Self) Iterator {
+            return .{ .map = self };
+        }
+
         fn getSlot(self: *Self, id: Id) ?*Slot {
             if (id.index >= self.slots.items.len) return null;
             const slot = &self.slots.items[id.index];
@@ -124,4 +155,27 @@ test "handle types are distinct between stores" {
 
     try std.testing.expect(SurfaceStore.Id != WindowStore.Id);
     try std.testing.expectEqual(@as(usize, 8), @sizeOf(SurfaceStore.Id));
+}
+
+test "iterator skips vacant slots and preserves handles" {
+    const Store = SlotMap(u32, enum { value });
+    var store: Store = .{};
+    defer store.deinit(std.testing.allocator);
+
+    const first = try store.insert(std.testing.allocator, 10);
+    const removed = try store.insert(std.testing.allocator, 20);
+    const third = try store.insert(std.testing.allocator, 30);
+    try std.testing.expectEqual(@as(u32, 20), store.remove(removed).?);
+
+    var iterator_value = store.iterator();
+    const first_entry = iterator_value.next().?;
+    try std.testing.expect(std.meta.eql(first, first_entry.id));
+    try std.testing.expectEqual(@as(u32, 10), first_entry.value.*);
+    const third_entry = iterator_value.next().?;
+    try std.testing.expect(std.meta.eql(third, third_entry.id));
+    try std.testing.expectEqual(@as(u32, 30), third_entry.value.*);
+    try std.testing.expectEqual(@as(?Store.Entry, null), iterator_value.next());
+
+    try std.testing.expectEqual(@as(u32, 10), store.remove(first).?);
+    try std.testing.expectEqual(@as(u32, 30), store.remove(third).?);
 }

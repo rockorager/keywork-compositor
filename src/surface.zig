@@ -270,7 +270,18 @@ pub fn discardCachedCommit(self: *Self) void {
 }
 
 pub fn sendFrameDone(self: *Self, time_milliseconds: u32) void {
-    const surface_state = self.state();
+    sendFrameDoneFor(self.store, self.id, time_milliseconds);
+}
+
+/// The returned snapshot is borrowed from the store and is invalidated by a
+/// replacement commit or any store insertion that reallocates its slots.
+pub fn currentBuffer(store: *Store, id: Id) ?*BufferSnapshot {
+    const surface_state = store.get(id) orelse return null;
+    return if (surface_state.current_buffer) |*buffer| buffer else null;
+}
+
+pub fn sendFrameDoneFor(store: *Store, id: Id, time_milliseconds: u32) void {
+    const surface_state = store.get(id) orelse return;
     while (true) {
         const callback = for (surface_state.callbacks.items) |candidate| {
             if (candidate.state == .active) break candidate;
