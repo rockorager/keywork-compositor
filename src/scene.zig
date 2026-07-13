@@ -9,11 +9,14 @@ const Surface = @import("surface.zig");
 
 allocator: std.mem.Allocator,
 windows: Store,
+decorations: DecorationStore,
 stack: std.ArrayList(Id),
 repaint_listener: ?RepaintListener,
 
 pub const Store = slot_map.SlotMap(Window, enum { scene_window });
 pub const Id = Store.Id;
+pub const DecorationStore = slot_map.SlotMap(Decoration, enum { scene_decoration });
+pub const DecorationId = DecorationStore.Id;
 
 pub const Position = struct {
     x: i32 = 0,
@@ -80,6 +83,19 @@ pub const Window = struct {
     content_geometry: ?ContentGeometry = null,
 };
 
+pub const DecorationLayer = enum {
+    below,
+    above,
+};
+
+pub const Decoration = struct {
+    window_id: Id,
+    surface_id: Surface.Id,
+    layer: DecorationLayer,
+    offset: Position = .{},
+    mapped: bool = false,
+};
+
 pub const RepaintListener = struct {
     context: *anyopaque,
     request: *const fn (*anyopaque) void,
@@ -105,10 +121,31 @@ pub const Iterator = struct {
     }
 };
 
+pub const DecorationIterator = struct {
+    inner: DecorationStore.Iterator,
+    window_id: Id,
+    layer: DecorationLayer,
+
+    pub const Entry = struct {
+        id: DecorationId,
+        decoration: *Decoration,
+    };
+
+    pub fn next(self: *DecorationIterator) ?Entry {
+        while (self.inner.next()) |entry| {
+            if (!std.meta.eql(entry.value.window_id, self.window_id)) continue;
+            if (entry.value.layer != self.layer) continue;
+            return .{ .id = entry.id, .decoration = entry.value };
+        }
+        return null;
+    }
+};
+
 pub fn init(self: *Self, allocator: std.mem.Allocator) void {
     self.* = .{
         .allocator = allocator,
         .windows = .{},
+        .decorations = .{},
         .stack = .empty,
         .repaint_listener = null,
     };
@@ -116,8 +153,10 @@ pub fn init(self: *Self, allocator: std.mem.Allocator) void {
 
 pub fn deinit(self: *Self) void {
     std.debug.assert(self.windows.len() == 0);
+    std.debug.assert(self.decorations.len() == 0);
     std.debug.assert(self.stack.items.len == 0);
     self.windows.deinit(self.allocator);
+    self.decorations.deinit(self.allocator);
     self.stack.deinit(self.allocator);
     self.* = undefined;
 }
@@ -141,6 +180,12 @@ pub fn addWindow(self: *Self, surface_id: Surface.Id) error{OutOfMemory}!Id {
 
 pub fn removeWindow(self: *Self, id: Id) void {
     const window = self.windows.remove(id) orelse return;
+    var decorations = self.decorations.iterator();
+    while (decorations.next()) |entry| {
+        if (std.meta.eql(entry.value.window_id, id)) {
+            _ = self.decorations.remove(entry.id);
+        }
+    }
     for (self.stack.items, 0..) |candidate, index| {
         if (std.meta.eql(candidate, id)) {
             _ = self.stack.orderedRemove(index);
@@ -148,6 +193,48 @@ pub fn removeWindow(self: *Self, id: Id) void {
         }
     }
     if (window.mapped) self.requestRepaint();
+}
+
+pub fn addDecoration(
+    self: *Self,
+    window_id: Id,
+    surface_id: Surface.Id,
+    layer: DecorationLayer,
+) error{ InvalidWindow, OutOfMemory }!DecorationId {
+    if (self.windows.get(window_id) == null) return error.InvalidWindow;
+    return self.decorations.insert(self.allocator, .{
+        .window_id = window_id,
+        .surface_id = surface_id,
+        .layer = layer,
+    });
+}
+
+pub fn removeDecoration(self: *Self, id: DecorationId) void {
+    const decoration = self.decorations.remove(id) orelse return;
+    const window = self.windows.get(decoration.window_id) orelse return;
+    if (window.mapped and decoration.mapped) self.requestRepaint();
+}
+
+pub fn setDecorationOffset(self: *Self, id: DecorationId, offset: Position) void {
+    const decoration = self.decorations.get(id) orelse return;
+    if (std.meta.eql(decoration.offset, offset)) return;
+    decoration.offset = offset;
+    const window = self.windows.get(decoration.window_id) orelse return;
+    if (window.mapped and decoration.mapped) self.requestRepaint();
+}
+
+pub fn setDecorationMapped(self: *Self, id: DecorationId, mapped: bool) void {
+    const decoration = self.decorations.get(id) orelse return;
+    if (decoration.mapped == mapped) return;
+    decoration.mapped = mapped;
+    const window = self.windows.get(decoration.window_id) orelse return;
+    if (window.mapped) self.requestRepaint();
+}
+
+pub fn decorationCommitted(self: *Self, id: DecorationId) void {
+    const decoration = self.decorations.get(id) orelse return;
+    const window = self.windows.get(decoration.window_id) orelse return;
+    if (window.mapped and decoration.mapped) self.requestRepaint();
 }
 
 pub fn setMapped(self: *Self, id: Id, mapped: bool) void {
@@ -260,6 +347,18 @@ pub fn setEffects(self: *Self, id: Id, effects: Effects) void {
 
 pub fn iterator(self: *Self) Iterator {
     return .{ .scene = self };
+}
+
+pub fn decorationIterator(
+    self: *Self,
+    window_id: Id,
+    layer: DecorationLayer,
+) DecorationIterator {
+    return .{
+        .inner = self.decorations.iterator(),
+        .window_id = window_id,
+        .layer = layer,
+    };
 }
 
 pub fn topFullscreen(self: *Self) ?Id {
@@ -390,4 +489,41 @@ test "scene reorders windows through handles" {
     scene.removeWindow(second);
     try std.testing.expectEqual(@as(?Id, null), scene.topFullscreen());
     scene.removeWindow(third);
+}
+
+test "scene attaches decoration handles to windows" {
+    var scene: Self = undefined;
+    scene.init(std.testing.allocator);
+    defer scene.deinit();
+
+    const window = try scene.addWindow(.{ .index = 1, .generation = 1 });
+    const below = try scene.addDecoration(
+        window,
+        .{ .index = 2, .generation = 1 },
+        .below,
+    );
+    const above = try scene.addDecoration(
+        window,
+        .{ .index = 3, .generation = 1 },
+        .above,
+    );
+    scene.setDecorationOffset(above, .{ .x = -12, .y = 8 });
+    scene.setDecorationMapped(above, true);
+
+    var below_iterator = scene.decorationIterator(window, .below);
+    const below_entry = below_iterator.next().?;
+    try std.testing.expect(std.meta.eql(below, below_entry.id));
+    try std.testing.expectEqual(DecorationLayer.below, below_entry.decoration.layer);
+    try std.testing.expectEqual(@as(?DecorationIterator.Entry, null), below_iterator.next());
+
+    var above_iterator = scene.decorationIterator(window, .above);
+    const above_entry = above_iterator.next().?;
+    try std.testing.expect(std.meta.eql(above, above_entry.id));
+    try std.testing.expectEqual(Position{ .x = -12, .y = 8 }, above_entry.decoration.offset);
+    try std.testing.expect(above_entry.decoration.mapped);
+    try std.testing.expectEqual(@as(?DecorationIterator.Entry, null), above_iterator.next());
+
+    scene.removeDecoration(below);
+    scene.removeWindow(window);
+    try std.testing.expectEqual(@as(?Decoration, null), scene.decorations.remove(above));
 }

@@ -164,6 +164,7 @@ pub const RoleError = error{
 pub const Role = enum {
     xdg_toplevel,
     subsurface,
+    river_decoration,
 };
 
 pub const CommitInfo = struct {

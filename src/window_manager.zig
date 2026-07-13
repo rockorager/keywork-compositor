@@ -8,6 +8,7 @@ const Output = @import("output.zig");
 const Scene = @import("scene.zig");
 const Seat = @import("seat.zig");
 const slot_map = @import("slot_map.zig");
+const Surface = @import("surface.zig");
 const XdgShell = @import("xdg_shell.zig");
 
 const wl = wayland.server.wl;
@@ -24,6 +25,7 @@ active: ?*river.WindowManagerV1,
 session_generation: u64,
 sequence: Sequence,
 windows: WindowStore,
+decorations: DecorationStore,
 stack_operations: std.ArrayList(StackOperation),
 focused: ?WindowId,
 pending_focus: PendingFocus,
@@ -31,6 +33,8 @@ configure_timer: *wl.EventSource,
 
 const WindowStore = slot_map.SlotMap(ManagedWindow, enum { managed_window });
 const WindowId = WindowStore.Id;
+const DecorationStore = slot_map.SlotMap(ManagedDecoration, enum { managed_decoration });
+const DecorationId = DecorationStore.Id;
 
 const ManagedWindow = struct {
     xdg_id: XdgShell.WindowId,
@@ -56,6 +60,13 @@ const ManagedWindow = struct {
     borders: ?Scene.Borders = null,
     clip_box: ?Scene.ClipBox = null,
     content_clip_box: ?Scene.ClipBox = null,
+};
+
+const ManagedDecoration = struct {
+    window_id: WindowId,
+    scene_id: ?Scene.DecorationId,
+    adapter: *DecorationResource,
+    pending_offset: ?Scene.Position = null,
 };
 
 const StackOperation = union(enum) {
@@ -180,12 +191,14 @@ pub fn init(
         .session_generation = 0,
         .sequence = .{},
         .windows = .{},
+        .decorations = .{},
         .stack_operations = .empty,
         .focused = null,
         .pending_focus = .unchanged,
         .configure_timer = undefined,
     };
     errdefer self.windows.deinit(allocator);
+    errdefer self.decorations.deinit(allocator);
     errdefer self.stack_operations.deinit(allocator);
     self.global = try wl.Global.create(
         display,
@@ -212,6 +225,7 @@ pub fn deinit(self: *Self) void {
     self.configure_timer.remove();
     self.releaseWindows();
     self.windows.deinit(self.allocator);
+    self.decorations.deinit(self.allocator);
     self.stack_operations.deinit(self.allocator);
     self.global.destroy();
     self.* = undefined;
@@ -462,6 +476,8 @@ fn finishRender(self: *Self, manager: *river.WindowManagerV1) void {
         manager.postError(.sequence_order, "render_finish outside a render sequence");
         return;
     }
+    if (!self.validateDecorationCommits()) return;
+    self.applyDecorationState();
 
     var iterator = self.windows.iterator();
     while (iterator.next()) |entry| {
@@ -557,6 +573,42 @@ fn finishRender(self: *Self, manager: *river.WindowManagerV1) void {
     }
 }
 
+fn validateDecorationCommits(self: *Self) bool {
+    var iterator = self.decorations.iterator();
+    while (iterator.next()) |entry| {
+        const adapter = entry.value.adapter;
+        if (adapter.owner_generation != self.session_generation) continue;
+        if (!adapter.synchronized_commit_requested) continue;
+        adapter.resource.postError(
+            .no_commit,
+            "sync_next_commit was not followed by wl_surface.commit",
+        );
+        return false;
+    }
+    return true;
+}
+
+fn applyDecorationState(self: *Self) void {
+    var iterator = self.decorations.iterator();
+    while (iterator.next()) |entry| {
+        const adapter = entry.value.adapter;
+        if (adapter.owner_generation != self.session_generation) continue;
+        if (entry.value.pending_offset) |offset| {
+            if (entry.value.scene_id) |scene_id| {
+                self.xdg_shell.setWindowDecorationOffset(scene_id, offset);
+            }
+            entry.value.pending_offset = null;
+        }
+        if (adapter.synchronized_commit_cached) {
+            if (adapter.surface) |surface| {
+                surface.applyCachedCommit();
+                if (surface.hasCachedCommit()) surface.discardCachedCommit();
+            }
+            adapter.synchronized_commit_cached = false;
+        }
+    }
+}
+
 fn releaseManager(self: *Self) void {
     self.active = null;
     self.sequence.reset();
@@ -569,6 +621,7 @@ fn releaseManager(self: *Self) void {
 fn releaseWindows(self: *Self) void {
     var iterator = self.windows.iterator();
     while (iterator.next()) |entry| {
+        self.detachDecorations(entry.id);
         self.xdg_shell.setWindowFocused(entry.value.xdg_id, false);
         self.xdg_shell.setWindowFullscreen(entry.value.xdg_id, false);
         self.xdg_shell.setWindowBorders(entry.value.xdg_id, null);
@@ -580,6 +633,14 @@ fn releaseWindows(self: *Self) void {
             entry.value.requested_dimensions,
         );
         _ = self.windows.remove(entry.id);
+    }
+}
+
+fn detachDecorations(self: *Self, window_id: WindowId) void {
+    var iterator = self.decorations.iterator();
+    while (iterator.next()) |entry| {
+        if (!std.meta.eql(entry.value.window_id, window_id)) continue;
+        entry.value.adapter.detach();
     }
 }
 
@@ -688,6 +749,7 @@ fn removeWindow(self: *Self, xdg_id: XdgShell.WindowId) void {
         .inflight => true,
         else => false,
     };
+    self.detachDecorations(id);
     self.xdg_shell.setWindowFocused(window.xdg_id, false);
     self.xdg_shell.setWindowFullscreen(window.xdg_id, false);
     self.xdg_shell.setWindowBorders(window.xdg_id, null);
@@ -854,9 +916,24 @@ const WindowResource = struct {
                     box.height,
                 ) };
             },
-            .get_decoration_above, .get_decoration_below => resource.getClient().postImplementationError(
-                "river decoration surfaces are not implemented",
-            ),
+            .get_decoration_above => |get| DecorationResource.create(
+                self.manager,
+                self.id,
+                manager_resource,
+                resource,
+                Surface.fromResource(get.surface),
+                .above,
+                get.id,
+            ) catch resource.postNoMemory(),
+            .get_decoration_below => |get| DecorationResource.create(
+                self.manager,
+                self.id,
+                manager_resource,
+                resource,
+                Surface.fromResource(get.surface),
+                .below,
+                get.id,
+            ) catch resource.postNoMemory(),
             .set_dimension_bounds => unreachable,
         }
     }
@@ -905,6 +982,190 @@ const WindowResource = struct {
         if (self.manager.session_generation == self.owner_generation) {
             if (self.manager.windows.get(self.id)) |window| window.resource = null;
         }
+        self.allocator.destroy(self);
+    }
+};
+
+const DecorationResource = struct {
+    allocator: std.mem.Allocator,
+    manager: *Self,
+    id: DecorationId,
+    resource: *river.DecorationV1,
+    surface: ?*Surface,
+    owner_generation: u64,
+    synchronized_commit_requested: bool,
+    synchronized_commit_cached: bool,
+
+    fn create(
+        manager: *Self,
+        window_id: WindowId,
+        manager_resource: *river.WindowManagerV1,
+        window_resource: *river.WindowV1,
+        surface: *Surface,
+        layer: Scene.DecorationLayer,
+        protocol_id: u32,
+    ) error{ OutOfMemory, ResourceCreateFailed }!void {
+        const window = manager.windows.get(window_id) orelse
+            return error.ResourceCreateFailed;
+        const resource = try river.DecorationV1.create(
+            window_resource.getClient(),
+            window_resource.getVersion(),
+            protocol_id,
+        );
+        errdefer resource.destroy();
+        const self = manager.allocator.create(DecorationResource) catch
+            return error.OutOfMemory;
+        errdefer manager.allocator.destroy(self);
+        self.* = .{
+            .allocator = manager.allocator,
+            .manager = manager,
+            .id = undefined,
+            .resource = resource,
+            .surface = surface,
+            .owner_generation = manager.session_generation,
+            .synchronized_commit_requested = false,
+            .synchronized_commit_cached = false,
+        };
+
+        if (surface.assignedRole() != null or surface.hasBufferAttachedOrCommitted()) {
+            manager_resource.postError(
+                .role,
+                "decoration wl_surface already has a role or buffer",
+            );
+            manager.allocator.destroy(self);
+            resource.destroy();
+            return;
+        }
+        surface.reserveRole(.river_decoration, .{
+            .context = self,
+            .before_commit = beforeSurfaceCommit,
+            .after_commit = afterSurfaceCommit,
+            .surface_destroyed = surfaceDestroyed,
+        }) catch {
+            manager_resource.postError(.role, "wl_surface is unavailable for decoration role");
+            manager.allocator.destroy(self);
+            resource.destroy();
+            return;
+        };
+        errdefer surface.releaseRole(self);
+
+        const scene_id = manager.xdg_shell.addWindowDecoration(
+            window.xdg_id,
+            surface.handle(),
+            layer,
+        ) catch |err| switch (err) {
+            error.InvalidWindow => return error.ResourceCreateFailed,
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        errdefer manager.xdg_shell.removeWindowDecoration(scene_id);
+        const id = manager.decorations.insert(manager.allocator, .{
+            .window_id = window_id,
+            .scene_id = scene_id,
+            .adapter = self,
+        }) catch return error.OutOfMemory;
+        errdefer _ = manager.decorations.remove(id);
+        self.id = id;
+
+        surface.assignReservedRole(.river_decoration, self) catch unreachable;
+        resource.setHandler(
+            *DecorationResource,
+            DecorationResource.handleRequest,
+            DecorationResource.handleDestroy,
+            self,
+        );
+    }
+
+    fn handleRequest(
+        resource: *river.DecorationV1,
+        request: river.DecorationV1.Request,
+        self: *DecorationResource,
+    ) void {
+        if (request == .destroy) {
+            resource.destroy();
+            return;
+        }
+        const manager_resource = self.activeManager() orelse return;
+        const decoration = self.manager.decorations.get(self.id) orelse return;
+        if (!self.requireRendering(manager_resource)) return;
+
+        switch (request) {
+            .destroy => unreachable,
+            .set_offset => |offset| decoration.pending_offset = .{
+                .x = offset.x,
+                .y = offset.y,
+            },
+            .sync_next_commit => self.synchronized_commit_requested = true,
+        }
+    }
+
+    fn beforeSurfaceCommit(
+        context: *anyopaque,
+        _: Surface.CommitInfo,
+    ) Surface.CommitAction {
+        const self: *DecorationResource = @ptrCast(@alignCast(context));
+        if (self.synchronized_commit_requested) {
+            self.synchronized_commit_requested = false;
+            self.synchronized_commit_cached = true;
+            return .cache;
+        }
+        if (self.synchronized_commit_cached) return .cache;
+        return .apply;
+    }
+
+    fn afterSurfaceCommit(context: *anyopaque, info: Surface.CommitInfo) void {
+        const self: *DecorationResource = @ptrCast(@alignCast(context));
+        const decoration = self.manager.decorations.get(self.id) orelse return;
+        const scene_id = decoration.scene_id orelse return;
+        self.manager.xdg_shell.setWindowDecorationMapped(scene_id, info.has_buffer);
+        self.manager.xdg_shell.windowDecorationCommitted(scene_id);
+    }
+
+    fn surfaceDestroyed(context: *anyopaque) void {
+        const self: *DecorationResource = @ptrCast(@alignCast(context));
+        self.surface = null;
+        self.synchronized_commit_requested = false;
+        self.synchronized_commit_cached = false;
+        const decoration = self.manager.decorations.get(self.id) orelse return;
+        if (decoration.scene_id) |scene_id| {
+            self.manager.xdg_shell.removeWindowDecoration(scene_id);
+            decoration.scene_id = null;
+        }
+    }
+
+    fn detach(self: *DecorationResource) void {
+        const decoration = self.manager.decorations.get(self.id) orelse return;
+        if (decoration.scene_id) |scene_id| {
+            self.manager.xdg_shell.removeWindowDecoration(scene_id);
+            decoration.scene_id = null;
+        }
+        decoration.pending_offset = null;
+        if (self.surface) |surface| surface.discardCachedCommit();
+        self.synchronized_commit_requested = false;
+        self.synchronized_commit_cached = false;
+    }
+
+    fn activeManager(self: *DecorationResource) ?*river.WindowManagerV1 {
+        if (self.manager.session_generation != self.owner_generation) return null;
+        return self.manager.active;
+    }
+
+    fn requireRendering(
+        self: *DecorationResource,
+        manager: *river.WindowManagerV1,
+    ) bool {
+        switch (self.manager.sequence.state) {
+            .manage, .inflight_configures, .render => return true,
+            .idle => {
+                manager.postError(.sequence_order, "decoration request outside a render sequence");
+                return false;
+            },
+        }
+    }
+
+    fn handleDestroy(_: *river.DecorationV1, self: *DecorationResource) void {
+        self.detach();
+        if (self.surface) |surface| surface.releaseRole(self);
+        _ = self.manager.decorations.remove(self.id);
         self.allocator.destroy(self);
     }
 };

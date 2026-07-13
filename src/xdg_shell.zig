@@ -431,6 +431,40 @@ pub fn setWindowContentClipBox(self: *Self, id: WindowId, clip_box: ?Scene.ClipB
     self.scene.setContentClipBox(window.scene_id, clip_box);
 }
 
+pub fn addWindowDecoration(
+    self: *Self,
+    id: WindowId,
+    surface_id: Surface.Id,
+    layer: Scene.DecorationLayer,
+) error{ InvalidWindow, OutOfMemory }!Scene.DecorationId {
+    const window = self.windows.get(id) orelse return error.InvalidWindow;
+    return self.scene.addDecoration(window.scene_id, surface_id, layer);
+}
+
+pub fn removeWindowDecoration(self: *Self, id: Scene.DecorationId) void {
+    self.scene.removeDecoration(id);
+}
+
+pub fn setWindowDecorationOffset(
+    self: *Self,
+    id: Scene.DecorationId,
+    offset: Scene.Position,
+) void {
+    self.scene.setDecorationOffset(id, offset);
+}
+
+pub fn setWindowDecorationMapped(
+    self: *Self,
+    id: Scene.DecorationId,
+    mapped: bool,
+) void {
+    self.scene.setDecorationMapped(id, mapped);
+}
+
+pub fn windowDecorationCommitted(self: *Self, id: Scene.DecorationId) void {
+    self.scene.decorationCommitted(id);
+}
+
 pub fn placeWindowTop(self: *Self, id: WindowId) void {
     const window = self.windows.get(id) orelse return;
     self.scene.placeTop(window.scene_id);

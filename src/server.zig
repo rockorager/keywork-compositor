@@ -229,6 +229,13 @@ fn renderFrame(self: *Self) renderer_types.Renderer.Error!void {
                 target,
             );
         }
+        try self.renderWindowDecorations(
+            entry.id,
+            entry.window,
+            .below,
+            window_clip,
+            target,
+        );
         var content_visible = true;
         var content_clip = if (entry.window.content_clip_box != null)
             content_rect
@@ -255,6 +262,13 @@ fn renderFrame(self: *Self) renderer_types.Renderer.Error!void {
             );
         }
         try self.renderWindowBorders(entry.window, content_rect, window_clip, target);
+        try self.renderWindowDecorations(
+            entry.id,
+            entry.window,
+            .above,
+            window_clip,
+            target,
+        );
     }
 
     self.frame_time_milliseconds +%= 16;
@@ -264,7 +278,9 @@ fn renderFrame(self: *Self) renderer_types.Renderer.Error!void {
         if (top_fullscreen) |id| {
             if (!std.meta.eql(entry.id, id)) continue;
         }
+        self.finishWindowDecorations(entry.id, .below);
         self.finishSurfaceTree(entry.window.surface_id);
+        self.finishWindowDecorations(entry.id, .above);
     }
 }
 
@@ -332,6 +348,28 @@ fn renderWindowBorders(
         .{ .size = self.headless_output.size, .commands = border_commands },
         target,
     );
+}
+
+fn renderWindowDecorations(
+    self: *Self,
+    window_id: Scene.Id,
+    window: *const Scene.Window,
+    layer: Scene.DecorationLayer,
+    clip: ?render.Rect,
+    target: renderer_types.Target,
+) renderer_types.Renderer.Error!void {
+    var decorations = self.scene.decorationIterator(window_id, layer);
+    while (decorations.next()) |entry| {
+        if (!entry.decoration.mapped) continue;
+        try self.renderSurfaceTree(
+            entry.decoration.surface_id,
+            window.position.x +| entry.decoration.offset.x,
+            window.position.y +| entry.decoration.offset.y,
+            0,
+            clip,
+            target,
+        );
+    }
 }
 
 fn makeBorderCommands(
@@ -438,6 +476,18 @@ fn finishSurfaceTree(self: *Self, surface_id: Surface.Id) void {
         ),
         .child => |child| self.finishSurfaceTree(child.surface_id),
     };
+}
+
+fn finishWindowDecorations(
+    self: *Self,
+    window_id: Scene.Id,
+    layer: Scene.DecorationLayer,
+) void {
+    var decorations = self.scene.decorationIterator(window_id, layer);
+    while (decorations.next()) |entry| {
+        if (!entry.decoration.mapped) continue;
+        self.finishSurfaceTree(entry.decoration.surface_id);
+    }
 }
 
 test "server creates and destroys protocol globals" {
