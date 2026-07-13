@@ -334,7 +334,26 @@ const XdgSurfaceResource = struct {
             .toplevel_resource = null,
         };
 
-        surface.reserveRole(.{
+        if (surface.assignedRole() != null) {
+            wm_base_resource.postError(.role, "wl_surface already has a role");
+            var removed = shell.xdg_surfaces.remove(state_id) orelse unreachable;
+            removed.deinit(shell.allocator);
+            shell.allocator.destroy(self);
+            resource.destroy();
+            return;
+        }
+        if (surface.hasBufferAttachedOrCommitted()) {
+            wm_base_resource.postError(
+                .invalid_surface_state,
+                "wl_surface already has a buffer attached or committed",
+            );
+            var removed = shell.xdg_surfaces.remove(state_id) orelse unreachable;
+            removed.deinit(shell.allocator);
+            shell.allocator.destroy(self);
+            resource.destroy();
+            return;
+        }
+        surface.reserveRole(.xdg_toplevel, .{
             .context = self,
             .before_commit = beforeSurfaceCommit,
             .after_commit = afterSurfaceCommit,
@@ -449,21 +468,21 @@ const XdgSurfaceResource = struct {
         state.last_acked_serial = serial;
     }
 
-    fn beforeSurfaceCommit(context: *anyopaque, info: Surface.CommitInfo) bool {
+    fn beforeSurfaceCommit(context: *anyopaque, info: Surface.CommitInfo) Surface.CommitAction {
         const self: *XdgSurfaceResource = @ptrCast(@alignCast(context));
         const state = self.shell.xdg_surfaces.get(self.id) orelse unreachable;
         if (state.role == null) {
             self.resource.postError(.not_constructed, "xdg_surface committed before role creation");
-            return false;
+            return .reject;
         }
         if (info.has_buffer and !state.configured and state.last_acked_serial == null) {
             self.resource.postError(
                 .unconfigured_buffer,
                 "buffer committed before the initial configure was acknowledged",
             );
-            return false;
+            return .reject;
         }
-        return true;
+        return .apply;
     }
 
     fn afterSurfaceCommit(context: *anyopaque, info: Surface.CommitInfo) void {
@@ -539,7 +558,7 @@ const ToplevelResource = struct {
         id: u32,
     ) error{ OutOfMemory, ResourceCreateFailed }!void {
         const surface = xdg_surface.surface orelse return error.ResourceCreateFailed;
-        surface.assignReservedRole(xdg_surface) catch {
+        surface.assignReservedRole(.xdg_toplevel, xdg_surface) catch {
             xdg_surface.resource.postError(.already_constructed, "wl_surface already has a role");
             return;
         };

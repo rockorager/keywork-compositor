@@ -33,6 +33,12 @@ pub fn copyFrom(self: *Self, other: *const Self) Error!void {
     }
 }
 
+pub fn unionWith(self: *Self, other: *const Self) Error!void {
+    if (pixman.pixman_region32_union(&self.region, &self.region, &other.region) == 0) {
+        return error.OutOfMemory;
+    }
+}
+
 pub fn add(self: *Self, x: i32, y: i32, width: i32, height: i32) Error!void {
     if (width <= 0 or height <= 0) return;
 

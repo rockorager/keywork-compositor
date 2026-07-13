@@ -8,6 +8,7 @@ pub fn build(b: *std.Build) void {
     const scanner = Scanner.create(b, .{});
     scanner.addSystemProtocol("stable/xdg-shell/xdg-shell.xml");
     scanner.generate("wl_compositor", 4);
+    scanner.generate("wl_subcompositor", 1);
     scanner.generate("wl_shm", 1);
     scanner.generate("wl_output", 4);
     scanner.generate("wl_seat", 10);

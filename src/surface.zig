@@ -18,6 +18,7 @@ resource: *wl.Surface,
 pending_attachment: Attachment,
 has_pending_attachment: bool,
 role_handler: ?RoleHandler,
+commit_listeners: std.ArrayList(*CommitListener),
 
 pub const Store = slot_map.SlotMap(State, enum { surface });
 pub const Id = Store.Id;
@@ -39,7 +40,18 @@ pub const State = struct {
     current_input: InputRegion,
     callbacks: std.ArrayList(*FrameCallback),
     current_buffer: ?BufferSnapshot,
-    role_assigned: bool,
+    cached_buffer: ?BufferSnapshot,
+    cached_attachment_changed: bool,
+    cached_offset_x: i32,
+    cached_offset_y: i32,
+    cached_scale: i32,
+    cached_transform: wl.Output.Transform,
+    cached_surface_damage: Region,
+    cached_buffer_damage: Region,
+    cached_opaque: Region,
+    cached_input: InputRegion,
+    has_cached_state: bool,
+    role: ?Role,
     has_committed: bool,
 
     fn init() State {
@@ -60,7 +72,18 @@ pub const State = struct {
             .current_input = InputRegion.init(),
             .callbacks = .empty,
             .current_buffer = null,
-            .role_assigned = false,
+            .cached_buffer = null,
+            .cached_attachment_changed = false,
+            .cached_offset_x = 0,
+            .cached_offset_y = 0,
+            .cached_scale = 1,
+            .cached_transform = .normal,
+            .cached_surface_damage = Region.init(),
+            .cached_buffer_damage = Region.init(),
+            .cached_opaque = Region.init(),
+            .cached_input = InputRegion.init(),
+            .has_cached_state = false,
+            .role = null,
             .has_committed = false,
         };
     }
@@ -69,12 +92,17 @@ pub const State = struct {
         std.debug.assert(self.callbacks.items.len == 0);
         self.callbacks.deinit(allocator);
         if (self.current_buffer) |*current| current.deinit();
+        if (self.cached_buffer) |*cached| cached.deinit();
         self.pending_surface_damage.deinit();
         self.pending_buffer_damage.deinit();
+        self.cached_surface_damage.deinit();
+        self.cached_buffer_damage.deinit();
         self.pending_opaque.deinit();
         self.current_opaque.deinit();
+        self.cached_opaque.deinit();
         self.pending_input.deinit();
         self.current_input.deinit();
+        self.cached_input.deinit();
         self.* = undefined;
     }
 };
@@ -109,6 +137,7 @@ pub fn create(
         .pending_attachment = .{},
         .has_pending_attachment = false,
         .role_handler = null,
+        .commit_listeners = .empty,
     };
 
     resource.setHandler(*Self, handleRequest, handleDestroy, self);
@@ -129,8 +158,12 @@ pub fn state(self: *Self) *State {
 pub const RoleError = error{
     AlreadyAssigned,
     AlreadyReserved,
-    HasBuffer,
     NotReserved,
+};
+
+pub const Role = enum {
+    xdg_toplevel,
+    subsurface,
 };
 
 pub const CommitInfo = struct {
@@ -139,30 +172,52 @@ pub const CommitInfo = struct {
     has_buffer: bool,
 };
 
+pub const CommitAction = enum {
+    apply,
+    cache,
+    apply_cached,
+    reject,
+};
+
 pub const RoleHandler = struct {
     context: *anyopaque,
-    before_commit: *const fn (*anyopaque, CommitInfo) bool,
+    before_commit: *const fn (*anyopaque, CommitInfo) CommitAction,
     after_commit: *const fn (*anyopaque, CommitInfo) void,
     surface_destroyed: *const fn (*anyopaque) void,
 };
 
-pub fn reserveRole(self: *Self, handler: RoleHandler) RoleError!void {
+pub const CommitListener = struct {
+    context: *anyopaque,
+    applied: *const fn (*anyopaque) void,
+    surface_destroyed: *const fn (*anyopaque) void,
+};
+
+pub fn reserveRole(self: *Self, role: Role, handler: RoleHandler) RoleError!void {
     const surface_state = self.state();
-    if (surface_state.role_assigned) return error.AlreadyAssigned;
-    if (self.role_handler != null) return error.AlreadyReserved;
-    if (self.pending_attachment.shm != null or surface_state.current_buffer != null) {
-        return error.HasBuffer;
+    if (surface_state.role) |assigned| {
+        if (assigned != role) return error.AlreadyAssigned;
     }
+    if (self.role_handler != null) return error.AlreadyReserved;
 
     self.role_handler = handler;
 }
 
-pub fn assignReservedRole(self: *Self, context: *anyopaque) RoleError!void {
+pub fn assignReservedRole(self: *Self, role: Role, context: *anyopaque) RoleError!void {
     const surface_state = self.state();
-    if (surface_state.role_assigned) return error.AlreadyAssigned;
+    if (surface_state.role) |assigned| {
+        if (assigned != role) return error.AlreadyAssigned;
+    }
     const handler = self.role_handler orelse return error.NotReserved;
     if (handler.context != context) return error.NotReserved;
-    surface_state.role_assigned = true;
+    surface_state.role = role;
+}
+
+pub fn assignedRole(self: *Self) ?Role {
+    return self.state().role;
+}
+
+pub fn hasBufferAttachedOrCommitted(self: *Self) bool {
+    return self.pending_attachment.shm != null or self.state().current_buffer != null;
 }
 
 pub fn releaseRole(self: *Self, context: *anyopaque) void {
@@ -171,11 +226,54 @@ pub fn releaseRole(self: *Self, context: *anyopaque) void {
     self.role_handler = null;
 }
 
+pub fn addCommitListener(
+    self: *Self,
+    listener: *CommitListener,
+) error{OutOfMemory}!void {
+    try self.commit_listeners.append(self.allocator, listener);
+}
+
+pub fn removeCommitListener(self: *Self, listener: *CommitListener) void {
+    for (self.commit_listeners.items, 0..) |candidate, index| {
+        if (candidate == listener) {
+            _ = self.commit_listeners.orderedRemove(index);
+            return;
+        }
+    }
+    unreachable;
+}
+
+pub fn applyCachedCommit(self: *Self) void {
+    if (!self.state().has_cached_state) return;
+    applyCached(self);
+}
+
+pub fn hasCachedCommit(self: *Self) bool {
+    return self.state().has_cached_state;
+}
+
+pub fn discardCachedCommit(self: *Self) void {
+    const surface_state = self.state();
+    if (surface_state.cached_buffer) |*cached| cached.deinit();
+    surface_state.cached_buffer = null;
+    surface_state.cached_attachment_changed = false;
+    surface_state.cached_surface_damage.clear();
+    surface_state.cached_buffer_damage.clear();
+    surface_state.has_cached_state = false;
+
+    var index = surface_state.callbacks.items.len;
+    while (index > 0) {
+        index -= 1;
+        const callback = surface_state.callbacks.items[index];
+        if (callback.state == .cached) callback.resource.destroy();
+    }
+}
+
 pub fn sendFrameDone(self: *Self, time_milliseconds: u32) void {
     const surface_state = self.state();
     while (true) {
         const callback = for (surface_state.callbacks.items) |candidate| {
-            if (!candidate.pending) break candidate;
+            if (candidate.state == .active) break candidate;
         } else return;
 
         callback.resource.destroySendDone(time_milliseconds);
@@ -250,18 +348,41 @@ fn handleRequest(resource: *wl.Surface, request: wl.Surface.Request, self: *Self
 }
 
 fn commit(self: *Self) void {
+    const commit_info = pendingCommitInfo(self);
+    const action = if (self.role_handler) |handler|
+        handler.before_commit(handler.context, commit_info)
+    else
+        CommitAction.apply;
+
+    switch (action) {
+        .apply => {
+            std.debug.assert(!self.state().has_cached_state);
+            applyPending(self, commit_info);
+        },
+        .cache => _ = cachePending(self),
+        .apply_cached => {
+            if (cachePending(self)) applyCached(self);
+        },
+        .reject => {},
+    }
+}
+
+fn pendingCommitInfo(self: *Self) CommitInfo {
     const surface_state = self.state();
-    const commit_info: CommitInfo = .{
+    return .{
         .attachment_changed = self.has_pending_attachment,
         .had_buffer = surface_state.current_buffer != null,
         .has_buffer = if (self.has_pending_attachment)
             self.pending_attachment.shm != null
+        else if (surface_state.cached_attachment_changed)
+            surface_state.cached_buffer != null
         else
             surface_state.current_buffer != null,
     };
-    if (self.role_handler) |handler| {
-        if (!handler.before_commit(handler.context, commit_info)) return;
-    }
+}
+
+fn applyPending(self: *Self, commit_info: CommitInfo) void {
+    const surface_state = self.state();
 
     surface_state.current_opaque.copyFrom(&surface_state.pending_opaque) catch {
         self.resource.postNoMemory();
@@ -324,14 +445,175 @@ fn commit(self: *Self) void {
     surface_state.pending_surface_damage.clear();
     surface_state.pending_buffer_damage.clear();
     surface_state.has_committed = true;
-    for (surface_state.callbacks.items) |callback| callback.pending = false;
+    for (surface_state.callbacks.items) |callback| {
+        if (callback.state == .pending) callback.state = .active;
+    }
 
+    finishApplied(self, commit_info);
+}
+
+fn cachePending(self: *Self) bool {
+    const surface_state = self.state();
+    var snapshot: ?BufferSnapshot = null;
+    defer if (snapshot) |*buffer| buffer.deinit();
+
+    if (self.has_pending_attachment) {
+        if (self.pending_attachment.shm) |shm_buffer| {
+            snapshot = BufferSnapshot.copyShm(
+                self.allocator,
+                shm_buffer,
+                surface_state.pending_scale,
+                surface_state.pending_transform,
+            ) catch |err| {
+                postBufferError(self, err);
+                return false;
+            };
+        }
+    } else {
+        const buffer = if (surface_state.cached_attachment_changed)
+            if (surface_state.cached_buffer) |*cached| cached else null
+        else if (surface_state.current_buffer) |*current|
+            current
+        else
+            null;
+        if (buffer) |existing| {
+            _ = logicalSize(
+                existing.buffer_size,
+                surface_state.pending_scale,
+                surface_state.pending_transform,
+            ) catch {
+                self.resource.postError(
+                    .invalid_size,
+                    "buffer dimensions are incompatible with surface state",
+                );
+                return false;
+            };
+        }
+    }
+
+    surface_state.cached_opaque.copyFrom(&surface_state.pending_opaque) catch {
+        self.resource.postNoMemory();
+        return false;
+    };
+    surface_state.cached_input.copyFrom(&surface_state.pending_input) catch {
+        self.resource.postNoMemory();
+        return false;
+    };
+    surface_state.cached_surface_damage.unionWith(&surface_state.pending_surface_damage) catch {
+        self.resource.postNoMemory();
+        return false;
+    };
+    surface_state.cached_buffer_damage.unionWith(&surface_state.pending_buffer_damage) catch {
+        self.resource.postNoMemory();
+        return false;
+    };
+
+    if (self.has_pending_attachment) {
+        if (surface_state.cached_buffer) |*cached| cached.deinit();
+        surface_state.cached_buffer = snapshot;
+        snapshot = null;
+        surface_state.cached_attachment_changed = true;
+        surface_state.cached_offset_x = surface_state.pending_offset_x;
+        surface_state.cached_offset_y = surface_state.pending_offset_y;
+
+        if (self.pending_attachment.resource) |buffer| buffer.sendRelease();
+        self.pending_attachment.clear();
+        self.has_pending_attachment = false;
+    }
+
+    surface_state.cached_scale = surface_state.pending_scale;
+    surface_state.cached_transform = surface_state.pending_transform;
+    surface_state.pending_surface_damage.clear();
+    surface_state.pending_buffer_damage.clear();
+    surface_state.has_cached_state = true;
+    surface_state.has_committed = true;
+    for (surface_state.callbacks.items) |callback| {
+        if (callback.state == .pending) callback.state = .cached;
+    }
+    return true;
+}
+
+fn applyCached(self: *Self) void {
+    const surface_state = self.state();
+    std.debug.assert(surface_state.has_cached_state);
+    const commit_info: CommitInfo = .{
+        .attachment_changed = surface_state.cached_attachment_changed,
+        .had_buffer = surface_state.current_buffer != null,
+        .has_buffer = if (surface_state.cached_attachment_changed)
+            surface_state.cached_buffer != null
+        else
+            surface_state.current_buffer != null,
+    };
+
+    surface_state.current_opaque.copyFrom(&surface_state.cached_opaque) catch {
+        self.resource.postNoMemory();
+        return;
+    };
+    surface_state.current_input.copyFrom(&surface_state.cached_input) catch {
+        self.resource.postNoMemory();
+        return;
+    };
+
+    if (surface_state.cached_attachment_changed) {
+        if (surface_state.current_buffer) |*current| current.deinit();
+        surface_state.current_buffer = surface_state.cached_buffer;
+        surface_state.cached_buffer = null;
+        surface_state.current_offset_x = surface_state.cached_offset_x;
+        surface_state.current_offset_y = surface_state.cached_offset_y;
+        surface_state.cached_attachment_changed = false;
+    }
+    if (surface_state.current_buffer) |*current| {
+        current.logical_size = logicalSize(
+            current.buffer_size,
+            surface_state.cached_scale,
+            surface_state.cached_transform,
+        ) catch unreachable;
+        current.scale = surface_state.cached_scale;
+        current.transform = surface_state.cached_transform;
+    }
+
+    surface_state.current_scale = surface_state.cached_scale;
+    surface_state.current_transform = surface_state.cached_transform;
+    surface_state.cached_surface_damage.clear();
+    surface_state.cached_buffer_damage.clear();
+    surface_state.has_cached_state = false;
+    for (surface_state.callbacks.items) |callback| {
+        if (callback.state == .cached) callback.state = .active;
+    }
+
+    finishApplied(self, commit_info);
+}
+
+fn postBufferError(self: *Self, err: BufferSnapshot.Error) void {
+    switch (err) {
+        error.OutOfMemory => self.resource.postNoMemory(),
+        error.InvalidSize => self.resource.postError(
+            .invalid_size,
+            "buffer dimensions are incompatible with surface state",
+        ),
+        error.InvalidBuffer => self.resource.getClient().postImplementationError(
+            "invalid shared-memory buffer",
+        ),
+    }
+}
+
+fn finishApplied(self: *Self, commit_info: CommitInfo) void {
     if (self.role_handler) |handler| handler.after_commit(handler.context, commit_info);
+
+    for (self.commit_listeners.items) |listener| listener.applied(listener.context);
 }
 
 fn handleDestroy(_: *wl.Surface, self: *Self) void {
     self.pending_attachment.clear();
     if (self.role_handler) |handler| handler.surface_destroyed(handler.context);
+    while (self.commit_listeners.items.len > 0) {
+        const previous_len = self.commit_listeners.items.len;
+        self.commit_listeners.items[previous_len - 1].surface_destroyed(
+            self.commit_listeners.items[previous_len - 1].context,
+        );
+        std.debug.assert(self.commit_listeners.items.len < previous_len);
+    }
+    self.commit_listeners.deinit(self.allocator);
     const surface_state = self.state();
 
     while (surface_state.callbacks.items.len > 0) {
@@ -543,7 +825,7 @@ const FrameCallback = struct {
     store: *Store,
     surface_id: Id,
     resource: *wl.Callback,
-    pending: bool,
+    state: enum { pending, cached, active },
 
     fn handleDestroy(resource: *wl.Resource) callconv(.c) void {
         const self: *FrameCallback = @ptrCast(@alignCast(resource.getUserData().?));
@@ -564,7 +846,7 @@ fn createFrameCallback(self: *Self, id: u32) error{OutOfMemory}!void {
         .store = self.store,
         .surface_id = self.id,
         .resource = resource,
-        .pending = true,
+        .state = .pending,
     };
     try self.state().callbacks.append(self.allocator, callback);
 
