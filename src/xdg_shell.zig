@@ -256,6 +256,33 @@ pub fn setWindowVisible(self: *Self, id: WindowId, visible: bool) void {
     self.scene.setMapped(window.scene_id, visible and window.mapped);
 }
 
+pub fn setWindowPosition(self: *Self, id: WindowId, position: Scene.Position) void {
+    const window = self.windows.get(id) orelse return;
+    self.scene.setPosition(window.scene_id, position);
+}
+
+pub fn placeWindowTop(self: *Self, id: WindowId) void {
+    const window = self.windows.get(id) orelse return;
+    self.scene.placeTop(window.scene_id);
+}
+
+pub fn placeWindowBottom(self: *Self, id: WindowId) void {
+    const window = self.windows.get(id) orelse return;
+    self.scene.placeBottom(window.scene_id);
+}
+
+pub fn placeWindowAbove(self: *Self, id: WindowId, other: WindowId) void {
+    const window = self.windows.get(id) orelse return;
+    const other_window = self.windows.get(other) orelse return;
+    self.scene.placeAbove(window.scene_id, other_window.scene_id);
+}
+
+pub fn placeWindowBelow(self: *Self, id: WindowId, other: WindowId) void {
+    const window = self.windows.get(id) orelse return;
+    const other_window = self.windows.get(other) orelse return;
+    self.scene.placeBelow(window.scene_id, other_window.scene_id);
+}
+
 pub fn closeWindow(self: *Self, id: WindowId) void {
     const window = self.windows.get(id) orelse return;
     const state = self.xdg_surfaces.get(window.xdg_surface_id) orelse return;

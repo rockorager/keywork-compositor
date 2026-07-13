@@ -143,6 +143,42 @@ pub fn setPosition(self: *Self, id: Id, position: Position) void {
     if (window.mapped) self.requestRepaint();
 }
 
+pub fn placeTop(self: *Self, id: Id) void {
+    const index = self.stackIndex(id) orelse return;
+    if (index == self.stack.items.len - 1) return;
+    const moved = self.stack.orderedRemove(index);
+    self.stack.appendAssumeCapacity(moved);
+    if (self.windows.get(id).?.mapped) self.requestRepaint();
+}
+
+pub fn placeBottom(self: *Self, id: Id) void {
+    const index = self.stackIndex(id) orelse return;
+    if (index == 0) return;
+    const moved = self.stack.orderedRemove(index);
+    self.stack.insertAssumeCapacity(0, moved);
+    if (self.windows.get(id).?.mapped) self.requestRepaint();
+}
+
+pub fn placeAbove(self: *Self, id: Id, other: Id) void {
+    if (std.meta.eql(id, other)) return;
+    const index = self.stackIndex(id) orelse return;
+    if (self.stackIndex(other) == null) return;
+    const moved = self.stack.orderedRemove(index);
+    const other_index = self.stackIndex(other) orelse unreachable;
+    self.stack.insertAssumeCapacity(other_index + 1, moved);
+    if (self.windows.get(id).?.mapped) self.requestRepaint();
+}
+
+pub fn placeBelow(self: *Self, id: Id, other: Id) void {
+    if (std.meta.eql(id, other)) return;
+    const index = self.stackIndex(id) orelse return;
+    if (self.stackIndex(other) == null) return;
+    const moved = self.stack.orderedRemove(index);
+    const other_index = self.stackIndex(other) orelse unreachable;
+    self.stack.insertAssumeCapacity(other_index, moved);
+    if (self.windows.get(id).?.mapped) self.requestRepaint();
+}
+
 pub fn setFocused(self: *Self, id: Id, focused: bool) void {
     const window = self.windows.get(id) orelse return;
     if (window.focused == focused) return;
@@ -162,6 +198,14 @@ pub fn iterator(self: *Self) Iterator {
 
 fn requestRepaint(self: *Self) void {
     if (self.repaint_listener) |listener| listener.request(listener.context);
+}
+
+fn stackIndex(self: *Self, id: Id) ?usize {
+    if (self.windows.get(id) == null) return null;
+    for (self.stack.items, 0..) |candidate, index| {
+        if (std.meta.eql(candidate, id)) return index;
+    }
+    unreachable;
 }
 
 test "scene keeps visual state behind generational handles" {
@@ -188,4 +232,27 @@ test "scene keeps visual state behind generational handles" {
 
     scene.removeWindow(id);
     try std.testing.expectEqual(@as(?*Window, null), scene.windows.get(id));
+}
+
+test "scene reorders windows through handles" {
+    var scene: Self = undefined;
+    scene.init(std.testing.allocator);
+    defer scene.deinit();
+
+    const first = try scene.addWindow(.{ .index = 1, .generation = 1 });
+    const second = try scene.addWindow(.{ .index = 2, .generation = 1 });
+    const third = try scene.addWindow(.{ .index = 3, .generation = 1 });
+
+    scene.placeTop(first);
+    try std.testing.expectEqualSlices(Id, &.{ second, third, first }, scene.stack.items);
+    scene.placeBelow(first, third);
+    try std.testing.expectEqualSlices(Id, &.{ second, first, third }, scene.stack.items);
+    scene.placeAbove(second, third);
+    try std.testing.expectEqualSlices(Id, &.{ first, third, second }, scene.stack.items);
+    scene.placeBottom(second);
+    try std.testing.expectEqualSlices(Id, &.{ second, first, third }, scene.stack.items);
+
+    scene.removeWindow(first);
+    scene.removeWindow(second);
+    scene.removeWindow(third);
 }

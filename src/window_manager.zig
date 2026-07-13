@@ -5,6 +5,7 @@ const Self = @This();
 const std = @import("std");
 const wayland = @import("wayland");
 const Output = @import("output.zig");
+const Scene = @import("scene.zig");
 const Seat = @import("seat.zig");
 const slot_map = @import("slot_map.zig");
 const XdgShell = @import("xdg_shell.zig");
@@ -21,6 +22,7 @@ active: ?*river.WindowManagerV1,
 session_generation: u64,
 sequence: Sequence,
 windows: WindowStore,
+stack_operations: std.ArrayList(StackOperation),
 configure_timer: *wl.EventSource,
 
 const WindowStore = slot_map.SlotMap(ManagedWindow, enum { managed_window });
@@ -29,6 +31,8 @@ const WindowId = WindowStore.Id;
 const ManagedWindow = struct {
     xdg_id: XdgShell.WindowId,
     resource: ?*river.WindowV1 = null,
+    node_resource: ?*river.NodeV1 = null,
+    node_created: bool = false,
     metadata_dirty: bool = true,
     proposed_dimensions: ?XdgShell.Dimensions = null,
     configure: ConfigureState = .idle,
@@ -36,6 +40,14 @@ const ManagedWindow = struct {
     last_dimensions: ?XdgShell.Dimensions = null,
     display_ready: bool = false,
     requested_visible: bool = true,
+    pending_position: ?Scene.Position = null,
+};
+
+const StackOperation = union(enum) {
+    top: WindowId,
+    bottom: WindowId,
+    above: struct { id: WindowId, other: WindowId },
+    below: struct { id: WindowId, other: WindowId },
 };
 
 const ConfigureState = union(enum) {
@@ -127,9 +139,11 @@ pub fn init(
         .session_generation = 0,
         .sequence = .{},
         .windows = .{},
+        .stack_operations = .empty,
         .configure_timer = undefined,
     };
     errdefer self.windows.deinit(allocator);
+    errdefer self.stack_operations.deinit(allocator);
     self.global = try wl.Global.create(display, river.WindowManagerV1, 1, *Self, self, bind);
     errdefer self.global.destroy();
     self.configure_timer = try display.getEventLoop().addTimer(*Self, handleConfigureTimeout, self);
@@ -148,6 +162,7 @@ pub fn deinit(self: *Self) void {
     self.configure_timer.remove();
     self.releaseWindows();
     self.windows.deinit(self.allocator);
+    self.stack_operations.deinit(self.allocator);
     self.global.destroy();
     self.* = undefined;
 }
@@ -356,11 +371,36 @@ fn finishRender(self: *Self, manager: *river.WindowManagerV1) void {
 
     var iterator = self.windows.iterator();
     while (iterator.next()) |entry| {
+        if (entry.value.pending_position) |position| {
+            self.xdg_shell.setWindowPosition(entry.value.xdg_id, position);
+            entry.value.pending_position = null;
+        }
         self.xdg_shell.setWindowVisible(
             entry.value.xdg_id,
             entry.value.display_ready and entry.value.requested_visible,
         );
     }
+    for (self.stack_operations.items) |operation| switch (operation) {
+        .top => |id| {
+            const window = self.windows.get(id) orelse continue;
+            self.xdg_shell.placeWindowTop(window.xdg_id);
+        },
+        .bottom => |id| {
+            const window = self.windows.get(id) orelse continue;
+            self.xdg_shell.placeWindowBottom(window.xdg_id);
+        },
+        .above => |placement| {
+            const window = self.windows.get(placement.id) orelse continue;
+            const other = self.windows.get(placement.other) orelse continue;
+            self.xdg_shell.placeWindowAbove(window.xdg_id, other.xdg_id);
+        },
+        .below => |placement| {
+            const window = self.windows.get(placement.id) orelse continue;
+            const other = self.windows.get(placement.other) orelse continue;
+            self.xdg_shell.placeWindowBelow(window.xdg_id, other.xdg_id);
+        },
+    };
+    self.stack_operations.clearRetainingCapacity();
     switch (self.sequence.finishRender()) {
         .invalid => unreachable,
         .idle => {},
@@ -377,6 +417,7 @@ fn finishRender(self: *Self, manager: *river.WindowManagerV1) void {
 fn releaseManager(self: *Self) void {
     self.active = null;
     self.sequence.reset();
+    self.stack_operations.clearRetainingCapacity();
     self.releaseWindows();
 }
 
@@ -544,9 +585,12 @@ const WindowResource = struct {
             .fullscreen,
             .exit_fullscreen,
             => _ = self.requireManage(manager_resource),
-            .get_node => resource.getClient().postImplementationError(
-                "river render nodes are not implemented",
-            ),
+            .get_node => |get| NodeResource.create(
+                self.manager,
+                self.id,
+                resource,
+                get.id,
+            ) catch resource.postNoMemory(),
             .use_ssd => resource.getClient().postImplementationError(
                 "server-side xdg decorations are not implemented",
             ),
@@ -584,6 +628,118 @@ const WindowResource = struct {
     fn handleDestroy(_: *river.WindowV1, self: *WindowResource) void {
         if (self.manager.session_generation == self.owner_generation) {
             if (self.manager.windows.get(self.id)) |window| window.resource = null;
+        }
+        self.allocator.destroy(self);
+    }
+};
+
+const NodeResource = struct {
+    allocator: std.mem.Allocator,
+    manager: *Self,
+    id: WindowId,
+    owner_generation: u64,
+
+    fn create(
+        manager: *Self,
+        id: WindowId,
+        window_resource: *river.WindowV1,
+        protocol_id: u32,
+    ) error{ OutOfMemory, ResourceCreateFailed }!void {
+        const window = manager.windows.get(id) orelse return error.ResourceCreateFailed;
+        if (window.node_created) {
+            window_resource.postError(.node_exists, "window already has a render node");
+            return;
+        }
+
+        const resource = try river.NodeV1.create(
+            window_resource.getClient(),
+            window_resource.getVersion(),
+            protocol_id,
+        );
+        errdefer resource.destroy();
+        const self = manager.allocator.create(NodeResource) catch return error.OutOfMemory;
+        errdefer manager.allocator.destroy(self);
+        self.* = .{
+            .allocator = manager.allocator,
+            .manager = manager,
+            .id = id,
+            .owner_generation = manager.session_generation,
+        };
+        resource.setHandler(*NodeResource, NodeResource.handleRequest, NodeResource.handleDestroy, self);
+        window.node_created = true;
+        window.node_resource = resource;
+    }
+
+    fn handleRequest(
+        resource: *river.NodeV1,
+        request: river.NodeV1.Request,
+        self: *NodeResource,
+    ) void {
+        if (request == .destroy) {
+            resource.destroy();
+            return;
+        }
+        const manager_resource = self.activeManager() orelse return;
+        const window = self.manager.windows.get(self.id) orelse return;
+        if (!self.requireRendering(manager_resource)) return;
+
+        switch (request) {
+            .destroy => unreachable,
+            .set_position => |position| window.pending_position = .{
+                .x = position.x,
+                .y = position.y,
+            },
+            .place_top => self.appendOperation(resource, .{ .top = self.id }),
+            .place_bottom => self.appendOperation(resource, .{ .bottom = self.id }),
+            .place_above => |placement| {
+                const other = self.resolveOther(placement.other) orelse return;
+                self.appendOperation(resource, .{ .above = .{ .id = self.id, .other = other } });
+            },
+            .place_below => |placement| {
+                const other = self.resolveOther(placement.other) orelse return;
+                self.appendOperation(resource, .{ .below = .{ .id = self.id, .other = other } });
+            },
+        }
+    }
+
+    fn appendOperation(
+        self: *NodeResource,
+        resource: *river.NodeV1,
+        operation: StackOperation,
+    ) void {
+        self.manager.stack_operations.append(self.manager.allocator, operation) catch
+            resource.postNoMemory();
+    }
+
+    fn resolveOther(self: *NodeResource, resource: *river.NodeV1) ?WindowId {
+        const data = resource.getUserData() orelse return null;
+        const other: *NodeResource = @ptrCast(@alignCast(data));
+        if (other.manager != self.manager or
+            other.owner_generation != self.owner_generation) return null;
+        if (self.manager.windows.get(other.id) == null) return null;
+        return other.id;
+    }
+
+    fn activeManager(self: *NodeResource) ?*river.WindowManagerV1 {
+        if (self.manager.session_generation != self.owner_generation) return null;
+        return self.manager.active;
+    }
+
+    fn requireRendering(self: *NodeResource, manager: *river.WindowManagerV1) bool {
+        switch (self.manager.sequence.state) {
+            .manage, .inflight_configures, .render => return true,
+            .idle => {
+                manager.postError(.sequence_order, "node request outside a render sequence");
+                return false;
+            },
+        }
+    }
+
+    fn handleDestroy(resource: *river.NodeV1, self: *NodeResource) void {
+        if (self.manager.session_generation == self.owner_generation) {
+            if (self.manager.windows.get(self.id)) |window| {
+                if (window.node_resource == resource) window.node_resource = null;
+            }
         }
         self.allocator.destroy(self);
     }
