@@ -5,6 +5,7 @@ const Self = @This();
 const std = @import("std");
 const wayland = @import("wayland");
 const Surface = @import("surface.zig");
+const Output = @import("output.zig");
 const WaylandRegion = @import("wayland_region.zig");
 
 const wl = wayland.server.wl;
@@ -12,15 +13,17 @@ const wl = wayland.server.wl;
 allocator: std.mem.Allocator,
 global: *wl.Global,
 surfaces: Surface.Store,
+output: ?*Output,
 
 pub fn init(self: *Self, allocator: std.mem.Allocator, display: *wl.Server) !void {
     self.* = .{
         .allocator = allocator,
         .global = undefined,
         .surfaces = .{},
+        .output = null,
     };
     errdefer self.surfaces.deinit(allocator);
-    self.global = try wl.Global.create(display, wl.Compositor, 4, *Self, self, bind);
+    self.global = try wl.Global.create(display, wl.Compositor, 6, *Self, self, bind);
 }
 
 pub fn deinit(self: *Self) void {
@@ -33,6 +36,11 @@ pub fn surfaceStore(self: *Self) *Surface.Store {
     return &self.surfaces;
 }
 
+pub fn setOutput(self: *Self, output: *Output) void {
+    std.debug.assert(self.output == null);
+    self.output = output;
+}
+
 fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
     const resource = wl.Compositor.create(client, version, id) catch {
         client.postNoMemory();
@@ -43,13 +51,7 @@ fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
 
 fn handleRequest(resource: *wl.Compositor, request: wl.Compositor.Request, self: *Self) void {
     switch (request) {
-        .create_surface => |create| Surface.create(
-            self.allocator,
-            &self.surfaces,
-            resource.getClient(),
-            resource.getVersion(),
-            create.id,
-        ) catch resource.postNoMemory(),
+        .create_surface => |create| self.createSurface(resource, create.id),
         .create_region => |create| WaylandRegion.create(
             self.allocator,
             resource.getClient(),
@@ -57,4 +59,18 @@ fn handleRequest(resource: *wl.Compositor, request: wl.Compositor.Request, self:
             create.id,
         ) catch resource.postNoMemory(),
     }
+}
+
+fn createSurface(self: *Self, compositor: *wl.Compositor, id: u32) void {
+    const surface = Surface.create(
+        self.allocator,
+        &self.surfaces,
+        compositor.getClient(),
+        compositor.getVersion(),
+        id,
+    ) catch {
+        compositor.postNoMemory();
+        return;
+    };
+    if (self.output) |output| output.configureSurface(surface.waylandResource());
 }

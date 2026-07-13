@@ -432,15 +432,28 @@ fn composite(
     const source = try createImage(image.buffer);
     defer _ = pixman.pixman_image_unref(source);
     if (image.size.width == 0 or image.size.height == 0) return error.InvalidTarget;
-    if (!std.meta.eql(image.size, image.buffer.size)) {
+    const source_rect = image.source orelse render_types.SourceRect{
+        .x = 0,
+        .y = 0,
+        .width = @floatFromInt(image.buffer.size.width),
+        .height = @floatFromInt(image.buffer.size.height),
+    };
+    if (!validSourceRect(source_rect, image.buffer.size)) return error.InvalidTarget;
+    if (image.source != null or
+        source_rect.width != @as(f64, @floatFromInt(image.size.width)) or
+        source_rect.height != @as(f64, @floatFromInt(image.size.height)))
+    {
+        const floating_transform: pixman.pixman_f_transform_t = .{ .m = .{
+            .{ source_rect.width / @as(f64, @floatFromInt(image.size.width)), 0, source_rect.x },
+            .{ 0, source_rect.height / @as(f64, @floatFromInt(image.size.height)), source_rect.y },
+            .{ 0, 0, 1 },
+        } };
         var transform: pixman.pixman_transform_t = undefined;
-        pixman.pixman_transform_init_scale(
+        if (pixman.pixman_transform_from_pixman_f_transform(
             &transform,
-            try fixedRatio(image.buffer.size.width, image.size.width),
-            try fixedRatio(image.buffer.size.height, image.size.height),
-        );
-        if (pixman.pixman_image_set_transform(source, &transform) == 0 or
-            pixman.pixman_image_set_filter(source, pixman.PIXMAN_FILTER_NEAREST, null, 0) == 0)
+            &floating_transform,
+        ) == 0 or pixman.pixman_image_set_transform(source, &transform) == 0 or
+            pixman.pixman_image_set_filter(source, pixman.PIXMAN_FILTER_BILINEAR, null, 0) == 0)
         {
             return error.OutOfMemory;
         }
@@ -477,6 +490,14 @@ fn composite(
         @intCast(clipped.width),
         @intCast(clipped.height),
     );
+}
+
+fn validSourceRect(source: render_types.SourceRect, buffer_size: render_types.Size) bool {
+    return std.math.isFinite(source.x) and std.math.isFinite(source.y) and
+        std.math.isFinite(source.width) and std.math.isFinite(source.height) and
+        source.x >= 0 and source.y >= 0 and source.width > 0 and source.height > 0 and
+        source.x + source.width <= @as(f64, @floatFromInt(buffer_size.width)) and
+        source.y + source.height <= @as(f64, @floatFromInt(buffer_size.height));
 }
 
 fn createRoundedMask(
@@ -526,14 +547,6 @@ fn createRoundedMask(
         }
     }
     return mask;
-}
-
-fn fixedRatio(numerator: u32, denominator: u32) Error!pixman.pixman_fixed_t {
-    std.debug.assert(denominator > 0);
-    const scaled = @as(u64, numerator) << 16;
-    const ratio = scaled / denominator;
-    if (ratio > std.math.maxInt(pixman.pixman_fixed_t)) return error.InvalidTarget;
-    return @intCast(ratio);
 }
 
 fn fill(
@@ -666,6 +679,36 @@ test "CPU renderer scales images to logical size" {
     }, output.target());
 
     try std.testing.expectEqual(@as(u32, 0xff336699), output.pixel(0, 0));
+}
+
+test "CPU renderer crops an image source rectangle" {
+    var output = try headless.init(std.testing.allocator, .{ .width = 2, .height = 1 });
+    defer output.deinit();
+
+    var source_pixels = [_]u32{ 0xffff0000, 0xff00ff00, 0xff0000ff, 0xffffffff };
+    const commands = [_]render_types.Command{
+        .{ .image = .{
+            .x = 0,
+            .y = 0,
+            .size = .{ .width = 2, .height = 1 },
+            .buffer = .{
+                .size = .{ .width = 4, .height = 1 },
+                .stride_pixels = 4,
+                .pixels = &source_pixels,
+            },
+            .source = .{ .x = 1, .y = 0, .width = 2, .height = 1 },
+        } },
+    };
+
+    var renderer = Self.init(std.testing.allocator);
+    defer renderer.deinit();
+    try renderer.render(.{
+        .size = .{ .width = 2, .height = 1 },
+        .commands = &commands,
+    }, output.target());
+
+    try std.testing.expectEqual(@as(u32, 0xff00ff00), output.pixel(0, 0));
+    try std.testing.expectEqual(@as(u32, 0xff0000ff), output.pixel(1, 0));
 }
 
 test "CPU renderer clips image corners with an antialiased mask" {

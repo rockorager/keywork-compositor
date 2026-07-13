@@ -9,12 +9,14 @@ const Subcompositor = @import("subcompositor.zig");
 const XdgShell = @import("xdg_shell.zig");
 const Seat = @import("seat.zig");
 const DataDevice = @import("data_device.zig");
+const FractionalScale = @import("fractional_scale.zig");
 const Output = @import("output.zig");
 const OutputBackend = @import("output_backend.zig");
 const renderer_types = @import("renderer.zig");
 const render = @import("render.zig");
 const Scene = @import("scene.zig");
 const Surface = @import("surface.zig");
+const Viewporter = @import("viewporter.zig");
 const WindowManager = @import("window_manager.zig");
 
 const wl = wayland.server.wl;
@@ -30,6 +32,8 @@ scene: Scene,
 xdg_shell: XdgShell,
 seat: Seat,
 data_device: DataDevice,
+fractional_scale: FractionalScale,
+viewporter: Viewporter,
 window_manager: WindowManager,
 renderer: renderer_types.Renderer,
 render_timer: *wl.EventSource,
@@ -62,6 +66,8 @@ pub fn create(
         .xdg_shell = undefined,
         .seat = undefined,
         .data_device = undefined,
+        .fractional_scale = undefined,
+        .viewporter = undefined,
         .window_manager = undefined,
         .renderer = try renderer_types.Renderer.init(allocator, renderer_kind),
         .render_timer = undefined,
@@ -107,8 +113,24 @@ pub fn create(
         },
     );
     errdefer self.render_output.deinit();
-    try self.output.init(display, self.render_output.size());
+    try self.output.init(
+        allocator,
+        display,
+        self.render_output.size(),
+        self.render_output.physicalSize(),
+        self.render_output.clientScale(),
+        self.compositor.surfaceStore(),
+    );
     errdefer self.output.deinit();
+    self.compositor.setOutput(&self.output);
+    try self.viewporter.init(allocator, display);
+    errdefer self.viewporter.deinit();
+    try self.fractional_scale.init(
+        allocator,
+        display,
+        self.render_output.renderScale(),
+    );
+    errdefer self.fractional_scale.deinit();
     try self.subcompositor.init(allocator, display, self.compositor.surfaceStore());
     errdefer self.subcompositor.deinit();
     self.scene.init(allocator);
@@ -156,6 +178,8 @@ pub fn destroy(self: *Self) void {
     self.xdg_shell.deinit();
     self.scene.deinit();
     self.subcompositor.deinit();
+    self.fractional_scale.deinit();
+    self.viewporter.deinit();
     self.output.deinit();
     self.render_output.deinit();
     self.seat.deinit();
@@ -427,10 +451,7 @@ fn renderFrame(self: *Self) renderer_types.Renderer.Error!void {
     const clear_command = [_]render.Command{
         .{ .clear = render.Color.rgba(24, 24, 27, 255) },
     };
-    try self.renderer.render(
-        .{ .size = output_size, .commands = &clear_command },
-        target,
-    );
+    try self.renderCommands(output_size, &clear_command, target);
 
     const top_fullscreen = self.scene.topFullscreen();
     var fullscreen_reached = top_fullscreen == null;
@@ -485,6 +506,19 @@ fn renderFrame(self: *Self) renderer_types.Renderer.Error!void {
     self.seat.setKeyboardFocus(keyboard_focus);
 }
 
+fn renderCommands(
+    self: *Self,
+    output_size: render.Size,
+    commands: []const render.Command,
+    target: renderer_types.Target,
+) renderer_types.Renderer.Error!void {
+    try self.renderer.render(.{
+        .size = output_size,
+        .commands = commands,
+        .scale = self.render_output.renderScale(),
+    }, target);
+}
+
 fn renderWindow(
     self: *Self,
     id: Scene.Id,
@@ -520,10 +554,7 @@ fn renderWindow(
                 .clip = window_clip,
             } },
         };
-        try self.renderer.render(
-            .{ .size = output_size, .commands = &shadow_command },
-            target,
-        );
+        try self.renderCommands(output_size, &shadow_command, target);
     }
     if (window.effects.blur) |blur| {
         const blur_command = [_]render.Command{
@@ -534,10 +565,7 @@ fn renderWindow(
                 .clip = window_clip,
             } },
         };
-        try self.renderer.render(
-            .{ .size = output_size, .commands = &blur_command },
-            target,
-        );
+        try self.renderCommands(output_size, &blur_command, target);
     }
     try self.renderWindowDecorations(id, window, .below, window_clip, target);
     var content_visible = true;
@@ -591,14 +619,12 @@ fn renderSurfaceTree(
                     .y = y,
                     .size = buffer.logical_size,
                     .buffer = buffer.pixelBuffer(),
+                    .source = buffer.source,
                     .corner_radius = corner_radius,
                     .clip = clip,
                 } },
             };
-            try self.renderer.render(
-                .{ .size = self.render_output.size(), .commands = &image_command },
-                target,
-            );
+            try self.renderCommands(self.render_output.size(), &image_command, target);
         },
         .child => |child| try self.renderSurfaceTree(
             child.surface_id,
@@ -626,10 +652,7 @@ fn renderWindowBorders(
         clip,
         &commands,
     );
-    try self.renderer.render(
-        .{ .size = self.render_output.size(), .commands = border_commands },
-        target,
-    );
+    try self.renderCommands(self.render_output.size(), border_commands, target);
 }
 
 fn renderWindowDecorations(

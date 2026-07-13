@@ -11,6 +11,36 @@ pub const Size = struct {
     }
 };
 
+pub const Scale = struct {
+    numerator: u32 = denominator,
+
+    pub const denominator = 120;
+
+    pub fn ceil(self: Scale) error{ InvalidScale, Overflow }!u32 {
+        if (self.numerator == 0) return error.InvalidScale;
+        return std.math.divCeil(u32, self.numerator, denominator) catch
+            return error.Overflow;
+    }
+
+    pub fn apply(self: Scale, size: Size) error{ InvalidScale, Overflow }!Size {
+        if (self.numerator == 0) return error.InvalidScale;
+        return .{
+            .width = try self.applyDimension(size.width),
+            .height = try self.applyDimension(size.height),
+        };
+    }
+
+    fn applyDimension(self: Scale, value: u32) error{Overflow}!u32 {
+        const product = std.math.mul(u64, value, self.numerator) catch
+            return error.Overflow;
+        const rounded = std.math.add(u64, product, denominator / 2) catch
+            return error.Overflow;
+        const result = rounded / denominator;
+        if (result > std.math.maxInt(u32)) return error.Overflow;
+        return @intCast(result);
+    }
+};
+
 pub const Rect = struct {
     x: i32,
     y: i32,
@@ -98,11 +128,19 @@ pub const SolidRect = struct {
     clip: ?Rect = null,
 };
 
+pub const SourceRect = struct {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+};
+
 pub const Image = struct {
     x: i32,
     y: i32,
     size: Size,
     buffer: PixelBuffer,
+    source: ?SourceRect = null,
     corner_radius: u32 = 0,
     clip: ?Rect = null,
 };
@@ -134,6 +172,7 @@ pub const Command = union(enum) {
 pub const Frame = struct {
     size: Size,
     commands: []const Command,
+    scale: Scale = .{},
 };
 
 /// A CPU-addressable ARGB8888 target. Rows may contain padding.
@@ -151,6 +190,19 @@ test "color conversion premultiplies alpha" {
     try std.testing.expectEqual(@as(u8, 0), color.blue);
     try std.testing.expectEqual(@as(u8, 128), color.alpha);
     try std.testing.expectEqual(@as(u32, 0x80804000), color.argb8888());
+}
+
+test "fractional scale rounds physical dimensions halfway up" {
+    const scale: Scale = .{ .numerator = 180 };
+    try std.testing.expectEqual(@as(u32, 2), try scale.ceil());
+    try std.testing.expectEqual(
+        Size{ .width = 1920, .height = 1080 },
+        try scale.apply(.{ .width = 1280, .height = 720 }),
+    );
+    try std.testing.expectEqual(
+        Size{ .width = 2, .height = 5 },
+        try scale.apply(.{ .width = 1, .height = 3 }),
+    );
 }
 
 test "rectangle clipping handles negative and overflowing coordinates" {

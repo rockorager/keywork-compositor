@@ -10,6 +10,7 @@ const slot_map = @import("slot_map.zig");
 const WaylandRegion = @import("wayland_region.zig");
 
 const wl = wayland.server.wl;
+const wp = wayland.server.wp;
 
 allocator: std.mem.Allocator,
 store: *Store,
@@ -18,6 +19,7 @@ resource: *wl.Surface,
 pending_attachment: Attachment,
 has_pending_attachment: bool,
 role_handler: ?RoleHandler,
+viewport_handler: ?ViewportHandler,
 commit_listeners: std.ArrayList(*CommitListener),
 
 pub const Store = slot_map.SlotMap(State, enum { surface });
@@ -33,6 +35,8 @@ pub const State = struct {
     current_scale: i32,
     pending_transform: wl.Output.Transform,
     current_transform: wl.Output.Transform,
+    pending_viewport: ViewportState,
+    current_viewport: ViewportState,
     pending_surface_damage: Region,
     pending_buffer_damage: Region,
     pending_opaque: Region,
@@ -47,6 +51,7 @@ pub const State = struct {
     cached_offset_y: i32,
     cached_scale: i32,
     cached_transform: wl.Output.Transform,
+    cached_viewport: ViewportState,
     cached_surface_damage: Region,
     cached_buffer_damage: Region,
     cached_opaque: Region,
@@ -66,6 +71,8 @@ pub const State = struct {
             .current_scale = 1,
             .pending_transform = .normal,
             .current_transform = .normal,
+            .pending_viewport = .{},
+            .current_viewport = .{},
             .pending_surface_damage = Region.init(),
             .pending_buffer_damage = Region.init(),
             .pending_opaque = Region.init(),
@@ -80,6 +87,7 @@ pub const State = struct {
             .cached_offset_y = 0,
             .cached_scale = 1,
             .cached_transform = .normal,
+            .cached_viewport = .{},
             .cached_surface_damage = Region.init(),
             .cached_buffer_damage = Region.init(),
             .cached_opaque = Region.init(),
@@ -120,7 +128,7 @@ pub fn create(
     client: *wl.Client,
     version: u32,
     id: u32,
-) CreateError!void {
+) CreateError!*Self {
     const resource = try wl.Surface.create(client, version, id);
     errdefer resource.destroy();
 
@@ -139,10 +147,12 @@ pub fn create(
         .pending_attachment = .{},
         .has_pending_attachment = false,
         .role_handler = null,
+        .viewport_handler = null,
         .commit_listeners = .empty,
     };
 
     resource.setHandler(*Self, handleRequest, handleDestroy, self);
+    return self;
 }
 
 pub fn fromResource(resource: *wl.Surface) *Self {
@@ -151,6 +161,10 @@ pub fn fromResource(resource: *wl.Surface) *Self {
 
 pub fn handle(self: *const Self) Id {
     return self.id;
+}
+
+pub fn waylandResource(self: *Self) *wl.Surface {
+    return self.resource;
 }
 
 pub fn state(self: *Self) *State {
@@ -167,6 +181,45 @@ pub const RoleError = error{
     AlreadyReserved,
     NotReserved,
 };
+
+pub const ViewportSource = struct {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+};
+
+pub const ViewportState = struct {
+    source: ?ViewportSource = null,
+    destination: ?render_types.Size = null,
+};
+
+pub const ViewportHandler = struct {
+    context: *anyopaque,
+    resource: *wp.Viewport,
+    surface_destroyed: *const fn (*anyopaque) void,
+};
+
+pub fn setViewportHandler(self: *Self, handler: ViewportHandler) error{AlreadyExists}!void {
+    if (self.viewport_handler != null) return error.AlreadyExists;
+    self.viewport_handler = handler;
+}
+
+pub fn clearViewportHandler(self: *Self) void {
+    std.debug.assert(self.viewport_handler != null);
+    self.viewport_handler = null;
+    self.state().pending_viewport = .{};
+}
+
+pub fn setViewportSource(self: *Self, source: ?ViewportSource) void {
+    std.debug.assert(self.viewport_handler != null);
+    self.state().pending_viewport.source = source;
+}
+
+pub fn setViewportDestination(self: *Self, destination: ?render_types.Size) void {
+    std.debug.assert(self.viewport_handler != null);
+    self.state().pending_viewport.destination = destination;
+}
 
 pub const Role = enum {
     xdg_toplevel,
@@ -319,13 +372,19 @@ fn handleRequest(resource: *wl.Surface, request: wl.Surface.Request, self: *Self
     switch (request) {
         .destroy => resource.destroy(),
         .attach => |attach| {
+            if (resource.getVersion() >= 5 and (attach.x != 0 or attach.y != 0)) {
+                resource.postError(.invalid_offset, "attach offset requires wl_surface.offset");
+                return;
+            }
             self.pending_attachment.set(attach.buffer) catch {
                 resource.getClient().postImplementationError("unsupported wl_buffer type");
                 return;
             };
             self.has_pending_attachment = true;
-            surface_state.pending_offset_x = attach.x;
-            surface_state.pending_offset_y = attach.y;
+            if (resource.getVersion() < 5) {
+                surface_state.pending_offset_x = attach.x;
+                surface_state.pending_offset_y = attach.y;
+            }
         },
         .damage => |damage| surface_state.pending_surface_damage.add(
             damage.x,
@@ -378,6 +437,10 @@ fn handleRequest(resource: *wl.Surface, request: wl.Surface.Request, self: *Self
             damage.width,
             damage.height,
         ) catch resource.postNoMemory(),
+        .offset => |offset| {
+            surface_state.pending_offset_x = offset.x;
+            surface_state.pending_offset_y = offset.y;
+        },
     }
 }
 
@@ -435,17 +498,9 @@ fn applyPending(self: *Self, commit_info: CommitInfo) void {
                 shm_buffer,
                 surface_state.pending_scale,
                 surface_state.pending_transform,
+                surface_state.pending_viewport,
             ) catch |err| {
-                switch (err) {
-                    error.OutOfMemory => self.resource.postNoMemory(),
-                    error.InvalidSize => self.resource.postError(
-                        .invalid_size,
-                        "buffer dimensions are incompatible with surface state",
-                    ),
-                    error.InvalidBuffer => self.resource.getClient().postImplementationError(
-                        "invalid shared-memory buffer",
-                    ),
-                }
+                postBufferError(self, err);
                 return;
             };
         }
@@ -459,23 +514,19 @@ fn applyPending(self: *Self, commit_info: CommitInfo) void {
         self.pending_attachment.clear();
         self.has_pending_attachment = false;
     } else if (surface_state.current_buffer) |*current| {
-        current.logical_size = logicalSize(
-            current.buffer_size,
+        current.updateGeometry(
             surface_state.pending_scale,
             surface_state.pending_transform,
-        ) catch {
-            self.resource.postError(
-                .invalid_size,
-                "buffer dimensions are incompatible with surface state",
-            );
+            surface_state.pending_viewport,
+        ) catch |err| {
+            postBufferError(self, err);
             return;
         };
-        current.scale = surface_state.pending_scale;
-        current.transform = surface_state.pending_transform;
     }
 
     surface_state.current_scale = surface_state.pending_scale;
     surface_state.current_transform = surface_state.pending_transform;
+    surface_state.current_viewport = surface_state.pending_viewport;
     surface_state.pending_surface_damage.clear();
     surface_state.pending_buffer_damage.clear();
     surface_state.has_committed = true;
@@ -498,6 +549,7 @@ fn cachePending(self: *Self) bool {
                 shm_buffer,
                 surface_state.pending_scale,
                 surface_state.pending_transform,
+                surface_state.pending_viewport,
             ) catch |err| {
                 postBufferError(self, err);
                 return false;
@@ -511,15 +563,13 @@ fn cachePending(self: *Self) bool {
         else
             null;
         if (buffer) |existing| {
-            _ = logicalSize(
+            _ = viewportGeometry(
                 existing.buffer_size,
                 surface_state.pending_scale,
                 surface_state.pending_transform,
-            ) catch {
-                self.resource.postError(
-                    .invalid_size,
-                    "buffer dimensions are incompatible with surface state",
-                );
+                surface_state.pending_viewport,
+            ) catch |err| {
+                postBufferError(self, err);
                 return false;
             };
         }
@@ -557,6 +607,7 @@ fn cachePending(self: *Self) bool {
 
     surface_state.cached_scale = surface_state.pending_scale;
     surface_state.cached_transform = surface_state.pending_transform;
+    surface_state.cached_viewport = surface_state.pending_viewport;
     surface_state.pending_surface_damage.clear();
     surface_state.pending_buffer_damage.clear();
     surface_state.has_cached_state = true;
@@ -597,17 +648,16 @@ fn applyCached(self: *Self) void {
         surface_state.cached_attachment_changed = false;
     }
     if (surface_state.current_buffer) |*current| {
-        current.logical_size = logicalSize(
-            current.buffer_size,
+        current.updateGeometry(
             surface_state.cached_scale,
             surface_state.cached_transform,
+            surface_state.cached_viewport,
         ) catch unreachable;
-        current.scale = surface_state.cached_scale;
-        current.transform = surface_state.cached_transform;
     }
 
     surface_state.current_scale = surface_state.cached_scale;
     surface_state.current_transform = surface_state.cached_transform;
+    surface_state.current_viewport = surface_state.cached_viewport;
     surface_state.cached_surface_damage.clear();
     surface_state.cached_buffer_damage.clear();
     surface_state.has_cached_state = false;
@@ -628,6 +678,14 @@ fn postBufferError(self: *Self, err: BufferSnapshot.Error) void {
         error.InvalidBuffer => self.resource.getClient().postImplementationError(
             "invalid shared-memory buffer",
         ),
+        error.BadViewportSize => if (self.viewport_handler) |handler|
+            handler.resource.postError(.bad_size, "viewport source size must be integral")
+        else
+            self.resource.getClient().postImplementationError("viewport object is missing"),
+        error.ViewportOutOfBuffer => if (self.viewport_handler) |handler|
+            handler.resource.postError(.out_of_buffer, "viewport source exceeds the buffer")
+        else
+            self.resource.getClient().postImplementationError("viewport object is missing"),
     }
 }
 
@@ -640,6 +698,10 @@ fn finishApplied(self: *Self, commit_info: CommitInfo) void {
 fn handleDestroy(_: *wl.Surface, self: *Self) void {
     self.pending_attachment.clear();
     if (self.role_handler) |handler| handler.surface_destroyed(handler.context);
+    if (self.viewport_handler) |handler| {
+        self.viewport_handler = null;
+        handler.surface_destroyed(handler.context);
+    }
     while (self.commit_listeners.items.len > 0) {
         const previous_len = self.commit_listeners.items.len;
         self.commit_listeners.items[previous_len - 1].surface_destroyed(
@@ -699,6 +761,57 @@ fn logicalSize(
     return .{
         .width = transformed.width / unsigned_scale,
         .height = transformed.height / unsigned_scale,
+    };
+}
+
+const ViewportGeometry = struct {
+    logical_size: render_types.Size,
+    source: ?render_types.SourceRect,
+};
+
+fn viewportGeometry(
+    buffer_size: render_types.Size,
+    scale: i32,
+    transform: wl.Output.Transform,
+    viewport: ViewportState,
+) BufferSnapshot.Error!ViewportGeometry {
+    const base_size = logicalSize(buffer_size, scale, transform) catch
+        return error.InvalidSize;
+    const source = viewport.source orelse return .{
+        .logical_size = viewport.destination orelse base_size,
+        .source = null,
+    };
+
+    const right = @as(i64, source.x) + source.width;
+    const bottom = @as(i64, source.y) + source.height;
+    if (source.x < 0 or source.y < 0 or source.width <= 0 or source.height <= 0 or
+        right > @as(i64, base_size.width) * 256 or
+        bottom > @as(i64, base_size.height) * 256)
+    {
+        return error.ViewportOutOfBuffer;
+    }
+
+    const logical_size = viewport.destination orelse size: {
+        if (@mod(source.width, 256) != 0 or @mod(source.height, 256) != 0) {
+            return error.BadViewportSize;
+        }
+        const source_size: render_types.Size = .{
+            .width = @as(u32, @intCast(@divExact(source.width, 256))),
+            .height = @as(u32, @intCast(@divExact(source.height, 256))),
+        };
+        break :size source_size;
+    };
+    // Rendering currently skips transformed buffers. When transform rendering is
+    // added, this post-transform source rectangle must be mapped back to buffer pixels.
+    const buffer_scale: f64 = @floatFromInt(scale);
+    return .{
+        .logical_size = logical_size,
+        .source = .{
+            .x = @as(f64, @floatFromInt(source.x)) / 256.0 * buffer_scale,
+            .y = @as(f64, @floatFromInt(source.y)) / 256.0 * buffer_scale,
+            .width = @as(f64, @floatFromInt(source.width)) / 256.0 * buffer_scale,
+            .height = @as(f64, @floatFromInt(source.height)) / 256.0 * buffer_scale,
+        },
     };
 }
 
@@ -773,12 +886,15 @@ pub const BufferSnapshot = struct {
     logical_size: render_types.Size,
     scale: i32,
     transform: wl.Output.Transform,
+    source: ?render_types.SourceRect,
     pixels: []u32,
 
     const Error = error{
         OutOfMemory,
         InvalidSize,
         InvalidBuffer,
+        BadViewportSize,
+        ViewportOutOfBuffer,
     };
 
     fn copyShm(
@@ -786,6 +902,7 @@ pub const BufferSnapshot = struct {
         shm_buffer: *wl.shm.Buffer,
         scale: i32,
         transform: wl.Output.Transform,
+        viewport: ViewportState,
     ) Error!BufferSnapshot {
         const width = shm_buffer.getWidth();
         const height = shm_buffer.getHeight();
@@ -796,8 +913,8 @@ pub const BufferSnapshot = struct {
             .width = @intCast(width),
             .height = @intCast(height),
         };
-        const logical_size = logicalSize(buffer_size, scale, transform) catch
-            return error.InvalidSize;
+        const geometry = viewportGeometry(buffer_size, scale, transform, viewport) catch |err|
+            return err;
         const row_bytes = std.math.mul(usize, buffer_size.width, @sizeOf(u32)) catch
             return error.InvalidBuffer;
         if (stride < row_bytes) return error.InvalidBuffer;
@@ -833,11 +950,25 @@ pub const BufferSnapshot = struct {
         return .{
             .allocator = allocator,
             .buffer_size = buffer_size,
-            .logical_size = logical_size,
+            .logical_size = geometry.logical_size,
             .scale = scale,
             .transform = transform,
+            .source = geometry.source,
             .pixels = pixels,
         };
+    }
+
+    fn updateGeometry(
+        self: *BufferSnapshot,
+        scale: i32,
+        transform: wl.Output.Transform,
+        viewport: ViewportState,
+    ) Error!void {
+        const geometry = try viewportGeometry(self.buffer_size, scale, transform, viewport);
+        self.logical_size = geometry.logical_size;
+        self.scale = scale;
+        self.transform = transform;
+        self.source = geometry.source;
     }
 
     pub fn deinit(self: *BufferSnapshot) void {
@@ -918,5 +1049,57 @@ test "logical surface size accounts for scale and transform" {
     try std.testing.expectError(
         error.InvalidSize,
         logicalSize(.{ .width = 201, .height = 100 }, 2, .normal),
+    );
+}
+
+test "viewport destination defines logical surface size" {
+    const geometry = try viewportGeometry(
+        .{ .width = 1200, .height = 900 },
+        1,
+        .normal,
+        .{ .destination = .{ .width = 800, .height = 600 } },
+    );
+    try std.testing.expectEqual(
+        render_types.Size{ .width = 800, .height = 600 },
+        geometry.logical_size,
+    );
+    try std.testing.expectEqual(@as(?render_types.SourceRect, null), geometry.source);
+}
+
+test "viewport source is validated and converted to buffer coordinates" {
+    const geometry = try viewportGeometry(
+        .{ .width = 8, .height = 8 },
+        2,
+        .normal,
+        .{
+            .source = .{ .x = 256, .y = 512, .width = 512, .height = 256 },
+            .destination = .{ .width = 4, .height = 2 },
+        },
+    );
+    try std.testing.expectEqual(
+        render_types.Size{ .width = 4, .height = 2 },
+        geometry.logical_size,
+    );
+    try std.testing.expectEqual(@as(f64, 2), geometry.source.?.x);
+    try std.testing.expectEqual(@as(f64, 4), geometry.source.?.y);
+    try std.testing.expectEqual(@as(f64, 4), geometry.source.?.width);
+    try std.testing.expectEqual(@as(f64, 2), geometry.source.?.height);
+    try std.testing.expectError(
+        error.ViewportOutOfBuffer,
+        viewportGeometry(
+            .{ .width = 8, .height = 8 },
+            2,
+            .normal,
+            .{ .source = .{ .x = 768, .y = 0, .width = 512, .height = 256 } },
+        ),
+    );
+    try std.testing.expectError(
+        error.BadViewportSize,
+        viewportGeometry(
+            .{ .width = 8, .height = 8 },
+            2,
+            .normal,
+            .{ .source = .{ .x = 0, .y = 0, .width = 128, .height = 256 } },
+        ),
     );
 }

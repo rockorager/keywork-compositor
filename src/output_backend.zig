@@ -57,6 +57,27 @@ pub fn size(self: *const Self) render.Size {
     };
 }
 
+pub fn physicalSize(self: *const Self) render.Size {
+    return switch (self.backend) {
+        .headless => |output| output.size,
+        .nested => |output| output.buffer_size,
+    };
+}
+
+pub fn renderScale(self: *const Self) render.Scale {
+    return switch (self.backend) {
+        .headless => .{},
+        .nested => |output| output.render_scale,
+    };
+}
+
+pub fn clientScale(self: *const Self) u32 {
+    return switch (self.backend) {
+        .headless => 1,
+        .nested => |output| output.client_scale,
+    };
+}
+
 pub fn acquire(self: *Self) ?render.PixelBuffer {
     return switch (self.backend) {
         .headless => |*output| output.target(),

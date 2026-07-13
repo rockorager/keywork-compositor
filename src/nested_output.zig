@@ -9,25 +9,37 @@ const render = @import("render.zig");
 const client = wayland.client;
 const wl = client.wl;
 const xdg = client.xdg;
+const wp = client.wp;
 const server_wl = wayland.server.wl;
 
 const buffer_count = 3;
+const scale_roundtrip_limit = 8;
+const max_render_scale_120 = 480;
 
 display: ?*wl.Display,
 registry: ?*wl.Registry,
 compositor: ?*wl.Compositor,
 shm: ?*wl.Shm,
 wm_base: ?*xdg.WmBase,
+viewporter: ?*wp.Viewporter,
+fractional_scale_manager: ?*wp.FractionalScaleManagerV1,
 seat: ?*wl.Seat,
 keyboard: ?*wl.Keyboard,
 pointer: ?*wl.Pointer,
 surface: ?*wl.Surface,
+viewport: ?*wp.Viewport,
+fractional_scale: ?*wp.FractionalScaleV1,
 xdg_surface: ?*xdg.Surface,
 toplevel: ?*xdg.Toplevel,
 event_source: ?*server_wl.EventSource,
 mapping: ?[]align(std.heap.page_size_min) u8,
 buffers: [buffer_count]Buffer,
 size: render.Size,
+buffer_size: render.Size,
+render_scale: render.Scale,
+client_scale: u32,
+preferred_scale_received: bool,
+scale_locked: bool,
 listener: Listener,
 acquired: ?usize,
 waiting_for_buffer: bool,
@@ -102,16 +114,25 @@ pub fn init(
         .compositor = null,
         .shm = null,
         .wm_base = null,
+        .viewporter = null,
+        .fractional_scale_manager = null,
         .seat = null,
         .keyboard = null,
         .pointer = null,
         .surface = null,
+        .viewport = null,
+        .fractional_scale = null,
         .xdg_surface = null,
         .toplevel = null,
         .event_source = null,
         .mapping = null,
         .buffers = undefined,
         .size = size,
+        .buffer_size = size,
+        .render_scale = .{},
+        .client_scale = 1,
+        .preferred_scale_received = false,
+        .scale_locked = false,
         .listener = listener,
         .acquired = null,
         .waiting_for_buffer = false,
@@ -140,6 +161,14 @@ pub fn init(
 
     const surface = try self.compositor.?.createSurface();
     self.surface = surface;
+    if (self.viewporter != null and self.fractional_scale_manager != null) {
+        const viewport = try self.viewporter.?.getViewport(surface);
+        self.viewport = viewport;
+        viewport.setDestination(@intCast(size.width), @intCast(size.height));
+        const fractional_scale = try self.fractional_scale_manager.?.getFractionalScale(surface);
+        self.fractional_scale = fractional_scale;
+        fractional_scale.setListener(*Self, handleFractionalScaleEvent, self);
+    }
     const xdg_surface = try self.wm_base.?.getXdgSurface(surface);
     self.xdg_surface = xdg_surface;
     xdg_surface.setListener(*Self, handleXdgSurfaceEvent, self);
@@ -150,11 +179,14 @@ pub fn init(
     toplevel.setMinSize(@intCast(size.width), @intCast(size.height));
     toplevel.setMaxSize(@intCast(size.width), @intCast(size.height));
 
-    try self.createBuffers(io);
     surface.commit();
     while (!self.configured) {
         if (display.dispatch() != .SUCCESS) return error.ParentDisplayFailed;
+        if (self.failed) return error.ParentDisplayFailed;
     }
+    if (self.fractional_scale != null) try self.negotiateScale(io);
+    self.buffer_size = self.render_scale.apply(size) catch return error.InvalidDimensions;
+    try self.createBuffers(io);
 
     self.registry.?.destroy();
     self.registry = null;
@@ -169,21 +201,22 @@ pub fn init(
 
 pub fn deinit(self: *Self) void {
     if (self.event_source) |source| source.remove();
-    for (&self.buffers) |*buffer| {
-        if (buffer.resource) |resource| resource.destroy();
-    }
+    self.destroyBuffers();
     if (self.toplevel) |toplevel| toplevel.destroy();
     if (self.xdg_surface) |xdg_surface| xdg_surface.destroy();
+    if (self.fractional_scale) |fractional_scale| fractional_scale.destroy();
+    if (self.viewport) |viewport| viewport.destroy();
     if (self.surface) |surface| surface.destroy();
     if (self.pointer) |pointer| releasePointer(pointer);
     if (self.keyboard) |keyboard| releaseKeyboard(keyboard);
     if (self.seat) |seat| releaseSeat(seat);
     if (self.wm_base) |wm_base| wm_base.destroy();
+    if (self.fractional_scale_manager) |manager| manager.destroy();
+    if (self.viewporter) |viewporter| viewporter.destroy();
     if (self.shm) |shm| shm.destroy();
     if (self.compositor) |compositor| compositor.destroy();
     if (self.registry) |registry| registry.destroy();
     if (self.display) |display| display.disconnect();
-    if (self.mapping) |mapping| std.posix.munmap(mapping);
     self.* = undefined;
 }
 
@@ -194,8 +227,8 @@ pub fn acquire(self: *Self) ?render.PixelBuffer {
         if (buffer.busy) continue;
         self.acquired = index;
         return .{
-            .size = self.size,
-            .stride_pixels = self.size.width,
+            .size = self.buffer_size,
+            .stride_pixels = self.buffer_size.width,
             .pixels = buffer.pixels,
         };
     }
@@ -216,7 +249,12 @@ pub fn present(self: *Self) !void {
 
     const surface = self.surface orelse return error.ParentDisplayFailed;
     surface.attach(resource, 0, 0);
-    surface.damageBuffer(0, 0, @intCast(self.size.width), @intCast(self.size.height));
+    surface.damageBuffer(
+        0,
+        0,
+        @intCast(self.buffer_size.width),
+        @intCast(self.buffer_size.height),
+    );
     surface.commit();
     switch (self.display.?.flush()) {
         .SUCCESS => {},
@@ -226,7 +264,8 @@ pub fn present(self: *Self) !void {
 }
 
 fn createBuffers(self: *Self, io: std.Io) !void {
-    const pixel_count = try self.size.pixelCount();
+    std.debug.assert(self.mapping == null);
+    const pixel_count = try self.buffer_size.pixelCount();
     const buffer_bytes = std.math.mul(usize, pixel_count, @sizeOf(u32)) catch
         return error.Overflow;
     const mapping_bytes = std.math.mul(usize, buffer_bytes, buffer_count) catch
@@ -254,9 +293,9 @@ fn createBuffers(self: *Self, io: std.Io) !void {
         const offset = index * buffer_bytes;
         const resource = try pool.createBuffer(
             @intCast(offset),
-            @intCast(self.size.width),
-            @intCast(self.size.height),
-            @intCast(self.size.width * @sizeOf(u32)),
+            @intCast(self.buffer_size.width),
+            @intCast(self.buffer_size.height),
+            @intCast(self.buffer_size.width * @sizeOf(u32)),
             .argb8888,
         );
         buffer.resource = resource;
@@ -265,36 +304,110 @@ fn createBuffers(self: *Self, io: std.Io) !void {
     }
 }
 
+fn destroyBuffers(self: *Self) void {
+    for (&self.buffers) |*buffer| {
+        if (buffer.resource) |resource| resource.destroy();
+        buffer.resource = null;
+        buffer.pixels = &.{};
+        buffer.busy = false;
+    }
+    if (self.mapping) |mapping| std.posix.munmap(mapping);
+    self.mapping = null;
+}
+
+fn negotiateScale(self: *Self, io: std.Io) !void {
+    self.buffer_size = .{ .width = 1, .height = 1 };
+    try self.createBuffers(io);
+    const buffer = &self.buffers[0];
+    buffer.busy = true;
+    const surface = self.surface orelse return error.ParentDisplayFailed;
+    surface.attach(buffer.resource orelse return error.ParentDisplayFailed, 0, 0);
+    surface.damageBuffer(0, 0, 1, 1);
+    surface.commit();
+
+    var roundtrips: usize = 0;
+    while (!self.preferred_scale_received and roundtrips < scale_roundtrip_limit) {
+        if (self.display.?.roundtrip() != .SUCCESS) return error.ParentDisplayFailed;
+        if (self.failed) return error.ParentDisplayFailed;
+        roundtrips += 1;
+    }
+    // Output scale and render buffers are fixed for this backend instance.
+    self.scale_locked = true;
+    self.destroyBuffers();
+}
+
 fn handleRegistryEvent(_: *wl.Registry, event: wl.Registry.Event, self: *Self) void {
     switch (event) {
         .global => |global| {
             const interface = std.mem.span(global.interface);
             if (std.mem.eql(u8, interface, std.mem.span(wl.Compositor.interface.name))) {
                 if (self.compositor == null) {
-                    self.compositor = self.registry.?.bind(global.name, wl.Compositor, global.version) catch {
+                    self.compositor = self.registry.?.bind(
+                        global.name,
+                        wl.Compositor,
+                        @min(global.version, wl.Compositor.generated_version),
+                    ) catch {
                         self.failed = true;
                         return;
                     };
                 }
             } else if (std.mem.eql(u8, interface, std.mem.span(wl.Shm.interface.name))) {
                 if (self.shm == null) {
-                    self.shm = self.registry.?.bind(global.name, wl.Shm, global.version) catch {
+                    self.shm = self.registry.?.bind(
+                        global.name,
+                        wl.Shm,
+                        @min(global.version, wl.Shm.generated_version),
+                    ) catch {
                         self.failed = true;
                         return;
                     };
                 }
             } else if (std.mem.eql(u8, interface, std.mem.span(xdg.WmBase.interface.name))) {
                 if (self.wm_base == null) {
-                    const wm_base = self.registry.?.bind(global.name, xdg.WmBase, global.version) catch {
+                    const wm_base = self.registry.?.bind(
+                        global.name,
+                        xdg.WmBase,
+                        @min(global.version, xdg.WmBase.generated_version),
+                    ) catch {
                         self.failed = true;
                         return;
                     };
                     self.wm_base = wm_base;
                     wm_base.setListener(*Self, handleWmBaseEvent, self);
                 }
+            } else if (std.mem.eql(u8, interface, std.mem.span(wp.Viewporter.interface.name))) {
+                if (self.viewporter == null) {
+                    self.viewporter = self.registry.?.bind(
+                        global.name,
+                        wp.Viewporter,
+                        @min(global.version, wp.Viewporter.generated_version),
+                    ) catch {
+                        self.failed = true;
+                        return;
+                    };
+                }
+            } else if (std.mem.eql(
+                u8,
+                interface,
+                std.mem.span(wp.FractionalScaleManagerV1.interface.name),
+            )) {
+                if (self.fractional_scale_manager == null) {
+                    self.fractional_scale_manager = self.registry.?.bind(
+                        global.name,
+                        wp.FractionalScaleManagerV1,
+                        @min(global.version, wp.FractionalScaleManagerV1.generated_version),
+                    ) catch {
+                        self.failed = true;
+                        return;
+                    };
+                }
             } else if (std.mem.eql(u8, interface, std.mem.span(wl.Seat.interface.name))) {
                 if (self.seat == null) {
-                    const seat = self.registry.?.bind(global.name, wl.Seat, global.version) catch {
+                    const seat = self.registry.?.bind(
+                        global.name,
+                        wl.Seat,
+                        @min(global.version, wl.Seat.generated_version),
+                    ) catch {
                         self.failed = true;
                         return;
                     };
@@ -304,6 +417,21 @@ fn handleRegistryEvent(_: *wl.Registry, event: wl.Registry.Event, self: *Self) v
             }
         },
         .global_remove => {},
+    }
+}
+
+fn handleFractionalScaleEvent(
+    _: *wp.FractionalScaleV1,
+    event: wp.FractionalScaleV1.Event,
+    self: *Self,
+) void {
+    switch (event) {
+        .preferred_scale => |preferred| {
+            if (self.scale_locked or preferred.scale == 0) return;
+            self.preferred_scale_received = true;
+            self.render_scale.numerator = @min(preferred.scale, max_render_scale_120);
+            self.client_scale = self.render_scale.ceil() catch 1;
+        },
     }
 }
 

@@ -53,6 +53,8 @@ test {
     _ = @import("nested_output.zig");
     _ = @import("output_backend.zig");
     _ = @import("output.zig");
+    _ = @import("fractional_scale.zig");
+    _ = @import("viewporter.zig");
     _ = @import("cpu_renderer.zig");
     _ = @import("vulkan_renderer.zig");
     _ = @import("region.zig");
