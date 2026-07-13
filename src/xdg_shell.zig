@@ -55,6 +55,7 @@ const XdgSurfaceState = struct {
     last_acked_serial: ?u32 = null,
     initial_configure_sent: bool = false,
     configured: bool = false,
+    sent_capabilities: ?WindowCapabilities = null,
     mapped: bool = false,
     surface_alive: bool = true,
     toplevel_resource: ?*xdg.Toplevel = null,
@@ -111,6 +112,31 @@ pub const WindowState = struct {
 pub const Dimensions = struct {
     width: i32,
     height: i32,
+};
+
+pub const TiledEdges = packed struct(u8) {
+    top: bool = false,
+    bottom: bool = false,
+    left: bool = false,
+    right: bool = false,
+    _padding: u4 = 0,
+};
+
+pub const WindowCapabilities = packed struct(u8) {
+    window_menu: bool = true,
+    maximize: bool = true,
+    fullscreen: bool = true,
+    minimize: bool = true,
+    _padding: u4 = 0,
+};
+
+pub const ToplevelConfigure = struct {
+    activated: bool = false,
+    maximized: bool = false,
+    fullscreen: bool = false,
+    resizing: bool = false,
+    tiled: TiledEdges = .{},
+    capabilities: WindowCapabilities = .{},
 };
 
 pub const WindowInfo = struct {
@@ -231,19 +257,25 @@ fn contentGeometry(self: *Self, state: *const XdgSurfaceState) ?Scene.ContentGeo
     return .{ .size = buffer.logical_size };
 }
 
+fn appendEnum(values: anytype, count: *usize, value: anytype) void {
+    std.debug.assert(count.* < values.len);
+    values[count.*] = @intCast(@intFromEnum(value));
+    count.* += 1;
+}
+
 pub fn configureWindow(
     self: *Self,
     id: WindowId,
     dimensions: Dimensions,
 ) error{ InvalidWindow, OutOfMemory }!u32 {
-    return self.configureWindowState(id, dimensions, false);
+    return self.configureWindowState(id, dimensions, .{});
 }
 
 pub fn configureWindowState(
     self: *Self,
     id: WindowId,
     dimensions: Dimensions,
-    activated: bool,
+    configuration: ToplevelConfigure,
 ) error{ InvalidWindow, OutOfMemory }!u32 {
     if (dimensions.width < 0 or dimensions.height < 0) return error.InvalidWindow;
     const window = self.windows.get(id) orelse return error.InvalidWindow;
@@ -253,18 +285,90 @@ pub fn configureWindowState(
     const serial = self.display.nextSerial();
     state.configure_serials.append(self.allocator, serial) catch return error.OutOfMemory;
 
-    var activated_value: u32 = @intCast(@intFromEnum(xdg.Toplevel.State.activated));
-    var array: wl.Array = .{
-        .size = if (activated) @sizeOf(u32) else 0,
-        .alloc = if (activated) @sizeOf(u32) else 0,
-        .data = if (activated) @ptrCast(&activated_value) else null,
-    };
-    if (toplevel.getVersion() >= 5 and !state.initial_configure_sent) {
-        const capabilities: std.ArrayList(u32) = .empty;
-        var capabilities_array = wl.Array.fromArrayList(u32, capabilities);
-        toplevel.sendWmCapabilities(&capabilities_array);
+    var state_values: [8]u32 = undefined;
+    var state_count: usize = 0;
+    if (configuration.maximized) appendEnum(
+        &state_values,
+        &state_count,
+        xdg.Toplevel.State.maximized,
+    );
+    if (configuration.fullscreen) appendEnum(
+        &state_values,
+        &state_count,
+        xdg.Toplevel.State.fullscreen,
+    );
+    if (configuration.resizing) appendEnum(
+        &state_values,
+        &state_count,
+        xdg.Toplevel.State.resizing,
+    );
+    if (configuration.activated) appendEnum(
+        &state_values,
+        &state_count,
+        xdg.Toplevel.State.activated,
+    );
+    if (toplevel.getVersion() >= 2) {
+        if (configuration.tiled.left) appendEnum(
+            &state_values,
+            &state_count,
+            xdg.Toplevel.State.tiled_left,
+        );
+        if (configuration.tiled.right) appendEnum(
+            &state_values,
+            &state_count,
+            xdg.Toplevel.State.tiled_right,
+        );
+        if (configuration.tiled.top) appendEnum(
+            &state_values,
+            &state_count,
+            xdg.Toplevel.State.tiled_top,
+        );
+        if (configuration.tiled.bottom) appendEnum(
+            &state_values,
+            &state_count,
+            xdg.Toplevel.State.tiled_bottom,
+        );
     }
-    toplevel.sendConfigure(dimensions.width, dimensions.height, &array);
+    var states_array: wl.Array = .{
+        .size = state_count * @sizeOf(u32),
+        .alloc = state_count * @sizeOf(u32),
+        .data = if (state_count == 0) null else @ptrCast(&state_values),
+    };
+    if (toplevel.getVersion() >= 5 and
+        (state.sent_capabilities == null or
+            !std.meta.eql(state.sent_capabilities.?, configuration.capabilities)))
+    {
+        var capability_values: [4]u32 = undefined;
+        var capability_count: usize = 0;
+        if (configuration.capabilities.window_menu) appendEnum(
+            &capability_values,
+            &capability_count,
+            xdg.Toplevel.WmCapabilities.window_menu,
+        );
+        if (configuration.capabilities.maximize) appendEnum(
+            &capability_values,
+            &capability_count,
+            xdg.Toplevel.WmCapabilities.maximize,
+        );
+        if (configuration.capabilities.fullscreen) appendEnum(
+            &capability_values,
+            &capability_count,
+            xdg.Toplevel.WmCapabilities.fullscreen,
+        );
+        if (configuration.capabilities.minimize) appendEnum(
+            &capability_values,
+            &capability_count,
+            xdg.Toplevel.WmCapabilities.minimize,
+        );
+        var capabilities_array: wl.Array = .{
+            .size = capability_count * @sizeOf(u32),
+            .alloc = capability_count * @sizeOf(u32),
+            .data = if (capability_count == 0) null else @ptrCast(&capability_values),
+        };
+        toplevel.sendWmCapabilities(&capabilities_array);
+        state.sent_capabilities = configuration.capabilities;
+    }
+    toplevel.sendConfigure(dimensions.width, dimensions.height, &states_array);
     const adapter: *ToplevelResource = @ptrCast(@alignCast(toplevel.getUserData().?));
     adapter.xdg_surface_resource.resource.sendConfigure(serial);
     state.initial_configure_sent = true;
@@ -283,7 +387,7 @@ pub fn restoreStandaloneWindow(
         _ = self.configureWindowState(
             id,
             if (deactivate) dimensions else .{ .width = 0, .height = 0 },
-            false,
+            .{},
         ) catch |err| switch (err) {
             error.OutOfMemory => if (state.toplevel_resource) |resource| resource.postNoMemory(),
             error.InvalidWindow => {},
@@ -305,6 +409,11 @@ pub fn setWindowPosition(self: *Self, id: WindowId, position: Scene.Position) vo
 pub fn setWindowFocused(self: *Self, id: WindowId, focused: bool) void {
     const window = self.windows.get(id) orelse return;
     self.scene.setFocused(window.scene_id, focused);
+}
+
+pub fn setWindowFullscreen(self: *Self, id: WindowId, fullscreen: bool) void {
+    const window = self.windows.get(id) orelse return;
+    self.scene.setFullscreen(window.scene_id, fullscreen);
 }
 
 pub fn setWindowBorders(self: *Self, id: WindowId, borders: ?Scene.Borders) void {
@@ -733,6 +842,7 @@ const XdgSurfaceResource = struct {
             state.mapped = false;
             state.configured = false;
             state.initial_configure_sent = false;
+            state.sent_capabilities = null;
             state.last_acked_serial = null;
             state.configure_serials.clearRetainingCapacity();
             self.shell.scene.setMapped(window.scene_id, false);
@@ -902,6 +1012,7 @@ const ToplevelResource = struct {
             xdg_surface.mapped = false;
             xdg_surface.configured = false;
             xdg_surface.initial_configure_sent = false;
+            xdg_surface.sent_capabilities = null;
             xdg_surface.last_acked_serial = null;
             xdg_surface.configure_serials.clearRetainingCapacity();
             xdg_surface.toplevel_resource = null;

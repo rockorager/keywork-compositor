@@ -174,9 +174,13 @@ fn renderFrame(self: *Self) renderer_types.Renderer.Error!void {
         target,
     );
 
+    const top_fullscreen = self.scene.topFullscreen();
     var windows = self.scene.iterator();
     while (windows.next()) |entry| {
         if (!entry.window.mapped) continue;
+        if (top_fullscreen) |id| {
+            if (!std.meta.eql(entry.id, id)) continue;
+        }
         const root_buffer = Surface.currentBuffer(
             self.compositor.surfaceStore(),
             entry.window.surface_id,
@@ -257,6 +261,9 @@ fn renderFrame(self: *Self) renderer_types.Renderer.Error!void {
     windows = self.scene.iterator();
     while (windows.next()) |entry| {
         if (!entry.window.mapped) continue;
+        if (top_fullscreen) |id| {
+            if (!std.meta.eql(entry.id, id)) continue;
+        }
         self.finishSurfaceTree(entry.window.surface_id);
     }
 }

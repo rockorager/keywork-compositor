@@ -72,6 +72,7 @@ pub const Window = struct {
     position: Position = .{},
     mapped: bool = false,
     focused: bool = false,
+    fullscreen: bool = false,
     effects: Effects = default_effects,
     borders: ?Borders = null,
     clip_box: ?ClipBox = null,
@@ -211,6 +212,13 @@ pub fn setFocused(self: *Self, id: Id, focused: bool) void {
     if (window.mapped) self.requestRepaint();
 }
 
+pub fn setFullscreen(self: *Self, id: Id, fullscreen: bool) void {
+    const window = self.windows.get(id) orelse return;
+    if (window.fullscreen == fullscreen) return;
+    window.fullscreen = fullscreen;
+    if (window.mapped) self.requestRepaint();
+}
+
 pub fn setBorders(self: *Self, id: Id, borders: ?Borders) void {
     if (borders) |value| {
         std.debug.assert(value.width > 0);
@@ -254,6 +262,17 @@ pub fn iterator(self: *Self) Iterator {
     return .{ .scene = self };
 }
 
+pub fn topFullscreen(self: *Self) ?Id {
+    var index = self.stack.items.len;
+    while (index > 0) {
+        index -= 1;
+        const id = self.stack.items[index];
+        const window = self.windows.get(id) orelse continue;
+        if (window.mapped and window.fullscreen) return id;
+    }
+    return null;
+}
+
 fn requestRepaint(self: *Self) void {
     if (self.repaint_listener) |listener| listener.request(listener.context);
 }
@@ -289,6 +308,7 @@ test "scene keeps visual state behind generational handles" {
     const id = try scene.addWindow(surface_id);
     scene.setPosition(id, .{ .x = 30, .y = 40 });
     scene.setFocused(id, true);
+    scene.setFullscreen(id, true);
     scene.setEffects(id, .{ .corner_radius = 12 });
     scene.setBorders(id, .{
         .edges = .{ .top = true },
@@ -309,6 +329,7 @@ test "scene keeps visual state behind generational handles" {
     try std.testing.expect(std.meta.eql(surface_id, entry.window.surface_id));
     try std.testing.expectEqual(Position{ .x = 30, .y = 40 }, entry.window.position);
     try std.testing.expect(entry.window.focused);
+    try std.testing.expect(entry.window.fullscreen);
     try std.testing.expect(entry.window.mapped);
     try std.testing.expectEqual(@as(u32, 12), entry.window.effects.corner_radius);
     try std.testing.expectEqual(@as(u32, 4), entry.window.borders.?.width);
@@ -344,16 +365,29 @@ test "scene reorders windows through handles" {
     const second = try scene.addWindow(.{ .index = 2, .generation = 1 });
     const third = try scene.addWindow(.{ .index = 3, .generation = 1 });
 
+    scene.setFullscreen(first, true);
+    scene.setMapped(first, true);
+    scene.setFullscreen(second, true);
+    try std.testing.expectEqual(first, scene.topFullscreen().?);
+    scene.setMapped(second, true);
+    try std.testing.expectEqual(second, scene.topFullscreen().?);
+
     scene.placeTop(first);
     try std.testing.expectEqualSlices(Id, &.{ second, third, first }, scene.stack.items);
+    try std.testing.expectEqual(first, scene.topFullscreen().?);
     scene.placeBelow(first, third);
     try std.testing.expectEqualSlices(Id, &.{ second, first, third }, scene.stack.items);
+    try std.testing.expectEqual(first, scene.topFullscreen().?);
     scene.placeAbove(second, third);
     try std.testing.expectEqualSlices(Id, &.{ first, third, second }, scene.stack.items);
+    try std.testing.expectEqual(second, scene.topFullscreen().?);
     scene.placeBottom(second);
     try std.testing.expectEqualSlices(Id, &.{ second, first, third }, scene.stack.items);
+    try std.testing.expectEqual(first, scene.topFullscreen().?);
 
     scene.removeWindow(first);
+    try std.testing.expectEqual(second, scene.topFullscreen().?);
     scene.removeWindow(second);
+    try std.testing.expectEqual(@as(?Id, null), scene.topFullscreen());
     scene.removeWindow(third);
 }

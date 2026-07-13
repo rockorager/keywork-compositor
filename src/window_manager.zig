@@ -40,7 +40,10 @@ const ManagedWindow = struct {
     metadata_dirty: bool = true,
     proposed_dimensions: ?XdgShell.Dimensions = null,
     requested_dimensions: XdgShell.Dimensions = .{ .width = 0, .height = 0 },
-    activated: bool = false,
+    requested_configuration: XdgShell.ToplevelConfigure = .{},
+    sent_configuration: XdgShell.ToplevelConfigure = .{},
+    fullscreen_output: bool = false,
+    fullscreen_dimensions_pending: bool = false,
     configure: ConfigureState = .idle,
     dimensions_pending: bool = false,
     last_dimensions: ?XdgShell.Dimensions = null,
@@ -50,6 +53,9 @@ const ManagedWindow = struct {
     pending_borders: PendingBorders = .unchanged,
     pending_clip_box: PendingClipBox = .unchanged,
     pending_content_clip_box: PendingClipBox = .unchanged,
+    borders: ?Scene.Borders = null,
+    clip_box: ?Scene.ClipBox = null,
+    content_clip_box: ?Scene.ClipBox = null,
 };
 
 const StackOperation = union(enum) {
@@ -379,14 +385,29 @@ fn finishManage(self: *Self, manager: *river.WindowManagerV1) void {
     var configure_count: u32 = 0;
     var iterator = self.windows.iterator();
     while (iterator.next()) |entry| {
-        const report_dimensions = entry.value.proposed_dimensions != null;
         const activated = if (focused) |id| std.meta.eql(id, entry.id) else false;
-        if (!report_dimensions and activated == entry.value.activated) continue;
-        const dimensions = entry.value.proposed_dimensions orelse entry.value.requested_dimensions;
+        entry.value.requested_configuration.activated = activated;
+        const report_dimensions = entry.value.proposed_dimensions != null or
+            entry.value.fullscreen_dimensions_pending;
+        const configuration_changed = !std.meta.eql(
+            entry.value.requested_configuration,
+            entry.value.sent_configuration,
+        );
+        if (!report_dimensions and !configuration_changed) continue;
+        const proposed_dimensions = entry.value.proposed_dimensions;
+        const dimensions = if (entry.value.fullscreen_output) fullscreen: {
+            const size = self.output.logicalSize();
+            break :fullscreen XdgShell.Dimensions{
+                .width = @intCast(size.width),
+                .height = @intCast(size.height),
+            };
+        } else proposed_dimensions orelse
+            (self.xdg_shell.windowInfo(entry.value.xdg_id) orelse continue).dimensions orelse
+            entry.value.requested_dimensions;
         const serial = self.xdg_shell.configureWindowState(
             entry.value.xdg_id,
             dimensions,
-            activated,
+            entry.value.requested_configuration,
         ) catch |err| {
             switch (err) {
                 error.OutOfMemory => manager.postNoMemory(),
@@ -396,9 +417,12 @@ fn finishManage(self: *Self, manager: *river.WindowManagerV1) void {
         };
         if (report_dimensions) {
             entry.value.proposed_dimensions = null;
-            entry.value.requested_dimensions = dimensions;
+            entry.value.fullscreen_dimensions_pending = false;
+            if (!entry.value.fullscreen_output and proposed_dimensions != null) {
+                entry.value.requested_dimensions = dimensions;
+            }
         }
-        entry.value.activated = activated;
+        entry.value.sent_configuration = entry.value.requested_configuration;
         entry.value.configure = .{ .inflight = .{
             .serial = serial,
             .report_dimensions = report_dimensions,
@@ -442,33 +466,57 @@ fn finishRender(self: *Self, manager: *river.WindowManagerV1) void {
     var iterator = self.windows.iterator();
     while (iterator.next()) |entry| {
         if (entry.value.pending_position) |position| {
-            self.xdg_shell.setWindowPosition(entry.value.xdg_id, position);
+            if (!entry.value.fullscreen_output) {
+                self.xdg_shell.setWindowPosition(entry.value.xdg_id, position);
+            }
             entry.value.pending_position = null;
+        }
+        if (entry.value.fullscreen_output) {
+            self.xdg_shell.setWindowPosition(entry.value.xdg_id, .{});
         }
         self.xdg_shell.setWindowFocused(
             entry.value.xdg_id,
             if (self.focused) |id| std.meta.eql(id, entry.id) else false,
         );
+        self.xdg_shell.setWindowFullscreen(entry.value.xdg_id, entry.value.fullscreen_output);
         switch (entry.value.pending_borders) {
             .unchanged => {},
             .set => |borders| {
-                self.xdg_shell.setWindowBorders(entry.value.xdg_id, borders);
+                entry.value.borders = borders;
                 entry.value.pending_borders = .unchanged;
             },
         }
         switch (entry.value.pending_clip_box) {
             .unchanged => {},
             .set => |clip_box| {
-                self.xdg_shell.setWindowClipBox(entry.value.xdg_id, clip_box);
+                entry.value.clip_box = clip_box;
                 entry.value.pending_clip_box = .unchanged;
             },
         }
         switch (entry.value.pending_content_clip_box) {
             .unchanged => {},
             .set => |clip_box| {
-                self.xdg_shell.setWindowContentClipBox(entry.value.xdg_id, clip_box);
+                entry.value.content_clip_box = clip_box;
                 entry.value.pending_content_clip_box = .unchanged;
             },
+        }
+        if (entry.value.fullscreen_output) {
+            const size = self.output.logicalSize();
+            self.xdg_shell.setWindowBorders(entry.value.xdg_id, null);
+            self.xdg_shell.setWindowClipBox(entry.value.xdg_id, .{
+                .x = 0,
+                .y = 0,
+                .width = size.width,
+                .height = size.height,
+            });
+            self.xdg_shell.setWindowContentClipBox(entry.value.xdg_id, null);
+        } else {
+            self.xdg_shell.setWindowBorders(entry.value.xdg_id, entry.value.borders);
+            self.xdg_shell.setWindowClipBox(entry.value.xdg_id, entry.value.clip_box);
+            self.xdg_shell.setWindowContentClipBox(
+                entry.value.xdg_id,
+                entry.value.content_clip_box,
+            );
         }
         self.xdg_shell.setWindowVisible(
             entry.value.xdg_id,
@@ -522,12 +570,13 @@ fn releaseWindows(self: *Self) void {
     var iterator = self.windows.iterator();
     while (iterator.next()) |entry| {
         self.xdg_shell.setWindowFocused(entry.value.xdg_id, false);
+        self.xdg_shell.setWindowFullscreen(entry.value.xdg_id, false);
         self.xdg_shell.setWindowBorders(entry.value.xdg_id, null);
         self.xdg_shell.setWindowClipBox(entry.value.xdg_id, null);
         self.xdg_shell.setWindowContentClipBox(entry.value.xdg_id, null);
         self.xdg_shell.restoreStandaloneWindow(
             entry.value.xdg_id,
-            entry.value.activated,
+            entry.value.sent_configuration.activated,
             entry.value.requested_dimensions,
         );
         _ = self.windows.remove(entry.id);
@@ -640,6 +689,7 @@ fn removeWindow(self: *Self, xdg_id: XdgShell.WindowId) void {
         else => false,
     };
     self.xdg_shell.setWindowFocused(window.xdg_id, false);
+    self.xdg_shell.setWindowFullscreen(window.xdg_id, false);
     self.xdg_shell.setWindowBorders(window.xdg_id, null);
     self.xdg_shell.setWindowClipBox(window.xdg_id, null);
     self.xdg_shell.setWindowContentClipBox(window.xdg_id, null);
@@ -693,27 +743,65 @@ const WindowResource = struct {
                 if (!self.requireRendering(manager_resource)) return;
                 window.requested_visible = true;
             },
-            .use_csd,
-            .set_tiled,
-            .inform_resize_start,
-            .inform_resize_end,
-            .set_capabilities,
-            .inform_maximized,
-            .inform_unmaximized,
-            .inform_fullscreen,
-            .inform_not_fullscreen,
-            .fullscreen,
-            .exit_fullscreen,
-            => _ = self.requireManage(manager_resource),
+            .use_csd, .use_ssd => _ = self.requireManage(manager_resource),
+            .set_tiled => |tiled| {
+                if (!self.requireManage(manager_resource)) return;
+                window.requested_configuration.tiled = .{
+                    .top = tiled.edges.top,
+                    .bottom = tiled.edges.bottom,
+                    .left = tiled.edges.left,
+                    .right = tiled.edges.right,
+                };
+            },
+            .inform_resize_start => {
+                if (!self.requireManage(manager_resource)) return;
+                window.requested_configuration.resizing = true;
+            },
+            .inform_resize_end => {
+                if (!self.requireManage(manager_resource)) return;
+                window.requested_configuration.resizing = false;
+            },
+            .set_capabilities => |capabilities| {
+                if (!self.requireManage(manager_resource)) return;
+                window.requested_configuration.capabilities = .{
+                    .window_menu = capabilities.caps.window_menu,
+                    .maximize = capabilities.caps.maximize,
+                    .fullscreen = capabilities.caps.fullscreen,
+                    .minimize = capabilities.caps.minimize,
+                };
+            },
+            .inform_maximized => {
+                if (!self.requireManage(manager_resource)) return;
+                window.requested_configuration.maximized = true;
+            },
+            .inform_unmaximized => {
+                if (!self.requireManage(manager_resource)) return;
+                window.requested_configuration.maximized = false;
+            },
+            .inform_fullscreen => {
+                if (!self.requireManage(manager_resource)) return;
+                window.requested_configuration.fullscreen = true;
+            },
+            .inform_not_fullscreen => {
+                if (!self.requireManage(manager_resource)) return;
+                window.requested_configuration.fullscreen = false;
+            },
+            .fullscreen => |fullscreen| {
+                if (!self.requireManage(manager_resource)) return;
+                if (!self.resolveOutput(fullscreen.output)) return;
+                window.fullscreen_output = true;
+                window.fullscreen_dimensions_pending = true;
+            },
+            .exit_fullscreen => {
+                if (!self.requireManage(manager_resource)) return;
+                window.fullscreen_output = false;
+            },
             .get_node => |get| NodeResource.create(
                 self.manager,
                 self.id,
                 resource,
                 get.id,
             ) catch resource.postNoMemory(),
-            .use_ssd => resource.getClient().postImplementationError(
-                "server-side xdg decorations are not implemented",
-            ),
             .set_borders => |borders| {
                 if (!self.requireRendering(manager_resource)) return;
                 const edges: u32 = @bitCast(borders.edges);
@@ -776,6 +864,13 @@ const WindowResource = struct {
     fn activeManager(self: *WindowResource) ?*river.WindowManagerV1 {
         if (self.manager.session_generation != self.owner_generation) return null;
         return self.manager.active;
+    }
+
+    fn resolveOutput(self: *WindowResource, resource: *river.OutputV1) bool {
+        const data = resource.getUserData() orelse return false;
+        const output: *OutputResource = @ptrCast(@alignCast(data));
+        return output.manager == self.manager and
+            output.owner_generation == self.owner_generation;
     }
 
     fn requireManage(self: *WindowResource, manager: *river.WindowManagerV1) bool {
