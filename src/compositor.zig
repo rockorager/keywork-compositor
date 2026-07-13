@@ -29,6 +29,10 @@ pub fn deinit(self: *Self) void {
     self.* = undefined;
 }
 
+pub fn surfaceStore(self: *Self) *Surface.Store {
+    return &self.surfaces;
+}
+
 fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
     const resource = wl.Compositor.create(client, version, id) catch {
         client.postNoMemory();

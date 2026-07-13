@@ -6,9 +6,12 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const scanner = Scanner.create(b, .{});
+    scanner.addSystemProtocol("stable/xdg-shell/xdg-shell.xml");
     scanner.generate("wl_compositor", 4);
     scanner.generate("wl_shm", 1);
     scanner.generate("wl_output", 4);
+    scanner.generate("wl_seat", 10);
+    scanner.generate("xdg_wm_base", 5);
 
     const wayland = b.createModule(.{
         .root_source_file = scanner.result,

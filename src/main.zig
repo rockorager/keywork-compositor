@@ -43,5 +43,6 @@ test {
     _ = @import("cpu_renderer.zig");
     _ = @import("region.zig");
     _ = @import("slot_map.zig");
+    _ = @import("xdg_shell.zig");
     _ = @import("server.zig");
 }

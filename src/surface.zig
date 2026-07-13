@@ -17,6 +17,7 @@ id: Id,
 resource: *wl.Surface,
 pending_attachment: Attachment,
 has_pending_attachment: bool,
+role_handler: ?RoleHandler,
 
 pub const Store = slot_map.SlotMap(State, enum { surface });
 pub const Id = Store.Id;
@@ -38,6 +39,8 @@ pub const State = struct {
     current_input: InputRegion,
     callbacks: std.ArrayList(*FrameCallback),
     current_buffer: ?BufferSnapshot,
+    role_assigned: bool,
+    has_committed: bool,
 
     fn init() State {
         return .{
@@ -57,6 +60,8 @@ pub const State = struct {
             .current_input = InputRegion.init(),
             .callbacks = .empty,
             .current_buffer = null,
+            .role_assigned = false,
+            .has_committed = false,
         };
     }
 
@@ -103,6 +108,7 @@ pub fn create(
         .resource = resource,
         .pending_attachment = .{},
         .has_pending_attachment = false,
+        .role_handler = null,
     };
 
     resource.setHandler(*Self, handleRequest, handleDestroy, self);
@@ -118,6 +124,51 @@ pub fn handle(self: *const Self) Id {
 
 pub fn state(self: *Self) *State {
     return self.store.get(self.id) orelse unreachable;
+}
+
+pub const RoleError = error{
+    AlreadyAssigned,
+    AlreadyReserved,
+    HasBuffer,
+    NotReserved,
+};
+
+pub const CommitInfo = struct {
+    attachment_changed: bool,
+    had_buffer: bool,
+    has_buffer: bool,
+};
+
+pub const RoleHandler = struct {
+    context: *anyopaque,
+    before_commit: *const fn (*anyopaque, CommitInfo) bool,
+    after_commit: *const fn (*anyopaque, CommitInfo) void,
+    surface_destroyed: *const fn (*anyopaque) void,
+};
+
+pub fn reserveRole(self: *Self, handler: RoleHandler) RoleError!void {
+    const surface_state = self.state();
+    if (surface_state.role_assigned) return error.AlreadyAssigned;
+    if (self.role_handler != null) return error.AlreadyReserved;
+    if (self.pending_attachment.shm != null or surface_state.current_buffer != null) {
+        return error.HasBuffer;
+    }
+
+    self.role_handler = handler;
+}
+
+pub fn assignReservedRole(self: *Self, context: *anyopaque) RoleError!void {
+    const surface_state = self.state();
+    if (surface_state.role_assigned) return error.AlreadyAssigned;
+    const handler = self.role_handler orelse return error.NotReserved;
+    if (handler.context != context) return error.NotReserved;
+    surface_state.role_assigned = true;
+}
+
+pub fn releaseRole(self: *Self, context: *anyopaque) void {
+    const handler = self.role_handler orelse return;
+    std.debug.assert(handler.context == context);
+    self.role_handler = null;
 }
 
 pub fn sendFrameDone(self: *Self, time_milliseconds: u32) void {
@@ -200,6 +251,18 @@ fn handleRequest(resource: *wl.Surface, request: wl.Surface.Request, self: *Self
 
 fn commit(self: *Self) void {
     const surface_state = self.state();
+    const commit_info: CommitInfo = .{
+        .attachment_changed = self.has_pending_attachment,
+        .had_buffer = surface_state.current_buffer != null,
+        .has_buffer = if (self.has_pending_attachment)
+            self.pending_attachment.shm != null
+        else
+            surface_state.current_buffer != null,
+    };
+    if (self.role_handler) |handler| {
+        if (!handler.before_commit(handler.context, commit_info)) return;
+    }
+
     surface_state.current_opaque.copyFrom(&surface_state.pending_opaque) catch {
         self.resource.postNoMemory();
         return;
@@ -260,11 +323,15 @@ fn commit(self: *Self) void {
     surface_state.current_transform = surface_state.pending_transform;
     surface_state.pending_surface_damage.clear();
     surface_state.pending_buffer_damage.clear();
+    surface_state.has_committed = true;
     for (surface_state.callbacks.items) |callback| callback.pending = false;
+
+    if (self.role_handler) |handler| handler.after_commit(handler.context, commit_info);
 }
 
 fn handleDestroy(_: *wl.Surface, self: *Self) void {
     self.pending_attachment.clear();
+    if (self.role_handler) |handler| handler.surface_destroyed(handler.context);
     const surface_state = self.state();
 
     while (surface_state.callbacks.items.len > 0) {

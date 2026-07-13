@@ -5,12 +5,14 @@ const Self = @This();
 const std = @import("std");
 const wayland = @import("wayland");
 const Compositor = @import("compositor.zig");
+const XdgShell = @import("xdg_shell.zig");
 
 const wl = wayland.server.wl;
 
 allocator: std.mem.Allocator,
 display: *wl.Server,
 compositor: Compositor,
+xdg_shell: XdgShell,
 socket_buffer: [11]u8,
 listening: bool,
 
@@ -26,10 +28,13 @@ pub fn create(allocator: std.mem.Allocator) !*Self {
         .allocator = allocator,
         .display = display,
         .compositor = undefined,
+        .xdg_shell = undefined,
         .socket_buffer = undefined,
         .listening = false,
     };
     try self.compositor.init(allocator, display);
+    errdefer self.compositor.deinit();
+    try self.xdg_shell.init(allocator, display, self.compositor.surfaceStore());
 
     return self;
 }
@@ -37,6 +42,7 @@ pub fn create(allocator: std.mem.Allocator) !*Self {
 pub fn destroy(self: *Self) void {
     const allocator = self.allocator;
     self.display.destroyClients();
+    self.xdg_shell.deinit();
     self.compositor.deinit();
     self.display.destroy();
     allocator.destroy(self);

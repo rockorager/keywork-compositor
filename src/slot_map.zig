@@ -51,11 +51,14 @@ pub fn SlotMap(comptime Value: type, comptime Tag: type) type {
             return .{ .index = index, .generation = slot.generation };
         }
 
+        /// The returned pointer is invalidated by an insert that reallocates this map.
+        /// Resolve handles near their point of use rather than retaining this pointer.
         pub fn get(self: *Self, id: Id) ?*Value {
             const slot = self.getSlot(id) orelse return null;
             return if (slot.value) |*value| value else null;
         }
 
+        /// The returned pointer is invalidated by an insert that reallocates this map.
         pub fn getConst(self: *const Self, id: Id) ?*const Value {
             const slot = self.getSlotConst(id) orelse return null;
             return if (slot.value) |*value| value else null;
