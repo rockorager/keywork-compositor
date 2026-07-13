@@ -17,6 +17,35 @@ pub const Rect = struct {
     width: u32,
     height: u32,
 
+    pub fn intersection(self: Rect, other: Rect) ?Rect {
+        const left = @max(@as(i64, self.x), other.x);
+        const top = @max(@as(i64, self.y), other.y);
+        const right = @min(
+            @as(i64, self.x) + self.width,
+            @as(i64, other.x) + other.width,
+        );
+        const bottom = @min(
+            @as(i64, self.y) + self.height,
+            @as(i64, other.y) + other.height,
+        );
+        if (left >= right or top >= bottom) return null;
+        return .{
+            .x = @intCast(left),
+            .y = @intCast(top),
+            .width = @intCast(right - left),
+            .height = @intCast(bottom - top),
+        };
+    }
+
+    pub fn translated(self: Rect, x: i32, y: i32) Rect {
+        return .{
+            .x = self.x +| x,
+            .y = self.y +| y,
+            .width = self.width,
+            .height = self.height,
+        };
+    }
+
     pub fn clipTo(self: Rect, size: Size) ?Rect {
         const left = @max(@as(i64, self.x), 0);
         const top = @max(@as(i64, self.y), 0);
@@ -66,6 +95,7 @@ pub const Color = struct {
 pub const SolidRect = struct {
     rect: Rect,
     color: Color,
+    clip: ?Rect = null,
 };
 
 pub const Image = struct {
@@ -74,6 +104,7 @@ pub const Image = struct {
     size: Size,
     buffer: PixelBuffer,
     corner_radius: u32 = 0,
+    clip: ?Rect = null,
 };
 
 pub const Shadow = struct {
@@ -82,12 +113,14 @@ pub const Shadow = struct {
     blur_radius: u32,
     spread: i32,
     color: Color,
+    clip: ?Rect = null,
 };
 
 pub const BackdropBlur = struct {
     rect: Rect,
     corner_radius: u32,
     radius: u32,
+    clip: ?Rect = null,
 };
 
 pub const Command = union(enum) {
@@ -141,4 +174,28 @@ test "rectangle clipping handles negative and overflowing coordinates" {
         .width = 1,
         .height = 1,
     }).clipTo(.{ .width = 5, .height = 7 }));
+}
+
+test "rectangle intersection and translation preserve logical coordinates" {
+    const first: Rect = .{ .x = 10, .y = 20, .width = 30, .height = 40 };
+    const second: Rect = .{ .x = 25, .y = 5, .width = 30, .height = 30 };
+
+    try std.testing.expectEqual(Rect{
+        .x = 25,
+        .y = 20,
+        .width = 15,
+        .height = 15,
+    }, first.intersection(second).?);
+    try std.testing.expectEqual(Rect{
+        .x = 7,
+        .y = 24,
+        .width = 30,
+        .height = 40,
+    }, first.translated(-3, 4));
+    try std.testing.expectEqual(@as(?Rect, null), first.intersection(.{
+        .x = 40,
+        .y = 20,
+        .width = 1,
+        .height = 1,
+    }));
 }

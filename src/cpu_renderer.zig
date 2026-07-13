@@ -38,7 +38,10 @@ pub fn render(self: *Self, frame: render_types.Frame, target: render_types.Pixel
                 pixman.PIXMAN_OP_SRC,
             ),
             .solid_rect => |solid| {
-                const clipped = solid.rect.clipTo(frame.size) orelse continue;
+                var clipped = solid.rect.clipTo(frame.size) orelse continue;
+                if (solid.clip) |clip| {
+                    clipped = clipped.intersection(clip) orelse continue;
+                }
                 try fill(destination, clipped, solid.color, pixman.PIXMAN_OP_OVER);
             },
             .shadow => |shadow| try self.drawShadow(destination, frame.size, shadow),
@@ -112,15 +115,33 @@ fn drawShadow(
     {
         return;
     }
-    if (mask_x < std.math.minInt(c_int) or mask_y < std.math.minInt(c_int) or
-        mask_x > std.math.maxInt(c_int) or mask_y > std.math.maxInt(c_int) or
-        mask_width > std.math.maxInt(c_int) or mask_height > std.math.maxInt(c_int))
-    {
-        return error.InvalidTarget;
+    var composite_rect = (render_types.Rect{
+        .x = @intCast(@max(mask_x, 0)),
+        .y = @intCast(@max(mask_y, 0)),
+        .width = @intCast(@min(mask_right, destination_size.width) - @max(mask_x, 0)),
+        .height = @intCast(@min(mask_bottom, destination_size.height) - @max(mask_y, 0)),
+    });
+    if (shadow.clip) |clip| {
+        composite_rect = composite_rect.intersection(clip) orelse return;
     }
 
-    const width: u32 = @intCast(mask_width);
-    const height: u32 = @intCast(mask_height);
+    const sample_x = @max(mask_x, @as(i64, composite_rect.x) - blur);
+    const sample_y = @max(mask_y, @as(i64, composite_rect.y) - blur);
+    const sample_right = @min(
+        mask_right,
+        @as(i64, composite_rect.x) + composite_rect.width + blur,
+    );
+    const sample_bottom = @min(
+        mask_bottom,
+        @as(i64, composite_rect.y) + composite_rect.height + blur,
+    );
+    const sample_width = sample_right - sample_x;
+    const sample_height = sample_bottom - sample_y;
+    if (sample_width > std.math.maxInt(c_int) or sample_height > std.math.maxInt(c_int)) {
+        return error.InvalidTarget;
+    }
+    const width: u32 = @intCast(sample_width);
+    const height: u32 = @intCast(sample_height);
     const mask = pixman.pixman_image_create_bits(
         pixman.PIXMAN_a8,
         @intCast(width),
@@ -133,18 +154,18 @@ fn drawShadow(
     const data: [*]u8 = @ptrCast(pixman.pixman_image_get_data(mask));
     const stride: usize = @intCast(pixman.pixman_image_get_stride(mask));
     const radius_value = @max(@as(i64, shadow.corner_radius) + spread, 0);
-    const radius: f32 = @floatFromInt(@min(
+    const radius: f64 = @floatFromInt(@min(
         radius_value,
         @divTrunc(@min(shape_width, shape_height), 2),
     ));
-    const shape_left: f32 = @floatFromInt(blur);
-    const shape_top: f32 = @floatFromInt(blur);
-    const shape_size_x: f32 = @floatFromInt(shape_width);
-    const shape_size_y: f32 = @floatFromInt(shape_height);
+    const shape_left: f64 = @floatFromInt(shape_x - sample_x);
+    const shape_top: f64 = @floatFromInt(shape_y - sample_y);
+    const shape_size_x: f64 = @floatFromInt(shape_width);
+    const shape_size_y: f64 = @floatFromInt(shape_height);
     for (0..height) |y| {
         for (0..width) |x| {
-            const pixel_x: f32 = @as(f32, @floatFromInt(x)) + 0.5;
-            const pixel_y: f32 = @as(f32, @floatFromInt(y)) + 0.5;
+            const pixel_x: f64 = @as(f64, @floatFromInt(x)) + 0.5;
+            const pixel_y: f64 = @as(f64, @floatFromInt(y)) + 0.5;
             const coverage = roundedRectCoverage(
                 pixel_x,
                 pixel_y,
@@ -177,12 +198,12 @@ fn drawShadow(
         destination,
         0,
         0,
-        0,
-        0,
-        @intCast(mask_x),
-        @intCast(mask_y),
-        @intCast(width),
-        @intCast(height),
+        @intCast(@as(i64, composite_rect.x) - sample_x),
+        @intCast(@as(i64, composite_rect.y) - sample_y),
+        composite_rect.x,
+        composite_rect.y,
+        @intCast(composite_rect.width),
+        @intCast(composite_rect.height),
     );
 }
 
@@ -192,7 +213,8 @@ fn drawBackdropBlur(
     blur: render_types.BackdropBlur,
 ) Error!void {
     if (blur.radius == 0 or blur.rect.width == 0 or blur.rect.height == 0) return;
-    const clipped = blur.rect.clipTo(target.size) orelse return;
+    var clipped = blur.rect.clipTo(target.size) orelse return;
+    if (blur.clip) |clip| clipped = clipped.intersection(clip) orelse return;
 
     const radius: i64 = blur.radius;
     const sample_left: u32 = @intCast(@max(@as(i64, clipped.x) - radius, 0));
@@ -237,8 +259,8 @@ fn drawBackdropBlur(
                 255
             else
                 @intFromFloat(roundedRectCoverage(
-                    @as(f32, @floatFromInt(output_x)) + 0.5,
-                    @as(f32, @floatFromInt(output_y)) + 0.5,
+                    @as(f64, @floatFromInt(output_x)) + 0.5,
+                    @as(f64, @floatFromInt(output_y)) + 0.5,
                     @floatFromInt(blur.rect.x),
                     @floatFromInt(blur.rect.y),
                     @floatFromInt(blur.rect.width),
@@ -341,14 +363,14 @@ fn blendArgb(source: u32, destination: u32, coverage: u8) u32 {
 }
 
 fn roundedRectCoverage(
-    pixel_x: f32,
-    pixel_y: f32,
-    left: f32,
-    top: f32,
-    width: f32,
-    height: f32,
-    radius: f32,
-) f32 {
+    pixel_x: f64,
+    pixel_y: f64,
+    left: f64,
+    top: f64,
+    width: f64,
+    height: f64,
+    radius: f64,
+) f64 {
     const half_width = width / 2.0;
     const half_height = height / 2.0;
     const center_x = left + half_width;
@@ -430,7 +452,8 @@ fn composite(
         .width = image.size.width,
         .height = image.size.height,
     };
-    const clipped = destination_rect.clipTo(destination_size) orelse return;
+    var clipped = destination_rect.clipTo(destination_size) orelse return;
+    if (image.clip) |clip| clipped = clipped.intersection(clip) orelse return;
     const source_x: i32 = clipped.x - image.x;
     const source_y: i32 = clipped.y - image.y;
     const mask = if (image.corner_radius > 0)
@@ -553,6 +576,7 @@ test "CPU renderer draws clipped premultiplied rectangles" {
         .{ .solid_rect = .{
             .rect = .{ .x = -1, .y = 1, .width = 3, .height = 2 },
             .color = render_types.Color.rgba(255, 0, 0, 128),
+            .clip = .{ .x = 1, .y = 0, .width = 1, .height = 3 },
         } },
     };
 
@@ -561,7 +585,7 @@ test "CPU renderer draws clipped premultiplied rectangles" {
     try renderer.render(.{ .size = size, .commands = &commands }, output.target());
 
     try std.testing.expectEqual(@as(u32, 0xff0000ff), output.pixel(0, 0));
-    try std.testing.expectEqual(@as(u32, 0xff80007f), output.pixel(0, 1));
+    try std.testing.expectEqual(@as(u32, 0xff0000ff), output.pixel(0, 1));
     try std.testing.expectEqual(@as(u32, 0xff80007f), output.pixel(1, 2));
     try std.testing.expectEqual(@as(u32, 0xff0000ff), output.pixel(2, 1));
 }
@@ -603,6 +627,7 @@ test "CPU renderer composites clipped images" {
                 .stride_pixels = 2,
                 .pixels = &source_pixels,
             },
+            .clip = .{ .x = 0, .y = 1, .width = 1, .height = 1 },
         } },
     };
 
@@ -610,7 +635,7 @@ test "CPU renderer composites clipped images" {
     defer renderer.deinit();
     try renderer.render(.{ .size = size, .commands = &commands }, output.target());
 
-    try std.testing.expectEqual(@as(u32, 0xff00ff00), output.pixel(0, 0));
+    try std.testing.expectEqual(@as(u32, 0xff000000), output.pixel(0, 0));
     try std.testing.expectEqual(@as(u32, 0xff808080), output.pixel(0, 1));
     try std.testing.expectEqual(@as(u32, 0xff000000), output.pixel(1, 0));
 }
@@ -684,6 +709,7 @@ test "CPU renderer draws blurred rounded shadows" {
             .blur_radius = 2,
             .spread = 0,
             .color = render_types.Color.rgba(0, 0, 0, 255),
+            .clip = .{ .x = 4, .y = 0, .width = 1, .height = 9 },
         } },
     };
 
@@ -691,11 +717,40 @@ test "CPU renderer draws blurred rounded shadows" {
     defer renderer.deinit();
     try renderer.render(.{ .size = size, .commands = &commands }, output.target());
 
-    const edge_alpha: u8 = @truncate(output.pixel(1, 4) >> 24);
     const center_alpha: u8 = @truncate(output.pixel(4, 4) >> 24);
-    try std.testing.expect(edge_alpha > 0);
-    try std.testing.expect(center_alpha > edge_alpha);
+    try std.testing.expect(center_alpha > 0);
+    try std.testing.expectEqual(@as(u32, 0), output.pixel(3, 4));
+    try std.testing.expectEqual(@as(u32, 0), output.pixel(5, 4));
     try std.testing.expectEqual(@as(u32, 0), output.pixel(8, 8));
+}
+
+test "CPU renderer bounds shadow work to the clipped output" {
+    const size: render_types.Size = .{ .width = 9, .height = 9 };
+    var output = try headless.init(std.testing.allocator, size);
+    defer output.deinit();
+
+    const commands = [_]render_types.Command{
+        .{ .shadow = .{
+            .rect = .{
+                .x = 0,
+                .y = 0,
+                .width = std.math.maxInt(i32),
+                .height = std.math.maxInt(i32),
+            },
+            .corner_radius = 0,
+            .blur_radius = 2,
+            .spread = 0,
+            .color = render_types.Color.rgba(0, 0, 0, 255),
+            .clip = .{ .x = 4, .y = 4, .width = 1, .height = 1 },
+        } },
+    };
+
+    var renderer = Self.init(std.testing.allocator);
+    defer renderer.deinit();
+    try renderer.render(.{ .size = size, .commands = &commands }, output.target());
+
+    try std.testing.expectEqual(@as(u32, 0xff000000), output.pixel(4, 4));
+    try std.testing.expectEqual(@as(u32, 0), output.pixel(3, 4));
 }
 
 test "CPU renderer blurs the backdrop inside a window region" {
@@ -716,6 +771,7 @@ test "CPU renderer blurs the backdrop inside a window region" {
             .rect = .{ .x = 1, .y = 0, .width = 3, .height = 1 },
             .corner_radius = 0,
             .radius = 1,
+            .clip = .{ .x = 2, .y = 0, .width = 1, .height = 1 },
         } },
     };
 
@@ -724,8 +780,8 @@ test "CPU renderer blurs the backdrop inside a window region" {
     try renderer.render(.{ .size = size, .commands = &commands }, target);
 
     try std.testing.expectEqual(@as(u32, 0xff000000), output.pixel(0, 0));
-    try std.testing.expectEqual(@as(u32, 0xff555555), output.pixel(1, 0));
+    try std.testing.expectEqual(@as(u32, 0xff000000), output.pixel(1, 0));
     try std.testing.expectEqual(@as(u32, 0xff555555), output.pixel(2, 0));
-    try std.testing.expectEqual(@as(u32, 0xff555555), output.pixel(3, 0));
+    try std.testing.expectEqual(@as(u32, 0xff000000), output.pixel(3, 0));
     try std.testing.expectEqual(@as(u32, 0xff000000), output.pixel(4, 0));
 }
