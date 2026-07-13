@@ -19,6 +19,7 @@ global: *wl.Global,
 bindings: BindingStore,
 xdg_surfaces: XdgSurfaceStore,
 windows: WindowStore,
+window_listener: ?WindowListener,
 
 const BindingStore = slot_map.SlotMap(BindingState, enum { xdg_binding });
 const BindingId = BindingStore.Id;
@@ -40,7 +41,7 @@ const Geometry = struct {
     height: i32,
 };
 
-const SizeHint = struct {
+pub const SizeHint = struct {
     width: i32 = 0,
     height: i32 = 0,
 };
@@ -56,6 +57,7 @@ const XdgSurfaceState = struct {
     configured: bool = false,
     mapped: bool = false,
     surface_alive: bool = true,
+    toplevel_resource: ?*xdg.Toplevel = null,
 
     fn deinit(self: *XdgSurfaceState, allocator: std.mem.Allocator) void {
         self.configure_serials.deinit(allocator);
@@ -74,6 +76,7 @@ pub const WindowState = struct {
     current_min_size: SizeHint = .{},
     current_max_size: SizeHint = .{},
     mapped: bool = false,
+    ready: bool = false,
 
     fn deinit(self: *WindowState, allocator: std.mem.Allocator) void {
         if (self.title) |title| allocator.free(title);
@@ -81,9 +84,12 @@ pub const WindowState = struct {
         self.* = undefined;
     }
 
-    fn commit(self: *WindowState) void {
+    fn commit(self: *WindowState) bool {
+        const changed = !std.meta.eql(self.current_min_size, self.pending_min_size) or
+            !std.meta.eql(self.current_max_size, self.pending_max_size);
         self.current_min_size = self.pending_min_size;
         self.current_max_size = self.pending_max_size;
+        return changed;
     }
 
     fn reset(self: *WindowState, allocator: std.mem.Allocator) void {
@@ -97,6 +103,42 @@ pub const WindowState = struct {
         self.current_min_size = .{};
         self.current_max_size = .{};
         self.mapped = false;
+        self.ready = false;
+    }
+};
+
+pub const Dimensions = struct {
+    width: i32,
+    height: i32,
+};
+
+pub const WindowInfo = struct {
+    scene_id: Scene.Id,
+    title: ?[:0]const u8,
+    app_id: ?[:0]const u8,
+    parent: ?WindowId,
+    min_size: SizeHint,
+    max_size: SizeHint,
+    dimensions: ?Dimensions,
+    ready: bool,
+    mapped: bool,
+};
+
+pub const WindowListener = struct {
+    context: *anyopaque,
+    ready: *const fn (*anyopaque, WindowId) bool,
+    committed: *const fn (*anyopaque, WindowId, ?u32) bool,
+    unmapped: *const fn (*anyopaque, WindowId) void,
+    destroyed: *const fn (*anyopaque, WindowId) void,
+    metadata_changed: *const fn (*anyopaque, WindowId) void,
+};
+
+pub const WindowIterator = struct {
+    inner: WindowStore.Iterator,
+
+    pub fn next(self: *WindowIterator) ?WindowId {
+        const entry = self.inner.next() orelse return null;
+        return entry.id;
     }
 };
 
@@ -116,6 +158,7 @@ pub fn init(
         .bindings = .{},
         .xdg_surfaces = .{},
         .windows = .{},
+        .window_listener = null,
     };
     errdefer self.bindings.deinit(allocator);
     errdefer self.xdg_surfaces.deinit(allocator);
@@ -124,11 +167,93 @@ pub fn init(
 }
 
 pub fn deinit(self: *Self) void {
+    std.debug.assert(self.window_listener == null);
     self.global.destroy();
     self.bindings.deinit(self.allocator);
     self.xdg_surfaces.deinit(self.allocator);
     self.windows.deinit(self.allocator);
     self.* = undefined;
+}
+
+pub fn setWindowListener(self: *Self, listener: WindowListener) void {
+    std.debug.assert(self.window_listener == null);
+    self.window_listener = listener;
+}
+
+pub fn clearWindowListener(self: *Self) void {
+    std.debug.assert(self.window_listener != null);
+    self.window_listener = null;
+}
+
+pub fn windowIterator(self: *Self) WindowIterator {
+    return .{ .inner = self.windows.iterator() };
+}
+
+pub fn windowInfo(self: *Self, id: WindowId) ?WindowInfo {
+    const window = self.windows.get(id) orelse return null;
+    const xdg_surface = self.xdg_surfaces.get(window.xdg_surface_id) orelse return null;
+    const dimensions: ?Dimensions = if (xdg_surface.current_geometry) |geometry|
+        .{ .width = geometry.width, .height = geometry.height }
+    else if (Surface.currentBuffer(self.surface_store, xdg_surface.surface_id)) |buffer|
+        .{
+            .width = @intCast(buffer.logical_size.width),
+            .height = @intCast(buffer.logical_size.height),
+        }
+    else
+        null;
+    return .{
+        .scene_id = window.scene_id,
+        .title = window.title,
+        .app_id = window.app_id,
+        .parent = window.parent,
+        .min_size = window.current_min_size,
+        .max_size = window.current_max_size,
+        .dimensions = dimensions,
+        .ready = window.ready,
+        .mapped = window.mapped,
+    };
+}
+
+pub fn configureWindow(
+    self: *Self,
+    id: WindowId,
+    dimensions: Dimensions,
+) error{ InvalidWindow, OutOfMemory }!u32 {
+    if (dimensions.width < 0 or dimensions.height < 0) return error.InvalidWindow;
+    const window = self.windows.get(id) orelse return error.InvalidWindow;
+    const state = self.xdg_surfaces.get(window.xdg_surface_id) orelse
+        return error.InvalidWindow;
+    const toplevel = state.toplevel_resource orelse return error.InvalidWindow;
+    const serial = self.display.nextSerial();
+    state.configure_serials.append(self.allocator, serial) catch return error.OutOfMemory;
+
+    const values: std.ArrayList(u32) = .empty;
+    var array = wl.Array.fromArrayList(u32, values);
+    if (toplevel.getVersion() >= 5 and !state.initial_configure_sent) {
+        toplevel.sendWmCapabilities(&array);
+    }
+    toplevel.sendConfigure(dimensions.width, dimensions.height, &array);
+    const adapter: *ToplevelResource = @ptrCast(@alignCast(toplevel.getUserData().?));
+    adapter.xdg_surface_resource.resource.sendConfigure(serial);
+    state.initial_configure_sent = true;
+    return serial;
+}
+
+pub fn restoreStandaloneWindow(self: *Self, id: WindowId) void {
+    const window = self.windows.get(id) orelse return;
+    const state = self.xdg_surfaces.get(window.xdg_surface_id) orelse return;
+    if (window.ready and !state.initial_configure_sent) {
+        _ = self.configureWindow(id, .{ .width = 0, .height = 0 }) catch |err| switch (err) {
+            error.OutOfMemory => if (state.toplevel_resource) |resource| resource.postNoMemory(),
+            error.InvalidWindow => {},
+        };
+    }
+    if (window.mapped) self.scene.setMapped(window.scene_id, true);
+}
+
+pub fn setWindowVisible(self: *Self, id: WindowId, visible: bool) void {
+    const window = self.windows.get(id) orelse return;
+    self.scene.setMapped(window.scene_id, visible and window.mapped);
 }
 
 fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
@@ -437,6 +562,9 @@ const XdgSurfaceResource = struct {
         };
         if (removed.role) |window_id| {
             if (self.shell.windows.remove(window_id)) |window_value| {
+                if (self.shell.window_listener) |listener| {
+                    listener.destroyed(listener.context, window_id);
+                }
                 var window = window_value;
                 self.shell.scene.removeWindow(window.scene_id);
                 window.deinit(self.allocator);
@@ -498,9 +626,16 @@ const XdgSurfaceResource = struct {
 
         const window_id = state.role orelse return;
         const window = self.shell.windows.get(window_id) orelse return;
-        window.commit();
+        if (window.commit()) {
+            if (self.shell.window_listener) |listener| {
+                listener.metadata_changed(listener.context, window_id);
+            }
+        }
 
         if (info.had_buffer and !info.has_buffer) {
+            if (self.shell.window_listener) |listener| {
+                listener.unmapped(listener.context, window_id);
+            }
             state.mapped = false;
             state.configured = false;
             state.initial_configure_sent = false;
@@ -513,20 +648,32 @@ const XdgSurfaceResource = struct {
 
         if (info.has_buffer) {
             const was_mapped = window.mapped;
-            if (state.last_acked_serial != null) {
+            const configure_serial = state.last_acked_serial;
+            if (configure_serial != null) {
                 state.configured = true;
                 state.last_acked_serial = null;
             }
             state.mapped = state.configured;
             window.mapped = state.mapped;
-            self.shell.scene.setMapped(window.scene_id, state.mapped);
+            const externally_managed = if (self.shell.window_listener) |listener|
+                listener.committed(listener.context, window_id, configure_serial)
+            else
+                false;
+            if (!externally_managed) self.shell.scene.setMapped(window.scene_id, state.mapped);
             if (was_mapped and state.mapped) {
                 self.shell.scene.surfaceCommitted(window.scene_id);
             }
             return;
         }
 
-        if (!state.initial_configure_sent) self.sendInitialConfigure();
+        if (!window.ready) {
+            window.ready = true;
+            const externally_managed = if (self.shell.window_listener) |listener|
+                listener.ready(listener.context, window_id)
+            else
+                false;
+            if (!externally_managed) self.sendInitialConfigure(window_id);
+        }
     }
 
     fn surfaceDestroyed(context: *anyopaque) void {
@@ -537,27 +684,23 @@ const XdgSurfaceResource = struct {
         state.mapped = false;
         if (state.role) |window_id| {
             if (self.shell.windows.get(window_id)) |window| {
+                if (window.ready) {
+                    if (self.shell.window_listener) |listener| {
+                        listener.unmapped(listener.context, window_id);
+                    }
+                }
                 window.mapped = false;
+                window.ready = false;
                 self.shell.scene.setMapped(window.scene_id, false);
             }
         }
     }
 
-    fn sendInitialConfigure(self: *XdgSurfaceResource) void {
-        const state = self.shell.xdg_surfaces.get(self.id) orelse return;
-        const toplevel = self.toplevel_resource orelse return;
-        const serial = self.shell.display.nextSerial();
-        state.configure_serials.append(self.allocator, serial) catch {
-            self.resource.postNoMemory();
-            return;
+    fn sendInitialConfigure(self: *XdgSurfaceResource, window_id: WindowId) void {
+        _ = self.shell.configureWindow(window_id, .{ .width = 0, .height = 0 }) catch |err| switch (err) {
+            error.OutOfMemory => self.resource.postNoMemory(),
+            error.InvalidWindow => {},
         };
-
-        const values: std.ArrayList(u32) = .empty;
-        var array = wl.Array.fromArrayList(u32, values);
-        if (toplevel.getVersion() >= 5) toplevel.sendWmCapabilities(&array);
-        toplevel.sendConfigure(0, 0, &array);
-        self.resource.sendConfigure(serial);
-        state.initial_configure_sent = true;
     }
 };
 
@@ -606,6 +749,7 @@ const ToplevelResource = struct {
         };
         const state = xdg_surface.shell.xdg_surfaces.get(xdg_surface.id) orelse unreachable;
         state.role = window_id;
+        state.toplevel_resource = resource;
         xdg_surface.toplevel_resource = resource;
         resource.setHandler(*ToplevelResource, handleRequest, handleDestroy, self);
     }
@@ -659,9 +803,13 @@ const ToplevelResource = struct {
             xdg_surface.initial_configure_sent = false;
             xdg_surface.last_acked_serial = null;
             xdg_surface.configure_serials.clearRetainingCapacity();
+            xdg_surface.toplevel_resource = null;
             self.xdg_surface_resource.toplevel_resource = null;
         }
         if (self.shell.windows.remove(self.id)) |window_value| {
+            if (self.shell.window_listener) |listener| {
+                listener.destroyed(listener.context, self.id);
+            }
             var window = window_value;
             self.shell.scene.removeWindow(window.scene_id);
             window.deinit(self.allocator);
@@ -686,6 +834,9 @@ const ToplevelResource = struct {
         };
         if (destination.*) |old| self.allocator.free(old);
         destination.* = copy;
+        if (self.shell.window_listener) |listener| {
+            listener.metadata_changed(listener.context, self.id);
+        }
     }
 
     fn setParent(
@@ -711,6 +862,9 @@ const ToplevelResource = struct {
             ancestor = candidate_window.parent;
         }
         window.parent = parent_id;
+        if (self.shell.window_listener) |listener| {
+            listener.metadata_changed(listener.context, self.id);
+        }
     }
 
     fn validMaxSize(maximum: SizeHint, minimum: SizeHint) bool {
