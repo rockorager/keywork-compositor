@@ -100,6 +100,7 @@ test {
     _ = @import("wayland/fixes.zig");
     _ = @import("wayland/linux_dmabuf.zig");
     _ = @import("wayland/single_pixel_buffer.zig");
+    _ = @import("wayland/content_type.zig");
     _ = @import("wayland/cursor_shape.zig");
     _ = @import("wayland/relative_pointer.zig");
     _ = @import("wayland/pointer_constraints.zig");

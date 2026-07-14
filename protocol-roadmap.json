@@ -553,15 +553,16 @@
       "interfaces": [
         {
           "name": "wp_content_type_manager_v1",
-          "current_version": null,
+          "current_version": 1,
           "target_version": 1
         }
       ],
-      "status": "not_started",
+      "status": "done",
       "privileged": false,
       "blocked_by": [
         "wl-compositor"
-      ]
+      ],
+      "status_detail": "Version 1 enforces one content-type object per wl_surface, keeps photo/video/game/none hints in the surface's pending, current, and synchronized-subsurface cached state, resets pending state to none when the object is destroyed, and makes objects inert when their wl_surface disappears."
     },
     {
       "id": "single-pixel-buffer",

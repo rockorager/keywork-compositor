@@ -13,6 +13,7 @@ const XdgShell = @import("wayland/xdg_shell.zig");
 const XdgForeign = @import("wayland/xdg_foreign.zig");
 const LayerShell = @import("wayland/layer_shell.zig");
 const SinglePixelBuffer = @import("wayland/single_pixel_buffer.zig");
+const ContentType = @import("wayland/content_type.zig");
 const CursorShape = @import("wayland/cursor_shape.zig");
 const RelativePointer = @import("wayland/relative_pointer.zig");
 const PointerConstraints = @import("wayland/pointer_constraints.zig");
@@ -62,6 +63,7 @@ xdg_output_initialized: bool,
 output_management: OutputManagement,
 output_management_initialized: bool,
 single_pixel_buffer: SinglePixelBuffer,
+content_type: ContentType,
 cursor_shape: CursorShape,
 relative_pointer: RelativePointer,
 pointer_constraints: PointerConstraints,
@@ -160,6 +162,7 @@ pub fn create(
         .output_management = undefined,
         .output_management_initialized = false,
         .single_pixel_buffer = undefined,
+        .content_type = undefined,
         .cursor_shape = undefined,
         .relative_pointer = undefined,
         .pointer_constraints = undefined,
@@ -257,6 +260,8 @@ pub fn create(
     }
     try self.single_pixel_buffer.init(allocator, display);
     errdefer self.single_pixel_buffer.deinit();
+    try self.content_type.init(allocator, display);
+    errdefer self.content_type.deinit();
     try self.cursor_shape.init(allocator, display, &self.seat);
     errdefer self.cursor_shape.deinit();
     try self.relative_pointer.init(allocator, display, &self.seat);
@@ -450,6 +455,7 @@ pub fn destroy(self: *Self) void {
     self.pointer_constraints.deinit();
     self.relative_pointer.deinit();
     self.cursor_shape.deinit();
+    self.content_type.deinit();
     self.single_pixel_buffer.deinit();
     self.xdg_output.deinit();
     self.xdg_output_initialized = false;

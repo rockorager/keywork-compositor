@@ -24,6 +24,7 @@ pending_attachment: Attachment,
 has_pending_attachment: bool,
 role_handler: ?RoleHandler,
 viewport_handler: ?ViewportHandler,
+content_type_handler: ?ContentTypeHandler,
 commit_listeners: std.ArrayList(*CommitListener),
 
 pub const Store = slot_map.SlotMap(State, enum { surface });
@@ -41,6 +42,8 @@ pub const State = struct {
     current_transform: wl.Output.Transform,
     pending_viewport: ViewportState,
     current_viewport: ViewportState,
+    pending_content_type: ContentType,
+    current_content_type: ContentType,
     pending_surface_damage: Region,
     pending_buffer_damage: Region,
     pending_opaque: Region,
@@ -61,6 +64,7 @@ pub const State = struct {
     cached_scale: i32,
     cached_transform: wl.Output.Transform,
     cached_viewport: ViewportState,
+    cached_content_type: ContentType,
     cached_surface_damage: Region,
     cached_buffer_damage: Region,
     cached_opaque: Region,
@@ -82,6 +86,8 @@ pub const State = struct {
             .current_transform = .normal,
             .pending_viewport = .{},
             .current_viewport = .{},
+            .pending_content_type = .none,
+            .current_content_type = .none,
             .pending_surface_damage = Region.init(),
             .pending_buffer_damage = Region.init(),
             .pending_opaque = Region.init(),
@@ -102,6 +108,7 @@ pub const State = struct {
             .cached_scale = 1,
             .cached_transform = .normal,
             .cached_viewport = .{},
+            .cached_content_type = .none,
             .cached_surface_damage = Region.init(),
             .cached_buffer_damage = Region.init(),
             .cached_opaque = Region.init(),
@@ -166,6 +173,7 @@ pub fn create(
         .has_pending_attachment = false,
         .role_handler = null,
         .viewport_handler = null,
+        .content_type_handler = null,
         .commit_listeners = .empty,
     };
 
@@ -218,6 +226,8 @@ pub const ViewportState = struct {
     destination: ?render_types.Size = null,
 };
 
+pub const ContentType = wp.ContentTypeV1.Type;
+
 pub const ViewportHandler = struct {
     context: *anyopaque,
     resource: *wp.Viewport,
@@ -243,6 +253,32 @@ pub fn setViewportSource(self: *Self, source: ?ViewportSource) void {
 pub fn setViewportDestination(self: *Self, destination: ?render_types.Size) void {
     std.debug.assert(self.viewport_handler != null);
     self.state().pending_viewport.destination = destination;
+}
+
+pub const ContentTypeHandler = struct {
+    context: *anyopaque,
+    surface_destroyed: *const fn (*anyopaque) void,
+};
+
+pub fn setContentTypeHandler(self: *Self, handler: ContentTypeHandler) error{AlreadyExists}!void {
+    if (self.content_type_handler != null) return error.AlreadyExists;
+    self.content_type_handler = handler;
+}
+
+pub fn clearContentTypeHandler(self: *Self) void {
+    std.debug.assert(self.content_type_handler != null);
+    self.content_type_handler = null;
+    self.state().pending_content_type = .none;
+}
+
+pub fn setPendingContentType(self: *Self, content_type: ContentType) void {
+    std.debug.assert(self.content_type_handler != null);
+    self.state().pending_content_type = content_type;
+}
+
+pub fn currentContentType(store: *Store, id: Id) ?ContentType {
+    const surface_state = store.get(id) orelse return null;
+    return surface_state.current_content_type;
 }
 
 pub const Role = enum {
@@ -690,6 +726,7 @@ fn applyPending(self: *Self, commit_info: CommitInfo) void {
     surface_state.current_scale = surface_state.pending_scale;
     surface_state.current_transform = surface_state.pending_transform;
     surface_state.current_viewport = surface_state.pending_viewport;
+    surface_state.current_content_type = surface_state.pending_content_type;
     surface_state.current_offset_x = surface_state.pending_offset_x;
     surface_state.current_offset_y = surface_state.pending_offset_y;
     surface_state.pending_offset_x = 0;
@@ -777,6 +814,7 @@ fn cachePending(self: *Self) bool {
     surface_state.cached_scale = surface_state.pending_scale;
     surface_state.cached_transform = surface_state.pending_transform;
     surface_state.cached_viewport = surface_state.pending_viewport;
+    surface_state.cached_content_type = surface_state.pending_content_type;
     surface_state.cached_offset_x +|= surface_state.pending_offset_x;
     surface_state.cached_offset_y +|= surface_state.pending_offset_y;
     surface_state.pending_offset_x = 0;
@@ -832,6 +870,7 @@ fn applyCached(self: *Self) void {
     surface_state.current_scale = surface_state.cached_scale;
     surface_state.current_transform = surface_state.cached_transform;
     surface_state.current_viewport = surface_state.cached_viewport;
+    surface_state.current_content_type = surface_state.cached_content_type;
     surface_state.current_offset_x = surface_state.cached_offset_x;
     surface_state.current_offset_y = surface_state.cached_offset_y;
     surface_state.cached_offset_x = 0;
@@ -958,6 +997,10 @@ fn handleDestroy(_: *wl.Surface, self: *Self) void {
     if (self.role_handler) |handler| handler.surface_destroyed(handler.context);
     if (self.viewport_handler) |handler| {
         self.viewport_handler = null;
+        handler.surface_destroyed(handler.context);
+    }
+    if (self.content_type_handler) |handler| {
+        self.content_type_handler = null;
         handler.surface_destroyed(handler.context);
     }
     while (self.commit_listeners.items.len > 0) {
