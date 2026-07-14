@@ -442,6 +442,15 @@ pub fn submitPresentationFor(store: *Store, id: Id) void {
     }
 }
 
+pub fn discardUnsubmittedFeedback(store: *Store) void {
+    var surfaces = store.iterator();
+    while (surfaces.next()) |entry| {
+        if (!entry.value.presentation_submitted) {
+            discardCommitFeedbacks(entry.value, .active);
+        }
+    }
+}
+
 pub fn finishPresentation(store: *Store, info: presentation.Info) void {
     var surfaces = store.iterator();
     while (surfaces.next()) |entry| {

@@ -101,11 +101,6 @@ pub fn findResource(self: *Self, resource: *wl.Output) ?Entry {
     return null;
 }
 
-pub fn configureSurface(self: *Self, surface: *wl.Surface) void {
-    var outputs = self.iterator();
-    while (outputs.next()) |entry| entry.output.configureSurface(surface);
-}
-
 pub fn iterator(self: *Self) Iterator {
     return .{ .inner = self.outputs.iterator() };
 }

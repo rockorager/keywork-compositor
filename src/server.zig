@@ -114,7 +114,6 @@ pub fn create(
     errdefer self.compositor.deinit();
     self.outputs.init(allocator, display, self.compositor.surfaceStore());
     errdefer self.outputs.deinit();
-    self.compositor.setOutputLayout(&self.outputs);
     try self.seat.init(allocator, io, display, self.compositor.surfaceStore());
     errdefer self.seat.deinit();
     try self.render_output.init(
@@ -955,6 +954,9 @@ fn renderFrame(self: *Self) renderer_types.Renderer.Error!void {
         return;
     };
     errdefer self.render_output.cancel();
+    const output = self.outputs.get(self.render_output_id).?;
+    output.beginFrame();
+    errdefer output.cancelFrame();
     const output_size = self.render_output.size();
     const target = self.renderer.makeTarget(pixel_target);
     const clear_command = [_]render.Command{
@@ -1031,6 +1033,7 @@ fn renderFrame(self: *Self) renderer_types.Renderer.Error!void {
     }
 
     const presented = self.render_output.present() catch return error.InvalidTarget;
+    output.endFrame();
 
     self.submitLayerSurfaces(.background);
     self.submitLayerSurfaces(.bottom);
@@ -1061,6 +1064,7 @@ fn renderFrame(self: *Self) renderer_types.Renderer.Error!void {
     while (input_popups.next()) |popup| self.submitSurfaceTree(popup.surface_id);
     if (drag_icon) |info| self.submitSurfaceTree(info.surface_id);
     if (cursor) |info| self.submitSurfaceTree(info.surface_id);
+    Surface.discardUnsubmittedFeedback(self.compositor.surfaceStore());
     if (presented) |info| outputPresented(self, info);
     const keyboard_focus = self.layer_shell.keyboardFocus(
         self.xdg_shell.popupKeyboardFocus(),
@@ -1288,6 +1292,18 @@ fn renderSurfaceTree(
                 self.compositor.surfaceStore(),
                 surface_id,
             ) orelse continue;
+            const surface_rect: render.Rect = .{
+                .x = x,
+                .y = y,
+                .width = buffer.logical_size.width,
+                .height = buffer.logical_size.height,
+            };
+            const output = self.outputs.get(self.render_output_id).?;
+            const visible_rect = surface_rect.intersection(output.logicalRect()) orelse continue;
+            if (clip) |clip_rect| {
+                if (visible_rect.intersection(clip_rect) == null) continue;
+            }
+            try output.markSurfaceVisible(surface_id);
             if (buffer.transform != .normal) continue;
             const image_command = [_]render.Command{
                 .{ .image = .{
@@ -1450,7 +1466,9 @@ fn submitSurfaceTree(self: *Self, surface_id: Surface.Id) void {
 
     var stack = self.subcompositor.stackIterator(surface_id);
     while (stack.next()) |entry| switch (entry) {
-        .parent => Surface.submitPresentationFor(self.compositor.surfaceStore(), surface_id),
+        .parent => if (self.outputs.get(self.render_output_id).?.containsSurface(surface_id)) {
+            Surface.submitPresentationFor(self.compositor.surfaceStore(), surface_id);
+        },
         .child => |child| self.submitSurfaceTree(child.surface_id),
     };
 }

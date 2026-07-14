@@ -5,7 +5,6 @@ const Self = @This();
 const std = @import("std");
 const wayland = @import("wayland");
 const Surface = @import("surface.zig");
-const OutputLayout = @import("output_layout.zig");
 const WaylandRegion = @import("region.zig");
 
 const wl = wayland.server.wl;
@@ -13,14 +12,12 @@ const wl = wayland.server.wl;
 allocator: std.mem.Allocator,
 global: *wl.Global,
 surfaces: Surface.Store,
-outputs: ?*OutputLayout,
 
 pub fn init(self: *Self, allocator: std.mem.Allocator, display: *wl.Server) !void {
     self.* = .{
         .allocator = allocator,
         .global = undefined,
         .surfaces = .{},
-        .outputs = null,
     };
     errdefer self.surfaces.deinit(allocator);
     self.global = try wl.Global.create(display, wl.Compositor, 7, *Self, self, bind);
@@ -34,11 +31,6 @@ pub fn deinit(self: *Self) void {
 
 pub fn surfaceStore(self: *Self) *Surface.Store {
     return &self.surfaces;
-}
-
-pub fn setOutputLayout(self: *Self, outputs: *OutputLayout) void {
-    std.debug.assert(self.outputs == null);
-    self.outputs = outputs;
 }
 
 fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
@@ -63,7 +55,7 @@ fn handleRequest(resource: *wl.Compositor, request: wl.Compositor.Request, self:
 }
 
 fn createSurface(self: *Self, compositor: *wl.Compositor, id: u32) void {
-    const surface = Surface.create(
+    _ = Surface.create(
         self.allocator,
         &self.surfaces,
         compositor.getClient(),
@@ -73,5 +65,4 @@ fn createSurface(self: *Self, compositor: *wl.Compositor, id: u32) void {
         compositor.postNoMemory();
         return;
     };
-    if (self.outputs) |outputs| outputs.configureSurface(surface.waylandResource());
 }

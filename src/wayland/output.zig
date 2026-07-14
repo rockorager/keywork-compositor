@@ -22,10 +22,17 @@ scale: i32,
 refresh_millihertz: i32,
 resources: std.ArrayList(*wl.Output),
 surfaces: *Surface.Store,
+memberships: std.ArrayList(Membership),
+frame_active: bool,
 
 pub const Position = struct {
     x: i32 = 0,
     y: i32 = 0,
+};
+
+const Membership = struct {
+    surface_id: Surface.Id,
+    visible: bool,
 };
 
 pub const Error = error{
@@ -62,13 +69,17 @@ pub fn init(
         .refresh_millihertz = 60_000,
         .resources = .empty,
         .surfaces = surfaces,
+        .memberships = .empty,
+        .frame_active = false,
     };
 }
 
 pub fn deinit(self: *Self) void {
     std.debug.assert(self.resources.items.len == 0);
+    std.debug.assert(!self.frame_active);
     self.global.destroy();
     self.resources.deinit(self.allocator);
+    self.memberships.deinit(self.allocator);
     self.* = undefined;
 }
 
@@ -82,6 +93,15 @@ pub fn logicalSize(self: *const Self) render.Size {
 
 pub fn logicalPosition(self: *const Self) Position {
     return self.position;
+}
+
+pub fn logicalRect(self: *const Self) render.Rect {
+    return .{
+        .x = self.position.x,
+        .y = self.position.y,
+        .width = self.size.width,
+        .height = self.size.height,
+    };
 }
 
 pub fn ownsResource(self: *Self, resource: *wl.Output) bool {
@@ -105,16 +125,62 @@ pub fn setRefresh(self: *Self, info: presentation.Info) void {
     }
 }
 
-pub fn configureSurface(self: *Self, surface: *wl.Surface) void {
+pub fn beginFrame(self: *Self) void {
+    std.debug.assert(!self.frame_active);
+    for (self.memberships.items) |*membership| membership.visible = false;
+    self.frame_active = true;
+}
+
+pub fn markSurfaceVisible(self: *Self, surface_id: Surface.Id) error{OutOfMemory}!void {
+    std.debug.assert(self.frame_active);
+    for (self.memberships.items) |*membership| {
+        if (!std.meta.eql(membership.surface_id, surface_id)) continue;
+        membership.visible = true;
+        return;
+    }
+
+    const surface = Surface.resourceFor(self.surfaces, surface_id) orelse return;
+    try self.memberships.append(self.allocator, .{
+        .surface_id = surface_id,
+        .visible = true,
+    });
     for (self.resources.items) |resource| {
-        if (resource.getClient() == surface.getClient()) {
-            surface.sendEnter(resource);
-        }
+        if (resource.getClient() == surface.getClient()) surface.sendEnter(resource);
     }
     if (surface.getVersion() >= wl.Surface.preferred_buffer_scale_since_version) {
         surface.sendPreferredBufferScale(self.scale);
         surface.sendPreferredBufferTransform(.normal);
     }
+}
+
+pub fn endFrame(self: *Self) void {
+    std.debug.assert(self.frame_active);
+    var index = self.memberships.items.len;
+    while (index > 0) {
+        index -= 1;
+        const membership = self.memberships.items[index];
+        if (membership.visible) continue;
+        if (Surface.resourceFor(self.surfaces, membership.surface_id)) |surface| {
+            for (self.resources.items) |resource| {
+                if (resource.getClient() == surface.getClient()) surface.sendLeave(resource);
+            }
+        }
+        _ = self.memberships.orderedRemove(index);
+    }
+    self.frame_active = false;
+}
+
+pub fn cancelFrame(self: *Self) void {
+    std.debug.assert(self.frame_active);
+    for (self.memberships.items) |*membership| membership.visible = true;
+    self.frame_active = false;
+}
+
+pub fn containsSurface(self: *const Self, surface_id: Surface.Id) bool {
+    for (self.memberships.items) |membership| {
+        if (std.meta.eql(membership.surface_id, surface_id)) return true;
+    }
+    return false;
 }
 
 fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
@@ -145,11 +211,9 @@ fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
         resource.sendDescription(output_description);
     }
     if (version >= wl.Output.done_since_version) resource.sendDone();
-    var surfaces = self.surfaces.iterator();
-    while (surfaces.next()) |entry| {
-        if (entry.value.resource.getClient() == client) {
-            entry.value.resource.sendEnter(resource);
-        }
+    for (self.memberships.items) |membership| {
+        const surface = Surface.resourceFor(self.surfaces, membership.surface_id) orelse continue;
+        if (surface.getClient() == client) surface.sendEnter(resource);
     }
 }
 
@@ -175,4 +239,61 @@ fn handleDestroy(resource: *wl.Output, self: *Self) void {
         return;
     }
     unreachable;
+}
+
+test "frame membership removes surfaces which are no longer visible" {
+    const display = try wl.Server.create();
+    defer display.destroy();
+
+    var surfaces: Surface.Store = .{};
+    defer surfaces.deinit(std.testing.allocator);
+
+    var output: Self = undefined;
+    try output.init(
+        std.testing.allocator,
+        display,
+        .{},
+        .{ .width = 1280, .height = 720 },
+        .{ .width = 1280, .height = 720 },
+        1,
+        &surfaces,
+    );
+    defer output.deinit();
+
+    try output.memberships.append(std.testing.allocator, .{
+        .surface_id = .{ .index = 0, .generation = 1 },
+        .visible = true,
+    });
+    output.beginFrame();
+    output.endFrame();
+    try std.testing.expectEqual(@as(usize, 0), output.memberships.items.len);
+}
+
+test "cancelled frame preserves existing membership" {
+    const display = try wl.Server.create();
+    defer display.destroy();
+
+    var surfaces: Surface.Store = .{};
+    defer surfaces.deinit(std.testing.allocator);
+
+    var output: Self = undefined;
+    try output.init(
+        std.testing.allocator,
+        display,
+        .{},
+        .{ .width = 1280, .height = 720 },
+        .{ .width = 1280, .height = 720 },
+        1,
+        &surfaces,
+    );
+    defer output.deinit();
+
+    try output.memberships.append(std.testing.allocator, .{
+        .surface_id = .{ .index = 0, .generation = 1 },
+        .visible = true,
+    });
+    output.beginFrame();
+    output.cancelFrame();
+    try std.testing.expectEqual(@as(usize, 1), output.memberships.items.len);
+    try std.testing.expect(output.memberships.items[0].visible);
 }
