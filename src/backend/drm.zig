@@ -235,6 +235,10 @@ pub fn activate(self: *Self, fd: std.posix.fd_t, selection: Selection, device_pa
     }
 
     if (self.enabled) {
+        log.info(
+            "allocating scanout buffers for connector {s} at {d}x{d}",
+            .{ self.name(), self.size.width, self.size.height },
+        );
         errdefer for (&self.buffers) |*buffer| destroyBuffer(fd, buffer);
         for (&self.buffers) |*buffer| {
             try createBuffer(fd, self.size, buffer);

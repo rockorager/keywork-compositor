@@ -141,15 +141,22 @@ fn newOutput(self: *Self, fd: std.posix.fd_t, selection: DrmOutput.Selection) !*
 
 fn activate(self: *Self) !void {
     std.debug.assert(self.device == null);
+    if (self.device_path) |path| {
+        log.info("opening DRM device {s}", .{path});
+    } else {
+        log.info("discovering DRM device", .{});
+    }
     const device = if (self.device_path) |path| try self.openDevice(path) else try self.discoverDevice();
     self.device = device;
     errdefer self.deactivate();
+    log.info("opened DRM device {s}", .{self.device_path.?});
     const selections = try DrmOutput.selectOutputs(
         self.allocator,
         device.fd,
         self.active_outputs.items,
     );
     defer self.allocator.free(selections);
+    log.info("found {d} usable connected DRM output(s)", .{selections.len});
     if (!self.initialized and selections.len == 0) return error.NoConnectedOutput;
 
     // Existing connector objects remain stable across a VT switch.
