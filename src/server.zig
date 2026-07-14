@@ -227,7 +227,7 @@ pub fn create(
     errdefer self.security_context.deinit();
     self.outputs.init(allocator, display, self.compositor.surfaceStore());
     errdefer self.outputs.deinit();
-    try self.seat.init(allocator, io, display, self.compositor.surfaceStore());
+    try self.seat.init(allocator, io, display, "default", self.compositor.surfaceStore());
     errdefer self.seat.deinit();
     var render_output_id: RenderOutputId = undefined;
     errdefer {

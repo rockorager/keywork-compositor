@@ -13,6 +13,7 @@ allocator: std.mem.Allocator,
 io: std.Io,
 display: *wl.Server,
 global: *wl.Global,
+name_value: [:0]const u8,
 surface_store: *Surface.Store,
 seat_resources: std.ArrayList(*wl.Seat),
 keyboard_resources: std.ArrayList(KeyboardResource),
@@ -199,6 +200,7 @@ pub fn init(
     allocator: std.mem.Allocator,
     io: std.Io,
     display: *wl.Server,
+    seat_name: [:0]const u8,
     surface_store: *Surface.Store,
 ) !void {
     self.* = .{
@@ -206,6 +208,7 @@ pub fn init(
         .io = io,
         .display = display,
         .global = undefined,
+        .name_value = seat_name,
         .surface_store = surface_store,
         .seat_resources = .empty,
         .keyboard_resources = .empty,
@@ -288,6 +291,10 @@ pub fn deinit(self: *Self) void {
 
 pub fn globalName(self: *const Self, client: *const wl.Client) u32 {
     return self.global.getName(client);
+}
+
+pub fn name(self: *const Self) [:0]const u8 {
+    return self.name_value;
 }
 
 pub fn ownsResource(self: *Self, resource: *wl.Seat) bool {
@@ -1142,7 +1149,7 @@ fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
         return;
     };
     resource.setHandler(*Self, handleRequest, handleSeatDestroy, self);
-    if (version >= wl.Seat.name_since_version) resource.sendName("seat0");
+    if (version >= wl.Seat.name_since_version) resource.sendName(self.name_value);
     resource.sendCapabilities(self.capabilities());
 }
 

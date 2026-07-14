@@ -203,6 +203,7 @@ fn managerDestroyed(_: *river.InputManagerV1, adapter: *ManagerResource) void {
 
 fn createSeat(self: *Self, resource: *river.InputManagerV1, name: []const u8) void {
     if (std.mem.eql(u8, name, default_seat) or self.hasSeat(name)) return;
+    log.warn("tracking seat {s}, but multi-seat input routing is not implemented yet", .{name});
     const copy = self.allocator.dupeSentinel(u8, name, 0) catch {
         resource.postNoMemory();
         return;
@@ -274,6 +275,9 @@ fn deviceRequest(
             const name = std.mem.span(assign.name);
             if (!self.hasSeat(name)) return;
             device.seat_name = self.seatName(name).?;
+            if (!std.mem.eql(u8, name, default_seat)) {
+                log.warn("device {d} remains routed through the default seat", .{device.id});
+            }
         },
         .set_repeat_info => |repeat| {
             if (repeat.rate < 0 or repeat.delay < 0) {
