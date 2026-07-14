@@ -21,6 +21,7 @@ target_output: OutputLayout.Id,
 managers: std.ArrayList(*ManagerResource),
 devices: std.ArrayList(*Device),
 device_resources: std.ArrayList(*DeviceResource),
+device_listeners: std.ArrayList(*DeviceListener),
 seats: std.ArrayList([:0]u8),
 
 const ManagerResource = struct {
@@ -38,6 +39,13 @@ pub const Device = struct {
     seat_name: [:0]const u8 = default_seat,
     output: ?OutputLayout.Id = null,
     rectangle: ?NativeInput.DeviceMap = null,
+    references: usize = 0,
+};
+
+pub const DeviceListener = struct {
+    context: *anyopaque,
+    added: *const fn (*anyopaque, *Device) void,
+    removed: *const fn (*anyopaque, *Device) void,
 };
 
 const DeviceResource = struct {
@@ -68,6 +76,7 @@ pub fn init(
         .managers = .empty,
         .devices = .empty,
         .device_resources = .empty,
+        .device_listeners = .empty,
         .seats = .empty,
     };
     errdefer self.deinitStorage();
@@ -84,6 +93,7 @@ pub fn init(
 
 pub fn deinit(self: *Self) void {
     std.debug.assert(self.native_input == null);
+    std.debug.assert(self.device_listeners.items.len == 0);
     for (self.managers.items) |manager| std.debug.assert(manager.resource == null);
     for (self.device_resources.items) |resource| std.debug.assert(resource.resource == null);
     self.security_context.unrestrictGlobal(self.global);
@@ -93,11 +103,13 @@ pub fn deinit(self: *Self) void {
 }
 
 fn deinitStorage(self: *Self) void {
+    self.device_listeners.deinit(self.allocator);
     for (self.device_resources.items) |resource| self.allocator.destroy(resource);
     self.device_resources.deinit(self.allocator);
     for (self.managers.items) |manager| self.allocator.destroy(manager);
     self.managers.deinit(self.allocator);
     for (self.devices.items) |device| {
+        std.debug.assert(device.references == 0);
         self.allocator.free(device.name);
         self.allocator.destroy(device);
     }
@@ -130,6 +142,50 @@ pub fn outputRemoved(self: *Self, output_id: OutputLayout.Id) void {
 pub fn findDevice(self: *Self, id: NativeInput.DeviceId) ?*Device {
     for (self.devices.items) |device| if (device.id == id and device.connected) return device;
     return null;
+}
+
+pub const DeviceIterator = struct {
+    devices: []const *Device,
+    index: usize = 0,
+
+    pub fn next(self: *DeviceIterator) ?*Device {
+        while (self.index < self.devices.len) {
+            defer self.index += 1;
+            const device = self.devices[self.index];
+            if (device.connected) return device;
+        }
+        return null;
+    }
+};
+
+pub fn deviceIterator(self: *Self) DeviceIterator {
+    return .{ .devices = self.devices.items };
+}
+
+pub fn addDeviceListener(self: *Self, listener: *DeviceListener) error{OutOfMemory}!void {
+    for (self.device_listeners.items) |registered| std.debug.assert(registered != listener);
+    try self.device_listeners.append(self.allocator, listener);
+    var devices = self.deviceIterator();
+    while (devices.next()) |device| listener.added(listener.context, device);
+}
+
+pub fn removeDeviceListener(self: *Self, listener: *DeviceListener) void {
+    for (self.device_listeners.items, 0..) |registered, index| {
+        if (registered != listener) continue;
+        _ = self.device_listeners.orderedRemove(index);
+        return;
+    }
+    unreachable;
+}
+
+pub fn retainDevice(device: *Device) void {
+    device.references = std.math.add(usize, device.references, 1) catch unreachable;
+}
+
+pub fn releaseDevice(device: *Device) void {
+    std.debug.assert(device.references > 0);
+    device.references -= 1;
+    device.manager.maybeDestroyDevice(device);
 }
 
 fn firstConnectedDevice(self: *Self) ?*Device {
@@ -245,6 +301,7 @@ fn createDeviceResource(self: *Self, manager: *ManagerResource, device: *Device)
     errdefer self.allocator.destroy(adapter);
     adapter.* = .{ .device = device, .resource = resource, .removed = false };
     try self.device_resources.append(self.allocator, adapter);
+    retainDevice(device);
     resource.setHandler(*DeviceResource, deviceRequest, deviceResourceDestroyed, adapter);
     manager_resource.sendInputDevice(resource);
     resource.sendType(switch (device.device_type) {
@@ -327,7 +384,7 @@ fn deviceRequest(
 
 fn deviceResourceDestroyed(_: *river.InputDeviceV1, adapter: *DeviceResource) void {
     adapter.resource = null;
-    adapter.device.manager.maybeDestroyDevice(adapter.device);
+    releaseDevice(adapter.device);
 }
 
 fn seatName(self: *const Self, name: []const u8) ?[:0]const u8 {
@@ -389,6 +446,7 @@ fn deviceAdded(context: *anyopaque, info: NativeInput.DeviceInfo) void {
         if (manager.resource == null or manager.stopped) continue;
         self.createDeviceResource(manager, device) catch manager.resource.?.postNoMemory();
     }
+    for (self.device_listeners.items) |listener| listener.added(listener.context, device);
 }
 
 fn deviceRemoved(context: *anyopaque, id: NativeInput.DeviceId) void {
@@ -400,6 +458,7 @@ fn deviceRemoved(context: *anyopaque, id: NativeInput.DeviceId) void {
 fn removeDevice(self: *Self, device: *Device) void {
     std.debug.assert(device.connected);
     device.connected = false;
+    for (self.device_listeners.items) |listener| listener.removed(listener.context, device);
     for (self.device_resources.items) |adapter| {
         if (adapter.device != device or adapter.resource == null or adapter.removed) continue;
         adapter.resource.?.sendRemoved();
@@ -409,10 +468,7 @@ fn removeDevice(self: *Self, device: *Device) void {
 }
 
 fn maybeDestroyDevice(self: *Self, device: *Device) void {
-    if (device.connected) return;
-    for (self.device_resources.items) |adapter| {
-        if (adapter.device == device and adapter.resource != null) return;
-    }
+    if (device.connected or device.references != 0) return;
     for (self.devices.items, 0..) |candidate, index| {
         if (candidate != device) continue;
         _ = self.devices.orderedRemove(index);
