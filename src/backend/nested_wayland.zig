@@ -228,8 +228,20 @@ pub fn deinit(self: *Self) void {
     if (self.presentation_manager) |manager| manager.destroy();
     if (self.fractional_scale_manager) |manager| manager.destroy();
     if (self.viewporter) |viewporter| viewporter.destroy();
-    if (self.shm) |shm| shm.destroy();
-    if (self.compositor) |compositor| compositor.destroy();
+    if (self.shm) |shm| {
+        if (shm.getVersion() >= wl.Shm.release_since_version) {
+            shm.release();
+        } else {
+            shm.destroy();
+        }
+    }
+    if (self.compositor) |compositor| {
+        if (compositor.getVersion() >= wl.Compositor.release_since_version) {
+            compositor.release();
+        } else {
+            compositor.destroy();
+        }
+    }
     if (self.registry) |registry| registry.destroy();
     if (self.display) |display| display.disconnect();
     self.* = undefined;

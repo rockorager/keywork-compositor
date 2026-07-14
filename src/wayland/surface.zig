@@ -45,6 +45,7 @@ pub const State = struct {
     pending_input: InputRegion,
     current_input: InputRegion,
     callbacks: std.ArrayList(*FrameCallback),
+    release_callbacks: std.ArrayList(*BufferReleaseCallback),
     commit_feedbacks: std.ArrayList(*CommitFeedback),
     presentation_submitted: bool,
     commit_after_submission: bool,
@@ -84,6 +85,7 @@ pub const State = struct {
             .pending_input = InputRegion.init(),
             .current_input = InputRegion.init(),
             .callbacks = .empty,
+            .release_callbacks = .empty,
             .commit_feedbacks = .empty,
             .presentation_submitted = false,
             .commit_after_submission = false,
@@ -107,8 +109,10 @@ pub const State = struct {
 
     fn deinit(self: *State, allocator: std.mem.Allocator) void {
         std.debug.assert(self.callbacks.items.len == 0);
+        std.debug.assert(self.release_callbacks.items.len == 0);
         std.debug.assert(self.commit_feedbacks.items.len == 0);
         self.callbacks.deinit(allocator);
+        self.release_callbacks.deinit(allocator);
         self.commit_feedbacks.deinit(allocator);
         if (self.current_buffer) |*current| current.deinit();
         if (self.cached_buffer) |*cached| cached.deinit();
@@ -532,10 +536,23 @@ fn handleRequest(resource: *wl.Surface, request: wl.Surface.Request, self: *Self
             surface_state.pending_offset_x = offset.x;
             surface_state.pending_offset_y = offset.y;
         },
+        .get_release => |release| createBufferReleaseCallback(self, release.callback) catch
+            resource.postNoMemory(),
     }
 }
 
 fn commit(self: *Self) void {
+    const surface_state = self.state();
+    if (surface_state.release_callbacks.items.len > 0 and
+        (!self.has_pending_attachment or self.pending_attachment.shm == null))
+    {
+        self.resource.postError(
+            .no_buffer,
+            "wl_surface.get_release requires a non-null buffer attachment",
+        );
+        return;
+    }
+
     const commit_info = pendingCommitInfo(self);
     const action = if (self.role_handler) |handler|
         handler.before_commit(handler.context, commit_info)
@@ -601,9 +618,7 @@ fn applyPending(self: *Self, commit_info: CommitInfo) void {
         if (surface_state.current_buffer) |*current| current.deinit();
         surface_state.current_buffer = snapshot;
 
-        if (self.pending_attachment.resource) |buffer| buffer.sendRelease();
-        self.pending_attachment.clear();
-        self.has_pending_attachment = false;
+        releasePendingAttachment(self);
     } else if (surface_state.current_buffer) |*current| {
         current.updateGeometry(
             surface_state.pending_scale,
@@ -701,9 +716,7 @@ fn cachePending(self: *Self) bool {
         snapshot = null;
         surface_state.cached_attachment_changed = true;
 
-        if (self.pending_attachment.resource) |buffer| buffer.sendRelease();
-        self.pending_attachment.clear();
-        self.has_pending_attachment = false;
+        releasePendingAttachment(self);
     }
 
     surface_state.cached_scale = surface_state.pending_scale;
@@ -812,6 +825,20 @@ fn finishApplied(self: *Self, commit_info: CommitInfo) void {
     for (self.commit_listeners.items) |listener| listener.applied(listener.context);
 }
 
+fn releasePendingAttachment(self: *Self) void {
+    std.debug.assert(self.has_pending_attachment);
+    // SHM storage is no longer used once its pixels have been copied, even
+    // when the resulting content update remains cached by a synchronized role.
+    if (self.pending_attachment.resource) |buffer| buffer.sendRelease();
+    self.pending_attachment.clear();
+    self.has_pending_attachment = false;
+
+    const surface_state = self.state();
+    while (surface_state.release_callbacks.items.len > 0) {
+        surface_state.release_callbacks.items[0].resource.destroySendDone(0);
+    }
+}
+
 fn commitFeedbackWithState(
     surface_state: *State,
     target_status: CommitFeedback.Status,
@@ -857,6 +884,10 @@ fn handleDestroy(_: *wl.Surface, self: *Self) void {
 
     while (surface_state.callbacks.items.len > 0) {
         surface_state.callbacks.items[surface_state.callbacks.items.len - 1].resource.destroy();
+    }
+    while (surface_state.release_callbacks.items.len > 0) {
+        surface_state.release_callbacks.items[surface_state.release_callbacks.items.len - 1]
+            .resource.destroy();
     }
     while (surface_state.commit_feedbacks.items.len > 0) {
         const feedback = surface_state.commit_feedbacks.items[surface_state.commit_feedbacks.items.len - 1];
@@ -1146,6 +1177,19 @@ const FrameCallback = struct {
     }
 };
 
+const BufferReleaseCallback = struct {
+    allocator: std.mem.Allocator,
+    store: *Store,
+    surface_id: Id,
+    resource: *wl.Callback,
+
+    fn handleDestroy(resource: *wl.Resource) callconv(.c) void {
+        const self: *BufferReleaseCallback = @ptrCast(@alignCast(resource.getUserData().?));
+        removeBufferReleaseCallback(self.store, self.surface_id, self);
+        self.allocator.destroy(self);
+    }
+};
+
 fn createFrameCallback(self: *Self, id: u32) error{OutOfMemory}!void {
     const resource = wl.Callback.create(self.resource.getClient(), 1, id) catch
         return error.OutOfMemory;
@@ -1170,11 +1214,50 @@ fn createFrameCallback(self: *Self, id: u32) error{OutOfMemory}!void {
     );
 }
 
+fn createBufferReleaseCallback(self: *Self, id: u32) error{OutOfMemory}!void {
+    const resource = wl.Callback.create(self.resource.getClient(), 1, id) catch
+        return error.OutOfMemory;
+    errdefer resource.destroy();
+
+    const callback = self.allocator.create(BufferReleaseCallback) catch
+        return error.OutOfMemory;
+    errdefer self.allocator.destroy(callback);
+    callback.* = .{
+        .allocator = self.allocator,
+        .store = self.store,
+        .surface_id = self.id,
+        .resource = resource,
+    };
+    try self.state().release_callbacks.append(self.allocator, callback);
+
+    @as(*wl.Resource, @ptrCast(resource)).setDispatcher(
+        null,
+        null,
+        callback,
+        BufferReleaseCallback.handleDestroy,
+    );
+}
+
 fn removeCallback(store: *Store, surface_id: Id, callback: *FrameCallback) void {
     const surface_state = store.get(surface_id) orelse unreachable;
     for (surface_state.callbacks.items, 0..) |candidate, index| {
         if (candidate == callback) {
             _ = surface_state.callbacks.orderedRemove(index);
+            return;
+        }
+    }
+    unreachable;
+}
+
+fn removeBufferReleaseCallback(
+    store: *Store,
+    surface_id: Id,
+    callback: *BufferReleaseCallback,
+) void {
+    const surface_state = store.get(surface_id) orelse unreachable;
+    for (surface_state.release_callbacks.items, 0..) |candidate, index| {
+        if (candidate == callback) {
+            _ = surface_state.release_callbacks.orderedRemove(index);
             return;
         }
     }

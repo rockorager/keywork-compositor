@@ -17,9 +17,9 @@ pub fn build(b: *std.Build) void {
     scanner.addSystemProtocol("staging/fractional-scale/fractional-scale-v1.xml");
     scanner.addSystemProtocol("stable/presentation-time/presentation-time.xml");
     scanner.addCustomProtocol(river.path("protocol/river-window-management-v1.xml"));
-    scanner.generate("wl_compositor", 6);
+    scanner.generate("wl_compositor", 7);
     scanner.generate("wl_subcompositor", 1);
-    scanner.generate("wl_shm", 1);
+    scanner.generate("wl_shm", 2);
     scanner.generate("wl_fixes", 1);
     scanner.generate("wl_output", 4);
     scanner.generate("wl_seat", 10);

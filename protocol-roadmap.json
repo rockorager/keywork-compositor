@@ -26,14 +26,14 @@
       "interfaces": [
         {
           "name": "wl_compositor",
-          "current_version": 6,
+          "current_version": 7,
           "target_version": 7
         }
       ],
-      "status": "in_progress",
+      "status": "done",
       "privileged": false,
       "blocked_by": [],
-      "status_detail": "Surface and region behavior is implemented through v6; v7 release and per-commit buffer-release semantics remain."
+      "status_detail": "Surface and region behavior is implemented through v7, including compositor release and per-commit buffer release callbacks."
     },
     {
       "id": "wl-shm",
@@ -44,14 +44,14 @@
       "interfaces": [
         {
           "name": "wl_shm",
-          "current_version": 1,
+          "current_version": 2,
           "target_version": 2
         }
       ],
-      "status": "in_progress",
+      "status": "done",
       "privileged": false,
       "blocked_by": [],
-      "status_detail": "libwayland provides v1; target v2 adds global release semantics."
+      "status_detail": "libwayland provides the v2 global, including release semantics; ARGB8888 and XRGB8888 buffers are copied into compositor-owned snapshots."
     },
     {
       "id": "wl-output",

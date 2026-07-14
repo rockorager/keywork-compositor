@@ -23,7 +23,7 @@ pub fn init(self: *Self, allocator: std.mem.Allocator, display: *wl.Server) !voi
         .output = null,
     };
     errdefer self.surfaces.deinit(allocator);
-    self.global = try wl.Global.create(display, wl.Compositor, 6, *Self, self, bind);
+    self.global = try wl.Global.create(display, wl.Compositor, 7, *Self, self, bind);
 }
 
 pub fn deinit(self: *Self) void {
@@ -58,6 +58,7 @@ fn handleRequest(resource: *wl.Compositor, request: wl.Compositor.Request, self:
             resource.getVersion(),
             create.id,
         ) catch resource.postNoMemory(),
+        .release => resource.destroy(),
     }
 }
 
