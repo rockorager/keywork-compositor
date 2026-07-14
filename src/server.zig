@@ -67,7 +67,7 @@ const RenderOutput = struct {
     server: *Self,
     backend: OutputBackend,
     protocol_id: OutputLayout.Id,
-    timer: *wl.EventSource,
+    timer: ?*wl.EventSource,
     repaint_needed: bool,
     render_scheduled: bool,
 
@@ -84,6 +84,16 @@ const RenderOutput = struct {
 
 const RenderOutputStore = slot_map.SlotMap(*RenderOutput, enum { render_output });
 const RenderOutputId = RenderOutputStore.Id;
+
+const RenderOutputConfig = struct {
+    kind: OutputBackend.Kind,
+    size: render.Size,
+    position: Output.Position = .{},
+    name: []const u8,
+    description: []const u8,
+    make: []const u8 = "keywork",
+    model: []const u8,
+};
 
 const OutputFrame = struct {
     render_output: *RenderOutput,
@@ -141,62 +151,9 @@ pub fn create(
     errdefer self.outputs.deinit();
     try self.seat.init(allocator, io, display, self.compositor.surfaceStore());
     errdefer self.seat.deinit();
-    const render_output = try allocator.create(RenderOutput);
-    errdefer allocator.destroy(render_output);
-    render_output.* = .{
-        .server = self,
-        .backend = undefined,
-        .protocol_id = undefined,
-        .timer = undefined,
-        .repaint_needed = false,
-        .render_scheduled = false,
-    };
-    try render_output.backend.init(
-        allocator,
-        io,
-        display,
-        .{ .width = 1280, .height = 720 },
-        output_kind,
-        .{
-            .context = render_output,
-            .ready = outputReady,
-            .presented = outputPresented,
-            .discarded = outputDiscarded,
-            .close = closeOutput,
-            .keyboard_available = keyboardAvailable,
-            .keyboard_keymap = keyboardKeymap,
-            .keyboard_enter = keyboardEnter,
-            .keyboard_leave = keyboardLeave,
-            .keyboard_key = keyboardKey,
-            .keyboard_modifiers = keyboardModifiers,
-            .keyboard_repeat_info = keyboardRepeatInfo,
-            .pointer_available = pointerAvailable,
-            .pointer_enter = pointerEnter,
-            .pointer_leave = pointerLeave,
-            .pointer_motion = pointerMotion,
-            .pointer_button = pointerButton,
-            .pointer_axis = pointerAxis,
-            .pointer_frame = pointerFrame,
-            .pointer_axis_source = pointerAxisSource,
-            .pointer_axis_stop = pointerAxisStop,
-            .pointer_axis_discrete = pointerAxisDiscrete,
-            .pointer_axis_value120 = pointerAxisValue120,
-            .pointer_axis_relative_direction = pointerAxisRelativeDirection,
-            .touch_available = touchAvailable,
-            .touch_down = touchDown,
-            .touch_up = touchUp,
-            .touch_motion = touchMotion,
-            .touch_frame = touchFrame,
-            .touch_cancel = touchCancel,
-            .touch_shape = touchShape,
-            .touch_orientation = touchOrientation,
-        },
-    );
-    errdefer render_output.backend.deinit();
-    render_output.protocol_id = try self.outputs.add(.{
-        .size = render_output.backend.size(),
-        .physical_size = render_output.backend.physicalSize(),
-        .scale = render_output.backend.clientScale(),
+    const render_output_id = try self.addRenderOutput(io, .{
+        .kind = output_kind,
+        .size = .{ .width = 1280, .height = 720 },
         .name = switch (output_kind) {
             .headless => "HEADLESS-1",
             .nested => "NESTED-1",
@@ -210,10 +167,9 @@ pub fn create(
             .nested => "nested-wayland",
         },
     });
-    errdefer std.debug.assert(self.outputs.remove(render_output.protocol_id));
-    const render_output_id = try self.render_outputs.insert(allocator, render_output);
-    errdefer std.debug.assert(self.render_outputs.remove(render_output_id) == render_output);
+    errdefer std.debug.assert(self.removeRenderOutput(render_output_id));
     self.primary_render_output = render_output_id;
+    const render_output = self.render_outputs.get(render_output_id).?.*;
     try self.xdg_output.init(display, &self.outputs);
     errdefer self.xdg_output.deinit();
     try self.single_pixel_buffer.init(allocator, display);
@@ -311,11 +267,6 @@ pub fn create(
         .{ .context = self, .route = routePointer },
     );
     errdefer self.window_manager.deinit();
-    render_output.timer = try display.getEventLoop().addTimer(
-        *RenderOutput,
-        handleRenderTimer,
-        render_output,
-    );
     self.subcompositor.setRepaintListener(.{
         .context = self,
         .request = requestRepaint,
@@ -345,7 +296,7 @@ pub fn destroy(self: *Self) void {
     self.scene.clearRepaintListener();
     self.subcompositor.clearRepaintListener();
     var render_outputs = self.render_outputs.iterator();
-    while (render_outputs.next()) |entry| entry.value.*.timer.remove();
+    while (render_outputs.next()) |entry| stopRenderOutput(entry.value.*);
     self.display.destroyClients();
     self.window_manager.deinit();
     self.input_method.deinit();
@@ -366,11 +317,7 @@ pub fn destroy(self: *Self) void {
     self.xdg_output.deinit();
     render_outputs = self.render_outputs.iterator();
     while (render_outputs.next()) |entry| {
-        const render_output = entry.value.*;
-        std.debug.assert(self.outputs.remove(render_output.protocol_id));
-        render_output.backend.deinit();
-        std.debug.assert(self.render_outputs.remove(entry.id) == render_output);
-        allocator.destroy(render_output);
+        std.debug.assert(self.removeRenderOutput(entry.id));
     }
     self.outputs.deinit();
     self.render_outputs.deinit(allocator);
@@ -379,6 +326,105 @@ pub fn destroy(self: *Self) void {
     self.renderer.deinit();
     self.display.destroy();
     allocator.destroy(self);
+}
+
+fn addRenderOutput(
+    self: *Self,
+    io: std.Io,
+    config: RenderOutputConfig,
+) !RenderOutputId {
+    const render_output = try self.allocator.create(RenderOutput);
+    errdefer self.allocator.destroy(render_output);
+    render_output.* = .{
+        .server = self,
+        .backend = undefined,
+        .protocol_id = undefined,
+        .timer = null,
+        .repaint_needed = false,
+        .render_scheduled = false,
+    };
+    try render_output.backend.init(
+        self.allocator,
+        io,
+        self.display,
+        config.size,
+        config.kind,
+        .{
+            .context = render_output,
+            .ready = outputReady,
+            .presented = outputPresented,
+            .discarded = outputDiscarded,
+            .close = closeOutput,
+            .keyboard_available = keyboardAvailable,
+            .keyboard_keymap = keyboardKeymap,
+            .keyboard_enter = keyboardEnter,
+            .keyboard_leave = keyboardLeave,
+            .keyboard_key = keyboardKey,
+            .keyboard_modifiers = keyboardModifiers,
+            .keyboard_repeat_info = keyboardRepeatInfo,
+            .pointer_available = pointerAvailable,
+            .pointer_enter = pointerEnter,
+            .pointer_leave = pointerLeave,
+            .pointer_motion = pointerMotion,
+            .pointer_button = pointerButton,
+            .pointer_axis = pointerAxis,
+            .pointer_frame = pointerFrame,
+            .pointer_axis_source = pointerAxisSource,
+            .pointer_axis_stop = pointerAxisStop,
+            .pointer_axis_discrete = pointerAxisDiscrete,
+            .pointer_axis_value120 = pointerAxisValue120,
+            .pointer_axis_relative_direction = pointerAxisRelativeDirection,
+            .touch_available = touchAvailable,
+            .touch_down = touchDown,
+            .touch_up = touchUp,
+            .touch_motion = touchMotion,
+            .touch_frame = touchFrame,
+            .touch_cancel = touchCancel,
+            .touch_shape = touchShape,
+            .touch_orientation = touchOrientation,
+        },
+    );
+    errdefer render_output.backend.deinit();
+    render_output.protocol_id = try self.outputs.add(.{
+        .position = config.position,
+        .size = render_output.backend.size(),
+        .physical_size = render_output.backend.physicalSize(),
+        .scale = render_output.backend.clientScale(),
+        .name = config.name,
+        .description = config.description,
+        .make = config.make,
+        .model = config.model,
+    });
+    errdefer std.debug.assert(self.outputs.remove(render_output.protocol_id));
+    render_output.timer = try self.display.getEventLoop().addTimer(
+        *RenderOutput,
+        handleRenderTimer,
+        render_output,
+    );
+    errdefer stopRenderOutput(render_output);
+    const id = try self.render_outputs.insert(self.allocator, render_output);
+    render_output.repaint_needed = true;
+    self.scheduleRepaint(render_output);
+    return id;
+}
+
+fn removeRenderOutput(self: *Self, id: RenderOutputId) bool {
+    const render_output = self.render_outputs.remove(id) orelse return false;
+    stopRenderOutput(render_output);
+    const protocol_output = self.outputs.get(render_output.protocol_id).?;
+    Surface.discardPresentation(self.compositor.surfaceStore(), protocol_output);
+    std.debug.assert(self.outputs.remove(render_output.protocol_id));
+    render_output.backend.deinit();
+    self.allocator.destroy(render_output);
+    return true;
+}
+
+fn stopRenderOutput(render_output: *RenderOutput) void {
+    if (render_output.timer) |timer| {
+        timer.remove();
+        render_output.timer = null;
+        render_output.render_scheduled = false;
+    }
 }
 
 pub fn listen(self: *Self) ![:0]const u8 {
@@ -428,7 +474,8 @@ fn primaryRenderOutput(self: *Self) *RenderOutput {
 
 fn scheduleRepaint(self: *Self, output: *RenderOutput) void {
     if (!output.repaint_needed or output.render_scheduled or !output.backend.ready()) return;
-    output.timer.timerUpdate(output.backend.repaintDelayMilliseconds()) catch |err| {
+    const timer = output.timer orelse return;
+    timer.timerUpdate(output.backend.repaintDelayMilliseconds()) catch |err| {
         log.err("failed to schedule repaint: {t}", .{err});
         self.terminate();
         return;
@@ -1605,6 +1652,28 @@ fn submitWindowPopups(self: *Self, output: *Output, window_id: Scene.Id) void {
 test "server creates and destroys protocol globals" {
     const server = try Self.create(std.testing.allocator, std.testing.io, .cpu, .headless);
     server.destroy();
+}
+
+test "server adds and removes independent render outputs" {
+    const server = try Self.create(std.testing.allocator, std.testing.io, .cpu, .headless);
+    defer server.destroy();
+
+    const second_id = try server.addRenderOutput(std.testing.io, .{
+        .kind = .headless,
+        .size = .{ .width = 640, .height = 480 },
+        .position = .{ .x = 1280 },
+        .name = "HEADLESS-2",
+        .description = "Keywork test output",
+        .model = "headless",
+    });
+    defer std.debug.assert(server.removeRenderOutput(second_id));
+
+    try std.testing.expectEqual(@as(usize, 2), server.render_outputs.len());
+    const second = server.render_outputs.get(second_id).?.*;
+    try std.testing.expectEqual(
+        Output.Position{ .x = 1280 },
+        server.outputs.get(second.protocol_id).?.logicalPosition(),
+    );
 }
 
 test "window borders occupy only requested exterior edges and corners" {
