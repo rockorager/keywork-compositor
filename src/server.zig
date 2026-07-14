@@ -20,6 +20,7 @@ const DataDevice = @import("wayland/data_device.zig");
 const PrimarySelection = @import("wayland/primary_selection.zig");
 const TextInput = @import("wayland/text_input.zig");
 const InputMethod = @import("wayland/input_method.zig");
+const VirtualKeyboard = @import("wayland/virtual_keyboard.zig");
 const PresentationProtocol = @import("wayland/presentation.zig");
 const FractionalScale = @import("wayland/fractional_scale.zig");
 const Fixes = @import("wayland/fixes.zig");
@@ -72,6 +73,7 @@ data_device: DataDevice,
 primary_selection: PrimarySelection,
 text_input: TextInput,
 input_method: InputMethod,
+virtual_keyboard: VirtualKeyboard,
 presentation_protocol: PresentationProtocol,
 fractional_scale: FractionalScale,
 fixes: Fixes,
@@ -167,6 +169,7 @@ pub fn create(
         .primary_selection = undefined,
         .text_input = undefined,
         .input_method = undefined,
+        .virtual_keyboard = undefined,
         .presentation_protocol = undefined,
         .fractional_scale = undefined,
         .fixes = undefined,
@@ -342,6 +345,8 @@ pub fn create(
         },
     );
     errdefer self.input_method.deinit();
+    try self.virtual_keyboard.init(allocator, io, display, &self.seat);
+    errdefer self.virtual_keyboard.deinit();
     try self.window_manager.init(
         allocator,
         display,
@@ -415,6 +420,7 @@ pub fn destroy(self: *Self) void {
     }
     self.window_manager.deinit();
     self.window_manager_initialized = false;
+    self.virtual_keyboard.deinit();
     self.input_method.deinit();
     self.text_input.deinit();
     self.primary_selection.deinit();

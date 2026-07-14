@@ -28,6 +28,7 @@ keyboard_ever_available: bool,
 pointer_ever_available: bool,
 touch_ever_available: bool,
 keyboard_available: bool,
+virtual_keyboard_count: usize,
 pointer_available: bool,
 touch_available: bool,
 keymap: ?Keymap,
@@ -219,6 +220,7 @@ pub fn init(
         .pointer_ever_available = false,
         .touch_ever_available = false,
         .keyboard_available = false,
+        .virtual_keyboard_count = 0,
         .pointer_available = false,
         .touch_available = false,
         .keymap = null,
@@ -265,6 +267,7 @@ pub fn deinit(self: *Self) void {
     std.debug.assert(self.pointer_resources.items.len == 0);
     std.debug.assert(self.touch_resources.items.len == 0);
     std.debug.assert(self.cursor_surface_count == 0);
+    std.debug.assert(self.virtual_keyboard_count == 0);
     std.debug.assert(self.keyboard_grab == null);
     std.debug.assert(self.repaint_listener == null);
     std.debug.assert(self.keyboard_focus_listeners.items.len == 0);
@@ -489,12 +492,14 @@ pub fn restoreUnfocusedCursor(self: *Self) void {
 }
 
 pub fn keyboardFocusedClient(self: *Self) ?*wl.Client {
+    if (!self.hasKeyboardCapability()) return null;
     if (!self.parent_focused or self.keymap == null) return null;
     const surface = self.focusedSurface() orelse return null;
     return surface.getClient();
 }
 
 pub fn keyboardFocusedSurface(self: *const Self) ?Surface.Id {
+    if (!self.hasKeyboardCapability()) return null;
     if (!self.parent_focused or self.keymap == null) return null;
     const focus = self.focus orelse return null;
     if (Surface.resourceFor(self.surface_store, focus) == null) return null;
@@ -521,7 +526,7 @@ pub fn cursorInfo(self: *const Self) ?CursorInfo {
 pub fn setKeyboardAvailable(self: *Self, available: bool) void {
     if (self.keyboard_available == available) return;
     const old_capability = self.hasKeyboardCapability();
-    if (!available) self.parentKeyboardLeave();
+    if (!available and self.virtual_keyboard_count == 0) self.parentKeyboardLeave();
     self.keyboard_available = available;
     const new_capability = self.hasKeyboardCapability();
     if (!old_capability and new_capability) {
@@ -531,6 +536,37 @@ pub fn setKeyboardAvailable(self: *Self, available: bool) void {
         );
     }
     if (old_capability != new_capability) self.broadcastCapabilities();
+}
+
+pub fn addVirtualKeyboard(self: *Self) void {
+    const old_capability = self.hasKeyboardCapability();
+    self.virtual_keyboard_count = std.math.add(usize, self.virtual_keyboard_count, 1) catch
+        unreachable;
+    const new_capability = self.hasKeyboardCapability();
+    if (!old_capability and new_capability) {
+        beginCapabilityGeneration(
+            &self.keyboard_capability_generation,
+            &self.keyboard_ever_available,
+        );
+    }
+    if (old_capability == new_capability) return;
+    self.broadcastCapabilities();
+    if (self.parent_focused) {
+        self.notifyKeyboardFocus();
+        self.sendEnter();
+    }
+}
+
+pub fn removeVirtualKeyboard(self: *Self) void {
+    std.debug.assert(self.virtual_keyboard_count > 0);
+    const old_capability = self.hasKeyboardCapability();
+    if (old_capability and !self.keyboard_available and
+        self.virtual_keyboard_count == 1 and self.parent_focused) self.sendLeave();
+    self.virtual_keyboard_count -= 1;
+    const new_capability = self.hasKeyboardCapability();
+    if (old_capability == new_capability) return;
+    self.broadcastCapabilities();
+    self.notifyKeyboardFocus();
 }
 
 pub fn setPointerAvailable(self: *Self, available: bool) void {
@@ -641,6 +677,25 @@ pub fn key(
     key_code: u32,
     state: wl.Keyboard.KeyState,
 ) error{OutOfMemory}!void {
+    try self.keyWithGrab(time, key_code, state, true);
+}
+
+pub fn virtualKey(
+    self: *Self,
+    time: u32,
+    key_code: u32,
+    state: wl.Keyboard.KeyState,
+) error{OutOfMemory}!void {
+    try self.keyWithGrab(time, key_code, state, false);
+}
+
+fn keyWithGrab(
+    self: *Self,
+    time: u32,
+    key_code: u32,
+    state: wl.Keyboard.KeyState,
+    allow_grab: bool,
+) error{OutOfMemory}!void {
     var route_to_grab: ?u64 = null;
     switch (state) {
         .pressed => {
@@ -649,12 +704,14 @@ pub fn key(
             }
             try self.pressed_keys.append(self.allocator, key_code);
             errdefer _ = self.pressed_keys.pop();
-            if (self.keyboard_grab) |grab| {
-                try self.grabbed_keys.append(self.allocator, .{
-                    .key = key_code,
-                    .token = grab.token,
-                });
-                route_to_grab = grab.token;
+            if (allow_grab) {
+                if (self.keyboard_grab) |grab| {
+                    try self.grabbed_keys.append(self.allocator, .{
+                        .key = key_code,
+                        .token = grab.token,
+                    });
+                    route_to_grab = grab.token;
+                }
             }
         },
         .released => {
@@ -663,11 +720,13 @@ pub fn key(
                 _ = self.pressed_keys.orderedRemove(index);
                 break;
             } else return;
-            for (self.grabbed_keys.items, 0..) |grabbed, index| {
-                if (grabbed.key != key_code) continue;
-                route_to_grab = grabbed.token;
-                _ = self.grabbed_keys.orderedRemove(index);
-                break;
+            if (allow_grab) {
+                for (self.grabbed_keys.items, 0..) |grabbed, index| {
+                    if (grabbed.key != key_code) continue;
+                    route_to_grab = grabbed.token;
+                    _ = self.grabbed_keys.orderedRemove(index);
+                    break;
+                }
             }
         },
         .repeated => for (self.grabbed_keys.items) |grabbed| {
@@ -705,15 +764,38 @@ pub fn setModifiers(
     locked: u32,
     group: u32,
 ) void {
+    self.setModifiersWithGrab(depressed, latched, locked, group, true);
+}
+
+pub fn setVirtualModifiers(
+    self: *Self,
+    depressed: u32,
+    latched: u32,
+    locked: u32,
+    group: u32,
+) void {
+    self.setModifiersWithGrab(depressed, latched, locked, group, false);
+}
+
+fn setModifiersWithGrab(
+    self: *Self,
+    depressed: u32,
+    latched: u32,
+    locked: u32,
+    group: u32,
+    allow_grab: bool,
+) void {
     self.modifiers = .{
         .depressed = depressed,
         .latched = latched,
         .locked = locked,
         .group = group,
     };
-    if (self.keyboard_grab) |grab| {
-        grab.modifiers(grab.context, depressed, latched, locked, group);
-        return;
+    if (allow_grab) {
+        if (self.keyboard_grab) |grab| {
+            grab.modifiers(grab.context, depressed, latched, locked, group);
+            return;
+        }
     }
     const surface = self.focusedSurface() orelse return;
     if (!self.parent_focused or self.keymap == null) return;
@@ -1238,7 +1320,7 @@ fn focusedSurface(self: *Self) ?*wl.Surface {
 }
 
 fn hasKeyboardCapability(self: *const Self) bool {
-    return self.keyboard_available and self.keymap != null;
+    return (self.keyboard_available or self.virtual_keyboard_count > 0) and self.keymap != null;
 }
 
 fn keyboardResourceActive(self: *const Self, entry: KeyboardResource) bool {

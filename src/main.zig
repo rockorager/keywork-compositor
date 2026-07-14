@@ -94,6 +94,7 @@ test {
     _ = @import("wayland/primary_selection.zig");
     _ = @import("wayland/text_input.zig");
     _ = @import("wayland/input_method.zig");
+    _ = @import("wayland/virtual_keyboard.zig");
     _ = @import("wayland/presentation.zig");
     _ = @import("wayland/fractional_scale.zig");
     _ = @import("wayland/fixes.zig");

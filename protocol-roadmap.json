@@ -386,15 +386,16 @@
       "interfaces": [
         {
           "name": "zwp_virtual_keyboard_manager_v1",
-          "current_version": null,
+          "current_version": 1,
           "target_version": 1
         }
       ],
-      "status": "not_started",
+      "status": "done",
       "privileged": true,
       "blocked_by": [
         "wl-seat"
-      ]
+      ],
+      "status_detail": "Version 1 validates bounded NUL-terminated XKB keymaps, contributes keyboard capability only after keymap setup, injects tracked key and modifier state into the focused client, releases held keys on destruction, and bypasses input-method keyboard grabs to avoid feeding synthetic input back to its source. The external MIT protocol XML remains privileged; security-context-v1 will provide sandbox-aware registry filtering."
     },
     {
       "id": "cursor-shape",
