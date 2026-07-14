@@ -692,13 +692,14 @@
       "interfaces": [
         {
           "name": "wp_security_context_manager_v1",
-          "current_version": null,
+          "current_version": 1,
           "target_version": 1
         }
       ],
-      "status": "not_started",
+      "status": "done",
       "privileged": false,
-      "blocked_by": []
+      "blocked_by": [],
+      "status_detail": "Version 1 validates and owns listening sockets, commits immutable sandbox-engine/application/instance metadata, accepts context-tagged Wayland clients until close-fd hangup, preserves listeners after the creating client disconnects, tracks metadata for each accepted client until disconnect, and prevents nested security contexts through global filtering and bind-time validation."
     },
     {
       "id": "session-lock",

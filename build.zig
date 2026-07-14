@@ -22,6 +22,7 @@ pub fn build(b: *std.Build) void {
     scanner.addSystemProtocol("staging/single-pixel-buffer/single-pixel-buffer-v1.xml");
     scanner.addSystemProtocol("staging/cursor-shape/cursor-shape-v1.xml");
     scanner.addSystemProtocol("staging/content-type/content-type-v1.xml");
+    scanner.addSystemProtocol("staging/security-context/security-context-v1.xml");
     scanner.addSystemProtocol("unstable/tablet/tablet-unstable-v2.xml");
     scanner.addSystemProtocol("unstable/relative-pointer/relative-pointer-unstable-v1.xml");
     scanner.addSystemProtocol("unstable/pointer-constraints/pointer-constraints-unstable-v1.xml");
@@ -53,6 +54,7 @@ pub fn build(b: *std.Build) void {
     scanner.generate("wp_single_pixel_buffer_manager_v1", 1);
     scanner.generate("wp_cursor_shape_manager_v1", 2);
     scanner.generate("wp_content_type_manager_v1", 1);
+    scanner.generate("wp_security_context_manager_v1", 1);
     scanner.generate("zwp_tablet_manager_v2", 1);
     scanner.generate("zwp_relative_pointer_manager_v1", 1);
     scanner.generate("zwp_pointer_constraints_v1", 1);
