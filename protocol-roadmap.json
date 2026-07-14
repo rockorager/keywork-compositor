@@ -1,0 +1,1419 @@
+{
+  "schema_version": 1,
+  "updated": "2026-07-14",
+  "baseline": {
+    "wayland": "1.25.0",
+    "wayland_protocols": "1.49"
+  },
+  "status_values": [
+    "done",
+    "in_progress",
+    "not_started"
+  ],
+  "notes": [
+    "Interface version means the advertised Wayland interface version, not the v1 or v2 protocol-generation suffix.",
+    "Only advertise the highest version whose complete request, event, lifecycle, error, and state semantics are implemented.",
+    "Privileged protocols require per-client global filtering or equivalent authorization before they are advertised.",
+    "blocked_by entries reference protocol IDs in this document and represent implementation dependencies, not protocol wire-level requirements."
+  ],
+  "protocols": [
+    {
+      "id": "wl-compositor",
+      "priority": "P0",
+      "priority_order": 1,
+      "protocol": "wayland",
+      "source": "wayland-core",
+      "interfaces": [
+        {
+          "name": "wl_compositor",
+          "current_version": 6,
+          "target_version": 7
+        }
+      ],
+      "status": "in_progress",
+      "privileged": false,
+      "blocked_by": [],
+      "status_detail": "Surface and region behavior is implemented through v6; v7 release and per-commit buffer-release semantics remain."
+    },
+    {
+      "id": "wl-shm",
+      "priority": "P0",
+      "priority_order": 2,
+      "protocol": "wayland",
+      "source": "wayland-core",
+      "interfaces": [
+        {
+          "name": "wl_shm",
+          "current_version": 1,
+          "target_version": 2
+        }
+      ],
+      "status": "in_progress",
+      "privileged": false,
+      "blocked_by": [],
+      "status_detail": "libwayland provides v1; target v2 adds global release semantics."
+    },
+    {
+      "id": "wl-output",
+      "priority": "P0",
+      "priority_order": 3,
+      "protocol": "wayland",
+      "source": "wayland-core",
+      "interfaces": [
+        {
+          "name": "wl_output",
+          "current_version": 4,
+          "target_version": 4
+        }
+      ],
+      "status": "done",
+      "privileged": false,
+      "blocked_by": [],
+      "status_detail": "The protocol is implemented for the current single static output; multi-output and hotplug are backend work."
+    },
+    {
+      "id": "wl-seat",
+      "priority": "P0",
+      "priority_order": 4,
+      "protocol": "wayland",
+      "source": "wayland-core",
+      "interfaces": [
+        {
+          "name": "wl_seat",
+          "current_version": 10,
+          "target_version": 10
+        }
+      ],
+      "status": "in_progress",
+      "privileged": false,
+      "blocked_by": [],
+      "status_detail": "Keyboard and pointer events are implemented; client cursor surfaces and touch support remain."
+    },
+    {
+      "id": "wl-data-device-manager",
+      "priority": "P0",
+      "priority_order": 5,
+      "protocol": "wayland",
+      "source": "wayland-core",
+      "interfaces": [
+        {
+          "name": "wl_data_device_manager",
+          "current_version": 3,
+          "target_version": 4
+        }
+      ],
+      "status": "in_progress",
+      "privileged": false,
+      "blocked_by": [
+        "wl-seat"
+      ],
+      "status_detail": "Resource creation and action validation exist, but clipboard transfers, selections, offers, and drag-and-drop are not functional."
+    },
+    {
+      "id": "wl-subcompositor",
+      "priority": "P0",
+      "priority_order": 6,
+      "protocol": "wayland",
+      "source": "wayland-core",
+      "interfaces": [
+        {
+          "name": "wl_subcompositor",
+          "current_version": 1,
+          "target_version": 1
+        }
+      ],
+      "status": "done",
+      "privileged": false,
+      "blocked_by": [
+        "wl-compositor"
+      ],
+      "status_detail": "Positioning, stacking, and synchronized and desynchronized commits are implemented."
+    },
+    {
+      "id": "wl-fixes",
+      "priority": "P0",
+      "priority_order": 7,
+      "protocol": "wayland",
+      "source": "wayland-core",
+      "interfaces": [
+        {
+          "name": "wl_fixes",
+          "current_version": null,
+          "target_version": 1
+        }
+      ],
+      "status": "not_started",
+      "privileged": false,
+      "blocked_by": []
+    },
+    {
+      "id": "xdg-shell",
+      "priority": "P0",
+      "priority_order": 8,
+      "protocol": "xdg-shell",
+      "source": "wayland-protocols/stable",
+      "interfaces": [
+        {
+          "name": "xdg_wm_base",
+          "current_version": 5,
+          "target_version": 7
+        }
+      ],
+      "status": "in_progress",
+      "privileged": false,
+      "blocked_by": [
+        "wl-compositor",
+        "wl-output",
+        "wl-seat"
+      ],
+      "status_detail": "Toplevels, popups, positioners, configure and ack, grabs, and repositioning are implemented through v5."
+    },
+    {
+      "id": "viewporter",
+      "priority": "P0",
+      "priority_order": 9,
+      "protocol": "viewporter",
+      "source": "wayland-protocols/stable",
+      "interfaces": [
+        {
+          "name": "wp_viewporter",
+          "current_version": 1,
+          "target_version": 1
+        }
+      ],
+      "status": "done",
+      "privileged": false,
+      "blocked_by": [
+        "wl-compositor"
+      ]
+    },
+    {
+      "id": "fractional-scale",
+      "priority": "P0",
+      "priority_order": 10,
+      "protocol": "fractional-scale-v1",
+      "source": "wayland-protocols/staging",
+      "interfaces": [
+        {
+          "name": "wp_fractional_scale_manager_v1",
+          "current_version": 1,
+          "target_version": 1
+        }
+      ],
+      "status": "done",
+      "privileged": false,
+      "blocked_by": [
+        "wl-compositor",
+        "wl-output",
+        "viewporter"
+      ],
+      "status_detail": "The current fixed preferred scale is implemented; future multi-output work must update it dynamically."
+    },
+    {
+      "id": "xdg-decoration",
+      "priority": "P0",
+      "priority_order": 11,
+      "protocol": "xdg-decoration-unstable-v1",
+      "source": "wayland-protocols/unstable",
+      "interfaces": [
+        {
+          "name": "zxdg_decoration_manager_v1",
+          "current_version": 2,
+          "target_version": 2
+        }
+      ],
+      "status": "in_progress",
+      "privileged": false,
+      "blocked_by": [
+        "xdg-shell"
+      ],
+      "status_detail": "Implementation is present in the current uncommitted working tree and still needs final verification."
+    },
+    {
+      "id": "river-window-management",
+      "priority": "P0",
+      "priority_order": 12,
+      "protocol": "river-window-management-v1",
+      "source": "river",
+      "interfaces": [
+        {
+          "name": "river_window_manager_v1",
+          "current_version": 3,
+          "target_version": 5
+        }
+      ],
+      "status": "in_progress",
+      "privileged": true,
+      "blocked_by": [
+        "wl-output",
+        "wl-seat",
+        "xdg-shell"
+      ],
+      "status_detail": "The compositor advertises v3, with output presentation and several seat operations still unsupported."
+    },
+    {
+      "id": "linux-dmabuf",
+      "priority": "P1",
+      "priority_order": 13,
+      "protocol": "linux-dmabuf-v1",
+      "source": "wayland-protocols/stable",
+      "interfaces": [
+        {
+          "name": "zwp_linux_dmabuf_v1",
+          "current_version": null,
+          "target_version": 6
+        }
+      ],
+      "status": "not_started",
+      "privileged": false,
+      "blocked_by": [
+        "wl-compositor"
+      ]
+    },
+    {
+      "id": "presentation-time",
+      "priority": "P1",
+      "priority_order": 14,
+      "protocol": "presentation-time",
+      "source": "wayland-protocols/stable",
+      "interfaces": [
+        {
+          "name": "wp_presentation",
+          "current_version": null,
+          "target_version": 2
+        }
+      ],
+      "status": "not_started",
+      "privileged": false,
+      "blocked_by": [
+        "wl-output"
+      ]
+    },
+    {
+      "id": "xdg-activation",
+      "priority": "P1",
+      "priority_order": 15,
+      "protocol": "xdg-activation-v1",
+      "source": "wayland-protocols/staging",
+      "interfaces": [
+        {
+          "name": "xdg_activation_v1",
+          "current_version": null,
+          "target_version": 1
+        }
+      ],
+      "status": "not_started",
+      "privileged": false,
+      "blocked_by": [
+        "wl-seat",
+        "xdg-shell"
+      ]
+    },
+    {
+      "id": "wlr-layer-shell",
+      "priority": "P1",
+      "priority_order": 16,
+      "protocol": "wlr-layer-shell-unstable-v1",
+      "source": "wlr-protocols",
+      "interfaces": [
+        {
+          "name": "zwlr_layer_shell_v1",
+          "current_version": null,
+          "target_version": 5
+        }
+      ],
+      "status": "not_started",
+      "privileged": false,
+      "blocked_by": [
+        "wl-compositor",
+        "wl-output",
+        "wl-seat",
+        "xdg-shell"
+      ]
+    },
+    {
+      "id": "text-input-v3",
+      "priority": "P1",
+      "priority_order": 17,
+      "protocol": "text-input-unstable-v3",
+      "source": "wayland-protocols/unstable",
+      "interfaces": [
+        {
+          "name": "zwp_text_input_manager_v3",
+          "current_version": null,
+          "target_version": 2
+        }
+      ],
+      "status": "not_started",
+      "privileged": false,
+      "blocked_by": [
+        "wl-seat"
+      ]
+    },
+    {
+      "id": "input-method-v2",
+      "priority": "P1",
+      "priority_order": 18,
+      "protocol": "input-method-unstable-v2",
+      "source": "external",
+      "interfaces": [
+        {
+          "name": "zwp_input_method_manager_v2",
+          "current_version": null,
+          "target_version": 1
+        }
+      ],
+      "status": "not_started",
+      "privileged": true,
+      "blocked_by": [
+        "text-input-v3",
+        "wl-seat"
+      ]
+    },
+    {
+      "id": "virtual-keyboard",
+      "priority": "P1",
+      "priority_order": 19,
+      "protocol": "virtual-keyboard-unstable-v1",
+      "source": "external",
+      "interfaces": [
+        {
+          "name": "zwp_virtual_keyboard_manager_v1",
+          "current_version": null,
+          "target_version": 1
+        }
+      ],
+      "status": "not_started",
+      "privileged": true,
+      "blocked_by": [
+        "wl-seat"
+      ]
+    },
+    {
+      "id": "cursor-shape",
+      "priority": "P1",
+      "priority_order": 20,
+      "protocol": "cursor-shape-v1",
+      "source": "wayland-protocols/staging",
+      "interfaces": [
+        {
+          "name": "wp_cursor_shape_manager_v1",
+          "current_version": null,
+          "target_version": 2
+        }
+      ],
+      "status": "not_started",
+      "privileged": false,
+      "blocked_by": [
+        "wl-seat"
+      ]
+    },
+    {
+      "id": "primary-selection",
+      "priority": "P1",
+      "priority_order": 21,
+      "protocol": "primary-selection-unstable-v1",
+      "source": "wayland-protocols/unstable",
+      "interfaces": [
+        {
+          "name": "zwp_primary_selection_device_manager_v1",
+          "current_version": null,
+          "target_version": 1
+        }
+      ],
+      "status": "not_started",
+      "privileged": false,
+      "blocked_by": [
+        "wl-data-device-manager",
+        "wl-seat"
+      ]
+    },
+    {
+      "id": "relative-pointer",
+      "priority": "P1",
+      "priority_order": 22,
+      "protocol": "relative-pointer-unstable-v1",
+      "source": "wayland-protocols/unstable",
+      "interfaces": [
+        {
+          "name": "zwp_relative_pointer_manager_v1",
+          "current_version": null,
+          "target_version": 1
+        }
+      ],
+      "status": "not_started",
+      "privileged": false,
+      "blocked_by": [
+        "wl-seat"
+      ]
+    },
+    {
+      "id": "pointer-constraints",
+      "priority": "P1",
+      "priority_order": 23,
+      "protocol": "pointer-constraints-unstable-v1",
+      "source": "wayland-protocols/unstable",
+      "interfaces": [
+        {
+          "name": "zwp_pointer_constraints_v1",
+          "current_version": null,
+          "target_version": 1
+        }
+      ],
+      "status": "not_started",
+      "privileged": false,
+      "blocked_by": [
+        "relative-pointer",
+        "wl-seat"
+      ]
+    },
+    {
+      "id": "idle-inhibit",
+      "priority": "P1",
+      "priority_order": 24,
+      "protocol": "idle-inhibit-unstable-v1",
+      "source": "wayland-protocols/unstable",
+      "interfaces": [
+        {
+          "name": "zwp_idle_inhibit_manager_v1",
+          "current_version": null,
+          "target_version": 1
+        }
+      ],
+      "status": "not_started",
+      "privileged": false,
+      "blocked_by": [
+        "wl-compositor"
+      ]
+    },
+    {
+      "id": "xdg-output",
+      "priority": "P1",
+      "priority_order": 25,
+      "protocol": "xdg-output-unstable-v1",
+      "source": "wayland-protocols/unstable",
+      "interfaces": [
+        {
+          "name": "zxdg_output_manager_v1",
+          "current_version": null,
+          "target_version": 3
+        }
+      ],
+      "status": "not_started",
+      "privileged": false,
+      "blocked_by": [
+        "wl-output"
+      ]
+    },
+    {
+      "id": "xdg-foreign-v2",
+      "priority": "P1",
+      "priority_order": 26,
+      "protocol": "xdg-foreign-unstable-v2",
+      "source": "wayland-protocols/unstable",
+      "interfaces": [
+        {
+          "name": "zxdg_exporter_v2",
+          "current_version": null,
+          "target_version": 1
+        },
+        {
+          "name": "zxdg_importer_v2",
+          "current_version": null,
+          "target_version": 1
+        }
+      ],
+      "status": "not_started",
+      "privileged": false,
+      "blocked_by": [
+        "xdg-shell"
+      ]
+    },
+    {
+      "id": "content-type",
+      "priority": "P1",
+      "priority_order": 27,
+      "protocol": "content-type-v1",
+      "source": "wayland-protocols/staging",
+      "interfaces": [
+        {
+          "name": "wp_content_type_manager_v1",
+          "current_version": null,
+          "target_version": 1
+        }
+      ],
+      "status": "not_started",
+      "privileged": false,
+      "blocked_by": [
+        "wl-compositor"
+      ]
+    },
+    {
+      "id": "single-pixel-buffer",
+      "priority": "P1",
+      "priority_order": 28,
+      "protocol": "single-pixel-buffer-v1",
+      "source": "wayland-protocols/staging",
+      "interfaces": [
+        {
+          "name": "wp_single_pixel_buffer_manager_v1",
+          "current_version": null,
+          "target_version": 1
+        }
+      ],
+      "status": "not_started",
+      "privileged": false,
+      "blocked_by": [
+        "wl-compositor",
+        "wl-shm"
+      ]
+    },
+    {
+      "id": "river-input-management",
+      "priority": "P1",
+      "priority_order": 29,
+      "protocol": "river-input-management-v1",
+      "source": "river",
+      "interfaces": [
+        {
+          "name": "river_input_manager_v1",
+          "current_version": null,
+          "target_version": 2
+        }
+      ],
+      "status": "not_started",
+      "privileged": true,
+      "blocked_by": [
+        "wl-seat"
+      ]
+    },
+    {
+      "id": "river-libinput-config",
+      "priority": "P1",
+      "priority_order": 30,
+      "protocol": "river-libinput-config-v1",
+      "source": "river",
+      "interfaces": [
+        {
+          "name": "river_libinput_config_v1",
+          "current_version": null,
+          "target_version": 2
+        }
+      ],
+      "status": "not_started",
+      "privileged": true,
+      "blocked_by": [
+        "river-input-management"
+      ]
+    },
+    {
+      "id": "river-xkb-config",
+      "priority": "P1",
+      "priority_order": 31,
+      "protocol": "river-xkb-config-v1",
+      "source": "river",
+      "interfaces": [
+        {
+          "name": "river_xkb_config_v1",
+          "current_version": null,
+          "target_version": 2
+        }
+      ],
+      "status": "not_started",
+      "privileged": true,
+      "blocked_by": [
+        "wl-seat"
+      ]
+    },
+    {
+      "id": "river-xkb-bindings",
+      "priority": "P1",
+      "priority_order": 32,
+      "protocol": "river-xkb-bindings-v1",
+      "source": "river",
+      "interfaces": [
+        {
+          "name": "river_xkb_bindings_v1",
+          "current_version": null,
+          "target_version": 3
+        }
+      ],
+      "status": "not_started",
+      "privileged": true,
+      "blocked_by": [
+        "river-window-management",
+        "river-xkb-config"
+      ]
+    },
+    {
+      "id": "river-layer-shell",
+      "priority": "P1",
+      "priority_order": 33,
+      "protocol": "river-layer-shell-v1",
+      "source": "river",
+      "interfaces": [
+        {
+          "name": "river_layer_shell_v1",
+          "current_version": null,
+          "target_version": 1
+        }
+      ],
+      "status": "not_started",
+      "privileged": true,
+      "blocked_by": [
+        "river-window-management",
+        "wlr-layer-shell"
+      ]
+    },
+    {
+      "id": "security-context",
+      "priority": "P2",
+      "priority_order": 34,
+      "protocol": "security-context-v1",
+      "source": "wayland-protocols/staging",
+      "interfaces": [
+        {
+          "name": "wp_security_context_manager_v1",
+          "current_version": null,
+          "target_version": 1
+        }
+      ],
+      "status": "not_started",
+      "privileged": false,
+      "blocked_by": []
+    },
+    {
+      "id": "session-lock",
+      "priority": "P2",
+      "priority_order": 35,
+      "protocol": "ext-session-lock-v1",
+      "source": "wayland-protocols/staging",
+      "interfaces": [
+        {
+          "name": "ext_session_lock_manager_v1",
+          "current_version": null,
+          "target_version": 1
+        }
+      ],
+      "status": "not_started",
+      "privileged": true,
+      "blocked_by": [
+        "security-context",
+        "wl-compositor",
+        "wl-output",
+        "wl-seat"
+      ]
+    },
+    {
+      "id": "idle-notify",
+      "priority": "P2",
+      "priority_order": 36,
+      "protocol": "ext-idle-notify-v1",
+      "source": "wayland-protocols/staging",
+      "interfaces": [
+        {
+          "name": "ext_idle_notifier_v1",
+          "current_version": null,
+          "target_version": 2
+        }
+      ],
+      "status": "not_started",
+      "privileged": false,
+      "blocked_by": [
+        "wl-seat"
+      ]
+    },
+    {
+      "id": "keyboard-shortcuts-inhibit",
+      "priority": "P2",
+      "priority_order": 37,
+      "protocol": "keyboard-shortcuts-inhibit-unstable-v1",
+      "source": "wayland-protocols/unstable",
+      "interfaces": [
+        {
+          "name": "zwp_keyboard_shortcuts_inhibit_manager_v1",
+          "current_version": null,
+          "target_version": 1
+        }
+      ],
+      "status": "not_started",
+      "privileged": false,
+      "blocked_by": [
+        "wl-seat"
+      ]
+    },
+    {
+      "id": "pointer-gestures",
+      "priority": "P2",
+      "priority_order": 38,
+      "protocol": "pointer-gestures-unstable-v1",
+      "source": "wayland-protocols/unstable",
+      "interfaces": [
+        {
+          "name": "zwp_pointer_gestures_v1",
+          "current_version": null,
+          "target_version": 3
+        }
+      ],
+      "status": "not_started",
+      "privileged": false,
+      "blocked_by": [
+        "wl-seat"
+      ]
+    },
+    {
+      "id": "tablet-v2",
+      "priority": "P2",
+      "priority_order": 39,
+      "protocol": "tablet-v2",
+      "source": "wayland-protocols/stable",
+      "interfaces": [
+        {
+          "name": "zwp_tablet_manager_v2",
+          "current_version": null,
+          "target_version": 2
+        }
+      ],
+      "status": "not_started",
+      "privileged": false,
+      "blocked_by": [
+        "cursor-shape",
+        "wl-seat"
+      ]
+    },
+    {
+      "id": "ext-data-control",
+      "priority": "P2",
+      "priority_order": 40,
+      "protocol": "ext-data-control-v1",
+      "source": "wayland-protocols/staging",
+      "interfaces": [
+        {
+          "name": "ext_data_control_manager_v1",
+          "current_version": null,
+          "target_version": 1
+        }
+      ],
+      "status": "not_started",
+      "privileged": true,
+      "blocked_by": [
+        "security-context",
+        "wl-data-device-manager"
+      ]
+    },
+    {
+      "id": "wlr-data-control",
+      "priority": "P2",
+      "priority_order": 41,
+      "protocol": "wlr-data-control-unstable-v1",
+      "source": "wlr-protocols",
+      "interfaces": [
+        {
+          "name": "zwlr_data_control_manager_v1",
+          "current_version": null,
+          "target_version": 2
+        }
+      ],
+      "status": "not_started",
+      "privileged": true,
+      "blocked_by": [
+        "ext-data-control"
+      ]
+    },
+    {
+      "id": "ext-foreign-toplevel-list",
+      "priority": "P2",
+      "priority_order": 42,
+      "protocol": "ext-foreign-toplevel-list-v1",
+      "source": "wayland-protocols/staging",
+      "interfaces": [
+        {
+          "name": "ext_foreign_toplevel_list_v1",
+          "current_version": null,
+          "target_version": 1
+        }
+      ],
+      "status": "not_started",
+      "privileged": true,
+      "blocked_by": [
+        "security-context",
+        "xdg-shell"
+      ]
+    },
+    {
+      "id": "wlr-foreign-toplevel-management",
+      "priority": "P2",
+      "priority_order": 43,
+      "protocol": "wlr-foreign-toplevel-management-unstable-v1",
+      "source": "wlr-protocols",
+      "interfaces": [
+        {
+          "name": "zwlr_foreign_toplevel_manager_v1",
+          "current_version": null,
+          "target_version": 3
+        }
+      ],
+      "status": "not_started",
+      "privileged": true,
+      "blocked_by": [
+        "ext-foreign-toplevel-list"
+      ]
+    },
+    {
+      "id": "workspace",
+      "priority": "P2",
+      "priority_order": 44,
+      "protocol": "ext-workspace-v1",
+      "source": "wayland-protocols/staging",
+      "interfaces": [
+        {
+          "name": "ext_workspace_manager_v1",
+          "current_version": null,
+          "target_version": 1
+        }
+      ],
+      "status": "not_started",
+      "privileged": true,
+      "blocked_by": [
+        "ext-foreign-toplevel-list",
+        "river-window-management"
+      ]
+    },
+    {
+      "id": "wlr-output-management",
+      "priority": "P2",
+      "priority_order": 45,
+      "protocol": "wlr-output-management-unstable-v1",
+      "source": "wlr-protocols",
+      "interfaces": [
+        {
+          "name": "zwlr_output_manager_v1",
+          "current_version": null,
+          "target_version": 4
+        }
+      ],
+      "status": "not_started",
+      "privileged": true,
+      "blocked_by": [
+        "security-context",
+        "wl-output"
+      ]
+    },
+    {
+      "id": "wlr-output-power-management",
+      "priority": "P2",
+      "priority_order": 46,
+      "protocol": "wlr-output-power-management-unstable-v1",
+      "source": "wlr-protocols",
+      "interfaces": [
+        {
+          "name": "zwlr_output_power_manager_v1",
+          "current_version": null,
+          "target_version": 1
+        }
+      ],
+      "status": "not_started",
+      "privileged": true,
+      "blocked_by": [
+        "wlr-output-management"
+      ]
+    },
+    {
+      "id": "image-capture-source",
+      "priority": "P2",
+      "priority_order": 47,
+      "protocol": "ext-image-capture-source-v1",
+      "source": "wayland-protocols/staging",
+      "interfaces": [
+        {
+          "name": "ext_output_image_capture_source_manager_v1",
+          "current_version": null,
+          "target_version": 1
+        },
+        {
+          "name": "ext_foreign_toplevel_image_capture_source_manager_v1",
+          "current_version": null,
+          "target_version": 1
+        }
+      ],
+      "status": "not_started",
+      "privileged": true,
+      "blocked_by": [
+        "ext-foreign-toplevel-list",
+        "security-context",
+        "wl-output"
+      ]
+    },
+    {
+      "id": "image-copy-capture",
+      "priority": "P2",
+      "priority_order": 48,
+      "protocol": "ext-image-copy-capture-v1",
+      "source": "wayland-protocols/staging",
+      "interfaces": [
+        {
+          "name": "ext_image_copy_capture_manager_v1",
+          "current_version": null,
+          "target_version": 1
+        }
+      ],
+      "status": "not_started",
+      "privileged": true,
+      "blocked_by": [
+        "image-capture-source",
+        "linux-dmabuf"
+      ]
+    },
+    {
+      "id": "wlr-screencopy",
+      "priority": "P2",
+      "priority_order": 49,
+      "protocol": "wlr-screencopy-unstable-v1",
+      "source": "wlr-protocols",
+      "interfaces": [
+        {
+          "name": "zwlr_screencopy_manager_v1",
+          "current_version": null,
+          "target_version": 3
+        }
+      ],
+      "status": "not_started",
+      "privileged": true,
+      "blocked_by": [
+        "image-copy-capture"
+      ]
+    },
+    {
+      "id": "xwayland-shell",
+      "priority": "P2",
+      "priority_order": 50,
+      "protocol": "xwayland-shell-v1",
+      "source": "wayland-protocols/staging",
+      "interfaces": [
+        {
+          "name": "xwayland_shell_v1",
+          "current_version": null,
+          "target_version": 1
+        }
+      ],
+      "status": "not_started",
+      "privileged": true,
+      "blocked_by": [
+        "security-context",
+        "wl-compositor"
+      ]
+    },
+    {
+      "id": "xwayland-keyboard-grab",
+      "priority": "P2",
+      "priority_order": 51,
+      "protocol": "xwayland-keyboard-grab-unstable-v1",
+      "source": "wayland-protocols/unstable",
+      "interfaces": [
+        {
+          "name": "zwp_xwayland_keyboard_grab_manager_v1",
+          "current_version": null,
+          "target_version": 1
+        }
+      ],
+      "status": "not_started",
+      "privileged": true,
+      "blocked_by": [
+        "wl-seat",
+        "xwayland-shell"
+      ]
+    },
+    {
+      "id": "gtk-shell",
+      "priority": "P2",
+      "priority_order": 52,
+      "protocol": "gtk-shell",
+      "source": "external",
+      "interfaces": [
+        {
+          "name": "gtk_shell1",
+          "current_version": null,
+          "target_version": 5
+        }
+      ],
+      "status": "not_started",
+      "privileged": false,
+      "blocked_by": [
+        "xdg-shell"
+      ]
+    },
+    {
+      "id": "linux-drm-syncobj",
+      "priority": "P3",
+      "priority_order": 53,
+      "protocol": "linux-drm-syncobj-v1",
+      "source": "wayland-protocols/staging",
+      "interfaces": [
+        {
+          "name": "wp_linux_drm_syncobj_manager_v1",
+          "current_version": null,
+          "target_version": 1
+        }
+      ],
+      "status": "not_started",
+      "privileged": false,
+      "blocked_by": [
+        "linux-dmabuf"
+      ]
+    },
+    {
+      "id": "tearing-control",
+      "priority": "P3",
+      "priority_order": 54,
+      "protocol": "tearing-control-v1",
+      "source": "wayland-protocols/staging",
+      "interfaces": [
+        {
+          "name": "wp_tearing_control_manager_v1",
+          "current_version": null,
+          "target_version": 1
+        }
+      ],
+      "status": "not_started",
+      "privileged": false,
+      "blocked_by": [
+        "linux-dmabuf",
+        "presentation-time"
+      ]
+    },
+    {
+      "id": "fifo",
+      "priority": "P3",
+      "priority_order": 55,
+      "protocol": "fifo-v1",
+      "source": "wayland-protocols/staging",
+      "interfaces": [
+        {
+          "name": "wp_fifo_manager_v1",
+          "current_version": null,
+          "target_version": 1
+        }
+      ],
+      "status": "not_started",
+      "privileged": false,
+      "blocked_by": [
+        "presentation-time"
+      ]
+    },
+    {
+      "id": "commit-timing",
+      "priority": "P3",
+      "priority_order": 56,
+      "protocol": "commit-timing-v1",
+      "source": "wayland-protocols/staging",
+      "interfaces": [
+        {
+          "name": "wp_commit_timing_manager_v1",
+          "current_version": null,
+          "target_version": 1
+        }
+      ],
+      "status": "not_started",
+      "privileged": false,
+      "blocked_by": [
+        "presentation-time"
+      ]
+    },
+    {
+      "id": "xdg-toplevel-drag",
+      "priority": "P3",
+      "priority_order": 57,
+      "protocol": "xdg-toplevel-drag-v1",
+      "source": "wayland-protocols/staging",
+      "interfaces": [
+        {
+          "name": "xdg_toplevel_drag_manager_v1",
+          "current_version": null,
+          "target_version": 1
+        }
+      ],
+      "status": "not_started",
+      "privileged": false,
+      "blocked_by": [
+        "wl-data-device-manager",
+        "xdg-shell"
+      ]
+    },
+    {
+      "id": "xdg-toplevel-icon",
+      "priority": "P3",
+      "priority_order": 58,
+      "protocol": "xdg-toplevel-icon-v1",
+      "source": "wayland-protocols/staging",
+      "interfaces": [
+        {
+          "name": "xdg_toplevel_icon_manager_v1",
+          "current_version": null,
+          "target_version": 1
+        }
+      ],
+      "status": "not_started",
+      "privileged": false,
+      "blocked_by": [
+        "wl-shm",
+        "xdg-shell"
+      ]
+    },
+    {
+      "id": "xdg-dialog",
+      "priority": "P3",
+      "priority_order": 59,
+      "protocol": "xdg-dialog-v1",
+      "source": "wayland-protocols/staging",
+      "interfaces": [
+        {
+          "name": "xdg_wm_dialog_v1",
+          "current_version": null,
+          "target_version": 1
+        }
+      ],
+      "status": "not_started",
+      "privileged": false,
+      "blocked_by": [
+        "xdg-shell"
+      ]
+    },
+    {
+      "id": "xdg-system-bell",
+      "priority": "P3",
+      "priority_order": 60,
+      "protocol": "xdg-system-bell-v1",
+      "source": "wayland-protocols/staging",
+      "interfaces": [
+        {
+          "name": "xdg_system_bell_v1",
+          "current_version": null,
+          "target_version": 1
+        }
+      ],
+      "status": "not_started",
+      "privileged": false,
+      "blocked_by": [
+        "xdg-shell"
+      ]
+    },
+    {
+      "id": "xdg-toplevel-tag",
+      "priority": "P3",
+      "priority_order": 61,
+      "protocol": "xdg-toplevel-tag-v1",
+      "source": "wayland-protocols/staging",
+      "interfaces": [
+        {
+          "name": "xdg_toplevel_tag_manager_v1",
+          "current_version": null,
+          "target_version": 1
+        }
+      ],
+      "status": "not_started",
+      "privileged": false,
+      "blocked_by": [
+        "xdg-shell"
+      ]
+    },
+    {
+      "id": "xdg-session-management",
+      "priority": "P3",
+      "priority_order": 62,
+      "protocol": "xdg-session-management-v1",
+      "source": "wayland-protocols/staging",
+      "interfaces": [
+        {
+          "name": "xdg_session_manager_v1",
+          "current_version": null,
+          "target_version": 1
+        }
+      ],
+      "status": "not_started",
+      "privileged": false,
+      "blocked_by": [
+        "workspace",
+        "xdg-shell",
+        "xdg-toplevel-tag"
+      ]
+    },
+    {
+      "id": "transient-seat",
+      "priority": "P3",
+      "priority_order": 63,
+      "protocol": "ext-transient-seat-v1",
+      "source": "wayland-protocols/staging",
+      "interfaces": [
+        {
+          "name": "ext_transient_seat_manager_v1",
+          "current_version": null,
+          "target_version": 1
+        }
+      ],
+      "status": "not_started",
+      "privileged": true,
+      "blocked_by": [
+        "security-context",
+        "wl-seat"
+      ]
+    },
+    {
+      "id": "wlr-virtual-pointer",
+      "priority": "P3",
+      "priority_order": 64,
+      "protocol": "wlr-virtual-pointer-unstable-v1",
+      "source": "wlr-protocols",
+      "interfaces": [
+        {
+          "name": "zwlr_virtual_pointer_manager_v1",
+          "current_version": null,
+          "target_version": 2
+        }
+      ],
+      "status": "not_started",
+      "privileged": true,
+      "blocked_by": [
+        "security-context",
+        "wl-seat"
+      ]
+    },
+    {
+      "id": "pointer-warp",
+      "priority": "P3",
+      "priority_order": 65,
+      "protocol": "pointer-warp-v1",
+      "source": "wayland-protocols/staging",
+      "interfaces": [
+        {
+          "name": "wp_pointer_warp_v1",
+          "current_version": null,
+          "target_version": 1
+        }
+      ],
+      "status": "not_started",
+      "privileged": false,
+      "blocked_by": [
+        "pointer-constraints",
+        "wl-seat"
+      ]
+    },
+    {
+      "id": "drm-lease",
+      "priority": "P3",
+      "priority_order": 66,
+      "protocol": "drm-lease-v1",
+      "source": "wayland-protocols/staging",
+      "interfaces": [
+        {
+          "name": "wp_drm_lease_device_v1",
+          "current_version": null,
+          "target_version": 1
+        }
+      ],
+      "status": "not_started",
+      "privileged": true,
+      "blocked_by": [
+        "security-context",
+        "wlr-output-management"
+      ]
+    },
+    {
+      "id": "color-management",
+      "priority": "P4",
+      "priority_order": 67,
+      "protocol": "color-management-v1",
+      "source": "wayland-protocols/staging",
+      "interfaces": [
+        {
+          "name": "wp_color_manager_v1",
+          "current_version": null,
+          "target_version": 3
+        }
+      ],
+      "status": "not_started",
+      "privileged": false,
+      "blocked_by": [
+        "linux-dmabuf",
+        "presentation-time"
+      ]
+    },
+    {
+      "id": "color-representation",
+      "priority": "P4",
+      "priority_order": 68,
+      "protocol": "color-representation-v1",
+      "source": "wayland-protocols/staging",
+      "interfaces": [
+        {
+          "name": "wp_color_representation_manager_v1",
+          "current_version": null,
+          "target_version": 1
+        }
+      ],
+      "status": "not_started",
+      "privileged": false,
+      "blocked_by": [
+        "color-management"
+      ]
+    },
+    {
+      "id": "alpha-modifier",
+      "priority": "P4",
+      "priority_order": 69,
+      "protocol": "alpha-modifier-v1",
+      "source": "wayland-protocols/staging",
+      "interfaces": [
+        {
+          "name": "wp_alpha_modifier_v1",
+          "current_version": null,
+          "target_version": 1
+        }
+      ],
+      "status": "not_started",
+      "privileged": false,
+      "blocked_by": [
+        "color-management"
+      ]
+    },
+    {
+      "id": "background-effect",
+      "priority": "P4",
+      "priority_order": 70,
+      "protocol": "ext-background-effect-v1",
+      "source": "wayland-protocols/staging",
+      "interfaces": [
+        {
+          "name": "ext_background_effect_manager_v1",
+          "current_version": null,
+          "target_version": 1
+        }
+      ],
+      "status": "not_started",
+      "privileged": false,
+      "blocked_by": [
+        "alpha-modifier",
+        "color-management"
+      ]
+    },
+    {
+      "id": "wlr-gamma-control",
+      "priority": "P4",
+      "priority_order": 71,
+      "protocol": "wlr-gamma-control-unstable-v1",
+      "source": "wlr-protocols",
+      "interfaces": [
+        {
+          "name": "zwlr_gamma_control_manager_v1",
+          "current_version": null,
+          "target_version": 1
+        }
+      ],
+      "status": "not_started",
+      "privileged": true,
+      "blocked_by": [
+        "color-management",
+        "wlr-output-management"
+      ]
+    }
+  ]
+}
