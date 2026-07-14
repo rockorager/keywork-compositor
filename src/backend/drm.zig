@@ -280,6 +280,10 @@ fn activate(self: *Self) !void {
         handleDrmEvent,
         self,
     );
+    log.info(
+        "activated {s} on {s} at {d}x{d}",
+        .{ self.name(), self.device_path.?, self.size.width, self.size.height },
+    );
 }
 
 fn openDevice(self: *Self, path: [:0]const u8) !OpenedDevice {
@@ -428,6 +432,7 @@ fn handleSessionActivated(context: *anyopaque) void {
 
 fn handleSessionDeactivated(context: *anyopaque) void {
     const self: *Self = @ptrCast(@alignCast(context));
+    log.info("deactivating {s}", .{self.name()});
     self.listener.discarded(self.listener.context);
     self.deactivate();
 }

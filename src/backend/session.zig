@@ -62,6 +62,7 @@ pub fn init(
         if (c.libseat_dispatch(self.seat, -1) < 0) return error.DispatchFailed;
     }
     if (self.failed) return error.DispatchFailed;
+    log.info("acquired seat {s}", .{self.name()});
     self.event_source = try event_loop.addFd(
         *Self,
         fd,
@@ -139,6 +140,7 @@ fn handleEnable(_: ?*c.struct_libseat, data: ?*anyopaque) callconv(.c) void {
     const self: *Self = @ptrCast(@alignCast(data.?));
     if (self.failed or self.active) return;
     self.active = true;
+    log.info("seat activated", .{});
     for (self.listeners.items) |listener| listener.activated(listener.context);
 }
 
@@ -146,6 +148,7 @@ fn handleDisable(seat: ?*c.struct_libseat, data: ?*anyopaque) callconv(.c) void 
     const self: *Self = @ptrCast(@alignCast(data.?));
     if (self.active) {
         self.active = false;
+        log.info("seat deactivated", .{});
         for (self.listeners.items) |listener| listener.deactivated(listener.context);
     }
     if (c.libseat_disable_seat(seat) < 0) self.fail();

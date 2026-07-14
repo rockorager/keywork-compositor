@@ -40,6 +40,10 @@ touch_count: usize,
 modifiers: Modifiers,
 left_meta_pressed: bool,
 right_meta_pressed: bool,
+left_ctrl_pressed: bool,
+right_ctrl_pressed: bool,
+left_alt_pressed: bool,
+right_alt_pressed: bool,
 launcher_enter_pressed: bool,
 suspended: bool,
 initialized: bool,
@@ -96,6 +100,10 @@ pub fn init(
         .modifiers = .{},
         .left_meta_pressed = false,
         .right_meta_pressed = false,
+        .left_ctrl_pressed = false,
+        .right_ctrl_pressed = false,
+        .left_alt_pressed = false,
+        .right_alt_pressed = false,
         .launcher_enter_pressed = false,
         .suspended = false,
         .initialized = false,
@@ -144,6 +152,10 @@ pub fn init(
     errdefer self.event_source.?.remove();
     try session.addListener(&self.session_listener);
     self.initialized = true;
+    log.info(
+        "initialized on {s}: {d} keyboard(s), {d} pointer(s), {d} touch device(s)",
+        .{ session.name(), self.keyboard_count, self.pointer_count, self.touch_count },
+    );
 }
 
 pub fn deinit(self: *Self) void {
@@ -248,18 +260,36 @@ fn processEvent(self: *Self, event: *c.struct_libinput_event) void {
 
 fn deviceAdded(self: *Self, device: *c.struct_libinput_device) void {
     if (self.suspended) return;
-    if (c.libinput_device_has_capability(device, c.LIBINPUT_DEVICE_CAP_KEYBOARD) != 0) {
+    const has_keyboard = c.libinput_device_has_capability(
+        device,
+        c.LIBINPUT_DEVICE_CAP_KEYBOARD,
+    ) != 0;
+    const has_pointer = c.libinput_device_has_capability(
+        device,
+        c.LIBINPUT_DEVICE_CAP_POINTER,
+    ) != 0;
+    const has_touch = c.libinput_device_has_capability(
+        device,
+        c.LIBINPUT_DEVICE_CAP_TOUCH,
+    ) != 0;
+    const name_pointer = c.libinput_device_get_name(device);
+    const name = if (name_pointer == null) "unknown" else std.mem.span(name_pointer);
+    log.info(
+        "added {s} (keyboard={}, pointer={}, touch={})",
+        .{ name, has_keyboard, has_pointer, has_touch },
+    );
+    if (has_keyboard) {
         self.keyboard_count += 1;
         if (self.keyboard_count == 1) {
             self.listener.keyboard_available(self.listener.context, true);
             self.listener.keyboard_enter(self.listener.context, &.{});
         }
     }
-    if (c.libinput_device_has_capability(device, c.LIBINPUT_DEVICE_CAP_POINTER) != 0) {
+    if (has_pointer) {
         self.pointer_count += 1;
         if (self.pointer_count == 1) self.listener.pointer_available(self.listener.context, true);
     }
-    if (c.libinput_device_has_capability(device, c.LIBINPUT_DEVICE_CAP_TOUCH) != 0) {
+    if (has_touch) {
         self.touch_count += 1;
         if (self.touch_count == 1) self.listener.touch_available(self.listener.context, true);
     }
@@ -267,6 +297,9 @@ fn deviceAdded(self: *Self, device: *c.struct_libinput_device) void {
 
 fn deviceRemoved(self: *Self, device: *c.struct_libinput_device) void {
     if (self.suspended) return;
+    const name_pointer = c.libinput_device_get_name(device);
+    const name = if (name_pointer == null) "unknown" else std.mem.span(name_pointer);
+    log.info("removed {s}", .{name});
     if (c.libinput_device_has_capability(device, c.LIBINPUT_DEVICE_CAP_KEYBOARD) != 0) {
         std.debug.assert(self.keyboard_count > 0);
         self.keyboard_count -= 1;
@@ -292,8 +325,21 @@ fn keyboardKey(self: *Self, event: *c.struct_libinput_event_keyboard) void {
     const pressed = c.libinput_event_keyboard_get_key_state(event) == c.LIBINPUT_KEY_STATE_PRESSED;
     const seat_key_count = c.libinput_event_keyboard_get_seat_key_count(event);
     if ((pressed and seat_key_count != 1) or (!pressed and seat_key_count != 0)) return;
+    log.debug("key {d} {s}", .{ key, if (pressed) "pressed" else "released" });
     if (key == c.KEY_LEFTMETA) self.left_meta_pressed = pressed;
     if (key == c.KEY_RIGHTMETA) self.right_meta_pressed = pressed;
+    if (key == c.KEY_LEFTCTRL) self.left_ctrl_pressed = pressed;
+    if (key == c.KEY_RIGHTCTRL) self.right_ctrl_pressed = pressed;
+    if (key == c.KEY_LEFTALT) self.left_alt_pressed = pressed;
+    if (key == c.KEY_RIGHTALT) self.right_alt_pressed = pressed;
+    if (pressed and key == c.KEY_BACKSPACE and
+        (self.left_ctrl_pressed or self.right_ctrl_pressed) and
+        (self.left_alt_pressed or self.right_alt_pressed))
+    {
+        log.warn("Ctrl+Alt+Backspace requested compositor exit", .{});
+        self.listener.close(self.listener.context);
+        return;
+    }
     if (key == c.KEY_ENTER) {
         if (pressed and (self.left_meta_pressed or self.right_meta_pressed)) {
             self.launcher_enter_pressed = true;
@@ -344,13 +390,17 @@ fn resetKeyboardState(self: *Self) !void {
     self.modifiers = .{};
     self.left_meta_pressed = false;
     self.right_meta_pressed = false;
+    self.left_ctrl_pressed = false;
+    self.right_ctrl_pressed = false;
+    self.left_alt_pressed = false;
+    self.right_alt_pressed = false;
     self.launcher_enter_pressed = false;
     self.listener.keyboard_modifiers(self.listener.context, 0, 0, 0, 0);
 }
 
 // Temporary native-session launcher for hardware testing.
 fn launchMonstar(self: *Self) void {
-    _ = std.process.spawn(self.io, .{
+    const child = std.process.spawn(self.io, .{
         .argv = &.{"monstar"},
         .environ_map = self.environ_map,
         .stdin = .ignore,
@@ -358,7 +408,9 @@ fn launchMonstar(self: *Self) void {
         .stderr = .inherit,
     }) catch |err| {
         log.err("failed to launch monstar: {t}", .{err});
+        return;
     };
+    log.info("launched monstar (pid {d})", .{child.id.?});
 }
 
 fn pointerMotion(self: *Self, event: *c.struct_libinput_event_pointer) void {
@@ -516,6 +568,7 @@ fn handleEvent(_: c_int, mask: wl.EventMask, self: *Self) c_int {
 fn handleSessionActivated(context: *anyopaque) void {
     const self: *Self = @ptrCast(@alignCast(context));
     if (self.failed or !self.suspended) return;
+    log.info("resuming input", .{});
     if (c.libinput_resume(self.context) != 0) return self.fail(error.ResumeFailed);
     self.suspended = false;
     self.dispatchEvents() catch |err| self.fail(err);
@@ -524,6 +577,7 @@ fn handleSessionActivated(context: *anyopaque) void {
 fn handleSessionDeactivated(context: *anyopaque) void {
     const self: *Self = @ptrCast(@alignCast(context));
     if (self.suspended) return;
+    log.info("suspending input", .{});
     self.clearCapabilities();
     self.suspended = true;
     c.libinput_suspend(self.context);
