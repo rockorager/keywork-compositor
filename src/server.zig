@@ -25,6 +25,7 @@ const XdgActivation = @import("wayland/xdg_activation.zig");
 const Output = @import("wayland/output.zig");
 const OutputLayout = @import("wayland/output_layout.zig");
 const OutputBackend = @import("backend/output.zig");
+const DrmDevice = @import("backend/drm_device.zig");
 const NativeInput = @import("backend/native_input.zig");
 const Session = @import("backend/session.zig");
 const renderer_types = @import("render/renderer.zig");
@@ -41,6 +42,8 @@ allocator: std.mem.Allocator,
 display: *wl.Server,
 session: Session,
 session_initialized: bool,
+drm_device: DrmDevice,
+drm_device_initialized: bool,
 native_input: NativeInput,
 native_input_initialized: bool,
 render_outputs: RenderOutputStore,
@@ -94,7 +97,6 @@ const RenderOutputId = RenderOutputStore.Id;
 const RenderOutputConfig = struct {
     kind: OutputBackend.Kind,
     size: render.Size,
-    drm_device_path: ?[]const u8 = null,
     position: Output.Position = .{},
     name: []const u8,
     description: []const u8,
@@ -127,6 +129,8 @@ pub fn create(
         .display = display,
         .session = undefined,
         .session_initialized = false,
+        .drm_device = undefined,
+        .drm_device_initialized = false,
         .native_input = undefined,
         .native_input_initialized = false,
         .render_outputs = .{},
@@ -160,8 +164,17 @@ pub fn create(
     if (output_kind == .drm) {
         try self.session.init(allocator, display.getEventLoop());
         self.session_initialized = true;
+        errdefer self.session.deinit();
+        try self.drm_device.init(
+            allocator,
+            io,
+            display.getEventLoop(),
+            &self.session,
+            drm_device_path,
+        );
+        self.drm_device_initialized = true;
+        errdefer self.drm_device.deinit();
     }
-    errdefer if (self.session_initialized) self.session.deinit();
     try self.compositor.init(allocator, display);
     errdefer self.compositor.deinit();
     self.outputs.init(allocator, display, self.compositor.surfaceStore());
@@ -171,7 +184,6 @@ pub fn create(
     const render_output_id = try self.addRenderOutput(io, .{
         .kind = output_kind,
         .size = .{ .width = 1280, .height = 720 },
-        .drm_device_path = drm_device_path,
         .name = switch (output_kind) {
             .drm => "DRM-1",
             .headless => "HEADLESS-1",
@@ -358,6 +370,7 @@ pub fn destroy(self: *Self) void {
     self.render_outputs.deinit(allocator);
     self.seat.deinit();
     self.compositor.deinit();
+    if (self.drm_device_initialized) self.drm_device.deinit();
     if (self.session_initialized) self.session.deinit();
     self.renderer.deinit();
     self.display.destroy();
@@ -385,8 +398,7 @@ fn addRenderOutput(
         self.display,
         config.size,
         config.kind,
-        if (self.session_initialized) &self.session else null,
-        config.drm_device_path,
+        if (self.drm_device_initialized) &self.drm_device else null,
         backendListener(render_output),
     );
     errdefer render_output.backend.deinit();

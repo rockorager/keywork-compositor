@@ -5,9 +5,9 @@ const Self = @This();
 const std = @import("std");
 const wayland = @import("wayland");
 const DrmOutput = @import("drm.zig");
+const DrmDevice = @import("drm_device.zig");
 const HeadlessOutput = @import("headless.zig");
 const NestedOutput = @import("nested_wayland.zig");
-const Session = @import("session.zig");
 const presentation = @import("../presentation.zig");
 const render = @import("../render/types.zig");
 
@@ -17,7 +17,7 @@ io: std.Io,
 backend: Backend,
 
 const Backend = union(enum) {
-    drm: DrmOutput,
+    drm: *DrmOutput,
     headless: HeadlessOutput,
     nested: NestedOutput,
 };
@@ -37,22 +37,15 @@ pub fn init(
     display: *wl.Server,
     output_size: render.Size,
     kind: Kind,
-    session: ?*Session,
-    drm_device_path: ?[]const u8,
+    drm_device: ?*DrmDevice,
     listener: Listener,
 ) !void {
     self.io = io;
     switch (kind) {
         .drm => {
-            self.backend = .{ .drm = undefined };
-            try self.backend.drm.init(
-                allocator,
-                io,
-                display.getEventLoop(),
-                session orelse return error.MissingSession,
-                drm_device_path,
-                listener,
-            );
+            const output = &(drm_device orelse return error.MissingDrmDevice).output;
+            output.attach(listener);
+            self.backend = .{ .drm = output };
         },
         .headless => self.backend = .{ .headless = try HeadlessOutput.init(allocator, output_size) },
         .nested => {
@@ -78,7 +71,7 @@ pub fn model(self: *const Self, fallback: []const u8) []const u8 {
 
 pub fn deinit(self: *Self) void {
     switch (self.backend) {
-        .drm => |*output| output.deinit(),
+        .drm => |output| output.detach(),
         .headless => |*output| output.deinit(),
         .nested => |*output| output.deinit(),
     }
@@ -119,7 +112,7 @@ pub fn clientScale(self: *const Self) u32 {
 
 pub fn ready(self: *const Self) bool {
     return switch (self.backend) {
-        .drm => |*output| output.ready(),
+        .drm => |output| output.ready(),
         .headless => true,
         .nested => |*output| output.ready(),
     };
@@ -144,7 +137,7 @@ pub fn presentationClockId(self: *const Self) u32 {
 
 pub fn acquire(self: *Self) ?render.PixelBuffer {
     return switch (self.backend) {
-        .drm => |*output| output.acquire(),
+        .drm => |output| output.acquire(),
         .headless => |*output| output.target(),
         .nested => |*output| output.acquire(),
     };
@@ -152,7 +145,7 @@ pub fn acquire(self: *Self) ?render.PixelBuffer {
 
 pub fn cancel(self: *Self) void {
     switch (self.backend) {
-        .drm => |*output| output.cancel(),
+        .drm => |output| output.cancel(),
         .headless => {},
         .nested => |*output| output.cancel(),
     }
@@ -160,7 +153,7 @@ pub fn cancel(self: *Self) void {
 
 pub fn present(self: *Self) !?presentation.Info {
     return switch (self.backend) {
-        .drm => |*output| output.present(),
+        .drm => |output| output.present(),
         .headless => presentation.Info.now(self.io),
         .nested => |*output| blk: {
             try output.present();

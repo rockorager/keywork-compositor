@@ -3,8 +3,6 @@
 const Self = @This();
 
 const std = @import("std");
-const wayland = @import("wayland");
-const Session = @import("session.zig");
 const NestedOutput = @import("nested_wayland.zig");
 const presentation = @import("../presentation.zig");
 const render = @import("../render/types.zig");
@@ -14,23 +12,12 @@ const c = @cImport({
     @cInclude("xf86drm.h");
     @cInclude("xf86drmMode.h");
 });
-const wl = wayland.server.wl;
-
 const log = std.log.scoped(.drm);
 const buffer_count = 2;
 
-allocator: std.mem.Allocator,
 io: std.Io,
-session: *Session,
-session_listener: Session.Listener,
-event_loop: *wl.EventLoop,
-event_source: ?*wl.EventSource,
-udev: ?*c.struct_udev,
-udev_monitor: ?*c.struct_udev_monitor,
-hotplug_source: ?*wl.EventSource,
-listener: Listener,
-device_path: ?[:0]u8,
-device: ?Session.Device,
+device_access: DeviceAccess,
+listener: ?Listener,
 old_crtc: ?*c.drmModeCrtc,
 buffers: [buffer_count]Buffer,
 mode: c.drmModeModeInfo,
@@ -46,7 +33,6 @@ acquired: ?usize,
 pending: ?usize,
 displayed: ?usize,
 mode_set: bool,
-initialized: bool,
 failed: bool,
 
 pub const Listener = NestedOutput.Listener;
@@ -59,7 +45,7 @@ const Buffer = struct {
     stride_pixels: u32 = 0,
 };
 
-const Selection = struct {
+pub const Selection = struct {
     mode: c.drmModeModeInfo,
     size: render.Size,
     physical_size: render.Size,
@@ -69,9 +55,11 @@ const Selection = struct {
     crtc_id: u32,
 };
 
-const OpenedDevice = struct {
-    device: Session.Device,
-    selection: Selection,
+pub const DeviceAccess = struct {
+    context: *anyopaque,
+    fd: *const fn (*anyopaque) ?std.posix.fd_t,
+    active: *const fn (*anyopaque) bool,
+    fail: *const fn (*anyopaque, anyerror) void,
 };
 
 const event_context: c.drmEventContext = .{
@@ -84,35 +72,13 @@ const event_context: c.drmEventContext = .{
 
 pub fn init(
     self: *Self,
-    allocator: std.mem.Allocator,
     io: std.Io,
-    event_loop: *wl.EventLoop,
-    session: *Session,
-    device_path: ?[]const u8,
-    listener: Listener,
-) !void {
-    const path = if (device_path) |value|
-        try allocator.dupeSentinel(u8, value, 0)
-    else
-        null;
+    device_access: DeviceAccess,
+) void {
     self.* = .{
-        .allocator = allocator,
         .io = io,
-        .session = session,
-        .session_listener = .{
-            .context = self,
-            .activated = handleSessionActivated,
-            .deactivated = handleSessionDeactivated,
-            .failed = handleSessionFailed,
-        },
-        .event_loop = event_loop,
-        .event_source = null,
-        .udev = null,
-        .udev_monitor = null,
-        .hotplug_source = null,
-        .listener = listener,
-        .device_path = path,
-        .device = null,
+        .device_access = device_access,
+        .listener = null,
         .old_crtc = null,
         .buffers = .{ .{}, .{} },
         .mode = std.mem.zeroes(c.drmModeModeInfo),
@@ -128,26 +94,24 @@ pub fn init(
         .pending = null,
         .displayed = null,
         .mode_set = false,
-        .initialized = false,
         .failed = false,
     };
-    errdefer if (self.device_path) |value| allocator.free(value);
-    try session.addListener(&self.session_listener);
-    errdefer session.removeListener(&self.session_listener);
-    if (!session.isActive()) return error.SessionInactive;
-    if (self.failed or self.device == null) return error.DrmInitializationFailed;
-    errdefer self.deactivate();
-    try self.initHotplugMonitor();
-    self.initialized = true;
 }
 
 pub fn deinit(self: *Self) void {
-    self.initialized = false;
-    self.session.removeListener(&self.session_listener);
-    self.deinitHotplugMonitor();
-    self.deactivate();
-    if (self.device_path) |value| self.allocator.free(value);
+    std.debug.assert(self.listener == null);
+    std.debug.assert(self.old_crtc == null);
     self.* = undefined;
+}
+
+pub fn attach(self: *Self, listener: Listener) void {
+    std.debug.assert(self.listener == null);
+    self.listener = listener;
+}
+
+pub fn detach(self: *Self) void {
+    std.debug.assert(self.listener != null);
+    self.listener = null;
 }
 
 pub fn name(self: *const Self) []const u8 {
@@ -155,7 +119,7 @@ pub fn name(self: *const Self) []const u8 {
 }
 
 pub fn ready(self: *const Self) bool {
-    if (self.failed or !self.session.isActive() or
+    if (self.failed or !self.device_access.active(self.device_access.context) or
         self.acquired != null or self.pending != null) return false;
     return self.availableBuffer() != null;
 }
@@ -179,14 +143,14 @@ pub fn cancel(self: *Self) void {
 
 pub fn present(self: *Self) !?presentation.Info {
     const index = self.acquired orelse return error.NoAcquiredBuffer;
-    const device = self.device orelse return error.SessionInactive;
-    if (!self.session.isActive() or self.failed) return error.SessionInactive;
+    const fd = self.device_access.fd(self.device_access.context) orelse return error.SessionInactive;
+    if (!self.device_access.active(self.device_access.context) or self.failed) return error.SessionInactive;
     const buffer = &self.buffers[index];
 
     if (!self.mode_set) {
         var connector_id = self.connector_id;
         if (c.drmModeSetCrtc(
-            device.fd,
+            fd,
             self.crtc_id,
             buffer.framebuffer_id,
             0,
@@ -208,7 +172,7 @@ pub fn present(self: *Self) !?presentation.Info {
     }
 
     if (c.drmModePageFlip(
-        device.fd,
+        fd,
         self.crtc_id,
         buffer.framebuffer_id,
         c.DRM_MODE_PAGE_FLIP_EVENT,
@@ -219,19 +183,7 @@ pub fn present(self: *Self) !?presentation.Info {
     return null;
 }
 
-fn activate(self: *Self) !void {
-    std.debug.assert(self.device == null);
-    const opened = if (self.device_path) |path|
-        try self.openDevice(path)
-    else
-        try self.discoverDevice();
-    const device = opened.device;
-    self.device = device;
-    errdefer {
-        self.session.closeDevice(device) catch {};
-        self.device = null;
-    }
-    const selection = opened.selection;
+pub fn activate(self: *Self, fd: std.posix.fd_t, selection: Selection, device_path: []const u8) !void {
     if (self.size.width != 0 and (!std.meta.eql(self.size, selection.size) or
         self.connector_id != selection.connector_id or self.crtc_id != selection.crtc_id))
     {
@@ -253,7 +205,7 @@ fn activate(self: *Self) !void {
     self.refresh_nanoseconds = refreshNanoseconds(self.mode);
 
     var monotonic: u64 = 0;
-    if (c.drmGetCap(device.fd, c.DRM_CAP_TIMESTAMP_MONOTONIC, &monotonic) == 0 and
+    if (c.drmGetCap(fd, c.DRM_CAP_TIMESTAMP_MONOTONIC, &monotonic) == 0 and
         monotonic != 0)
     {
         self.presentation_clock_id = presentation.monotonic_clock_id;
@@ -261,72 +213,24 @@ fn activate(self: *Self) !void {
         self.presentation_clock_id = @intCast(@intFromEnum(std.posix.CLOCK.REALTIME));
     }
 
-    self.old_crtc = c.drmModeGetCrtc(device.fd, self.crtc_id);
+    self.old_crtc = c.drmModeGetCrtc(fd, self.crtc_id);
     if (self.old_crtc == null) return error.GetCrtcFailed;
     errdefer {
         c.drmModeFreeCrtc(self.old_crtc.?);
         self.old_crtc = null;
     }
 
-    errdefer for (&self.buffers) |*buffer| destroyBuffer(device.fd, buffer);
+    errdefer for (&self.buffers) |*buffer| destroyBuffer(fd, buffer);
     for (&self.buffers) |*buffer| {
-        try createBuffer(device.fd, self.size, buffer);
+        try createBuffer(fd, self.size, buffer);
     }
-
-    self.event_source = try self.event_loop.addFd(
-        *Self,
-        device.fd,
-        .{ .readable = true },
-        handleDrmEvent,
-        self,
-    );
     log.info(
         "activated {s} on {s} at {d}x{d}",
-        .{ self.name(), self.device_path.?, self.size.width, self.size.height },
+        .{ self.name(), device_path, self.size.width, self.size.height },
     );
 }
 
-fn openDevice(self: *Self, path: [:0]const u8) !OpenedDevice {
-    const device = try self.session.openDevice(path);
-    errdefer self.session.closeDevice(device) catch {};
-    if (c.drmIsKMS(device.fd) != 1) return error.NotKmsDevice;
-    return .{
-        .device = device,
-        .selection = try selectOutput(device.fd),
-    };
-}
-
-fn discoverDevice(self: *Self) !OpenedDevice {
-    const udev = c.udev_new() orelse return error.UdevContextFailed;
-    defer _ = c.udev_unref(udev);
-    const enumerate = c.udev_enumerate_new(udev) orelse return error.UdevEnumerateFailed;
-    defer _ = c.udev_enumerate_unref(enumerate);
-    if (c.udev_enumerate_add_match_subsystem(enumerate, "drm") != 0 or
-        c.udev_enumerate_scan_devices(enumerate) != 0)
-    {
-        return error.UdevEnumerateFailed;
-    }
-
-    var entry = c.udev_enumerate_get_list_entry(enumerate);
-    while (entry) |current| : (entry = c.udev_list_entry_get_next(current)) {
-        const syspath = c.udev_list_entry_get_name(current) orelse continue;
-        const udev_device = c.udev_device_new_from_syspath(udev, syspath) orelse continue;
-        defer _ = c.udev_device_unref(udev_device);
-        const devnode = c.udev_device_get_devnode(udev_device) orelse continue;
-        const path = std.mem.span(devnode);
-        if (!isPrimaryNode(path)) continue;
-        const opened = self.openDevice(path) catch continue;
-        const stored_path = self.allocator.dupeSentinel(u8, path, 0) catch |err| {
-            self.session.closeDevice(opened.device) catch {};
-            return err;
-        };
-        self.device_path = stored_path;
-        return opened;
-    }
-    return error.NoDrmDevice;
-}
-
-fn isPrimaryNode(path: []const u8) bool {
+pub fn isPrimaryNode(path: []const u8) bool {
     const basename = std.fs.path.basename(path);
     if (!std.mem.startsWith(u8, basename, "card") or basename.len == "card".len) return false;
     for (basename["card".len..]) |character| {
@@ -335,81 +239,29 @@ fn isPrimaryNode(path: []const u8) bool {
     return true;
 }
 
-fn initHotplugMonitor(self: *Self) !void {
-    const udev = c.udev_new() orelse return error.UdevContextFailed;
-    self.udev = udev;
-    errdefer {
-        _ = c.udev_unref(udev);
-        self.udev = null;
-    }
-    const monitor = c.udev_monitor_new_from_netlink(udev, "udev") orelse
-        return error.UdevMonitorFailed;
-    self.udev_monitor = monitor;
-    errdefer {
-        _ = c.udev_monitor_unref(monitor);
-        self.udev_monitor = null;
-    }
-    if (c.udev_monitor_filter_add_match_subsystem_devtype(monitor, "drm", null) != 0 or
-        c.udev_monitor_enable_receiving(monitor) != 0)
-    {
-        return error.UdevMonitorFailed;
-    }
-    const fd = c.udev_monitor_get_fd(monitor);
-    if (fd < 0) return error.UdevMonitorFailed;
-    self.hotplug_source = try self.event_loop.addFd(
-        *Self,
-        fd,
-        .{ .readable = true },
-        handleHotplugEvent,
-        self,
-    );
-}
-
-fn deinitHotplugMonitor(self: *Self) void {
-    if (self.hotplug_source) |source| {
-        source.remove();
-        self.hotplug_source = null;
-    }
-    if (self.udev_monitor) |monitor| {
-        _ = c.udev_monitor_unref(monitor);
-        self.udev_monitor = null;
-    }
-    if (self.udev) |udev| {
-        _ = c.udev_unref(udev);
-        self.udev = null;
-    }
-}
-
-fn deactivate(self: *Self) void {
-    if (self.event_source) |source| {
-        source.remove();
-        self.event_source = null;
-    }
-    const device = self.device orelse return;
-    if (self.mode_set) restoreCrtc(device.fd, self.connector_id, self.old_crtc.?);
+pub fn deactivate(self: *Self, fd: std.posix.fd_t) void {
+    if (self.mode_set) restoreCrtc(fd, self.connector_id, self.old_crtc.?);
     self.mode_set = false;
     self.acquired = null;
     self.pending = null;
     self.displayed = null;
-    for (&self.buffers) |*buffer| destroyBuffer(device.fd, buffer);
+    for (&self.buffers) |*buffer| destroyBuffer(fd, buffer);
     if (self.old_crtc) |old_crtc| {
         c.drmModeFreeCrtc(old_crtc);
         self.old_crtc = null;
     }
-    self.session.closeDevice(device) catch |err| {
-        log.err("failed to close DRM device: {t}", .{err});
-    };
-    self.device = null;
 }
 
-fn fail(self: *Self, err: anyerror) void {
-    if (self.failed) return;
+pub fn beginFail(self: *Self, err: anyerror) bool {
+    if (self.failed) return false;
     self.failed = true;
     log.err("DRM output failed: {t}", .{err});
-    if (self.pending != null) self.listener.discarded(self.listener.context);
-    self.deinitHotplugMonitor();
-    self.deactivate();
-    if (self.initialized) self.listener.close(self.listener.context);
+    if (self.pending != null) if (self.listener) |listener| listener.discarded(listener.context);
+    return true;
+}
+
+pub fn notifyClose(self: *Self) void {
+    if (self.listener) |listener| listener.close(listener.context);
 }
 
 fn availableBuffer(self: *const Self) ?usize {
@@ -420,61 +272,18 @@ fn availableBuffer(self: *const Self) ?usize {
     return null;
 }
 
-fn handleSessionActivated(context: *anyopaque) void {
-    const self: *Self = @ptrCast(@alignCast(context));
-    if (self.failed) return;
-    self.activate() catch |err| {
-        self.fail(err);
-        return;
-    };
-    if (self.initialized) self.listener.ready(self.listener.context);
+pub fn notifyReady(self: *Self) void {
+    if (self.listener) |listener| listener.ready(listener.context);
 }
 
-fn handleSessionDeactivated(context: *anyopaque) void {
-    const self: *Self = @ptrCast(@alignCast(context));
+pub fn notifyDeactivated(self: *Self) void {
     log.info("deactivating {s}", .{self.name()});
-    self.listener.discarded(self.listener.context);
-    self.deactivate();
+    if (self.listener) |listener| listener.discarded(listener.context);
 }
 
-fn handleSessionFailed(context: *anyopaque) void {
-    const self: *Self = @ptrCast(@alignCast(context));
-    self.fail(error.SessionFailed);
-}
-
-fn handleDrmEvent(_: c_int, mask: wl.EventMask, self: *Self) c_int {
-    if (mask.hangup or mask.@"error") {
-        self.fail(error.DeviceDisconnected);
-        return 0;
-    }
-    if (mask.readable) {
-        var context = event_context;
-        if (c.drmHandleEvent(self.device.?.fd, &context) != 0) {
-            self.fail(error.EventDispatchFailed);
-        }
-    }
-    return 0;
-}
-
-fn handleHotplugEvent(_: c_int, mask: wl.EventMask, self: *Self) c_int {
-    if (mask.hangup or mask.@"error") {
-        self.fail(error.UdevMonitorFailed);
-        return 0;
-    }
-    if (!mask.readable) return 0;
-    var received = false;
-    while (c.udev_monitor_receive_device(self.udev_monitor.?)) |device| {
-        received = true;
-        _ = c.udev_device_unref(device);
-    }
-    if (received) {
-        if (self.device) |device| {
-            if (!connectorAvailable(device.fd, self.connector_id, self.size)) {
-                self.fail(error.OutputDisconnected);
-            }
-        }
-    }
-    return 0;
+pub fn dispatchEvent(_: *Self, fd: std.posix.fd_t) !void {
+    var context = event_context;
+    if (c.drmHandleEvent(fd, &context) != 0) return error.EventDispatchFailed;
 }
 
 fn handlePageFlip(
@@ -486,12 +295,13 @@ fn handlePageFlip(
 ) callconv(.c) void {
     const self: *Self = @ptrCast(@alignCast(data.?));
     const pending = self.pending orelse {
-        self.fail(error.UnexpectedPageFlip);
+        self.device_access.fail(self.device_access.context, error.UnexpectedPageFlip);
         return;
     };
     self.displayed = pending;
     self.pending = null;
-    self.listener.presented(self.listener.context, .{
+    const listener = self.listener orelse return;
+    listener.presented(listener.context, .{
         .timestamp = .{
             .seconds = seconds,
             .nanoseconds = microseconds * std.time.ns_per_us,
@@ -505,10 +315,10 @@ fn handlePageFlip(
             .zero_copy = true,
         },
     });
-    self.listener.ready(self.listener.context);
+    listener.ready(listener.context);
 }
 
-fn selectOutput(fd: std.posix.fd_t) !Selection {
+pub fn selectOutput(fd: std.posix.fd_t) !Selection {
     const resources = c.drmModeGetResources(fd) orelse return error.GetResourcesFailed;
     defer c.drmModeFreeResources(resources);
     if (resources.*.count_crtcs <= 0) return error.NoCrtc;
@@ -544,7 +354,7 @@ fn selectOutput(fd: std.posix.fd_t) !Selection {
     return error.NoConnectedOutput;
 }
 
-fn connectorAvailable(fd: std.posix.fd_t, connector_id: u32, size: render.Size) bool {
+pub fn connectorAvailable(fd: std.posix.fd_t, connector_id: u32, size: render.Size) bool {
     const connector = c.drmModeGetConnector(fd, connector_id) orelse return false;
     defer c.drmModeFreeConnector(connector);
     if (connector.*.connection != c.DRM_MODE_CONNECTED or connector.*.count_modes <= 0) {

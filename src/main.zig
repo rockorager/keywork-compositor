@@ -74,6 +74,7 @@ test {
     _ = @import("backend/headless.zig");
     _ = @import("backend/nested_wayland.zig");
     _ = @import("backend/drm.zig");
+    _ = @import("backend/drm_device.zig");
     _ = @import("backend/native_input.zig");
     _ = @import("backend/output.zig");
     _ = @import("backend/session.zig");
