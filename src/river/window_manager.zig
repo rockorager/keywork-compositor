@@ -10,6 +10,7 @@ const Seat = @import("../wayland/seat.zig");
 const slot_map = @import("../slot_map.zig");
 const Surface = @import("../wayland/surface.zig");
 const XdgShell = @import("../wayland/xdg_shell.zig");
+const LayerShell = @import("../wayland/layer_shell.zig");
 
 const wl = wayland.server.wl;
 const river = wayland.server.river;
@@ -18,10 +19,12 @@ const protocol_version = 3;
 
 allocator: std.mem.Allocator,
 global: *wl.Global,
+layer_global: *wl.Global,
 output: *Output,
 seat: *Seat,
 scene: *Scene,
 xdg_shell: *XdgShell,
+layer_shell: *LayerShell,
 active: ?*river.WindowManagerV1,
 output_resource: ?*river.OutputV1,
 seat_resource: ?*river.SeatV1,
@@ -35,6 +38,10 @@ stack_operations: std.ArrayList(StackOperation),
 focused: ?WindowId,
 pending_focus: PendingFocus,
 configure_timer: *wl.EventSource,
+layer_bindings: std.ArrayList(*LayerBinding),
+layer_area: LayerShell.Rect,
+layer_focus: LayerShell.FocusClass,
+layer_focus_sent: LayerShell.FocusClass,
 
 const WindowStore = slot_map.SlotMap(ManagedWindow, enum { managed_window });
 const WindowId = WindowStore.Id;
@@ -217,14 +224,17 @@ pub fn init(
     seat: *Seat,
     scene: *Scene,
     xdg_shell: *XdgShell,
+    layer_shell: *LayerShell,
 ) !void {
     self.* = .{
         .allocator = allocator,
         .global = undefined,
+        .layer_global = undefined,
         .output = output,
         .seat = seat,
         .scene = scene,
         .xdg_shell = xdg_shell,
+        .layer_shell = layer_shell,
         .active = null,
         .output_resource = null,
         .seat_resource = null,
@@ -238,6 +248,10 @@ pub fn init(
         .focused = null,
         .pending_focus = .unchanged,
         .configure_timer = undefined,
+        .layer_bindings = .empty,
+        .layer_area = layer_shell.usableArea(),
+        .layer_focus = .none,
+        .layer_focus_sent = .none,
     };
     errdefer self.windows.deinit(allocator);
     errdefer self.decorations.deinit(allocator);
@@ -253,6 +267,8 @@ pub fn init(
         bind,
     );
     errdefer self.global.destroy();
+    self.layer_global = try wl.Global.create(display, river.LayerShellV1, 1, *Self, self, bindLayerShell);
+    errdefer self.layer_global.destroy();
     self.configure_timer = try display.getEventLoop().addTimer(*Self, handleConfigureTimeout, self);
     xdg_shell.setWindowListener(.{
         .context = self,
@@ -263,9 +279,15 @@ pub fn init(
         .metadata_changed = windowMetadataChanged,
         .request = windowRequest,
     });
+    layer_shell.setPolicyListener(.{
+        .context = self,
+        .supported = layerSupported,
+        .changed = layerChanged,
+    });
 }
 
 pub fn deinit(self: *Self) void {
+    self.layer_shell.clearPolicyListener();
     self.xdg_shell.clearWindowListener();
     self.configure_timer.remove();
     self.releaseWindows();
@@ -275,6 +297,9 @@ pub fn deinit(self: *Self) void {
     self.shell_surfaces.deinit(self.allocator);
     self.window_requests.deinit(self.allocator);
     self.stack_operations.deinit(self.allocator);
+    std.debug.assert(self.layer_bindings.items.len == 0);
+    self.layer_bindings.deinit(self.allocator);
+    self.layer_global.destroy();
     self.global.destroy();
     self.* = undefined;
 }
@@ -297,6 +322,7 @@ fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
 
     self.active = resource;
     self.session_generation +%= 1;
+    for (self.layer_bindings.items) |binding| binding.beginSession(if (binding.resource.getClient() == resource.getClient()) self.session_generation else null);
     self.createOutput(resource) catch {
         resource.postNoMemory();
         return;
@@ -377,6 +403,22 @@ fn requestManage(self: *Self) void {
 }
 
 fn sendPendingState(self: *Self, manager: *river.WindowManagerV1) !void {
+    self.layer_focus_sent = self.layer_focus;
+    for (self.layer_bindings.items) |binding| if (binding.active()) {
+        if (binding.output) |output| if (output.sent_area == null or !std.meta.eql(output.sent_area.?, self.layer_area)) {
+            const area = self.layer_area;
+            output.resource.sendNonExclusiveArea(area.x, area.y, area.width, area.height);
+            output.sent_area = area;
+        };
+        if (binding.seat) |seat| if (seat.sent_focus == null or seat.sent_focus.? != self.layer_focus) {
+            switch (self.layer_focus) {
+                .exclusive => seat.resource.sendFocusExclusive(),
+                .non_exclusive => seat.resource.sendFocusNonExclusive(),
+                .none => seat.resource.sendFocusNone(),
+            }
+            seat.sent_focus = self.layer_focus;
+        };
+    };
     var iterator = self.windows.iterator();
     while (iterator.next()) |entry| {
         if (entry.value.resource == null) try self.createWindowResource(manager, entry.id);
@@ -744,7 +786,206 @@ fn sceneNodeId(self: *Self, id: ManagedNodeId) ?Scene.NodeId {
     };
 }
 
+fn bindLayerShell(client: *wl.Client, manager: *Self, version: u32, id: u32) void {
+    const resource = river.LayerShellV1.create(client, version, id) catch {
+        client.postNoMemory();
+        return;
+    };
+    const binding = manager.allocator.create(LayerBinding) catch {
+        resource.destroy();
+        client.postNoMemory();
+        return;
+    };
+    binding.* = .{ .manager = manager, .resource = resource };
+    manager.layer_bindings.append(manager.allocator, binding) catch {
+        manager.allocator.destroy(binding);
+        resource.destroy();
+        client.postNoMemory();
+        return;
+    };
+    if (manager.active) |active| {
+        if (active.getClient() == client) binding.owner_generation = manager.session_generation;
+    }
+    resource.setHandler(*LayerBinding, LayerBinding.handleRequest, LayerBinding.handleDestroy, binding);
+}
+
+fn activeLayerBinding(self: *Self) ?*LayerBinding {
+    for (self.layer_bindings.items) |binding| {
+        if (binding.owner_generation == self.session_generation and self.active != null and
+            binding.resource.getClient() == self.active.?.getClient()) return binding;
+    }
+    return null;
+}
+
+fn layerSupported(context: *anyopaque) bool {
+    const self: *Self = @ptrCast(@alignCast(context));
+    return self.activeLayerBinding() != null;
+}
+
+fn layerChanged(context: *anyopaque, area: LayerShell.Rect, focus: LayerShell.FocusClass) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    if (std.meta.eql(self.layer_area, area) and self.layer_focus == focus) return;
+    self.layer_area = area;
+    self.layer_focus = focus;
+    self.requestManage();
+}
+
+fn hasLayerOutput(self: *Self) bool {
+    for (self.layer_bindings.items) |binding| {
+        if (binding.active() and binding.output != null) return true;
+    }
+    return false;
+}
+
+fn hasLayerSeat(self: *Self) bool {
+    for (self.layer_bindings.items) |binding| {
+        if (binding.active() and binding.seat != null) return true;
+    }
+    return false;
+}
+
+const LayerBinding = struct {
+    manager: *Self,
+    resource: *river.LayerShellV1,
+    owner_generation: ?u64 = null,
+    output: ?*LayerOutput = null,
+    seat: ?*LayerSeat = null,
+
+    fn active(self: *LayerBinding) bool {
+        return self.owner_generation == self.manager.session_generation and
+            self.manager.active != null and self.resource.getClient() == self.manager.active.?.getClient();
+    }
+
+    fn beginSession(self: *LayerBinding, generation: ?u64) void {
+        if (self.output) |child| child.binding = null;
+        if (self.seat) |child| child.binding = null;
+        self.output = null;
+        self.seat = null;
+        self.owner_generation = generation;
+    }
+
+    fn handleRequest(resource: *river.LayerShellV1, request: river.LayerShellV1.Request, self: *LayerBinding) void {
+        switch (request) {
+            .destroy => resource.destroy(),
+            .get_output => |get| {
+                if (self.output != null or (self.active() and self.manager.hasLayerOutput())) {
+                    resource.postError(.object_already_created, "layer shell output already created");
+                    return;
+                }
+                const child = LayerOutput.create(self, get.id) catch {
+                    resource.postNoMemory();
+                    return;
+                };
+                if (!self.active() or !validOutput(self, get.output)) {
+                    child.binding = null;
+                    return;
+                }
+                self.output = child;
+                child.attached = true;
+                self.manager.requestManage();
+            },
+            .get_seat => |get| {
+                if (self.seat != null or (self.active() and self.manager.hasLayerSeat())) {
+                    resource.postError(.object_already_created, "layer shell seat already created");
+                    return;
+                }
+                const child = LayerSeat.create(self, get.id) catch {
+                    resource.postNoMemory();
+                    return;
+                };
+                if (!self.active() or !validSeat(self, get.seat)) {
+                    child.binding = null;
+                    return;
+                }
+                self.seat = child;
+                child.attached = true;
+                self.manager.requestManage();
+            },
+        }
+    }
+
+    fn validOutput(self: *LayerBinding, resource: *river.OutputV1) bool {
+        const data = resource.getUserData() orelse return false;
+        const output: *OutputResource = @ptrCast(@alignCast(data));
+        return output.manager == self.manager and output.owner_generation == self.owner_generation.? and
+            resource.getClient() == self.resource.getClient();
+    }
+
+    fn validSeat(self: *LayerBinding, resource: *river.SeatV1) bool {
+        const data = resource.getUserData() orelse return false;
+        const seat: *SeatResource = @ptrCast(@alignCast(data));
+        return seat.manager == self.manager and seat.owner_generation == self.owner_generation.? and
+            resource.getClient() == self.resource.getClient();
+    }
+
+    fn handleDestroy(_: *river.LayerShellV1, self: *LayerBinding) void {
+        if (self.output) |child| child.binding = null;
+        if (self.seat) |child| child.binding = null;
+        for (self.manager.layer_bindings.items, 0..) |candidate, i| if (candidate == self) {
+            _ = self.manager.layer_bindings.swapRemove(i);
+            break;
+        };
+        self.manager.allocator.destroy(self);
+    }
+};
+
+const LayerOutput = struct {
+    allocator: std.mem.Allocator,
+    binding: ?*LayerBinding,
+    resource: *river.LayerShellOutputV1,
+    attached: bool = false,
+    sent_area: ?LayerShell.Rect = null,
+
+    fn create(binding: *LayerBinding, id: u32) !*LayerOutput {
+        const resource = try river.LayerShellOutputV1.create(binding.resource.getClient(), 1, id);
+        errdefer resource.destroy();
+        const self = try binding.manager.allocator.create(LayerOutput);
+        self.* = .{ .allocator = binding.manager.allocator, .binding = binding, .resource = resource };
+        resource.setHandler(*LayerOutput, LayerOutput.handleRequest, LayerOutput.handleDestroy, self);
+        return self;
+    }
+    fn handleRequest(resource: *river.LayerShellOutputV1, request: river.LayerShellOutputV1.Request, self: *LayerOutput) void {
+        switch (request) {
+            .destroy => resource.destroy(),
+            .set_default => if (self.binding) |binding| if (binding.active() and binding.manager.sequence.state != .manage)
+                binding.manager.active.?.postError(.sequence_order, "set_default outside a manage sequence"),
+        }
+    }
+    fn handleDestroy(_: *river.LayerShellOutputV1, self: *LayerOutput) void {
+        if (self.binding) |binding| {
+            if (self.attached and binding.output == self) binding.output = null;
+        }
+        self.allocator.destroy(self);
+    }
+};
+
+const LayerSeat = struct {
+    allocator: std.mem.Allocator,
+    binding: ?*LayerBinding,
+    resource: *river.LayerShellSeatV1,
+    attached: bool = false,
+    sent_focus: ?LayerShell.FocusClass = null,
+    fn create(binding: *LayerBinding, id: u32) !*LayerSeat {
+        const resource = try river.LayerShellSeatV1.create(binding.resource.getClient(), 1, id);
+        errdefer resource.destroy();
+        const self = try binding.manager.allocator.create(LayerSeat);
+        self.* = .{ .allocator = binding.manager.allocator, .binding = binding, .resource = resource };
+        resource.setHandler(*LayerSeat, LayerSeat.handleRequest, LayerSeat.handleDestroy, self);
+        return self;
+    }
+    fn handleRequest(resource: *river.LayerShellSeatV1, request: river.LayerShellSeatV1.Request, _: *LayerSeat) void {
+        if (request == .destroy) resource.destroy();
+    }
+    fn handleDestroy(_: *river.LayerShellSeatV1, self: *LayerSeat) void {
+        if (self.binding) |binding| {
+            if (self.attached and binding.seat == self) binding.seat = null;
+        }
+        self.allocator.destroy(self);
+    }
+};
+
 fn releaseManager(self: *Self) void {
+    for (self.layer_bindings.items) |binding| binding.beginSession(null);
     self.active = null;
     self.output_resource = null;
     self.seat_resource = null;
@@ -1804,16 +2045,22 @@ const SeatResource = struct {
             .destroy => unreachable,
             .focus_window => |focus| {
                 if (!self.requireManage(manager_resource)) return;
+                if (self.manager.layer_focus_sent == .exclusive) return;
                 const id = self.resolveWindow(focus.window) orelse return;
+                _ = self.manager.layer_shell.relinquishNonExclusiveFocus();
                 self.manager.pending_focus = .{ .window = id };
             },
             .clear_focus => {
                 if (!self.requireManage(manager_resource)) return;
+                if (self.manager.layer_focus_sent == .exclusive) return;
+                _ = self.manager.layer_shell.relinquishNonExclusiveFocus();
                 self.manager.pending_focus = .clear;
             },
             .focus_shell_surface => |focus| {
                 if (!self.requireManage(manager_resource)) return;
+                if (self.manager.layer_focus_sent == .exclusive) return;
                 if (!self.resolveShellSurface(focus.shell_surface)) return;
+                _ = self.manager.layer_shell.relinquishNonExclusiveFocus();
                 self.manager.pending_focus = .clear;
             },
             .op_start_pointer, .op_end => {

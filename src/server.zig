@@ -200,6 +200,7 @@ pub fn create(
         &self.seat,
         &self.scene,
         &self.xdg_shell,
+        &self.layer_shell,
     );
     errdefer self.window_manager.deinit();
     self.render_timer = try display.getEventLoop().addTimer(*Self, handleRenderTimer, self);
@@ -215,6 +216,10 @@ pub fn create(
         .context = self,
         .request = requestRepaint,
     });
+    self.layer_shell.setRepaintListener(.{
+        .context = self,
+        .request = requestRepaint,
+    });
     requestRepaint(self);
 
     return self;
@@ -222,6 +227,7 @@ pub fn create(
 
 pub fn destroy(self: *Self) void {
     const allocator = self.allocator;
+    self.layer_shell.clearRepaintListener();
     self.seat.clearRepaintListener();
     self.scene.clearRepaintListener();
     self.subcompositor.clearRepaintListener();

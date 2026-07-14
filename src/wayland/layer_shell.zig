@@ -25,11 +25,23 @@ global: *wl.Global,
 states: Store = .{},
 regular_focus: ?Surface.Id = null,
 usable_area: Rect,
+policy_listener: ?PolicyListener = null,
+repaint_listener: ?RepaintListener = null,
 
 const Store = slot_map.SlotMap(State, enum { layer_surface });
 const Id = Store.Id;
 
 pub const Rect = struct { x: i32, y: i32, width: i32, height: i32 };
+pub const FocusClass = enum { exclusive, non_exclusive, none };
+pub const PolicyListener = struct {
+    context: *anyopaque,
+    supported: *const fn (*anyopaque) bool,
+    changed: *const fn (*anyopaque, Rect, FocusClass) void,
+};
+pub const RepaintListener = struct {
+    context: *anyopaque,
+    request: *const fn (*anyopaque) void,
+};
 const Margins = struct { top: i32 = 0, right: i32 = 0, bottom: i32 = 0, left: i32 = 0 };
 const StateValue = struct {
     width: u32 = 0,
@@ -83,6 +95,48 @@ pub fn usableArea(self: *const Self) Rect {
     return self.usable_area;
 }
 
+pub fn setPolicyListener(self: *Self, listener: PolicyListener) void {
+    self.policy_listener = listener;
+    self.notifyPolicy();
+}
+
+pub fn clearPolicyListener(self: *Self) void {
+    self.policy_listener = null;
+}
+
+pub fn setRepaintListener(self: *Self, listener: RepaintListener) void {
+    std.debug.assert(self.repaint_listener == null);
+    self.repaint_listener = listener;
+}
+
+pub fn clearRepaintListener(self: *Self) void {
+    std.debug.assert(self.repaint_listener != null);
+    self.repaint_listener = null;
+}
+
+pub fn relinquishNonExclusiveFocus(self: *Self) bool {
+    if (self.focusClass() != .non_exclusive) return false;
+    self.regular_focus = null;
+    self.notifyPolicy();
+    self.requestRepaint();
+    return true;
+}
+
+fn focusClass(self: *Self) FocusClass {
+    if (self.exclusiveKeyboardFocus() != null) return .exclusive;
+    if (self.regularKeyboardFocus() != null) return .non_exclusive;
+    return .none;
+}
+
+fn notifyPolicy(self: *Self) void {
+    const listener = self.policy_listener orelse return;
+    listener.changed(listener.context, self.usable_area, self.focusClass());
+}
+
+fn requestRepaint(self: *Self) void {
+    if (self.repaint_listener) |listener| listener.request(listener.context);
+}
+
 fn exclusiveKeyboardFocus(self: *Self) ?Surface.Id {
     const layers = [_]Scene.Layer{ .overlay, .top };
     for (layers) |layer| {
@@ -117,6 +171,7 @@ pub fn keyboardFocus(self: *Self, popup_focus: ?Surface.Id) ?Surface.Id {
 
 pub fn pointerPressed(self: *Self, id: ?Surface.Id) void {
     self.regular_focus = null;
+    defer self.notifyPolicy();
     const surface_id = id orelse return;
     const state = self.findSurface(surface_id) orelse popup: {
         const scene_id = self.xdg_shell.popupRootLayerSurface(surface_id) orelse return;
@@ -188,6 +243,11 @@ fn createSurface(self: *Self, manager: *zwlr.LayerShellV1, r: anytype) CreateErr
     adapter.resource = protocol;
     protocol.setHandler(*Adapter, surfaceRequest, resourceDestroyed, adapter);
     surface.assignReservedRole(.layer_surface, adapter) catch unreachable;
+    if (self.policy_listener) |listener| if (!listener.supported(listener.context)) {
+        protocol.sendClosed();
+        self.remove(id);
+        return;
+    };
 }
 
 fn surfaceRequest(resource: *zwlr.LayerSurfaceV1, request: zwlr.LayerSurfaceV1.Request, adapter: *Adapter) void {
@@ -317,6 +377,7 @@ fn arrange(self: *Self) void {
         }
     }
     self.usable_area = usable;
+    self.notifyPolicy();
 }
 
 fn resourceDestroyed(_: *zwlr.LayerSurfaceV1, adapter: *Adapter) void {
