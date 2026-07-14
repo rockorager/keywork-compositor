@@ -21,6 +21,7 @@ pointer_available: bool,
 keymap: ?Keymap,
 repeat_info: RepeatInfo,
 repaint_listener: ?RepaintListener,
+keyboard_focus_listener: ?KeyboardFocusListener,
 parent_focused: bool,
 focus: ?Surface.Id,
 pointer_focus: ?PointerFocus,
@@ -31,6 +32,11 @@ cursor_surface_count: usize,
 pressed_keys: std.ArrayList(u32),
 modifiers: Modifiers,
 last_user_action: ?UserAction,
+recent_user_actions: [user_action_history_capacity]UserAction,
+recent_user_action_count: usize,
+next_user_action: usize,
+
+const user_action_history_capacity = 32;
 
 const Keymap = struct {
     format: wl.Keyboard.KeymapFormat,
@@ -83,6 +89,11 @@ pub const RepaintListener = struct {
     request: *const fn (*anyopaque) void,
 };
 
+pub const KeyboardFocusListener = struct {
+    context: *anyopaque,
+    changed: *const fn (*anyopaque, ?*wl.Client) void,
+};
+
 pub fn init(
     self: *Self,
     allocator: std.mem.Allocator,
@@ -104,6 +115,7 @@ pub fn init(
         .keymap = null,
         .repeat_info = .{},
         .repaint_listener = null,
+        .keyboard_focus_listener = null,
         .parent_focused = false,
         .focus = null,
         .pointer_focus = null,
@@ -114,6 +126,9 @@ pub fn init(
         .pressed_keys = .empty,
         .modifiers = .{},
         .last_user_action = null,
+        .recent_user_actions = undefined,
+        .recent_user_action_count = 0,
+        .next_user_action = 0,
     };
     errdefer self.seat_resources.deinit(allocator);
     errdefer self.keyboard_resources.deinit(allocator);
@@ -128,6 +143,7 @@ pub fn deinit(self: *Self) void {
     std.debug.assert(self.pointer_resources.items.len == 0);
     std.debug.assert(self.cursor_surface_count == 0);
     std.debug.assert(self.repaint_listener == null);
+    std.debug.assert(self.keyboard_focus_listener == null);
     self.global.destroy();
     if (self.keymap) |keymap| keymap.file.close(self.io);
     self.pressed_keys.deinit(self.allocator);
@@ -155,6 +171,16 @@ pub fn clearRepaintListener(self: *Self) void {
     self.repaint_listener = null;
 }
 
+pub fn setKeyboardFocusListener(self: *Self, listener: KeyboardFocusListener) void {
+    std.debug.assert(self.keyboard_focus_listener == null);
+    self.keyboard_focus_listener = listener;
+}
+
+pub fn clearKeyboardFocusListener(self: *Self) void {
+    std.debug.assert(self.keyboard_focus_listener != null);
+    self.keyboard_focus_listener = null;
+}
+
 pub fn acceptsUserActionSerial(
     self: *Self,
     resource: *wl.Seat,
@@ -162,6 +188,17 @@ pub fn acceptsUserActionSerial(
     serial: u32,
 ) bool {
     if (!self.ownsResource(resource)) return false;
+    return self.acceptsClientUserActionSerial(client, serial);
+}
+
+pub fn acceptsSelectionSerial(self: *Self, client: *wl.Client, serial: u32) bool {
+    for (self.recent_user_actions[0..self.recent_user_action_count]) |action| {
+        if (action.client == client and action.serial == serial) return true;
+    }
+    return false;
+}
+
+pub fn acceptsClientUserActionSerial(self: *const Self, client: *wl.Client, serial: u32) bool {
     const action = self.last_user_action orelse return false;
     return action.client == client and action.serial == serial;
 }
@@ -169,6 +206,12 @@ pub fn acceptsUserActionSerial(
 pub fn pointerFocusedSurface(self: *const Self) ?Surface.Id {
     const focus = self.pointer_focus orelse return null;
     return focus.surface_id;
+}
+
+pub fn keyboardFocusedClient(self: *Self) ?*wl.Client {
+    if (!self.parent_focused or self.keymap == null) return null;
+    const surface = self.focusedSurface() orelse return null;
+    return surface.getClient();
 }
 
 pub fn cursorInfo(self: *const Self) ?CursorInfo {
@@ -202,6 +245,7 @@ pub fn setKeymap(
     fd: std.posix.fd_t,
     size: u32,
 ) void {
+    const old_focus = self.keyboardFocusedClient();
     const old_capability = self.hasKeyboardCapability();
     if (self.keymap) |keymap| keymap.file.close(self.io);
     self.keymap = .{
@@ -213,6 +257,10 @@ pub fn setKeymap(
     for (self.keyboard_resources.items) |resource| {
         self.sendKeymap(resource);
         self.sendRepeatInfo(resource);
+    }
+    if (old_focus == null and self.keyboardFocusedClient() != null) {
+        self.notifyKeyboardFocus();
+        self.sendEnter();
     }
 }
 
@@ -226,7 +274,10 @@ pub fn setKeyboardFocus(self: *Self, focus: ?Surface.Id) void {
     if (std.meta.eql(self.focus, focus)) return;
     if (self.parent_focused) self.sendLeave();
     self.focus = focus;
-    if (self.parent_focused) self.sendEnter();
+    if (self.parent_focused) {
+        self.notifyKeyboardFocus();
+        self.sendEnter();
+    }
 }
 
 pub fn parentKeyboardEnter(self: *Self, pressed_keys: []const u32) error{OutOfMemory}!void {
@@ -234,12 +285,14 @@ pub fn parentKeyboardEnter(self: *Self, pressed_keys: []const u32) error{OutOfMe
     try self.pressed_keys.appendSlice(self.allocator, pressed_keys);
     if (self.parent_focused) return;
     self.parent_focused = true;
+    self.notifyKeyboardFocus();
     self.sendEnter();
 }
 
 pub fn parentKeyboardLeave(self: *Self) void {
     if (self.parent_focused) self.sendLeave();
     self.parent_focused = false;
+    self.notifyKeyboardFocus();
     self.pressed_keys.clearRetainingCapacity();
 }
 
@@ -270,10 +323,7 @@ pub fn key(
     const surface = self.focusedSurface() orelse return;
     if (!self.parent_focused or self.keymap == null) return;
     const serial = self.display.nextSerial();
-    if (state == .pressed) self.last_user_action = .{
-        .client = surface.getClient(),
-        .serial = serial,
-    };
+    if (state == .pressed) self.recordUserAction(surface.getClient(), serial);
     for (self.keyboard_resources.items) |resource| {
         if (resource.getClient() != surface.getClient()) continue;
         if (state == .repeated and resource.getVersion() < 10) continue;
@@ -328,10 +378,7 @@ pub fn pointerButton(
 ) void {
     const surface = self.pointerSurface() orelse return;
     const serial = self.display.nextSerial();
-    if (state == .pressed) self.last_user_action = .{
-        .client = surface.getClient(),
-        .serial = serial,
-    };
+    if (state == .pressed) self.recordUserAction(surface.getClient(), serial);
     for (self.pointer_resources.items) |resource| {
         if (resource.getClient() == surface.getClient()) {
             resource.sendButton(serial, time, button, state);
@@ -470,6 +517,7 @@ fn createKeyboard(self: *Self, seat: *wl.Seat, id: u32) void {
     const surface = self.focusedSurface() orelse return;
     if (self.parent_focused and resource.getClient() == surface.getClient()) {
         const serial = self.display.nextSerial();
+        self.recordSelectionSerial(surface.getClient(), serial);
         self.sendEnterTo(resource, surface, serial);
     }
 }
@@ -568,6 +616,7 @@ fn sendEnter(self: *Self) void {
     if (self.keymap == null) return;
     const surface = self.focusedSurface() orelse return;
     const serial = self.display.nextSerial();
+    self.recordSelectionSerial(surface.getClient(), serial);
     for (self.keyboard_resources.items) |resource| {
         if (resource.getClient() == surface.getClient()) {
             self.sendEnterTo(resource, surface, serial);
@@ -742,6 +791,28 @@ fn cursorSurfaceDestroyed(self: *Self, id: Surface.Id) void {
 
 fn requestRepaint(self: *Self) void {
     if (self.repaint_listener) |listener| listener.request(listener.context);
+}
+
+fn recordUserAction(self: *Self, client: *wl.Client, serial: u32) void {
+    const action: UserAction = .{ .client = client, .serial = serial };
+    self.last_user_action = action;
+    self.recordSelectionSerial(client, serial);
+}
+
+fn recordSelectionSerial(self: *Self, client: *wl.Client, serial: u32) void {
+    const action: UserAction = .{ .client = client, .serial = serial };
+    self.recent_user_actions[self.next_user_action] = action;
+    self.next_user_action = (self.next_user_action + 1) % user_action_history_capacity;
+    self.recent_user_action_count = @min(
+        self.recent_user_action_count + 1,
+        user_action_history_capacity,
+    );
+}
+
+fn notifyKeyboardFocus(self: *Self) void {
+    if (self.keyboard_focus_listener) |listener| {
+        listener.changed(listener.context, self.keyboardFocusedClient());
+    }
 }
 
 const CursorSurface = struct {
