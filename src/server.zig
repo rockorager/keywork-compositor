@@ -25,6 +25,7 @@ const XdgActivation = @import("wayland/xdg_activation.zig");
 const Output = @import("wayland/output.zig");
 const OutputLayout = @import("wayland/output_layout.zig");
 const OutputBackend = @import("backend/output.zig");
+const NativeInput = @import("backend/native_input.zig");
 const Session = @import("backend/session.zig");
 const renderer_types = @import("render/renderer.zig");
 const render = @import("render/types.zig");
@@ -40,6 +41,8 @@ allocator: std.mem.Allocator,
 display: *wl.Server,
 session: Session,
 session_initialized: bool,
+native_input: NativeInput,
+native_input_initialized: bool,
 render_outputs: RenderOutputStore,
 primary_render_output: RenderOutputId,
 outputs: OutputLayout,
@@ -122,6 +125,8 @@ pub fn create(
         .display = display,
         .session = undefined,
         .session_initialized = false,
+        .native_input = undefined,
+        .native_input_initialized = false,
         .render_outputs = .{},
         .primary_render_output = undefined,
         .outputs = undefined,
@@ -298,6 +303,17 @@ pub fn create(
         .context = self,
         .request = requestRepaint,
     });
+    if (output_kind == .drm) {
+        try self.native_input.init(
+            allocator,
+            io,
+            display.getEventLoop(),
+            &self.session,
+            render_output.backend.size(),
+            backendListener(render_output),
+        );
+        self.native_input_initialized = true;
+    }
     requestRepaint(self);
 
     return self;
@@ -306,6 +322,7 @@ pub fn create(
 pub fn destroy(self: *Self) void {
     const allocator = self.allocator;
     self.data_device.cancel();
+    if (self.native_input_initialized) self.native_input.deinit();
     self.layer_shell.clearRepaintListener();
     self.seat.clearRepaintListener();
     self.scene.clearRepaintListener();
@@ -366,40 +383,7 @@ fn addRenderOutput(
         config.size,
         config.kind,
         if (self.session_initialized) &self.session else null,
-        .{
-            .context = render_output,
-            .ready = outputReady,
-            .presented = outputPresented,
-            .discarded = outputDiscarded,
-            .close = closeOutput,
-            .keyboard_available = keyboardAvailable,
-            .keyboard_keymap = keyboardKeymap,
-            .keyboard_enter = keyboardEnter,
-            .keyboard_leave = keyboardLeave,
-            .keyboard_key = keyboardKey,
-            .keyboard_modifiers = keyboardModifiers,
-            .keyboard_repeat_info = keyboardRepeatInfo,
-            .pointer_available = pointerAvailable,
-            .pointer_enter = pointerEnter,
-            .pointer_leave = pointerLeave,
-            .pointer_motion = pointerMotion,
-            .pointer_button = pointerButton,
-            .pointer_axis = pointerAxis,
-            .pointer_frame = pointerFrame,
-            .pointer_axis_source = pointerAxisSource,
-            .pointer_axis_stop = pointerAxisStop,
-            .pointer_axis_discrete = pointerAxisDiscrete,
-            .pointer_axis_value120 = pointerAxisValue120,
-            .pointer_axis_relative_direction = pointerAxisRelativeDirection,
-            .touch_available = touchAvailable,
-            .touch_down = touchDown,
-            .touch_up = touchUp,
-            .touch_motion = touchMotion,
-            .touch_frame = touchFrame,
-            .touch_cancel = touchCancel,
-            .touch_shape = touchShape,
-            .touch_orientation = touchOrientation,
-        },
+        backendListener(render_output),
     );
     errdefer render_output.backend.deinit();
     render_output.protocol_id = try self.outputs.add(.{
@@ -424,6 +408,43 @@ fn addRenderOutput(
     render_output.repaint_needed = true;
     self.scheduleRepaint(render_output);
     return id;
+}
+
+fn backendListener(render_output: *RenderOutput) OutputBackend.Listener {
+    return .{
+        .context = render_output,
+        .ready = outputReady,
+        .presented = outputPresented,
+        .discarded = outputDiscarded,
+        .close = closeOutput,
+        .keyboard_available = keyboardAvailable,
+        .keyboard_keymap = keyboardKeymap,
+        .keyboard_enter = keyboardEnter,
+        .keyboard_leave = keyboardLeave,
+        .keyboard_key = keyboardKey,
+        .keyboard_modifiers = keyboardModifiers,
+        .keyboard_repeat_info = keyboardRepeatInfo,
+        .pointer_available = pointerAvailable,
+        .pointer_enter = pointerEnter,
+        .pointer_leave = pointerLeave,
+        .pointer_motion = pointerMotion,
+        .pointer_button = pointerButton,
+        .pointer_axis = pointerAxis,
+        .pointer_frame = pointerFrame,
+        .pointer_axis_source = pointerAxisSource,
+        .pointer_axis_stop = pointerAxisStop,
+        .pointer_axis_discrete = pointerAxisDiscrete,
+        .pointer_axis_value120 = pointerAxisValue120,
+        .pointer_axis_relative_direction = pointerAxisRelativeDirection,
+        .touch_available = touchAvailable,
+        .touch_down = touchDown,
+        .touch_up = touchUp,
+        .touch_motion = touchMotion,
+        .touch_frame = touchFrame,
+        .touch_cancel = touchCancel,
+        .touch_shape = touchShape,
+        .touch_orientation = touchOrientation,
+    };
 }
 
 fn removeRenderOutput(self: *Self, id: RenderOutputId) bool {

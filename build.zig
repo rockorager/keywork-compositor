@@ -63,10 +63,13 @@ pub fn build(b: *std.Build) void {
     root_module.addImport("wayland", wayland);
     root_module.addImport("vulkan", vulkan);
     root_module.linkSystemLibrary("libdrm", .{});
+    root_module.linkSystemLibrary("libinput", .{});
     root_module.linkSystemLibrary("pixman-1", .{});
     root_module.linkSystemLibrary("libseat", .{});
+    root_module.linkSystemLibrary("libudev", .{});
     root_module.linkSystemLibrary("wayland-client", .{});
     root_module.linkSystemLibrary("wayland-server", .{});
+    root_module.linkSystemLibrary("xkbcommon", .{});
 
     const exe = b.addExecutable(.{
         .name = "keywork_compositor",

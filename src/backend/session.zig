@@ -105,7 +105,7 @@ pub fn isActive(self: *const Self) bool {
     return self.active and !self.failed;
 }
 
-pub fn name(self: *const Self) []const u8 {
+pub fn name(self: *const Self) [:0]const u8 {
     const value = c.libseat_seat_name(self.seat);
     return if (value == null) "" else std.mem.span(value);
 }
@@ -122,6 +122,7 @@ pub fn openDevice(self: *Self, path: [:0]const u8) !Device {
 pub fn closeDevice(self: *Self, device: Device) !void {
     std.debug.assert(self.device_count > 0);
     self.device_count -= 1;
+    defer _ = std.c.close(device.fd);
     if (c.libseat_close_device(self.seat, device.id) < 0) return error.CloseDeviceFailed;
 }
 
