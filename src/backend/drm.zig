@@ -10,6 +10,7 @@ const presentation = @import("../presentation.zig");
 const render = @import("../render/types.zig");
 
 const c = @cImport({
+    @cInclude("libudev.h");
     @cInclude("xf86drm.h");
     @cInclude("xf86drmMode.h");
 });
@@ -17,7 +18,6 @@ const wl = wayland.server.wl;
 
 const log = std.log.scoped(.drm);
 const buffer_count = 2;
-const default_device_path = "/dev/dri/card0";
 
 allocator: std.mem.Allocator,
 io: std.Io,
@@ -26,7 +26,7 @@ session_listener: Session.Listener,
 event_loop: *wl.EventLoop,
 event_source: ?*wl.EventSource,
 listener: Listener,
-device_path: [:0]u8,
+device_path: ?[:0]u8,
 device: ?Session.Device,
 old_crtc: ?*c.drmModeCrtc,
 buffers: [buffer_count]Buffer,
@@ -66,6 +66,11 @@ const Selection = struct {
     crtc_id: u32,
 };
 
+const OpenedDevice = struct {
+    device: Session.Device,
+    selection: Selection,
+};
+
 const event_context: c.drmEventContext = .{
     .version = 2,
     .vblank_handler = null,
@@ -83,12 +88,10 @@ pub fn init(
     device_path: ?[]const u8,
     listener: Listener,
 ) !void {
-    const path = try allocator.dupeSentinel(
-        u8,
-        device_path orelse default_device_path,
-        0,
-    );
-    errdefer allocator.free(path);
+    const path = if (device_path) |value|
+        try allocator.dupeSentinel(u8, value, 0)
+    else
+        null;
     self.* = .{
         .allocator = allocator,
         .io = io,
@@ -122,6 +125,7 @@ pub fn init(
         .initialized = false,
         .failed = false,
     };
+    errdefer if (self.device_path) |value| allocator.free(value);
     try session.addListener(&self.session_listener);
     errdefer session.removeListener(&self.session_listener);
     if (!session.isActive()) return error.SessionInactive;
@@ -133,7 +137,7 @@ pub fn deinit(self: *Self) void {
     self.initialized = false;
     self.session.removeListener(&self.session_listener);
     self.deactivate();
-    self.allocator.free(self.device_path);
+    if (self.device_path) |value| self.allocator.free(value);
     self.* = undefined;
 }
 
@@ -208,15 +212,17 @@ pub fn present(self: *Self) !?presentation.Info {
 
 fn activate(self: *Self) !void {
     std.debug.assert(self.device == null);
-    const device = try self.session.openDevice(self.device_path);
+    const opened = if (self.device_path) |path|
+        try self.openDevice(path)
+    else
+        try self.discoverDevice();
+    const device = opened.device;
     self.device = device;
     errdefer {
         self.session.closeDevice(device) catch {};
         self.device = null;
     }
-    if (c.drmIsKMS(device.fd) != 1) return error.NotKmsDevice;
-
-    const selection = try selectOutput(device.fd);
+    const selection = opened.selection;
     if (self.size.width != 0 and (!std.meta.eql(self.size, selection.size) or
         self.connector_id != selection.connector_id or self.crtc_id != selection.crtc_id))
     {
@@ -265,6 +271,55 @@ fn activate(self: *Self) !void {
         handleDrmEvent,
         self,
     );
+}
+
+fn openDevice(self: *Self, path: [:0]const u8) !OpenedDevice {
+    const device = try self.session.openDevice(path);
+    errdefer self.session.closeDevice(device) catch {};
+    if (c.drmIsKMS(device.fd) != 1) return error.NotKmsDevice;
+    return .{
+        .device = device,
+        .selection = try selectOutput(device.fd),
+    };
+}
+
+fn discoverDevice(self: *Self) !OpenedDevice {
+    const udev = c.udev_new() orelse return error.UdevContextFailed;
+    defer _ = c.udev_unref(udev);
+    const enumerate = c.udev_enumerate_new(udev) orelse return error.UdevEnumerateFailed;
+    defer _ = c.udev_enumerate_unref(enumerate);
+    if (c.udev_enumerate_add_match_subsystem(enumerate, "drm") != 0 or
+        c.udev_enumerate_scan_devices(enumerate) != 0)
+    {
+        return error.UdevEnumerateFailed;
+    }
+
+    var entry = c.udev_enumerate_get_list_entry(enumerate);
+    while (entry) |current| : (entry = c.udev_list_entry_get_next(current)) {
+        const syspath = c.udev_list_entry_get_name(current) orelse continue;
+        const udev_device = c.udev_device_new_from_syspath(udev, syspath) orelse continue;
+        defer _ = c.udev_device_unref(udev_device);
+        const devnode = c.udev_device_get_devnode(udev_device) orelse continue;
+        const path = std.mem.span(devnode);
+        if (!isPrimaryNode(path)) continue;
+        const opened = self.openDevice(path) catch continue;
+        const stored_path = self.allocator.dupeSentinel(u8, path, 0) catch |err| {
+            self.session.closeDevice(opened.device) catch {};
+            return err;
+        };
+        self.device_path = stored_path;
+        return opened;
+    }
+    return error.NoDrmDevice;
+}
+
+fn isPrimaryNode(path: []const u8) bool {
+    const basename = std.fs.path.basename(path);
+    if (!std.mem.startsWith(u8, basename, "card") or basename.len == "card".len) return false;
+    for (basename["card".len..]) |character| {
+        if (!std.ascii.isDigit(character)) return false;
+    }
+    return true;
 }
 
 fn deactivate(self: *Self) void {
@@ -566,4 +621,11 @@ test "DRM mode refresh converts to presentation period" {
     try std.testing.expectEqual(@as(u32, 20_000_000), refreshNanoseconds(mode));
     mode.vrefresh = 0;
     try std.testing.expectEqual(presentation.nominal_refresh_nanoseconds, refreshNanoseconds(mode));
+}
+
+test "DRM discovery only accepts primary nodes" {
+    try std.testing.expect(isPrimaryNode("/dev/dri/card0"));
+    try std.testing.expect(isPrimaryNode("/dev/dri/card12"));
+    try std.testing.expect(!isPrimaryNode("/dev/dri/renderD128"));
+    try std.testing.expect(!isPrimaryNode("/sys/class/drm/card0-DP-1"));
 }
