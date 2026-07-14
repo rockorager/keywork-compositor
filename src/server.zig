@@ -35,9 +35,8 @@ const log = std.log.scoped(.server);
 
 allocator: std.mem.Allocator,
 display: *wl.Server,
-render_output: OutputBackend,
+render_output: RenderOutput,
 outputs: OutputLayout,
-render_output_id: OutputLayout.Id,
 xdg_output: XdgOutput,
 single_pixel_buffer: SinglePixelBuffer,
 compositor: Compositor,
@@ -58,11 +57,27 @@ xdg_activation: XdgActivation,
 viewporter: Viewporter,
 window_manager: WindowManager,
 renderer: renderer_types.Renderer,
-render_timer: *wl.EventSource,
-repaint_needed: bool,
-render_scheduled: bool,
 socket_buffer: [11]u8,
 listening: bool,
+
+const RenderOutput = struct {
+    server: *Self,
+    backend: OutputBackend,
+    protocol_id: OutputLayout.Id,
+    timer: *wl.EventSource,
+    repaint_needed: bool,
+    render_scheduled: bool,
+
+    const Point = struct { x: f64, y: f64 };
+
+    fn globalPoint(self: *RenderOutput, x: f64, y: f64) Point {
+        const position = self.server.outputs.get(self.protocol_id).?.logicalPosition();
+        return .{
+            .x = x + @as(f64, @floatFromInt(position.x)),
+            .y = y + @as(f64, @floatFromInt(position.y)),
+        };
+    }
+};
 
 pub fn create(
     allocator: std.mem.Allocator,
@@ -80,9 +95,15 @@ pub fn create(
     self.* = .{
         .allocator = allocator,
         .display = display,
-        .render_output = undefined,
+        .render_output = .{
+            .server = self,
+            .backend = undefined,
+            .protocol_id = undefined,
+            .timer = undefined,
+            .repaint_needed = false,
+            .render_scheduled = false,
+        },
         .outputs = undefined,
-        .render_output_id = undefined,
         .xdg_output = undefined,
         .single_pixel_buffer = undefined,
         .compositor = undefined,
@@ -103,9 +124,6 @@ pub fn create(
         .viewporter = undefined,
         .window_manager = undefined,
         .renderer = try renderer_types.Renderer.init(allocator, renderer_kind),
-        .render_timer = undefined,
-        .repaint_needed = false,
-        .render_scheduled = false,
         .socket_buffer = undefined,
         .listening = false,
     };
@@ -116,14 +134,14 @@ pub fn create(
     errdefer self.outputs.deinit();
     try self.seat.init(allocator, io, display, self.compositor.surfaceStore());
     errdefer self.seat.deinit();
-    try self.render_output.init(
+    try self.render_output.backend.init(
         allocator,
         io,
         display,
         .{ .width = 1280, .height = 720 },
         output_kind,
         .{
-            .context = self,
+            .context = &self.render_output,
             .ready = outputReady,
             .presented = outputPresented,
             .discarded = outputDiscarded,
@@ -157,13 +175,13 @@ pub fn create(
             .touch_orientation = touchOrientation,
         },
     );
-    errdefer self.render_output.deinit();
-    self.render_output_id = try self.outputs.add(.{
-        .size = self.render_output.size(),
-        .physical_size = self.render_output.physicalSize(),
-        .scale = self.render_output.clientScale(),
+    errdefer self.render_output.backend.deinit();
+    self.render_output.protocol_id = try self.outputs.add(.{
+        .size = self.render_output.backend.size(),
+        .physical_size = self.render_output.backend.physicalSize(),
+        .scale = self.render_output.backend.clientScale(),
     });
-    errdefer std.debug.assert(self.outputs.remove(self.render_output_id));
+    errdefer std.debug.assert(self.outputs.remove(self.render_output.protocol_id));
     try self.xdg_output.init(display, &self.outputs);
     errdefer self.xdg_output.deinit();
     try self.single_pixel_buffer.init(allocator, display);
@@ -173,8 +191,8 @@ pub fn create(
         display,
         self.compositor.surfaceStore(),
         &self.outputs,
-        self.render_output_id,
-        self.render_output.presentationClockId(),
+        self.render_output.protocol_id,
+        self.render_output.backend.presentationClockId(),
     );
     errdefer self.presentation_protocol.deinit();
     try self.viewporter.init(allocator, display);
@@ -182,7 +200,7 @@ pub fn create(
     try self.fractional_scale.init(
         allocator,
         display,
-        self.render_output.renderScale(),
+        self.render_output.backend.renderScale(),
     );
     errdefer self.fractional_scale.deinit();
     try self.fixes.init(display);
@@ -199,14 +217,14 @@ pub fn create(
         self.compositor.surfaceStore(),
         &self.scene,
         &self.seat,
-        self.render_output.size(),
+        self.render_output.backend.size(),
     );
     errdefer self.xdg_shell.deinit();
     try self.layer_shell.init(
         allocator,
         display,
         &self.outputs,
-        self.render_output_id,
+        self.render_output.protocol_id,
         &self.scene,
         &self.seat,
         &self.xdg_shell,
@@ -255,7 +273,7 @@ pub fn create(
         allocator,
         display,
         &self.outputs,
-        self.render_output_id,
+        self.render_output.protocol_id,
         &self.seat,
         &self.scene,
         &self.xdg_shell,
@@ -263,7 +281,11 @@ pub fn create(
         .{ .context = self, .route = routePointer },
     );
     errdefer self.window_manager.deinit();
-    self.render_timer = try display.getEventLoop().addTimer(*Self, handleRenderTimer, self);
+    self.render_output.timer = try display.getEventLoop().addTimer(
+        *RenderOutput,
+        handleRenderTimer,
+        &self.render_output,
+    );
     self.subcompositor.setRepaintListener(.{
         .context = self,
         .request = requestRepaint,
@@ -292,7 +314,7 @@ pub fn destroy(self: *Self) void {
     self.seat.clearRepaintListener();
     self.scene.clearRepaintListener();
     self.subcompositor.clearRepaintListener();
-    self.render_timer.remove();
+    self.render_output.timer.remove();
     self.display.destroyClients();
     self.window_manager.deinit();
     self.input_method.deinit();
@@ -311,9 +333,9 @@ pub fn destroy(self: *Self) void {
     self.presentation_protocol.deinit();
     self.single_pixel_buffer.deinit();
     self.xdg_output.deinit();
-    std.debug.assert(self.outputs.remove(self.render_output_id));
+    std.debug.assert(self.outputs.remove(self.render_output.protocol_id));
     self.outputs.deinit();
-    self.render_output.deinit();
+    self.render_output.backend.deinit();
     self.seat.deinit();
     self.compositor.deinit();
     self.renderer.deinit();
@@ -343,7 +365,7 @@ pub fn terminate(self: *Self) void {
 
 fn requestRepaint(context: *anyopaque) void {
     const self: *Self = @ptrCast(@alignCast(context));
-    self.repaint_needed = true;
+    self.render_output.repaint_needed = true;
     self.scheduleRepaint();
 }
 
@@ -355,43 +377,51 @@ fn inputMethodSurfacePosition(context: *anyopaque, surface_id: Surface.Id) ?Inpu
 
 fn inputMethodOutputSize(context: *anyopaque) render.Size {
     const self: *Self = @ptrCast(@alignCast(context));
-    return self.render_output.size();
+    return self.render_output.backend.size();
 }
 
 fn scheduleRepaint(self: *Self) void {
-    if (!self.repaint_needed or self.render_scheduled or !self.render_output.ready()) return;
-    self.render_timer.timerUpdate(self.render_output.repaintDelayMilliseconds()) catch |err| {
+    const output = &self.render_output;
+    if (!output.repaint_needed or output.render_scheduled or !output.backend.ready()) return;
+    output.timer.timerUpdate(output.backend.repaintDelayMilliseconds()) catch |err| {
         log.err("failed to schedule repaint: {t}", .{err});
         self.terminate();
         return;
     };
-    self.render_scheduled = true;
+    output.render_scheduled = true;
 }
 
 fn outputReady(context: *anyopaque) void {
-    const self: *Self = @ptrCast(@alignCast(context));
-    self.scheduleRepaint();
+    const output: *RenderOutput = @ptrCast(@alignCast(context));
+    output.server.scheduleRepaint();
 }
 
 fn outputPresented(context: *anyopaque, info: presentation.Info) void {
-    const self: *Self = @ptrCast(@alignCast(context));
-    self.outputs.get(self.render_output_id).?.setRefresh(info);
+    const output: *RenderOutput = @ptrCast(@alignCast(context));
+    const self = output.server;
+    self.outputs.get(output.protocol_id).?.setRefresh(info);
     Surface.finishPresentation(self.compositor.surfaceStore(), info);
 }
 
 fn outputDiscarded(context: *anyopaque) void {
-    const self: *Self = @ptrCast(@alignCast(context));
+    const output: *RenderOutput = @ptrCast(@alignCast(context));
+    const self = output.server;
     Surface.discardPresentation(self.compositor.surfaceStore());
-    requestRepaint(context);
+    requestRepaint(self);
 }
 
 fn closeOutput(context: *anyopaque) void {
-    const self: *Self = @ptrCast(@alignCast(context));
-    self.terminate();
+    const output: *RenderOutput = @ptrCast(@alignCast(context));
+    output.server.terminate();
+}
+
+fn serverForOutput(context: *anyopaque) *Self {
+    const output: *RenderOutput = @ptrCast(@alignCast(context));
+    return output.server;
 }
 
 fn keyboardAvailable(context: *anyopaque, available: bool) void {
-    const self: *Self = @ptrCast(@alignCast(context));
+    const self = serverForOutput(context);
     self.seat.setKeyboardAvailable(available);
 }
 
@@ -401,12 +431,12 @@ fn keyboardKeymap(
     fd: std.posix.fd_t,
     size: u32,
 ) void {
-    const self: *Self = @ptrCast(@alignCast(context));
+    const self = serverForOutput(context);
     self.seat.setKeymap(format, fd, size);
 }
 
 fn keyboardEnter(context: *anyopaque, pressed_keys: []const u32) void {
-    const self: *Self = @ptrCast(@alignCast(context));
+    const self = serverForOutput(context);
     self.seat.parentKeyboardEnter(pressed_keys) catch {
         log.err("failed to store pressed keyboard keys", .{});
         self.terminate();
@@ -414,7 +444,7 @@ fn keyboardEnter(context: *anyopaque, pressed_keys: []const u32) void {
 }
 
 fn keyboardLeave(context: *anyopaque) void {
-    const self: *Self = @ptrCast(@alignCast(context));
+    const self = serverForOutput(context);
     self.seat.parentKeyboardLeave();
 }
 
@@ -424,7 +454,7 @@ fn keyboardKey(
     key: u32,
     state: wl.Keyboard.KeyState,
 ) void {
-    const self: *Self = @ptrCast(@alignCast(context));
+    const self = serverForOutput(context);
     self.seat.key(time, key, state) catch {
         log.err("failed to store keyboard state", .{});
         self.terminate();
@@ -438,51 +468,64 @@ fn keyboardModifiers(
     locked: u32,
     group: u32,
 ) void {
-    const self: *Self = @ptrCast(@alignCast(context));
+    const self = serverForOutput(context);
     self.seat.setModifiers(depressed, latched, locked, group);
 }
 
 fn keyboardRepeatInfo(context: *anyopaque, rate: i32, delay: i32) void {
-    const self: *Self = @ptrCast(@alignCast(context));
+    const self = serverForOutput(context);
     self.seat.setRepeatInfo(rate, delay);
 }
 
 fn pointerAvailable(context: *anyopaque, available: bool) void {
-    const self: *Self = @ptrCast(@alignCast(context));
+    const self = serverForOutput(context);
     if (!available) self.data_device.cancel();
     self.seat.setPointerAvailable(available);
 }
 
 fn pointerEnter(context: *anyopaque, x: f64, y: f64) void {
-    const self: *Self = @ptrCast(@alignCast(context));
-    const route = self.pointerRoute(x, y);
+    const output: *RenderOutput = @ptrCast(@alignCast(context));
+    const self = output.server;
+    const point = output.globalPoint(x, y);
+    const route = self.pointerRoute(point.x, point.y);
     if (self.data_device.isDragging()) {
-        self.seat.pointerEnter(x, y, null);
+        self.seat.pointerEnter(point.x, point.y, null);
         self.data_device.pointerEntered(route.focus);
         self.window_manager.pointerMoved(null);
         return;
     }
-    self.seat.pointerEnter(x, y, if (self.window_manager.pointerGrabbed()) null else route.focus);
+    self.seat.pointerEnter(
+        point.x,
+        point.y,
+        if (self.window_manager.pointerGrabbed()) null else route.focus,
+    );
     self.window_manager.pointerMoved(if (self.window_manager.pointerGrabbed()) null else route.root);
 }
 
 fn pointerLeave(context: *anyopaque) void {
-    const self: *Self = @ptrCast(@alignCast(context));
+    const self = serverForOutput(context);
     self.data_device.pointerLeft();
     self.seat.pointerLeave();
     self.window_manager.pointerMoved(null);
 }
 
 fn pointerMotion(context: *anyopaque, time: u32, x: f64, y: f64) void {
-    const self: *Self = @ptrCast(@alignCast(context));
-    const route = self.pointerRoute(x, y);
+    const output: *RenderOutput = @ptrCast(@alignCast(context));
+    const self = output.server;
+    const point = output.globalPoint(x, y);
+    const route = self.pointerRoute(point.x, point.y);
     if (self.data_device.isDragging()) {
-        self.seat.pointerMotion(time, x, y, null);
+        self.seat.pointerMotion(time, point.x, point.y, null);
         self.data_device.pointerMotion(time, route.focus);
         self.window_manager.pointerMoved(null);
         return;
     }
-    self.seat.pointerMotion(time, x, y, if (self.window_manager.pointerGrabbed()) null else route.focus);
+    self.seat.pointerMotion(
+        time,
+        point.x,
+        point.y,
+        if (self.window_manager.pointerGrabbed()) null else route.focus,
+    );
     self.window_manager.pointerMoved(if (self.window_manager.pointerGrabbed()) null else route.root);
 }
 
@@ -492,7 +535,7 @@ fn pointerButton(
     button: u32,
     state: wl.Pointer.ButtonState,
 ) void {
-    const self: *Self = @ptrCast(@alignCast(context));
+    const self = serverForOutput(context);
     if (self.data_device.isDragging()) {
         const grab_ended = self.seat.pointerButton(time, button, state) catch {
             log.err("failed to store pointer button state", .{});
@@ -552,32 +595,32 @@ fn dragEnded(context: *anyopaque) void {
 }
 
 fn pointerAxis(context: *anyopaque, time: u32, axis: wl.Pointer.Axis, value: wl.Fixed) void {
-    const self: *Self = @ptrCast(@alignCast(context));
+    const self = serverForOutput(context);
     self.seat.pointerAxis(time, axis, value);
 }
 
 fn pointerFrame(context: *anyopaque) void {
-    const self: *Self = @ptrCast(@alignCast(context));
+    const self = serverForOutput(context);
     self.seat.pointerFrame();
 }
 
 fn pointerAxisSource(context: *anyopaque, source: wl.Pointer.AxisSource) void {
-    const self: *Self = @ptrCast(@alignCast(context));
+    const self = serverForOutput(context);
     self.seat.pointerAxisSource(source);
 }
 
 fn pointerAxisStop(context: *anyopaque, time: u32, axis: wl.Pointer.Axis) void {
-    const self: *Self = @ptrCast(@alignCast(context));
+    const self = serverForOutput(context);
     self.seat.pointerAxisStop(time, axis);
 }
 
 fn pointerAxisDiscrete(context: *anyopaque, axis: wl.Pointer.Axis, discrete: i32) void {
-    const self: *Self = @ptrCast(@alignCast(context));
+    const self = serverForOutput(context);
     self.seat.pointerAxisDiscrete(axis, discrete);
 }
 
 fn pointerAxisValue120(context: *anyopaque, axis: wl.Pointer.Axis, value120: i32) void {
-    const self: *Self = @ptrCast(@alignCast(context));
+    const self = serverForOutput(context);
     self.seat.pointerAxisValue120(axis, value120);
 }
 
@@ -586,32 +629,34 @@ fn pointerAxisRelativeDirection(
     axis: wl.Pointer.Axis,
     direction: wl.Pointer.AxisRelativeDirection,
 ) void {
-    const self: *Self = @ptrCast(@alignCast(context));
+    const self = serverForOutput(context);
     self.seat.pointerAxisRelativeDirection(axis, direction);
 }
 
 fn touchAvailable(context: *anyopaque, available: bool) void {
-    const self: *Self = @ptrCast(@alignCast(context));
+    const self = serverForOutput(context);
     self.seat.setTouchAvailable(available);
 }
 
 fn touchDown(context: *anyopaque, time: u32, id: i32, x: f64, y: f64) void {
-    const self: *Self = @ptrCast(@alignCast(context));
-    const focus = self.pointerFocus(x, y);
+    const output: *RenderOutput = @ptrCast(@alignCast(context));
+    const self = output.server;
+    const point = output.globalPoint(x, y);
+    const focus = self.pointerFocus(point.x, point.y);
     if (focus) |target| {
         self.layer_shell.pointerPressed(self.subcompositor.rootSurface(target.surface_id));
         requestRepaint(self);
     } else if (self.xdg_shell.hasPopupGrab()) {
         self.xdg_shell.dismissPopupGrab();
     }
-    self.seat.touchDown(time, id, x, y, focus) catch {
+    self.seat.touchDown(time, id, point.x, point.y, focus) catch {
         log.err("failed to store touch point", .{});
         self.terminate();
     };
 }
 
 fn touchUp(context: *anyopaque, time: u32, id: i32) void {
-    const self: *Self = @ptrCast(@alignCast(context));
+    const self = serverForOutput(context);
     self.seat.touchUp(time, id) catch {
         log.err("failed to finish touch point", .{});
         self.terminate();
@@ -619,25 +664,27 @@ fn touchUp(context: *anyopaque, time: u32, id: i32) void {
 }
 
 fn touchMotion(context: *anyopaque, time: u32, id: i32, x: f64, y: f64) void {
-    const self: *Self = @ptrCast(@alignCast(context));
-    self.seat.touchMotion(time, id, x, y) catch {
+    const output: *RenderOutput = @ptrCast(@alignCast(context));
+    const self = output.server;
+    const point = output.globalPoint(x, y);
+    self.seat.touchMotion(time, id, point.x, point.y) catch {
         log.err("failed to update touch point", .{});
         self.terminate();
     };
 }
 
 fn touchFrame(context: *anyopaque) void {
-    const self: *Self = @ptrCast(@alignCast(context));
+    const self = serverForOutput(context);
     self.seat.touchFrame();
 }
 
 fn touchCancel(context: *anyopaque) void {
-    const self: *Self = @ptrCast(@alignCast(context));
+    const self = serverForOutput(context);
     self.seat.touchCancel();
 }
 
 fn touchShape(context: *anyopaque, id: i32, major: f64, minor: f64) void {
-    const self: *Self = @ptrCast(@alignCast(context));
+    const self = serverForOutput(context);
     self.seat.touchShape(id, major, minor) catch {
         log.err("failed to update touch shape", .{});
         self.terminate();
@@ -645,7 +692,7 @@ fn touchShape(context: *anyopaque, id: i32, major: f64, minor: f64) void {
 }
 
 fn touchOrientation(context: *anyopaque, id: i32, orientation: f64) void {
-    const self: *Self = @ptrCast(@alignCast(context));
+    const self = serverForOutput(context);
     self.seat.touchOrientation(id, orientation) catch {
         log.err("failed to update touch orientation", .{});
         self.terminate();
@@ -936,10 +983,11 @@ fn pointInRoundedRect(x: f64, y: f64, rect: render.Rect, requested_radius: u32) 
     return distance_x * distance_x + distance_y * distance_y <= radius * radius;
 }
 
-fn handleRenderTimer(self: *Self) c_int {
-    self.render_scheduled = false;
-    if (!self.repaint_needed or !self.render_output.ready()) return 0;
-    self.repaint_needed = false;
+fn handleRenderTimer(output_context: *RenderOutput) c_int {
+    const self = output_context.server;
+    output_context.render_scheduled = false;
+    if (!output_context.repaint_needed or !output_context.backend.ready()) return 0;
+    output_context.repaint_needed = false;
     self.renderFrame() catch |err| {
         log.err("output frame failed: {t}", .{err});
         self.terminate();
@@ -949,15 +997,16 @@ fn handleRenderTimer(self: *Self) c_int {
 }
 
 fn renderFrame(self: *Self) renderer_types.Renderer.Error!void {
-    const pixel_target = self.render_output.acquire() orelse {
-        self.repaint_needed = true;
+    const render_output = &self.render_output;
+    const pixel_target = render_output.backend.acquire() orelse {
+        render_output.repaint_needed = true;
         return;
     };
-    errdefer self.render_output.cancel();
-    const output = self.outputs.get(self.render_output_id).?;
+    errdefer render_output.backend.cancel();
+    const output = self.outputs.get(render_output.protocol_id).?;
     output.beginFrame();
     errdefer output.cancelFrame();
-    const output_size = self.render_output.size();
+    const output_size = render_output.backend.size();
     const target = self.renderer.makeTarget(pixel_target);
     const clear_command = [_]render.Command{
         .{ .clear = render.Color.rgba(24, 24, 27, 255) },
@@ -1032,7 +1081,7 @@ fn renderFrame(self: *Self) renderer_types.Renderer.Error!void {
         );
     }
 
-    const presented = self.render_output.present() catch return error.InvalidTarget;
+    const presented = render_output.backend.present() catch return error.InvalidTarget;
     output.endFrame();
 
     self.submitLayerSurfaces(.background);
@@ -1065,7 +1114,7 @@ fn renderFrame(self: *Self) renderer_types.Renderer.Error!void {
     if (drag_icon) |info| self.submitSurfaceTree(info.surface_id);
     if (cursor) |info| self.submitSurfaceTree(info.surface_id);
     Surface.discardUnsubmittedFeedback(self.compositor.surfaceStore());
-    if (presented) |info| outputPresented(self, info);
+    if (presented) |info| outputPresented(render_output, info);
     const keyboard_focus = self.layer_shell.keyboardFocus(
         self.xdg_shell.popupKeyboardFocus(),
     ) orelse
@@ -1163,7 +1212,7 @@ fn renderCommands(
     try self.renderer.render(.{
         .size = output_size,
         .commands = commands,
-        .scale = self.render_output.renderScale(),
+        .scale = self.render_output.backend.renderScale(),
     }, target);
 }
 
@@ -1298,7 +1347,7 @@ fn renderSurfaceTree(
                 .width = buffer.logical_size.width,
                 .height = buffer.logical_size.height,
             };
-            const output = self.outputs.get(self.render_output_id).?;
+            const output = self.outputs.get(self.render_output.protocol_id).?;
             const visible_rect = surface_rect.intersection(output.logicalRect()) orelse continue;
             if (clip) |clip_rect| {
                 if (visible_rect.intersection(clip_rect) == null) continue;
@@ -1316,7 +1365,7 @@ fn renderSurfaceTree(
                     .clip = clip,
                 } },
             };
-            try self.renderCommands(self.render_output.size(), &image_command, target);
+            try self.renderCommands(self.render_output.backend.size(), &image_command, target);
         },
         .child => |child| try self.renderSurfaceTree(
             child.surface_id,
@@ -1344,7 +1393,7 @@ fn renderWindowBorders(
         clip,
         &commands,
     );
-    try self.renderCommands(self.render_output.size(), border_commands, target);
+    try self.renderCommands(self.render_output.backend.size(), border_commands, target);
 }
 
 fn renderWindowDecorations(
@@ -1466,7 +1515,7 @@ fn submitSurfaceTree(self: *Self, surface_id: Surface.Id) void {
 
     var stack = self.subcompositor.stackIterator(surface_id);
     while (stack.next()) |entry| switch (entry) {
-        .parent => if (self.outputs.get(self.render_output_id).?.containsSurface(surface_id)) {
+        .parent => if (self.outputs.get(self.render_output.protocol_id).?.containsSurface(surface_id)) {
             Surface.submitPresentationFor(self.compositor.surfaceStore(), surface_id);
         },
         .child => |child| self.submitSurfaceTree(child.surface_id),
