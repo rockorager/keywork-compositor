@@ -22,6 +22,7 @@ pub fn build(b: *std.Build) void {
     scanner.addSystemProtocol("staging/single-pixel-buffer/single-pixel-buffer-v1.xml");
     scanner.addSystemProtocol("unstable/xdg-output/xdg-output-unstable-v1.xml");
     scanner.addCustomProtocol(b.path("protocol/input-method-unstable-v2.xml"));
+    scanner.addCustomProtocol(b.path("protocol/wlr-output-management-unstable-v1.xml"));
     scanner.addCustomProtocol(river.path("protocol/upstream/wlr-layer-shell-unstable-v1.xml"));
     scanner.addCustomProtocol(river.path("protocol/river-window-management-v1.xml"));
     scanner.addCustomProtocol(river.path("protocol/river-layer-shell-v1.xml"));
@@ -44,6 +45,7 @@ pub fn build(b: *std.Build) void {
     scanner.generate("wp_single_pixel_buffer_manager_v1", 1);
     scanner.generate("zxdg_output_manager_v1", 3);
     scanner.generate("zwp_input_method_manager_v2", 1);
+    scanner.generate("zwlr_output_manager_v1", 4);
     scanner.generate("zwlr_layer_shell_v1", 5);
     scanner.generate("river_window_manager_v1", 5);
     scanner.generate("river_layer_shell_v1", 1);
