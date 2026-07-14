@@ -14,6 +14,7 @@ const c = @cImport({
     @cInclude("linux/input-event-codes.h");
     @cInclude("stdlib.h");
     @cInclude("xkbcommon/xkbcommon.h");
+    @cInclude("xkbcommon/xkbcommon-names.h");
 });
 const wl = wayland.server.wl;
 
@@ -32,8 +33,9 @@ next_input_device_id: DeviceId,
 device_listener: ?DeviceListener,
 environ_map: ?*const std.process.Environ.Map,
 xkb_context: *c.struct_xkb_context,
-xkb_keymap: *c.struct_xkb_keymap,
-xkb_state: *c.struct_xkb_state,
+default_keymap: *Keymap,
+active_keyboard: ?DeviceId,
+keyboard_state_listener: ?KeyboardStateListener,
 active_repeat_info: RepeatInfo,
 size: render.Size,
 pointer_x: f64,
@@ -93,6 +95,47 @@ pub const ScrollMethods = packed struct(u32) {
     _padding: u29 = 0,
 };
 pub const CalibrationMatrix = [6]f32;
+
+pub const KeymapFormat = enum(u32) {
+    text_v1 = 1,
+    text_v2 = 2,
+};
+
+pub const Keymap = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    native: *c.struct_xkb_keymap,
+    file: std.Io.File,
+    size: u32,
+    references: usize = 1,
+
+    pub fn ref(self: *Keymap) *Keymap {
+        self.references = std.math.add(usize, self.references, 1) catch unreachable;
+        return self;
+    }
+
+    pub fn unref(self: *Keymap) void {
+        std.debug.assert(self.references > 0);
+        self.references -= 1;
+        if (self.references != 0) return;
+        self.file.close(self.io);
+        c.xkb_keymap_unref(self.native);
+        self.allocator.destroy(self);
+    }
+};
+
+pub const KeyboardState = struct {
+    keymap: *const Keymap,
+    layout_index: u32,
+    layout_name: ?[*:0]const u8,
+    capslock_enabled: bool,
+    numlock_enabled: bool,
+};
+
+pub const KeyboardStateListener = struct {
+    context: *anyopaque,
+    changed: *const fn (*anyopaque, DeviceId, KeyboardState) void,
+};
 
 pub fn Setting(comptime T: type) type {
     return struct { default: T, current: T };
@@ -169,9 +212,15 @@ pub const DeviceListener = struct {
 const InputDevice = struct {
     info: DeviceInfo,
     libinput_device: *c.struct_libinput_device,
+    keyboard: ?Keyboard = null,
     repeat_info: RepeatInfo = .{},
     scroll_factor: f64 = 1,
     map: ?DeviceMap = null,
+};
+
+const Keyboard = struct {
+    keymap: *Keymap,
+    state: *c.struct_xkb_state,
 };
 
 pub const DeviceMap = struct {
@@ -238,8 +287,9 @@ pub fn init(
         .device_listener = null,
         .environ_map = null,
         .xkb_context = undefined,
-        .xkb_keymap = undefined,
-        .xkb_state = undefined,
+        .default_keymap = undefined,
+        .active_keyboard = null,
+        .keyboard_state_listener = null,
         .active_repeat_info = .{},
         .size = size,
         .pointer_x = @as(f64, @floatFromInt(size.width)) / 2,
@@ -266,16 +316,15 @@ pub fn init(
     self.xkb_context = c.xkb_context_new(c.XKB_CONTEXT_NO_FLAGS) orelse
         return error.XkbContextFailed;
     errdefer c.xkb_context_unref(self.xkb_context);
-    self.xkb_keymap = c.xkb_keymap_new_from_names2(
+    const default_native_keymap = c.xkb_keymap_new_from_names2(
         self.xkb_context,
         null,
         c.XKB_KEYMAP_FORMAT_TEXT_V1,
         c.XKB_KEYMAP_COMPILE_NO_FLAGS,
     ) orelse return error.XkbKeymapFailed;
-    errdefer c.xkb_keymap_unref(self.xkb_keymap);
-    self.xkb_state = c.xkb_state_new(self.xkb_keymap) orelse return error.XkbStateFailed;
-    errdefer c.xkb_state_unref(self.xkb_state);
-    try self.installKeymap();
+    self.default_keymap = try self.wrapKeymap(default_native_keymap);
+    errdefer self.default_keymap.unref();
+    try self.installKeymap(self.default_keymap);
     listener.keyboard_repeat_info(listener.context, 25, 600);
 
     const udev = c.udev_new() orelse return error.UdevContextFailed;
@@ -312,6 +361,7 @@ pub fn init(
 
 pub fn deinit(self: *Self) void {
     std.debug.assert(self.device_listener == null);
+    std.debug.assert(self.keyboard_state_listener == null);
     self.initialized = false;
     self.session.removeListener(&self.session_listener);
     if (self.event_source) |source| {
@@ -324,8 +374,8 @@ pub fn deinit(self: *Self) void {
     self.devices.deinit(self.allocator);
     std.debug.assert(self.input_devices.items.len == 0);
     self.input_devices.deinit(self.allocator);
-    c.xkb_state_unref(self.xkb_state);
-    c.xkb_keymap_unref(self.xkb_keymap);
+    std.debug.assert(self.default_keymap.references == 1);
+    self.default_keymap.unref();
     c.xkb_context_unref(self.xkb_context);
     self.* = undefined;
 }
@@ -347,8 +397,87 @@ pub fn clearDeviceListener(self: *Self) void {
     self.device_listener = null;
 }
 
+pub fn setKeyboardStateListener(self: *Self, listener: KeyboardStateListener) void {
+    std.debug.assert(self.keyboard_state_listener == null);
+    self.keyboard_state_listener = listener;
+}
+
+pub fn clearKeyboardStateListener(self: *Self) void {
+    std.debug.assert(self.keyboard_state_listener != null);
+    self.keyboard_state_listener = null;
+}
+
 pub fn deviceIterator(self: *const Self) DeviceIterator {
     return .{ .devices = self.input_devices.items };
+}
+
+pub fn compileKeymap(self: *Self, format: KeymapFormat, text: []const u8) !?*Keymap {
+    if (text.len == 0) return null;
+    const native = c.xkb_keymap_new_from_buffer(
+        self.xkb_context,
+        text.ptr,
+        text.len,
+        @as(c.enum_xkb_keymap_format, @intFromEnum(format)),
+        c.XKB_KEYMAP_COMPILE_NO_FLAGS,
+    ) orelse return null;
+    return try self.wrapKeymap(native);
+}
+
+pub fn keyboardState(self: *Self, id: DeviceId) ?KeyboardState {
+    const device = self.findInputDeviceById(id) orelse return null;
+    const keyboard = if (device.keyboard) |*value| value else return null;
+    return stateSnapshot(keyboard);
+}
+
+pub fn setKeyboardKeymap(self: *Self, id: DeviceId, keymap: *Keymap) !bool {
+    const device = self.findInputDeviceById(id) orelse return false;
+    const keyboard = if (device.keyboard) |*value| value else return false;
+    const state = c.xkb_state_new(keymap.native) orelse return error.XkbStateFailed;
+    errdefer c.xkb_state_unref(state);
+    if (self.active_keyboard == id) try self.installKeymap(keymap);
+    const old_keymap = keyboard.keymap;
+    const old_state = keyboard.state;
+    keyboard.* = .{ .keymap = keymap.ref(), .state = state };
+    c.xkb_state_unref(old_state);
+    old_keymap.unref();
+    if (self.active_keyboard == id) self.sendKeyboardModifiers(keyboard, true);
+    self.notifyKeyboardState(device);
+    return true;
+}
+
+pub fn setKeyboardLayoutIndex(self: *Self, id: DeviceId, index: i32) bool {
+    const device = self.findInputDeviceById(id) orelse return false;
+    const keyboard = if (device.keyboard) |*value| value else return false;
+    if (index < 0 or index >= c.xkb_keymap_num_layouts(keyboard.keymap.native)) return true;
+    _ = c.xkb_state_update_latched_locked(
+        keyboard.state,
+        0,
+        0,
+        false,
+        0,
+        0,
+        0,
+        true,
+        index,
+    );
+    self.configuredKeyboardStateChanged(device);
+    return true;
+}
+
+pub fn setKeyboardLayoutName(self: *Self, id: DeviceId, name: [*:0]const u8) bool {
+    const device = self.findInputDeviceById(id) orelse return false;
+    const keyboard = if (device.keyboard) |*value| value else return false;
+    const index = c.xkb_keymap_layout_get_index(keyboard.keymap.native, name);
+    if (index == c.XKB_LAYOUT_INVALID) return true;
+    return self.setKeyboardLayoutIndex(id, @intCast(index));
+}
+
+pub fn setKeyboardCapslock(self: *Self, id: DeviceId, enabled: bool) bool {
+    return self.setKeyboardLock(id, c.XKB_MOD_NAME_CAPS, enabled);
+}
+
+pub fn setKeyboardNumlock(self: *Self, id: DeviceId, enabled: bool) bool {
+    return self.setKeyboardLock(id, c.XKB_MOD_NAME_NUM, enabled);
 }
 
 pub fn setDeviceRepeatInfo(self: *Self, id: DeviceId, rate: i32, delay: i32) void {
@@ -519,9 +648,10 @@ pub fn setPointerPosition(self: *Self, x: f64, y: f64) void {
     self.pointer_y = clampCoordinate(y, self.size.height);
 }
 
-fn installKeymap(self: *Self) !void {
+fn wrapKeymap(self: *Self, native: *c.struct_xkb_keymap) !*Keymap {
+    errdefer c.xkb_keymap_unref(native);
     const text_pointer = c.xkb_keymap_get_as_string(
-        self.xkb_keymap,
+        native,
         c.XKB_KEYMAP_FORMAT_TEXT_V1,
     ) orelse return error.SerializeKeymapFailed;
     defer c.free(text_pointer);
@@ -544,11 +674,29 @@ fn installKeymap(self: *Self) !void {
     if (std.c.fcntl(fd, std.os.linux.F.ADD_SEALS, @as(c_int, seals)) < 0) {
         return error.SealKeymapFailed;
     }
+    const keymap = try self.allocator.create(Keymap);
+    keymap.* = .{
+        .allocator = self.allocator,
+        .io = self.io,
+        .native = native,
+        .file = file,
+        .size = @intCast(size),
+    };
+    return keymap;
+}
+
+fn installKeymap(self: *Self, keymap: *const Keymap) !void {
+    const duplicate = std.c.fcntl(
+        keymap.file.handle,
+        std.os.linux.F.DUPFD_CLOEXEC,
+        @as(c_int, 0),
+    );
+    if (duplicate < 0) return error.DuplicateKeymapFailed;
     self.listener.keyboard_keymap(
         self.listener.context,
         .xkb_v1,
-        fd,
-        @intCast(size),
+        duplicate,
+        keymap.size,
     );
 }
 
@@ -619,22 +767,22 @@ fn deviceAdded(self: *Self, device: *c.struct_libinput_device) void {
         .{ name, has_keyboard, has_pointer, has_touch },
     );
     const old_device_count = self.input_devices.items.len;
-    if (has_keyboard) self.addInputDevice(device, .keyboard, name) catch {
+    if (has_keyboard) self.addInputDevice(device, .keyboard, name) catch |err| {
         self.rollbackInputDevices(old_device_count);
-        return self.fail(error.OutOfMemory);
+        return self.fail(err);
     };
-    if (has_pointer) self.addInputDevice(device, .pointer, name) catch {
+    if (has_pointer) self.addInputDevice(device, .pointer, name) catch |err| {
         self.rollbackInputDevices(old_device_count);
-        return self.fail(error.OutOfMemory);
+        return self.fail(err);
     };
-    if (has_touch) self.addInputDevice(device, .touch, name) catch {
+    if (has_touch) self.addInputDevice(device, .touch, name) catch |err| {
         self.rollbackInputDevices(old_device_count);
-        return self.fail(error.OutOfMemory);
+        return self.fail(err);
     };
     if (c.libinput_device_has_capability(device, c.LIBINPUT_DEVICE_CAP_TABLET_TOOL) != 0) {
-        self.addInputDevice(device, .tablet, name) catch {
+        self.addInputDevice(device, .tablet, name) catch |err| {
             self.rollbackInputDevices(old_device_count);
-            return self.fail(error.OutOfMemory);
+            return self.fail(err);
         };
     }
     if (has_keyboard) {
@@ -665,7 +813,7 @@ fn deviceRemoved(self: *Self, device: *c.struct_libinput_device) void {
         self.keyboard_count -= 1;
         if (self.keyboard_count == 0) {
             self.listener.keyboard_available(self.listener.context, false);
-            self.resetKeyboardState() catch |err| self.fail(err);
+            self.resetKeyboardState();
         }
     }
     if (c.libinput_device_has_capability(device, c.LIBINPUT_DEVICE_CAP_POINTER) != 0) {
@@ -685,11 +833,21 @@ fn addInputDevice(
     libinput_device: *c.struct_libinput_device,
     device_type: DeviceType,
     name: []const u8,
-) error{OutOfMemory}!void {
+) !void {
     const name_copy = try self.allocator.dupeSentinel(u8, name, 0);
     errdefer self.allocator.free(name_copy);
     const id = self.next_input_device_id;
     self.next_input_device_id = std.math.add(DeviceId, id, 1) catch return error.OutOfMemory;
+    var keyboard: ?Keyboard = null;
+    if (device_type == .keyboard) {
+        const keymap = self.default_keymap.ref();
+        errdefer keymap.unref();
+        keyboard = .{
+            .keymap = keymap,
+            .state = c.xkb_state_new(keymap.native) orelse return error.XkbStateFailed,
+        };
+    }
+    errdefer if (keyboard) |value| c.xkb_state_unref(value.state);
     try self.input_devices.append(self.allocator, .{
         .info = .{
             .id = id,
@@ -698,7 +856,9 @@ fn addInputDevice(
             .name = name_copy,
         },
         .libinput_device = libinput_device,
+        .keyboard = keyboard,
     });
+    if (device_type == .keyboard and self.active_keyboard == null) self.active_keyboard = id;
     if (self.device_listener) |listener| {
         listener.added(listener.context, self.input_devices.items[self.input_devices.items.len - 1].info);
     }
@@ -706,48 +866,85 @@ fn addInputDevice(
 
 fn rollbackInputDevices(self: *Self, old_count: usize) void {
     while (self.input_devices.items.len > old_count) {
-        const device = self.input_devices.pop().?;
+        var device = self.input_devices.pop().?;
         if (self.device_listener) |listener| listener.removed(listener.context, device.info.id);
-        self.allocator.free(device.info.name);
+        if (self.active_keyboard == device.info.id) self.active_keyboard = null;
+        self.deinitInputDevice(&device);
     }
+    self.promoteKeyboard();
 }
 
 fn removeInputDevices(self: *Self, libinput_device: *c.struct_libinput_device) void {
     var index = self.input_devices.items.len;
     while (index > 0) {
         index -= 1;
-        const device = self.input_devices.items[index];
+        var device = self.input_devices.items[index];
         if (device.libinput_device != libinput_device) continue;
         _ = self.input_devices.orderedRemove(index);
         if (self.device_listener) |listener| listener.removed(listener.context, device.info.id);
-        self.allocator.free(device.info.name);
+        if (self.active_keyboard == device.info.id) self.active_keyboard = null;
+        self.deinitInputDevice(&device);
     }
+    self.promoteKeyboard();
 }
 
 fn removeAllInputDevices(self: *Self) void {
-    while (self.input_devices.pop()) |device| {
+    while (self.input_devices.pop()) |value| {
+        var device = value;
         if (self.device_listener) |listener| listener.removed(listener.context, device.info.id);
-        self.allocator.free(device.info.name);
+        self.deinitInputDevice(&device);
+    }
+    self.active_keyboard = null;
+}
+
+fn deinitInputDevice(self: *Self, device: *InputDevice) void {
+    if (device.keyboard) |*keyboard| {
+        c.xkb_state_unref(keyboard.state);
+        keyboard.keymap.unref();
+    }
+    self.allocator.free(device.info.name);
+}
+
+fn promoteKeyboard(self: *Self) void {
+    if (self.active_keyboard != null) return;
+    for (self.input_devices.items) |*device| {
+        const keyboard = if (device.keyboard) |*value| value else continue;
+        self.installKeymap(keyboard.keymap) catch |err| return self.fail(err);
+        self.active_keyboard = device.info.id;
+        self.sendKeyboardModifiers(keyboard, true);
+        return;
     }
 }
 
 fn keyboardKey(self: *Self, event: *c.struct_libinput_event_keyboard) void {
     const base_event = c.libinput_event_keyboard_get_base_event(event);
     const libinput_device = c.libinput_event_get_device(base_event).?;
-    if (self.findInputDevice(libinput_device, .keyboard)) |device| {
-        if (!std.meta.eql(self.active_repeat_info, device.repeat_info)) {
-            self.active_repeat_info = device.repeat_info;
-            self.listener.keyboard_repeat_info(
-                self.listener.context,
-                device.repeat_info.rate,
-                device.repeat_info.delay,
-            );
-        }
+    const device = self.findInputDevice(libinput_device, .keyboard) orelse return;
+    const keyboard = if (device.keyboard) |*value| value else unreachable;
+    if (!std.meta.eql(self.active_repeat_info, device.repeat_info)) {
+        self.active_repeat_info = device.repeat_info;
+        self.listener.keyboard_repeat_info(
+            self.listener.context,
+            device.repeat_info.rate,
+            device.repeat_info.delay,
+        );
     }
     const key = c.libinput_event_keyboard_get_key(event);
     const pressed = c.libinput_event_keyboard_get_key_state(event) == c.LIBINPUT_KEY_STATE_PRESSED;
     const seat_key_count = c.libinput_event_keyboard_get_seat_key_count(event);
-    if ((pressed and seat_key_count != 1) or (!pressed and seat_key_count != 0)) return;
+    const forward = (pressed and seat_key_count == 1) or (!pressed and seat_key_count == 0);
+    if (forward and self.active_keyboard != device.info.id) {
+        self.activateKeyboard(device) catch |err| return self.fail(err);
+    }
+    const old_state = stateSnapshot(keyboard);
+    _ = c.xkb_state_update_key(
+        keyboard.state,
+        key + 8,
+        if (pressed) c.XKB_KEY_DOWN else c.XKB_KEY_UP,
+    );
+    const new_state = stateSnapshot(keyboard);
+    if (!keyboardStatesEqual(old_state, new_state)) self.notifyKeyboardState(device);
+    if (!forward) return;
     log.debug("key {d} {s}", .{ key, if (pressed) "pressed" else "released" });
     if (key == c.KEY_LEFTMETA) self.left_meta_pressed = pressed;
     if (key == c.KEY_RIGHTMETA) self.right_meta_pressed = pressed;
@@ -793,22 +990,24 @@ fn keyboardKey(self: *Self, event: *c.struct_libinput_event_keyboard) void {
         key,
         if (pressed) .pressed else .released,
     );
-    _ = c.xkb_state_update_key(
-        self.xkb_state,
-        key + 8,
-        if (pressed) c.XKB_KEY_DOWN else c.XKB_KEY_UP,
-    );
-    self.sendModifiers();
+    self.sendKeyboardModifiers(keyboard, false);
 }
 
-fn sendModifiers(self: *Self) void {
+fn activateKeyboard(self: *Self, device: *InputDevice) !void {
+    const keyboard = if (device.keyboard) |*value| value else unreachable;
+    try self.installKeymap(keyboard.keymap);
+    self.active_keyboard = device.info.id;
+    self.sendKeyboardModifiers(keyboard, true);
+}
+
+fn sendKeyboardModifiers(self: *Self, keyboard: *const Keyboard, force: bool) void {
     const modifiers: Modifiers = .{
-        .depressed = c.xkb_state_serialize_mods(self.xkb_state, c.XKB_STATE_MODS_DEPRESSED),
-        .latched = c.xkb_state_serialize_mods(self.xkb_state, c.XKB_STATE_MODS_LATCHED),
-        .locked = c.xkb_state_serialize_mods(self.xkb_state, c.XKB_STATE_MODS_LOCKED),
-        .group = c.xkb_state_serialize_layout(self.xkb_state, c.XKB_STATE_LAYOUT_EFFECTIVE),
+        .depressed = c.xkb_state_serialize_mods(keyboard.state, c.XKB_STATE_MODS_DEPRESSED),
+        .latched = c.xkb_state_serialize_mods(keyboard.state, c.XKB_STATE_MODS_LATCHED),
+        .locked = c.xkb_state_serialize_mods(keyboard.state, c.XKB_STATE_MODS_LOCKED),
+        .group = c.xkb_state_serialize_layout(keyboard.state, c.XKB_STATE_LAYOUT_EFFECTIVE),
     };
-    if (std.meta.eql(self.modifiers, modifiers)) return;
+    if (!force and std.meta.eql(self.modifiers, modifiers)) return;
     self.modifiers = modifiers;
     self.listener.keyboard_modifiers(
         self.listener.context,
@@ -819,10 +1018,8 @@ fn sendModifiers(self: *Self) void {
     );
 }
 
-fn resetKeyboardState(self: *Self) !void {
-    const state = c.xkb_state_new(self.xkb_keymap) orelse return error.XkbStateFailed;
-    c.xkb_state_unref(self.xkb_state);
-    self.xkb_state = state;
+fn resetKeyboardState(self: *Self) void {
+    self.active_keyboard = null;
     self.modifiers = .{};
     self.left_meta_pressed = false;
     self.right_meta_pressed = false;
@@ -833,6 +1030,68 @@ fn resetKeyboardState(self: *Self) !void {
     self.launcher_enter_pressed = false;
     self.session_switch_key = null;
     self.listener.keyboard_modifiers(self.listener.context, 0, 0, 0, 0);
+}
+
+fn configuredKeyboardStateChanged(self: *Self, device: *InputDevice) void {
+    const keyboard = if (device.keyboard) |*value| value else unreachable;
+    if (self.active_keyboard == device.info.id) self.sendKeyboardModifiers(keyboard, false);
+    self.notifyKeyboardState(device);
+}
+
+fn notifyKeyboardState(self: *Self, device: *const InputDevice) void {
+    const listener = self.keyboard_state_listener orelse return;
+    const keyboard = if (device.keyboard) |*value| value else unreachable;
+    listener.changed(listener.context, device.info.id, stateSnapshot(keyboard));
+}
+
+fn setKeyboardLock(self: *Self, id: DeviceId, name: [*:0]const u8, enabled: bool) bool {
+    const device = self.findInputDeviceById(id) orelse return false;
+    const keyboard = if (device.keyboard) |*value| value else return false;
+    const index = c.xkb_keymap_mod_get_index(keyboard.keymap.native, name);
+    if (index == c.XKB_MOD_INVALID or index >= @bitSizeOf(c.xkb_mod_mask_t)) return true;
+    const mask = @as(c.xkb_mod_mask_t, 1) << @intCast(index);
+    _ = c.xkb_state_update_latched_locked(
+        keyboard.state,
+        0,
+        0,
+        false,
+        0,
+        mask,
+        if (enabled) mask else 0,
+        false,
+        0,
+    );
+    self.configuredKeyboardStateChanged(device);
+    return true;
+}
+
+fn stateSnapshot(keyboard: *const Keyboard) KeyboardState {
+    const layout_index: u32 = c.xkb_state_serialize_layout(
+        keyboard.state,
+        c.XKB_STATE_LAYOUT_EFFECTIVE,
+    );
+    return .{
+        .keymap = keyboard.keymap,
+        .layout_index = layout_index,
+        .layout_name = c.xkb_keymap_layout_get_name(keyboard.keymap.native, layout_index),
+        .capslock_enabled = c.xkb_state_mod_name_is_active(
+            keyboard.state,
+            c.XKB_MOD_NAME_CAPS,
+            c.XKB_STATE_MODS_LOCKED,
+        ) > 0,
+        .numlock_enabled = c.xkb_state_mod_name_is_active(
+            keyboard.state,
+            c.XKB_MOD_NAME_NUM,
+            c.XKB_STATE_MODS_LOCKED,
+        ) > 0,
+    };
+}
+
+fn keyboardStatesEqual(a: KeyboardState, b: KeyboardState) bool {
+    return a.keymap == b.keymap and
+        a.layout_index == b.layout_index and
+        a.capslock_enabled == b.capslock_enabled and
+        a.numlock_enabled == b.numlock_enabled;
 }
 
 // Temporary native-session launcher for hardware testing.
@@ -1023,7 +1282,7 @@ fn clearCapabilities(self: *Self) void {
     self.keyboard_count = 0;
     self.pointer_count = 0;
     self.touch_count = 0;
-    self.resetKeyboardState() catch |err| self.fail(err);
+    self.resetKeyboardState();
 }
 
 fn discardEvents(self: *Self) void {
