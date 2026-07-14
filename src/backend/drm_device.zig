@@ -14,6 +14,7 @@ const c = @cImport({
 });
 const wl = wayland.server.wl;
 const log = std.log.scoped(.drm);
+const rescan_interval_milliseconds = 1000;
 
 allocator: std.mem.Allocator,
 io: std.Io,
@@ -24,6 +25,7 @@ event_source: ?*wl.EventSource,
 udev: ?*c.struct_udev,
 udev_monitor: ?*c.struct_udev_monitor,
 hotplug_source: ?*wl.EventSource,
+rescan_source: ?*wl.EventSource,
 device_path: ?[:0]u8,
 device: ?Session.Device,
 active_outputs: std.ArrayList(*DrmOutput),
@@ -51,6 +53,7 @@ pub fn init(self: *Self, allocator: std.mem.Allocator, io: std.Io, event_loop: *
         .udev = null,
         .udev_monitor = null,
         .hotplug_source = null,
+        .rescan_source = null,
         .device_path = path,
         .device = null,
         .active_outputs = .empty,
@@ -219,14 +222,21 @@ fn reconcile(self: *Self) !void {
         self.active_outputs.items,
     );
     defer self.allocator.free(selections);
+    var topology_changed = selections.len != self.active_outputs.items.len;
+    for (selections) |selection| {
+        const output = self.findOutput(selection.connector_id) orelse {
+            topology_changed = true;
+            continue;
+        };
+        if (!std.meta.eql(output.size, selection.size) or output.crtc_id != selection.crtc_id) {
+            return error.OutputChanged;
+        }
+    }
+    if (!topology_changed) return;
     log.info(
         "reconciling DRM hotplug: {d} active output(s), {d} usable connected output(s)",
         .{ self.active_outputs.items.len, selections.len },
     );
-    for (selections) |selection| if (self.findOutput(selection.connector_id)) |output| {
-        if (!std.meta.eql(output.size, selection.size) or output.crtc_id != selection.crtc_id)
-            return error.OutputChanged;
-    };
     for (selections) |selection| if (self.findOutput(selection.connector_id) == null) {
         const output = try self.newOutput(device.fd, selection);
         self.active_outputs.append(self.allocator, output) catch |err| {
@@ -310,9 +320,23 @@ fn initHotplugMonitor(self: *Self) !void {
     const fd = c.udev_monitor_get_fd(monitor);
     if (fd < 0) return error.UdevMonitorFailed;
     self.hotplug_source = try self.event_loop.addFd(*Self, fd, .{ .readable = true }, handleHotplugEvent, self);
+    errdefer {
+        self.hotplug_source.?.remove();
+        self.hotplug_source = null;
+    }
+    self.rescan_source = try self.event_loop.addTimer(*Self, handleRescanTimer, self);
+    errdefer {
+        self.rescan_source.?.remove();
+        self.rescan_source = null;
+    }
+    try self.scheduleRescan();
 }
 
 fn deinitHotplugMonitor(self: *Self) void {
+    if (self.rescan_source) |source| {
+        source.remove();
+        self.rescan_source = null;
+    }
     if (self.hotplug_source) |source| {
         source.remove();
         self.hotplug_source = null;
@@ -325,6 +349,10 @@ fn deinitHotplugMonitor(self: *Self) void {
         _ = c.udev_unref(udev);
         self.udev = null;
     }
+}
+
+fn scheduleRescan(self: *Self) !void {
+    try self.rescan_source.?.timerUpdate(rescan_interval_milliseconds);
 }
 
 fn fail(self: *Self, err: anyerror) void {
@@ -372,6 +400,15 @@ fn handleHotplugEvent(_: c_int, mask: wl.EventMask, self: *Self) c_int {
         _ = c.udev_device_unref(device);
     }
     if (received and self.device != null) self.reconcile() catch |err| self.fail(err);
+    return 0;
+}
+
+fn handleRescanTimer(self: *Self) c_int {
+    if (self.device != null) self.reconcile() catch |err| {
+        self.fail(err);
+        return 0;
+    };
+    if (!self.failed) self.scheduleRescan() catch |err| self.fail(err);
     return 0;
 }
 
