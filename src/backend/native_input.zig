@@ -11,6 +11,7 @@ const render = @import("../render/types.zig");
 const c = @cImport({
     @cInclude("libinput.h");
     @cInclude("libudev.h");
+    @cInclude("linux/input-event-codes.h");
     @cInclude("stdlib.h");
     @cInclude("xkbcommon/xkbcommon.h");
 });
@@ -26,6 +27,7 @@ event_source: ?*wl.EventSource,
 context: *c.struct_libinput,
 listener: Listener,
 devices: std.AutoHashMapUnmanaged(std.posix.fd_t, Session.Device),
+environ_map: ?*const std.process.Environ.Map,
 xkb_context: *c.struct_xkb_context,
 xkb_keymap: *c.struct_xkb_keymap,
 xkb_state: *c.struct_xkb_state,
@@ -36,6 +38,9 @@ keyboard_count: usize,
 pointer_count: usize,
 touch_count: usize,
 modifiers: Modifiers,
+left_meta_pressed: bool,
+right_meta_pressed: bool,
+launcher_enter_pressed: bool,
 suspended: bool,
 initialized: bool,
 failed: bool,
@@ -78,6 +83,7 @@ pub fn init(
         .context = undefined,
         .listener = listener,
         .devices = .empty,
+        .environ_map = null,
         .xkb_context = undefined,
         .xkb_keymap = undefined,
         .xkb_state = undefined,
@@ -88,6 +94,9 @@ pub fn init(
         .pointer_count = 0,
         .touch_count = 0,
         .modifiers = .{},
+        .left_meta_pressed = false,
+        .right_meta_pressed = false,
+        .launcher_enter_pressed = false,
         .suspended = false,
         .initialized = false,
         .failed = false,
@@ -152,6 +161,10 @@ pub fn deinit(self: *Self) void {
     c.xkb_keymap_unref(self.xkb_keymap);
     c.xkb_context_unref(self.xkb_context);
     self.* = undefined;
+}
+
+pub fn setEnvironMap(self: *Self, environ_map: *const std.process.Environ.Map) void {
+    self.environ_map = environ_map;
 }
 
 fn installKeymap(self: *Self) !void {
@@ -279,6 +292,19 @@ fn keyboardKey(self: *Self, event: *c.struct_libinput_event_keyboard) void {
     const pressed = c.libinput_event_keyboard_get_key_state(event) == c.LIBINPUT_KEY_STATE_PRESSED;
     const seat_key_count = c.libinput_event_keyboard_get_seat_key_count(event);
     if ((pressed and seat_key_count != 1) or (!pressed and seat_key_count != 0)) return;
+    if (key == c.KEY_LEFTMETA) self.left_meta_pressed = pressed;
+    if (key == c.KEY_RIGHTMETA) self.right_meta_pressed = pressed;
+    if (key == c.KEY_ENTER) {
+        if (pressed and (self.left_meta_pressed or self.right_meta_pressed)) {
+            self.launcher_enter_pressed = true;
+            self.launchMonstar();
+            return;
+        }
+        if (!pressed and self.launcher_enter_pressed) {
+            self.launcher_enter_pressed = false;
+            return;
+        }
+    }
     self.listener.keyboard_key(
         self.listener.context,
         c.libinput_event_keyboard_get_time(event),
@@ -316,7 +342,23 @@ fn resetKeyboardState(self: *Self) !void {
     c.xkb_state_unref(self.xkb_state);
     self.xkb_state = state;
     self.modifiers = .{};
+    self.left_meta_pressed = false;
+    self.right_meta_pressed = false;
+    self.launcher_enter_pressed = false;
     self.listener.keyboard_modifiers(self.listener.context, 0, 0, 0, 0);
+}
+
+// Temporary native-session launcher for hardware testing.
+fn launchMonstar(self: *Self) void {
+    _ = std.process.spawn(self.io, .{
+        .argv = &.{"monstar"},
+        .environ_map = self.environ_map,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .inherit,
+    }) catch |err| {
+        log.err("failed to launch monstar: {t}", .{err});
+    };
 }
 
 fn pointerMotion(self: *Self, event: *c.struct_libinput_event_pointer) void {

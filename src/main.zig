@@ -37,8 +37,17 @@ pub fn main(init: std.process.Init) !void {
         server,
     );
     defer terminate_signal.remove();
+    const child_signal = try server.eventLoop().addSignal(
+        *Server,
+        @intFromEnum(std.posix.SIG.CHLD),
+        reapChildren,
+        server,
+    );
+    defer child_signal.remove();
 
     const socket_name = try server.listen();
+    try init.environ_map.put("WAYLAND_DISPLAY", socket_name);
+    server.setLauncherEnvironment(init.environ_map);
     var buffer: [4096]u8 = undefined;
     var writer = std.Io.File.stdout().writer(init.io, &buffer);
     try writer.interface.print("WAYLAND_DISPLAY={s}\n", .{socket_name});
@@ -49,6 +58,11 @@ pub fn main(init: std.process.Init) !void {
 
 fn terminate(_: c_int, server: *Server) c_int {
     server.terminate();
+    return 0;
+}
+
+fn reapChildren(_: c_int, _: *Server) c_int {
+    while (std.c.waitpid(-1, null, std.os.linux.W.NOHANG) > 0) {}
     return 0;
 }
 

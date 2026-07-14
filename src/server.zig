@@ -477,6 +477,13 @@ pub fn listen(self: *Self) ![:0]const u8 {
     return socket_name;
 }
 
+pub fn setLauncherEnvironment(
+    self: *Self,
+    environ_map: *const std.process.Environ.Map,
+) void {
+    if (self.native_input_initialized) self.native_input.setEnvironMap(environ_map);
+}
+
 pub fn eventLoop(self: *Self) *wl.EventLoop {
     return self.display.getEventLoop();
 }
