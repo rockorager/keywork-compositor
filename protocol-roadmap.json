@@ -617,15 +617,16 @@
       "interfaces": [
         {
           "name": "river_libinput_config_v1",
-          "current_version": null,
+          "current_version": 2,
           "target_version": 2
         }
       ],
-      "status": "not_started",
+      "status": "done",
       "privileged": true,
       "blocked_by": [
         "river-input-management"
-      ]
+      ],
+      "status_detail": "Version 2 is implemented for native libinput devices, including complete support/default/current discovery, configuration result objects, custom acceleration curves, hotplug lifetime, and atomic done updates."
     },
     {
       "id": "river-xkb-config",

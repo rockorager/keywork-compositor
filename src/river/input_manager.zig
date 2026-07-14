@@ -22,6 +22,7 @@ managers: std.ArrayList(*ManagerResource),
 devices: std.ArrayList(*Device),
 device_resources: std.ArrayList(*DeviceResource),
 device_listeners: std.ArrayList(*DeviceListener),
+resource_listeners: std.ArrayList(*ResourceListener),
 seats: std.ArrayList([:0]u8),
 
 const ManagerResource = struct {
@@ -47,6 +48,11 @@ pub const DeviceListener = struct {
     context: *anyopaque,
     added: *const fn (*anyopaque, *Device) void,
     removed: *const fn (*anyopaque, *Device) void,
+};
+
+pub const ResourceListener = struct {
+    context: *anyopaque,
+    created: *const fn (*anyopaque, *Device, *river.InputDeviceV1) void,
 };
 
 const DeviceResource = struct {
@@ -78,6 +84,7 @@ pub fn init(
         .devices = .empty,
         .device_resources = .empty,
         .device_listeners = .empty,
+        .resource_listeners = .empty,
         .seats = .empty,
     };
     errdefer self.deinitStorage();
@@ -95,6 +102,7 @@ pub fn init(
 pub fn deinit(self: *Self) void {
     std.debug.assert(self.native_input == null);
     std.debug.assert(self.device_listeners.items.len == 0);
+    std.debug.assert(self.resource_listeners.items.len == 0);
     for (self.managers.items) |manager| std.debug.assert(manager.resource == null);
     for (self.device_resources.items) |resource| std.debug.assert(resource.resource == null);
     self.security_context.unrestrictGlobal(self.global);
@@ -104,6 +112,7 @@ pub fn deinit(self: *Self) void {
 }
 
 fn deinitStorage(self: *Self) void {
+    self.resource_listeners.deinit(self.allocator);
     self.device_listeners.deinit(self.allocator);
     for (self.device_resources.items) |resource| self.allocator.destroy(resource);
     self.device_resources.deinit(self.allocator);
@@ -174,6 +183,20 @@ pub fn removeDeviceListener(self: *Self, listener: *DeviceListener) void {
     for (self.device_listeners.items, 0..) |registered, index| {
         if (registered != listener) continue;
         _ = self.device_listeners.orderedRemove(index);
+        return;
+    }
+    unreachable;
+}
+
+pub fn addResourceListener(self: *Self, listener: *ResourceListener) error{OutOfMemory}!void {
+    for (self.resource_listeners.items) |registered| std.debug.assert(registered != listener);
+    try self.resource_listeners.append(self.allocator, listener);
+}
+
+pub fn removeResourceListener(self: *Self, listener: *ResourceListener) void {
+    for (self.resource_listeners.items, 0..) |registered, index| {
+        if (registered != listener) continue;
+        _ = self.resource_listeners.orderedRemove(index);
         return;
     }
     unreachable;
@@ -313,6 +336,7 @@ fn createDeviceResource(self: *Self, manager: *ManagerResource, device: *Device)
     });
     resource.sendName(device.name);
     if (resource.getVersion() >= river.InputDeviceV1.done_since_version) resource.sendDone();
+    for (self.resource_listeners.items) |listener| listener.created(listener.context, device, resource);
 }
 
 fn deviceRequest(

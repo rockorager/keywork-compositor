@@ -138,7 +138,7 @@ pub const AccelConfig = struct {
         if (!validAccelPoints(step, points)) return .invalid;
         return statusFromNative(c.libinput_config_accel_set_points(
             @ptrCast(@alignCast(self.native)),
-            @enumFromInt(@intFromEnum(accel_type)),
+            @as(c.enum_libinput_config_accel_type, @intFromEnum(accel_type)),
             step,
             points.len,
             points.ptr,
@@ -375,7 +375,9 @@ pub fn setDeviceMap(self: *Self, id: DeviceId, map: ?DeviceMap) void {
 }
 
 pub fn createAccelConfig(profile: AccelProfile) ?AccelConfig {
-    const native = c.libinput_config_accel_create(@enumFromInt(@intFromEnum(profile))) orelse return null;
+    const native = c.libinput_config_accel_create(
+        @as(c.enum_libinput_config_accel_profile, @intFromEnum(profile)),
+    ) orelse return null;
     return .{ .native = native };
 }
 
@@ -428,29 +430,33 @@ pub fn deviceConfig(self: *Self, id: DeviceId) ?DeviceConfig {
 }
 
 pub fn setSendEvents(self: *Self, id: DeviceId, value: SendEventsModes) ?Status {
-    return self.call(id, c.libinput_device_config_send_events_set_mode, @bitCast(value));
+    return self.call(
+        id,
+        c.libinput_device_config_send_events_set_mode,
+        @as(c.enum_libinput_config_send_events_mode, @bitCast(value)),
+    );
 }
 pub fn setTap(self: *Self, id: DeviceId, value: Toggle) ?Status {
-    return self.call(id, c.libinput_device_config_tap_set_enabled, @enumFromInt(@intFromEnum(value)));
+    return self.call(id, c.libinput_device_config_tap_set_enabled, @as(c.enum_libinput_config_tap_state, @intFromEnum(value)));
 }
 pub fn setTapButtonMap(self: *Self, id: DeviceId, value: TapButtonMap) ?Status {
-    return self.call(id, c.libinput_device_config_tap_set_button_map, @enumFromInt(@intFromEnum(value)));
+    return self.call(id, c.libinput_device_config_tap_set_button_map, @as(c.enum_libinput_config_tap_button_map, @intFromEnum(value)));
 }
 pub fn setDrag(self: *Self, id: DeviceId, value: Toggle) ?Status {
-    return self.call(id, c.libinput_device_config_tap_set_drag_enabled, @enumFromInt(@intFromEnum(value)));
+    return self.call(id, c.libinput_device_config_tap_set_drag_enabled, @as(c.enum_libinput_config_drag_state, @intFromEnum(value)));
 }
 pub fn setDragLock(self: *Self, id: DeviceId, value: DragLock) ?Status {
-    return self.call(id, c.libinput_device_config_tap_set_drag_lock_enabled, @enumFromInt(@intFromEnum(value)));
+    return self.call(id, c.libinput_device_config_tap_set_drag_lock_enabled, @as(c.enum_libinput_config_drag_lock_state, @intFromEnum(value)));
 }
 pub fn setThreeFingerDrag(self: *Self, id: DeviceId, value: ThreeFingerDrag) ?Status {
-    return self.call(id, c.libinput_device_config_3fg_drag_set_enabled, @enumFromInt(@intFromEnum(value)));
+    return self.call(id, c.libinput_device_config_3fg_drag_set_enabled, @as(c.enum_libinput_config_3fg_drag_state, @intFromEnum(value)));
 }
 pub fn setCalibrationMatrix(self: *Self, id: DeviceId, value: CalibrationMatrix) ?Status {
     if (!validMatrix(value)) return .invalid;
     return self.call(id, c.libinput_device_config_calibration_set_matrix, &value);
 }
 pub fn setAccelProfile(self: *Self, id: DeviceId, value: AccelProfile) ?Status {
-    return self.call(id, c.libinput_device_config_accel_set_profile, @enumFromInt(@intFromEnum(value)));
+    return self.call(id, c.libinput_device_config_accel_set_profile, @as(c.enum_libinput_config_accel_profile, @intFromEnum(value)));
 }
 pub fn setAccelSpeed(self: *Self, id: DeviceId, value: f64) ?Status {
     if (!std.math.isFinite(value) or value < -1 or value > 1) return .invalid;
@@ -466,28 +472,28 @@ pub fn setLeftHanded(self: *Self, id: DeviceId, value: Toggle) ?Status {
     return self.call(id, c.libinput_device_config_left_handed_set, @intFromEnum(value));
 }
 pub fn setClickMethod(self: *Self, id: DeviceId, value: ClickMethod) ?Status {
-    return self.call(id, c.libinput_device_config_click_set_method, @enumFromInt(@intFromEnum(value)));
+    return self.call(id, c.libinput_device_config_click_set_method, @as(c.enum_libinput_config_click_method, @intFromEnum(value)));
 }
 pub fn setClickfingerButtonMap(self: *Self, id: DeviceId, value: ClickfingerButtonMap) ?Status {
-    return self.call(id, c.libinput_device_config_click_set_clickfinger_button_map, @enumFromInt(@intFromEnum(value)));
+    return self.call(id, c.libinput_device_config_click_set_clickfinger_button_map, @as(c.enum_libinput_config_clickfinger_button_map, @intFromEnum(value)));
 }
 pub fn setMiddleEmulation(self: *Self, id: DeviceId, value: Toggle) ?Status {
-    return self.call(id, c.libinput_device_config_middle_emulation_set_enabled, @enumFromInt(@intFromEnum(value)));
+    return self.call(id, c.libinput_device_config_middle_emulation_set_enabled, @as(c.enum_libinput_config_middle_emulation_state, @intFromEnum(value)));
 }
 pub fn setScrollMethod(self: *Self, id: DeviceId, value: ScrollMethod) ?Status {
-    return self.call(id, c.libinput_device_config_scroll_set_method, @enumFromInt(@intFromEnum(value)));
+    return self.call(id, c.libinput_device_config_scroll_set_method, @as(c.enum_libinput_config_scroll_method, @intFromEnum(value)));
 }
 pub fn setScrollButton(self: *Self, id: DeviceId, value: u32) ?Status {
     return self.call(id, c.libinput_device_config_scroll_set_button, value);
 }
 pub fn setScrollButtonLock(self: *Self, id: DeviceId, value: Toggle) ?Status {
-    return self.call(id, c.libinput_device_config_scroll_set_button_lock, @enumFromInt(@intFromEnum(value)));
+    return self.call(id, c.libinput_device_config_scroll_set_button_lock, @as(c.enum_libinput_config_scroll_button_lock_state, @intFromEnum(value)));
 }
 pub fn setDwt(self: *Self, id: DeviceId, value: Toggle) ?Status {
-    return self.call(id, c.libinput_device_config_dwt_set_enabled, @enumFromInt(@intFromEnum(value)));
+    return self.call(id, c.libinput_device_config_dwt_set_enabled, @as(c.enum_libinput_config_dwt_state, @intFromEnum(value)));
 }
 pub fn setDwtp(self: *Self, id: DeviceId, value: Toggle) ?Status {
-    return self.call(id, c.libinput_device_config_dwtp_set_enabled, @enumFromInt(@intFromEnum(value)));
+    return self.call(id, c.libinput_device_config_dwtp_set_enabled, @as(c.enum_libinput_config_dwtp_state, @intFromEnum(value)));
 }
 pub fn setRotation(self: *Self, id: DeviceId, value: u32) ?Status {
     if (value >= 360) return .invalid;
@@ -1109,7 +1115,11 @@ fn statusFromNative(status: c.enum_libinput_config_status) Status {
 }
 
 fn nativeEnum(comptime T: type, value: anytype) T {
-    return @enumFromInt(@intFromEnum(value));
+    return @enumFromInt(switch (@typeInfo(@TypeOf(value))) {
+        .@"enum" => @intFromEnum(value),
+        .int => value,
+        else => unreachable,
+    });
 }
 
 fn setting(comptime T: type, default: anytype, current: @TypeOf(default)) Setting(T) {
