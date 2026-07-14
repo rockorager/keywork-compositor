@@ -5,6 +5,7 @@ const Self = @This();
 const std = @import("std");
 const wayland = @import("wayland");
 const Output = @import("../wayland/output.zig");
+const OutputLayout = @import("../wayland/output_layout.zig");
 const Scene = @import("../scene.zig");
 const Seat = @import("../wayland/seat.zig");
 const slot_map = @import("../slot_map.zig");
@@ -21,7 +22,8 @@ allocator: std.mem.Allocator,
 display: *wl.Server,
 global: *wl.Global,
 layer_global: *wl.Global,
-output: *Output,
+outputs: *OutputLayout,
+output_id: OutputLayout.Id,
 seat: *Seat,
 scene: *Scene,
 xdg_shell: *XdgShell,
@@ -274,7 +276,8 @@ pub fn init(
     self: *Self,
     allocator: std.mem.Allocator,
     display: *wl.Server,
-    output: *Output,
+    outputs: *OutputLayout,
+    output_id: OutputLayout.Id,
     seat: *Seat,
     scene: *Scene,
     xdg_shell: *XdgShell,
@@ -286,7 +289,8 @@ pub fn init(
         .display = display,
         .global = undefined,
         .layer_global = undefined,
-        .output = output,
+        .outputs = outputs,
+        .output_id = output_id,
         .seat = seat,
         .scene = scene,
         .xdg_shell = xdg_shell,
@@ -355,6 +359,10 @@ pub fn init(
         .supported = layerSupported,
         .changed = layerChanged,
     });
+}
+
+fn resolveOutput(self: *Self) *Output {
+    return self.outputs.get(self.output_id) orelse unreachable;
 }
 
 pub fn deinit(self: *Self) void {
@@ -801,7 +809,7 @@ fn finishManage(self: *Self, manager: *river.WindowManagerV1) void {
     }
     self.pending_operation = .unchanged;
     if (self.pending_warp) |requested| {
-        const size = self.output.logicalSize();
+        const size = self.resolveOutput().logicalSize();
         const point = clampPoint(requested, size.width, size.height);
         const route = self.router.route(self.router.context, @floatFromInt(point.x), @floatFromInt(point.y));
         self.seat.pointerEnter(@floatFromInt(point.x), @floatFromInt(point.y), if (self.pointerGrabbed()) null else route.focus);
@@ -830,7 +838,7 @@ fn finishManage(self: *Self, manager: *river.WindowManagerV1) void {
             !info.decoration_configure_requested) continue;
         const proposed_dimensions = entry.value.proposed_dimensions;
         const dimensions = if (entry.value.fullscreen_output) fullscreen: {
-            const size = self.output.logicalSize();
+            const size = self.resolveOutput().logicalSize();
             break :fullscreen XdgShell.Dimensions{
                 .width = @intCast(size.width),
                 .height = @intCast(size.height),
@@ -948,7 +956,7 @@ fn finishRender(self: *Self, manager: *river.WindowManagerV1) void {
             },
         }
         if (entry.value.fullscreen_output) {
-            const size = self.output.logicalSize();
+            const size = self.resolveOutput().logicalSize();
             self.xdg_shell.setWindowBorders(entry.value.xdg_id, null);
             self.xdg_shell.setWindowClipBox(entry.value.xdg_id, .{
                 .x = 0,
@@ -1478,7 +1486,7 @@ fn windowRequest(
         .maximize => .maximize,
         .unmaximize => .unmaximize,
         .fullscreen => |output| .{ .fullscreen = if (output) |resource|
-            self.output.ownsResource(resource)
+            self.resolveOutput().ownsResource(resource)
         else
             false },
         .exit_fullscreen => .exit_fullscreen,
@@ -2340,9 +2348,11 @@ fn createOutput(self: *Self, manager: *river.WindowManagerV1) !void {
 
     self.output_resource = resource;
     manager.sendOutput(resource);
-    resource.sendWlOutput(self.output.globalName(manager.getClient()));
-    resource.sendPosition(0, 0);
-    const size = self.output.logicalSize();
+    const output = self.resolveOutput();
+    resource.sendWlOutput(output.globalName(manager.getClient()));
+    const position = output.logicalPosition();
+    resource.sendPosition(position.x, position.y);
+    const size = output.logicalSize();
     resource.sendDimensions(@intCast(size.width), @intCast(size.height));
     if (resource.getVersion() >= river.OutputV1.capture_sessions_since_version) {
         resource.sendCaptureSessions(0);

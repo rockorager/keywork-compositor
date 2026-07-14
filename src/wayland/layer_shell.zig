@@ -7,6 +7,7 @@ const wayland = @import("wayland");
 const Scene = @import("../scene.zig");
 const slot_map = @import("../slot_map.zig");
 const Output = @import("output.zig");
+const OutputLayout = @import("output_layout.zig");
 const Seat = @import("seat.zig");
 const Surface = @import("surface.zig");
 const XdgShell = @import("xdg_shell.zig");
@@ -16,7 +17,8 @@ const zwlr = wayland.server.zwlr;
 
 allocator: std.mem.Allocator,
 display: *wl.Server,
-output: *Output,
+outputs: *OutputLayout,
+output_id: OutputLayout.Id,
 scene: *Scene,
 seat: *Seat,
 xdg_shell: *XdgShell,
@@ -69,12 +71,14 @@ const State = struct {
 };
 const Adapter = struct { shell: *Self, id: Id, resource: ?*zwlr.LayerSurfaceV1, surface: ?*Surface };
 
-pub fn init(self: *Self, allocator: std.mem.Allocator, display: *wl.Server, output: *Output, scene: *Scene, seat: *Seat, xdg_shell: *XdgShell, surfaces: *Surface.Store) !void {
+pub fn init(self: *Self, allocator: std.mem.Allocator, display: *wl.Server, outputs: *OutputLayout, output_id: OutputLayout.Id, scene: *Scene, seat: *Seat, xdg_shell: *XdgShell, surfaces: *Surface.Store) !void {
+    const output = outputs.get(output_id) orelse unreachable;
     const size = output.logicalSize();
     self.* = .{
         .allocator = allocator,
         .display = display,
-        .output = output,
+        .outputs = outputs,
+        .output_id = output_id,
         .scene = scene,
         .seat = seat,
         .xdg_shell = xdg_shell,
@@ -93,6 +97,10 @@ pub fn deinit(self: *Self) void {
 
 pub fn usableArea(self: *const Self) Rect {
     return self.usable_area;
+}
+
+fn resolveOutput(self: *Self) *Output {
+    return self.outputs.get(self.output_id) orelse unreachable;
 }
 
 pub fn setPolicyListener(self: *Self, listener: PolicyListener) void {
@@ -220,7 +228,10 @@ const CreateError = error{
 };
 fn createSurface(self: *Self, manager: *zwlr.LayerShellV1, r: anytype) CreateError!void {
     if (!validLayer(r.layer)) return error.InvalidLayer;
-    if (r.output) |output| if (!self.output.ownsResource(output)) return error.InvalidOutput;
+    if (r.output) |resource| {
+        const output = self.outputs.findResource(resource) orelse return error.InvalidOutput;
+        if (!std.meta.eql(output.id, self.output_id)) return error.InvalidOutput;
+    }
     if (!std.unicode.utf8ValidateSlice(std.mem.span(r.namespace))) {
         return error.InvalidNamespace;
     }
@@ -339,7 +350,7 @@ fn afterCommit(context: *anyopaque, info: Surface.CommitInfo) void {
 }
 
 fn arrange(self: *Self) void {
-    const size = self.output.logicalSize();
+    const size = self.resolveOutput().logicalSize();
     var usable: Rect = .{ .x = 0, .y = 0, .width = @intCast(size.width), .height = @intCast(size.height) };
     var pass: u2 = 0;
     while (pass < 2) : (pass += 1) {

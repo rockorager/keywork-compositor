@@ -5,7 +5,7 @@ const Self = @This();
 const std = @import("std");
 const wayland = @import("wayland");
 const presentation = @import("../presentation.zig");
-const Output = @import("output.zig");
+const OutputLayout = @import("output_layout.zig");
 const Surface = @import("surface.zig");
 
 const wl = wayland.server.wl;
@@ -14,7 +14,8 @@ const wp = wayland.server.wp;
 allocator: std.mem.Allocator,
 global: *wl.Global,
 surfaces: *Surface.Store,
-output: *Output,
+outputs: *OutputLayout,
+output_id: OutputLayout.Id,
 clock_id: u32,
 
 pub fn init(
@@ -22,14 +23,16 @@ pub fn init(
     allocator: std.mem.Allocator,
     display: *wl.Server,
     surfaces: *Surface.Store,
-    output: *Output,
+    outputs: *OutputLayout,
+    output_id: OutputLayout.Id,
     clock_id: u32,
 ) !void {
     self.* = .{
         .allocator = allocator,
         .global = try wl.Global.create(display, wp.Presentation, 2, *Self, self, bind),
         .surfaces = surfaces,
-        .output = output,
+        .outputs = outputs,
+        .output_id = output_id,
         .clock_id = clock_id,
     };
 }
@@ -69,7 +72,8 @@ const Feedback = struct {
     allocator: std.mem.Allocator,
     store: *Surface.Store,
     surface_id: Surface.Id,
-    output: *Output,
+    outputs: *OutputLayout,
+    output_id: OutputLayout.Id,
     resource: *wp.PresentationFeedback,
     commit_feedback: Surface.CommitFeedback,
 
@@ -92,7 +96,8 @@ const Feedback = struct {
             .allocator = manager.allocator,
             .store = manager.surfaces,
             .surface_id = surface.handle(),
-            .output = manager.output,
+            .outputs = manager.outputs,
+            .output_id = manager.output_id,
             .resource = resource,
             .commit_feedback = .{
                 .context = self,
@@ -112,9 +117,11 @@ const Feedback = struct {
 
     fn presented(context: *anyopaque, info: presentation.Info) void {
         const self: *Feedback = @ptrCast(@alignCast(context));
-        for (self.output.boundResources()) |output_resource| {
-            if (output_resource.getClient() == self.resource.getClient()) {
-                self.resource.sendSyncOutput(output_resource);
+        if (self.outputs.get(self.output_id)) |output| {
+            for (output.boundResources()) |output_resource| {
+                if (output_resource.getClient() == self.resource.getClient()) {
+                    self.resource.sendSyncOutput(output_resource);
+                }
             }
         }
         self.resource.destroySendPresented(

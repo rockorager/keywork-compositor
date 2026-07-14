@@ -5,18 +5,19 @@ const Self = @This();
 const std = @import("std");
 const wayland = @import("wayland");
 const Output = @import("output.zig");
+const OutputLayout = @import("output_layout.zig");
 
 const wl = wayland.server.wl;
 const zxdg = wayland.server.zxdg;
 
 global: *wl.Global,
-output: *Output,
+outputs: *OutputLayout,
 resource_count: usize = 0,
 
-pub fn init(self: *Self, display: *wl.Server, output: *Output) !void {
+pub fn init(self: *Self, display: *wl.Server, outputs: *OutputLayout) !void {
     self.* = .{
         .global = try wl.Global.create(display, zxdg.OutputManagerV1, 3, *Self, self, bind),
-        .output = output,
+        .outputs = outputs,
     };
 }
 
@@ -42,13 +43,13 @@ fn managerRequest(
     switch (request) {
         .destroy => resource.destroy(),
         .get_xdg_output => |get| {
-            if (!self.output.ownsResource(get.output)) {
+            const output = self.outputs.findResource(get.output) orelse {
                 resource.getClient().postImplementationError(
                     "zxdg_output_v1 requested for an unknown wl_output",
                 );
                 return;
-            }
-            self.createOutput(resource, get.id, get.output);
+            };
+            self.createOutput(resource, get.id, get.output, output.output);
         },
     }
 }
@@ -58,6 +59,7 @@ fn createOutput(
     manager: *zxdg.OutputManagerV1,
     id: u32,
     output_resource: *wl.Output,
+    output: *Output,
 ) void {
     const resource = zxdg.OutputV1.create(
         manager.getClient(),
@@ -70,8 +72,9 @@ fn createOutput(
     self.resource_count += 1;
     resource.setHandler(*Self, outputRequest, outputDestroyed, self);
 
-    const size = self.output.logicalSize();
-    resource.sendLogicalPosition(0, 0);
+    const position = output.logicalPosition();
+    const size = output.logicalSize();
+    resource.sendLogicalPosition(position.x, position.y);
     resource.sendLogicalSize(@intCast(size.width), @intCast(size.height));
     if (resource.getVersion() >= zxdg.OutputV1.name_since_version) {
         resource.sendName(Output.output_name);

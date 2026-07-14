@@ -21,7 +21,7 @@ const FractionalScale = @import("wayland/fractional_scale.zig");
 const Fixes = @import("wayland/fixes.zig");
 const LinuxDmabuf = @import("wayland/linux_dmabuf.zig");
 const XdgActivation = @import("wayland/xdg_activation.zig");
-const Output = @import("wayland/output.zig");
+const OutputLayout = @import("wayland/output_layout.zig");
 const OutputBackend = @import("backend/output.zig");
 const renderer_types = @import("render/renderer.zig");
 const render = @import("render/types.zig");
@@ -36,7 +36,8 @@ const log = std.log.scoped(.server);
 allocator: std.mem.Allocator,
 display: *wl.Server,
 render_output: OutputBackend,
-output: Output,
+outputs: OutputLayout,
+render_output_id: OutputLayout.Id,
 xdg_output: XdgOutput,
 single_pixel_buffer: SinglePixelBuffer,
 compositor: Compositor,
@@ -80,7 +81,8 @@ pub fn create(
         .allocator = allocator,
         .display = display,
         .render_output = undefined,
-        .output = undefined,
+        .outputs = undefined,
+        .render_output_id = undefined,
         .xdg_output = undefined,
         .single_pixel_buffer = undefined,
         .compositor = undefined,
@@ -110,6 +112,9 @@ pub fn create(
     errdefer self.renderer.deinit();
     try self.compositor.init(allocator, display);
     errdefer self.compositor.deinit();
+    self.outputs.init(allocator, display, self.compositor.surfaceStore());
+    errdefer self.outputs.deinit();
+    self.compositor.setOutputLayout(&self.outputs);
     try self.seat.init(allocator, io, display, self.compositor.surfaceStore());
     errdefer self.seat.deinit();
     try self.render_output.init(
@@ -154,17 +159,13 @@ pub fn create(
         },
     );
     errdefer self.render_output.deinit();
-    try self.output.init(
-        allocator,
-        display,
-        self.render_output.size(),
-        self.render_output.physicalSize(),
-        self.render_output.clientScale(),
-        self.compositor.surfaceStore(),
-    );
-    errdefer self.output.deinit();
-    self.compositor.setOutput(&self.output);
-    try self.xdg_output.init(display, &self.output);
+    self.render_output_id = try self.outputs.add(.{
+        .size = self.render_output.size(),
+        .physical_size = self.render_output.physicalSize(),
+        .scale = self.render_output.clientScale(),
+    });
+    errdefer std.debug.assert(self.outputs.remove(self.render_output_id));
+    try self.xdg_output.init(display, &self.outputs);
     errdefer self.xdg_output.deinit();
     try self.single_pixel_buffer.init(allocator, display);
     errdefer self.single_pixel_buffer.deinit();
@@ -172,7 +173,8 @@ pub fn create(
         allocator,
         display,
         self.compositor.surfaceStore(),
-        &self.output,
+        &self.outputs,
+        self.render_output_id,
         self.render_output.presentationClockId(),
     );
     errdefer self.presentation_protocol.deinit();
@@ -204,7 +206,8 @@ pub fn create(
     try self.layer_shell.init(
         allocator,
         display,
-        &self.output,
+        &self.outputs,
+        self.render_output_id,
         &self.scene,
         &self.seat,
         &self.xdg_shell,
@@ -252,7 +255,8 @@ pub fn create(
     try self.window_manager.init(
         allocator,
         display,
-        &self.output,
+        &self.outputs,
+        self.render_output_id,
         &self.seat,
         &self.scene,
         &self.xdg_shell,
@@ -308,7 +312,8 @@ pub fn destroy(self: *Self) void {
     self.presentation_protocol.deinit();
     self.single_pixel_buffer.deinit();
     self.xdg_output.deinit();
-    self.output.deinit();
+    std.debug.assert(self.outputs.remove(self.render_output_id));
+    self.outputs.deinit();
     self.render_output.deinit();
     self.seat.deinit();
     self.compositor.deinit();
@@ -371,7 +376,7 @@ fn outputReady(context: *anyopaque) void {
 
 fn outputPresented(context: *anyopaque, info: presentation.Info) void {
     const self: *Self = @ptrCast(@alignCast(context));
-    self.output.setRefresh(info);
+    self.outputs.get(self.render_output_id).?.setRefresh(info);
     Surface.finishPresentation(self.compositor.surfaceStore(), info);
 }
 

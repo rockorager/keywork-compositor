@@ -15,12 +15,18 @@ pub const output_description = "Keywork virtual output";
 
 allocator: std.mem.Allocator,
 global: *wl.Global,
+position: Position,
 size: render.Size,
 physical_size: render.Size,
 scale: i32,
 refresh_millihertz: i32,
 resources: std.ArrayList(*wl.Output),
 surfaces: *Surface.Store,
+
+pub const Position = struct {
+    x: i32 = 0,
+    y: i32 = 0,
+};
 
 pub const Error = error{
     InvalidDimensions,
@@ -31,6 +37,7 @@ pub fn init(
     self: *Self,
     allocator: std.mem.Allocator,
     display: *wl.Server,
+    position: Position,
     size: render.Size,
     physical_size: render.Size,
     scale: u32,
@@ -48,6 +55,7 @@ pub fn init(
     self.* = .{
         .allocator = allocator,
         .global = try wl.Global.create(display, wl.Output, 4, *Self, self, bind),
+        .position = position,
         .size = size,
         .physical_size = physical_size,
         .scale = @intCast(scale),
@@ -70,6 +78,10 @@ pub fn globalName(self: *const Self, client: *const wl.Client) u32 {
 
 pub fn logicalSize(self: *const Self) render.Size {
     return self.size;
+}
+
+pub fn logicalPosition(self: *const Self) Position {
+    return self.position;
 }
 
 pub fn ownsResource(self: *Self, resource: *wl.Output) bool {
@@ -116,7 +128,16 @@ fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
         return;
     };
     resource.setHandler(*Self, handleRequest, handleDestroy, self);
-    resource.sendGeometry(0, 0, 0, 0, .unknown, "keywork", "headless", .normal);
+    resource.sendGeometry(
+        self.position.x,
+        self.position.y,
+        0,
+        0,
+        .unknown,
+        "keywork",
+        "headless",
+        .normal,
+    );
     self.sendMode(resource);
     if (version >= wl.Output.scale_since_version) resource.sendScale(self.scale);
     if (version >= wl.Output.name_since_version) {
