@@ -637,15 +637,16 @@
       "interfaces": [
         {
           "name": "river_xkb_config_v1",
-          "current_version": null,
+          "current_version": 2,
           "target_version": 2
         }
       ],
-      "status": "not_started",
+      "status": "done",
       "privileged": true,
       "blocked_by": [
-        "wl-seat"
-      ]
+        "river-input-management"
+      ],
+      "status_detail": "Version 2 is implemented for native keyboards, including keymap compilation, per-device keymap and xkb state, layout selection, capslock and numlock control, hotplug lifetime, and atomic state updates."
     },
     {
       "id": "river-xkb-bindings",

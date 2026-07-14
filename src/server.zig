@@ -46,6 +46,7 @@ const Surface = @import("wayland/surface.zig");
 const Viewporter = @import("wayland/viewporter.zig");
 const InputManager = @import("river/input_manager.zig");
 const LibinputConfig = @import("river/libinput_config.zig");
+const XkbConfig = @import("river/xkb_config.zig");
 const WindowManager = @import("river/window_manager.zig");
 
 const wl = wayland.server.wl;
@@ -63,6 +64,8 @@ input_manager: InputManager,
 input_manager_initialized: bool,
 libinput_config: LibinputConfig,
 libinput_config_initialized: bool,
+xkb_config: XkbConfig,
+xkb_config_initialized: bool,
 render_outputs: RenderOutputStore,
 primary_render_output: RenderOutputId,
 outputs: OutputLayout,
@@ -170,6 +173,8 @@ pub fn create(
         .input_manager_initialized = false,
         .libinput_config = undefined,
         .libinput_config_initialized = false,
+        .xkb_config = undefined,
+        .xkb_config_initialized = false,
         .render_outputs = .{},
         .primary_render_output = undefined,
         .outputs = undefined,
@@ -481,6 +486,19 @@ pub fn create(
             self.libinput_config.deinit();
             self.libinput_config_initialized = false;
         }
+        try self.xkb_config.init(
+            allocator,
+            io,
+            display,
+            &self.security_context,
+            &self.input_manager,
+            &self.native_input,
+        );
+        self.xkb_config_initialized = true;
+        errdefer {
+            self.xkb_config.deinit();
+            self.xkb_config_initialized = false;
+        }
     }
     requestRepaint(self);
 
@@ -498,6 +516,7 @@ pub fn destroy(self: *Self) void {
     const allocator = self.allocator;
     if (self.drm_device_initialized) self.drm_device.clearListener();
     self.data_device.cancel();
+    if (self.xkb_config_initialized) self.xkb_config.detachNativeInput();
     if (self.input_manager_initialized) self.input_manager.detachNativeInput();
     if (self.native_input_initialized) self.native_input.deinit();
     self.layer_shell.clearRepaintListener();
@@ -507,6 +526,10 @@ pub fn destroy(self: *Self) void {
     var render_outputs = self.render_outputs.iterator();
     while (render_outputs.next()) |entry| stopRenderOutput(entry.value.*);
     self.display.destroyClients();
+    if (self.xkb_config_initialized) {
+        self.xkb_config.deinit();
+        self.xkb_config_initialized = false;
+    }
     if (self.libinput_config_initialized) {
         self.libinput_config.deinit();
         self.libinput_config_initialized = false;
