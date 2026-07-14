@@ -73,6 +73,7 @@ linux_dmabuf: LinuxDmabuf,
 xdg_activation: XdgActivation,
 viewporter: Viewporter,
 window_manager: WindowManager,
+window_manager_initialized: bool,
 renderer: renderer_types.Renderer,
 socket_buffer: [11]u8,
 listening: bool,
@@ -164,6 +165,7 @@ pub fn create(
         .xdg_activation = undefined,
         .viewporter = undefined,
         .window_manager = undefined,
+        .window_manager_initialized = false,
         .renderer = try renderer_types.Renderer.init(allocator, renderer_kind),
         .socket_buffer = undefined,
         .listening = false,
@@ -331,7 +333,11 @@ pub fn create(
         &self.layer_shell,
         .{ .context = self, .route = routePointer },
     );
-    errdefer self.window_manager.deinit();
+    self.window_manager_initialized = true;
+    errdefer {
+        self.window_manager.deinit();
+        self.window_manager_initialized = false;
+    }
     self.subcompositor.setRepaintListener(.{
         .context = self,
         .request = requestRepaint,
@@ -388,6 +394,7 @@ pub fn destroy(self: *Self) void {
         self.output_management_initialized = false;
     }
     self.window_manager.deinit();
+    self.window_manager_initialized = false;
     self.input_method.deinit();
     self.text_input.deinit();
     self.primary_selection.deinit();
@@ -465,6 +472,10 @@ fn addRenderOutput(
     );
     errdefer stopRenderOutput(render_output);
     const id = try self.render_outputs.insert(self.allocator, render_output);
+    errdefer std.debug.assert(self.render_outputs.remove(id) != null);
+    if (self.window_manager_initialized) {
+        try self.window_manager.outputAdded(render_output.protocol_id);
+    }
     render_output.repaint_needed = true;
     self.scheduleRepaint(render_output);
     return id;
@@ -511,6 +522,9 @@ fn removeRenderOutput(self: *Self, id: RenderOutputId) bool {
     const render_output = self.render_outputs.remove(id) orelse return false;
     stopRenderOutput(render_output);
     const protocol_output = self.outputs.get(render_output.protocol_id).?;
+    if (self.window_manager_initialized) {
+        self.window_manager.outputRemoved(render_output.protocol_id);
+    }
     Surface.discardPresentation(self.compositor.surfaceStore(), protocol_output);
     if (self.xdg_output_initialized) self.xdg_output.removeOutput(protocol_output);
     std.debug.assert(self.outputs.remove(render_output.protocol_id));
@@ -525,8 +539,9 @@ fn drmOutputAdded(context: *anyopaque, drm_output: *DrmOutput) void {
     var iterator = self.render_outputs.iterator();
     while (iterator.next()) |entry| {
         const output = entry.value.*;
-        const position = self.outputs.get(output.protocol_id).?.logicalPosition();
-        right = @max(right, position.x + @as(i32, @intCast(output.backend.size().width)));
+        const protocol_output = self.outputs.get(output.protocol_id).?;
+        const position = protocol_output.logicalPosition();
+        right = @max(right, position.x + @as(i32, @intCast(protocol_output.logicalSize().width)));
     }
     drm_output.logical_x = right;
     drm_output.logical_y = 0;

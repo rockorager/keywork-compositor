@@ -378,7 +378,7 @@ pub fn outputStateChanged(
     position_changed: bool,
     dimensions_changed: bool,
 ) void {
-    const resource = self.outputResource(output_id) orelse return;
+    const resource = (self.outputResource(output_id) orelse return).resource;
     const output = self.outputs.get(output_id) orelse return;
     if (position_changed) {
         const position = output.logicalPosition();
@@ -391,10 +391,40 @@ pub fn outputStateChanged(
     if (position_changed or dimensions_changed) self.requestManage();
 }
 
-fn outputResource(self: *Self, output_id: OutputLayout.Id) ?*river.OutputV1 {
+pub fn outputAdded(self: *Self, output_id: OutputLayout.Id) !void {
+    const output = self.outputs.get(output_id) orelse unreachable;
+    const manager = self.active orelse return;
+    try self.createOutput(manager, output_id, output);
+    self.requestManage();
+}
+
+pub fn outputRemoved(self: *Self, output_id: OutputLayout.Id) void {
+    std.debug.assert(self.outputs.get(output_id) != null);
+    if (std.meta.eql(self.output_id, output_id)) {
+        var outputs = self.outputs.iterator();
+        while (outputs.next()) |entry| std.debug.assert(std.meta.eql(entry.id, output_id));
+    }
+
+    if (self.outputResource(output_id)) |output_resource| {
+        output_resource.removed = true;
+        output_resource.resource.sendRemoved();
+    }
+
+    const replacement = if (std.meta.eql(self.output_id, output_id)) null else self.output_id;
+    var windows = self.windows.iterator();
+    while (windows.next()) |entry| {
+        if (!std.meta.eql(entry.value.fullscreen_output, output_id)) continue;
+        entry.value.fullscreen_output = replacement;
+        entry.value.fullscreen_dimensions_pending = replacement != null;
+    }
+    self.requestManage();
+}
+
+fn outputResource(self: *Self, output_id: OutputLayout.Id) ?*OutputResource {
     for (self.output_resources.items) |output_resource| {
         if (output_resource.owner_generation != self.session_generation) continue;
-        if (std.meta.eql(output_resource.output_id, output_id)) return output_resource.resource;
+        if (output_resource.removed) continue;
+        if (std.meta.eql(output_resource.output_id, output_id)) return output_resource;
     }
     return null;
 }
@@ -752,7 +782,7 @@ fn sendPendingState(self: *Self, manager: *river.WindowManagerV1) !void {
             .maximize => resource.sendMaximizeRequested(),
             .unmaximize => resource.sendUnmaximizeRequested(),
             .fullscreen => |preferred_output| resource.sendFullscreenRequested(if (preferred_output) |id|
-                self.outputResource(id)
+                if (self.outputResource(id)) |output| output.resource else null
             else
                 null),
             .exit_fullscreen => resource.sendExitFullscreenRequested(),
@@ -1789,6 +1819,7 @@ const WindowResource = struct {
         const output: *OutputResource = @ptrCast(@alignCast(data));
         if (output.manager != self.manager or
             output.owner_generation != self.owner_generation) return null;
+        if (output.removed) return null;
         if (self.manager.outputs.get(output.output_id) == null) return null;
         return output.output_id;
     }
@@ -2396,6 +2427,7 @@ fn createOutput(
         .owner_generation = self.session_generation,
         .output_id = output_id,
         .resource = resource,
+        .removed = false,
     };
     try self.output_resources.append(self.allocator, adapter);
     resource.setHandler(*OutputResource, OutputResource.handleRequest, OutputResource.handleDestroy, adapter);
@@ -2439,12 +2471,17 @@ const OutputResource = struct {
     owner_generation: u64,
     output_id: OutputLayout.Id,
     resource: *river.OutputV1,
+    removed: bool,
 
     fn handleRequest(
         resource: *river.OutputV1,
         request: river.OutputV1.Request,
         self: *OutputResource,
     ) void {
+        if (self.removed) {
+            if (request == .destroy) resource.destroy();
+            return;
+        }
         switch (request) {
             .destroy => resource.destroy(),
             .set_presentation_mode => |set| {
@@ -2462,6 +2499,7 @@ const OutputResource = struct {
     }
 
     fn activeManager(self: *OutputResource) ?*river.WindowManagerV1 {
+        if (self.removed) return null;
         if (self.manager.session_generation != self.owner_generation) return null;
         return self.manager.active;
     }
@@ -2638,6 +2676,47 @@ const PointerBinding = struct {
         self.manager.allocator.destroy(self);
     }
 };
+
+test "removed River outputs stay inert until the client destroys them" {
+    const display = try wl.Server.create();
+    defer display.destroy();
+
+    var sockets: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.CLOEXEC, 0, &sockets),
+    );
+    defer _ = std.c.close(sockets[1]);
+    const client = wl.Client.create(display, sockets[0]) orelse return error.OutOfMemory;
+    defer client.destroy();
+
+    var manager: Self = undefined;
+    manager.allocator = std.testing.allocator;
+    manager.output_resources = .empty;
+    defer manager.output_resources.deinit(std.testing.allocator);
+
+    const resource = try river.OutputV1.create(client, protocol_version, 0);
+    const adapter = try std.testing.allocator.create(OutputResource);
+    adapter.* = .{
+        .allocator = std.testing.allocator,
+        .manager = &manager,
+        .owner_generation = 1,
+        .output_id = .{ .index = 0, .generation = 1 },
+        .resource = resource,
+        .removed = true,
+    };
+    try manager.output_resources.append(std.testing.allocator, adapter);
+    resource.setHandler(*OutputResource, OutputResource.handleRequest, OutputResource.handleDestroy, adapter);
+    const resource_id = resource.getId();
+
+    OutputResource.handleRequest(resource, .{ .set_presentation_mode = .{ .mode = .async } }, adapter);
+    try std.testing.expect(client.getObject(resource_id) != null);
+    try std.testing.expectEqual(@as(usize, 1), manager.output_resources.items.len);
+
+    OutputResource.handleRequest(resource, .destroy, adapter);
+    try std.testing.expect(client.getObject(resource_id) == null);
+    try std.testing.expectEqual(@as(usize, 0), manager.output_resources.items.len);
+}
 
 test "window management sequence preserves dirty work across render" {
     var sequence: Sequence = .{};

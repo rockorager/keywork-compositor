@@ -250,7 +250,7 @@
         "wl-seat",
         "xdg-shell"
       ],
-      "status_detail": "Version 5 window, output, seat, pointer binding, operation, focus, cursor ownership, and transaction semantics are implemented. Async presentation is stored as a preference with backend fallback; capture counts remain zero until a capture protocol is implemented."
+      "status_detail": "Version 5 window, output, seat, pointer binding, operation, focus, cursor ownership, transaction, and dynamic output lifecycle semantics are implemented. Async presentation is stored as a preference with backend fallback; capture counts remain zero until a capture protocol is implemented."
     },
     {
       "id": "linux-dmabuf",
