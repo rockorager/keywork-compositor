@@ -71,6 +71,7 @@ test {
     _ = @import("wayland/fixes.zig");
     _ = @import("wayland/linux_dmabuf.zig");
     _ = @import("wayland/xdg_activation.zig");
+    _ = @import("wayland/xdg_output.zig");
     _ = @import("wayland/viewporter.zig");
     _ = @import("wayland/xdg_shell.zig");
     _ = @import("wayland/layer_shell.zig");

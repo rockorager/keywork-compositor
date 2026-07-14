@@ -7,6 +7,7 @@ const wayland = @import("wayland");
 const presentation = @import("presentation.zig");
 const Compositor = @import("wayland/compositor.zig");
 const Subcompositor = @import("wayland/subcompositor.zig");
+const XdgOutput = @import("wayland/xdg_output.zig");
 const XdgShell = @import("wayland/xdg_shell.zig");
 const LayerShell = @import("wayland/layer_shell.zig");
 const Seat = @import("wayland/seat.zig");
@@ -33,6 +34,7 @@ allocator: std.mem.Allocator,
 display: *wl.Server,
 render_output: OutputBackend,
 output: Output,
+xdg_output: XdgOutput,
 compositor: Compositor,
 subcompositor: Subcompositor,
 scene: Scene,
@@ -73,6 +75,7 @@ pub fn create(
         .display = display,
         .render_output = undefined,
         .output = undefined,
+        .xdg_output = undefined,
         .compositor = undefined,
         .subcompositor = undefined,
         .scene = undefined,
@@ -144,6 +147,8 @@ pub fn create(
     );
     errdefer self.output.deinit();
     self.compositor.setOutput(&self.output);
+    try self.xdg_output.init(display, &self.output);
+    errdefer self.xdg_output.deinit();
     try self.presentation_protocol.init(
         allocator,
         display,
@@ -246,6 +251,7 @@ pub fn destroy(self: *Self) void {
     self.fractional_scale.deinit();
     self.viewporter.deinit();
     self.presentation_protocol.deinit();
+    self.xdg_output.deinit();
     self.output.deinit();
     self.render_output.deinit();
     self.seat.deinit();

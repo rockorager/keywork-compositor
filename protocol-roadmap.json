@@ -501,15 +501,16 @@
       "interfaces": [
         {
           "name": "zxdg_output_manager_v1",
-          "current_version": null,
+          "current_version": 3,
           "target_version": 3
         }
       ],
-      "status": "not_started",
+      "status": "done",
       "privileged": false,
       "blocked_by": [
         "wl-output"
-      ]
+      ],
+      "status_detail": "Version 3 reports the single output's logical position, logical size, stable name, and description, with version-correct done events."
     },
     {
       "id": "xdg-foreign-v2",

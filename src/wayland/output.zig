@@ -10,6 +10,9 @@ const Surface = @import("surface.zig");
 
 const wl = wayland.server.wl;
 
+pub const output_name = "HEADLESS-1";
+pub const output_description = "Keywork virtual output";
+
 allocator: std.mem.Allocator,
 global: *wl.Global,
 size: render.Size,
@@ -117,8 +120,8 @@ fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
     self.sendMode(resource);
     if (version >= wl.Output.scale_since_version) resource.sendScale(self.scale);
     if (version >= wl.Output.name_since_version) {
-        resource.sendName("HEADLESS-1");
-        resource.sendDescription("Keywork virtual output");
+        resource.sendName(output_name);
+        resource.sendDescription(output_description);
     }
     if (version >= wl.Output.done_since_version) resource.sendDone();
     var surfaces = self.surfaces.iterator();
