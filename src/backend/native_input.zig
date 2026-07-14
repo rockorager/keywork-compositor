@@ -57,6 +57,94 @@ failed: bool,
 pub const Listener = NestedOutput.Listener;
 
 pub const DeviceId = u64;
+pub const PhysicalDeviceId = u64;
+
+pub const Status = enum { success, unsupported, invalid };
+pub const Toggle = enum(u1) { disabled, enabled };
+pub const TapButtonMap = enum(u1) { lrm, lmr };
+pub const ClickfingerButtonMap = enum(u1) { lrm, lmr };
+pub const DragLock = enum(u2) { disabled, timeout, sticky };
+pub const ThreeFingerDrag = enum(u2) { disabled, three_fingers, four_fingers };
+pub const AccelProfile = enum(u3) { none = 0, flat = 1, adaptive = 2, custom = 4 };
+pub const ClickMethod = enum(u2) { none = 0, button_areas = 1, clickfinger = 2 };
+pub const ScrollMethod = enum(u3) { none = 0, two_finger = 1, edge = 2, on_button_down = 4 };
+pub const AccelType = enum { fallback, motion, scroll };
+
+pub const SendEventsModes = packed struct(u32) {
+    disabled: bool = false,
+    disabled_on_external_mouse: bool = false,
+    _padding: u30 = 0,
+};
+pub const AccelProfiles = packed struct(u32) {
+    flat: bool = false,
+    adaptive: bool = false,
+    custom: bool = false,
+    _padding: u29 = 0,
+};
+pub const ClickMethods = packed struct(u32) {
+    button_areas: bool = false,
+    clickfinger: bool = false,
+    _padding: u30 = 0,
+};
+pub const ScrollMethods = packed struct(u32) {
+    two_finger: bool = false,
+    edge: bool = false,
+    on_button_down: bool = false,
+    _padding: u29 = 0,
+};
+pub const CalibrationMatrix = [6]f32;
+
+pub fn Setting(comptime T: type) type {
+    return struct { default: T, current: T };
+}
+
+/// Null sections are unsupported. This avoids exposing libinput's placeholder
+/// return values as real defaults on devices without the feature.
+pub const DeviceConfig = struct {
+    physical_id: PhysicalDeviceId,
+    send_events: struct { supported: SendEventsModes, default: SendEventsModes, current: SendEventsModes },
+    tap_finger_count: u32,
+    tap: ?Setting(Toggle),
+    tap_button_map: ?Setting(TapButtonMap),
+    drag: ?Setting(Toggle),
+    drag_lock: ?Setting(DragLock),
+    three_finger_drag_count: u32,
+    three_finger_drag: ?Setting(ThreeFingerDrag),
+    calibration_matrix: ?Setting(CalibrationMatrix),
+    accel_profiles: ?struct { supported: AccelProfiles, default: AccelProfile, current: AccelProfile, speed: Setting(f64) },
+    natural_scroll: ?Setting(Toggle),
+    left_handed: ?Setting(Toggle),
+    click_method: ?struct { supported: ClickMethods, default: ClickMethod, current: ClickMethod },
+    clickfinger_button_map: ?Setting(ClickfingerButtonMap),
+    middle_emulation: ?Setting(Toggle),
+    scroll_method: ?struct { supported: ScrollMethods, default: ScrollMethod, current: ScrollMethod },
+    scroll_button: ?Setting(u32),
+    scroll_button_lock: ?Setting(Toggle),
+    dwt: ?Setting(Toggle),
+    dwtp: ?Setting(Toggle),
+    rotation: ?Setting(u32),
+};
+
+/// Owns one transient native acceleration configuration. Call deinit exactly once.
+pub const AccelConfig = struct {
+    native: *anyopaque,
+
+    pub fn deinit(self: *AccelConfig) void {
+        c.libinput_config_accel_destroy(@ptrCast(@alignCast(self.native)));
+        self.* = undefined;
+    }
+
+    pub fn setPoints(self: *AccelConfig, accel_type: AccelType, step: f64, points: []const f64) Status {
+        if (!validAccelPoints(step, points)) return .invalid;
+        return statusFromNative(c.libinput_config_accel_set_points(
+            @ptrCast(@alignCast(self.native)),
+            @enumFromInt(@intFromEnum(accel_type)),
+            step,
+            points.len,
+            points.ptr,
+        ));
+    }
+};
 
 pub const DeviceType = enum {
     keyboard,
@@ -67,6 +155,7 @@ pub const DeviceType = enum {
 
 pub const DeviceInfo = struct {
     id: DeviceId,
+    physical_id: PhysicalDeviceId,
     device_type: DeviceType,
     name: [:0]const u8,
 };
@@ -285,6 +374,131 @@ pub fn setDeviceMap(self: *Self, id: DeviceId, map: ?DeviceMap) void {
     device.map = map;
 }
 
+pub fn createAccelConfig(profile: AccelProfile) ?AccelConfig {
+    const native = c.libinput_config_accel_create(@enumFromInt(@intFromEnum(profile))) orelse return null;
+    return .{ .native = native };
+}
+
+pub fn deviceConfig(self: *Self, id: DeviceId) ?DeviceConfig {
+    const d = (self.findInputDeviceById(id) orelse return null).libinput_device;
+    const tap_count: u32 = @intCast(c.libinput_device_config_tap_get_finger_count(d));
+    const drag_count: u32 = @intCast(c.libinput_device_config_3fg_drag_get_finger_count(d));
+    const click_bits = c.libinput_device_config_click_get_methods(d);
+    const scroll_bits = c.libinput_device_config_scroll_get_methods(d);
+    var matrix_default: CalibrationMatrix = undefined;
+    var matrix_current: CalibrationMatrix = undefined;
+    const has_matrix = c.libinput_device_config_calibration_has_matrix(d) != 0;
+    if (has_matrix) {
+        _ = c.libinput_device_config_calibration_get_default_matrix(d, &matrix_default);
+        _ = c.libinput_device_config_calibration_get_matrix(d, &matrix_current);
+    }
+    return .{
+        .physical_id = physicalId(d),
+        .send_events = .{
+            .supported = @bitCast(c.libinput_device_config_send_events_get_modes(d)),
+            .default = @bitCast(c.libinput_device_config_send_events_get_default_mode(d)),
+            .current = @bitCast(c.libinput_device_config_send_events_get_mode(d)),
+        },
+        .tap_finger_count = tap_count,
+        .tap = if (tap_count > 0) setting(Toggle, c.libinput_device_config_tap_get_default_enabled(d), c.libinput_device_config_tap_get_enabled(d)) else null,
+        .tap_button_map = if (tap_count > 0) setting(TapButtonMap, c.libinput_device_config_tap_get_default_button_map(d), c.libinput_device_config_tap_get_button_map(d)) else null,
+        .drag = if (tap_count > 0) setting(Toggle, c.libinput_device_config_tap_get_default_drag_enabled(d), c.libinput_device_config_tap_get_drag_enabled(d)) else null,
+        .drag_lock = if (tap_count > 0) setting(DragLock, c.libinput_device_config_tap_get_default_drag_lock_enabled(d), c.libinput_device_config_tap_get_drag_lock_enabled(d)) else null,
+        .three_finger_drag_count = drag_count,
+        .three_finger_drag = if (drag_count >= 3) setting(ThreeFingerDrag, c.libinput_device_config_3fg_drag_get_default_enabled(d), c.libinput_device_config_3fg_drag_get_enabled(d)) else null,
+        .calibration_matrix = if (has_matrix) .{ .default = matrix_default, .current = matrix_current } else null,
+        .accel_profiles = if (c.libinput_device_config_accel_is_available(d) != 0) .{
+            .supported = @bitCast(c.libinput_device_config_accel_get_profiles(d)),
+            .default = nativeEnum(AccelProfile, c.libinput_device_config_accel_get_default_profile(d)),
+            .current = nativeEnum(AccelProfile, c.libinput_device_config_accel_get_profile(d)),
+            .speed = .{ .default = c.libinput_device_config_accel_get_default_speed(d), .current = c.libinput_device_config_accel_get_speed(d) },
+        } else null,
+        .natural_scroll = if (c.libinput_device_config_scroll_has_natural_scroll(d) != 0) settingBool(c.libinput_device_config_scroll_get_default_natural_scroll_enabled(d), c.libinput_device_config_scroll_get_natural_scroll_enabled(d)) else null,
+        .left_handed = if (c.libinput_device_config_left_handed_is_available(d) != 0) settingBool(c.libinput_device_config_left_handed_get_default(d), c.libinput_device_config_left_handed_get(d)) else null,
+        .click_method = if (click_bits != 0) .{ .supported = @bitCast(click_bits), .default = nativeEnum(ClickMethod, c.libinput_device_config_click_get_default_method(d)), .current = nativeEnum(ClickMethod, c.libinput_device_config_click_get_method(d)) } else null,
+        .clickfinger_button_map = if (click_bits & c.LIBINPUT_CONFIG_CLICK_METHOD_CLICKFINGER != 0) setting(ClickfingerButtonMap, c.libinput_device_config_click_get_default_clickfinger_button_map(d), c.libinput_device_config_click_get_clickfinger_button_map(d)) else null,
+        .middle_emulation = if (c.libinput_device_config_middle_emulation_is_available(d) != 0) setting(Toggle, c.libinput_device_config_middle_emulation_get_default_enabled(d), c.libinput_device_config_middle_emulation_get_enabled(d)) else null,
+        .scroll_method = if (scroll_bits != 0) .{ .supported = @bitCast(scroll_bits), .default = nativeEnum(ScrollMethod, c.libinput_device_config_scroll_get_default_method(d)), .current = nativeEnum(ScrollMethod, c.libinput_device_config_scroll_get_method(d)) } else null,
+        .scroll_button = if (scroll_bits & c.LIBINPUT_CONFIG_SCROLL_ON_BUTTON_DOWN != 0) .{ .default = c.libinput_device_config_scroll_get_default_button(d), .current = c.libinput_device_config_scroll_get_button(d) } else null,
+        .scroll_button_lock = if (scroll_bits & c.LIBINPUT_CONFIG_SCROLL_ON_BUTTON_DOWN != 0) setting(Toggle, c.libinput_device_config_scroll_get_default_button_lock(d), c.libinput_device_config_scroll_get_button_lock(d)) else null,
+        .dwt = if (c.libinput_device_config_dwt_is_available(d) != 0) setting(Toggle, c.libinput_device_config_dwt_get_default_enabled(d), c.libinput_device_config_dwt_get_enabled(d)) else null,
+        .dwtp = if (c.libinput_device_config_dwtp_is_available(d) != 0) setting(Toggle, c.libinput_device_config_dwtp_get_default_enabled(d), c.libinput_device_config_dwtp_get_enabled(d)) else null,
+        .rotation = if (c.libinput_device_config_rotation_is_available(d) != 0) .{ .default = c.libinput_device_config_rotation_get_default_angle(d), .current = c.libinput_device_config_rotation_get_angle(d) } else null,
+    };
+}
+
+pub fn setSendEvents(self: *Self, id: DeviceId, value: SendEventsModes) ?Status {
+    return self.call(id, c.libinput_device_config_send_events_set_mode, @bitCast(value));
+}
+pub fn setTap(self: *Self, id: DeviceId, value: Toggle) ?Status {
+    return self.call(id, c.libinput_device_config_tap_set_enabled, @enumFromInt(@intFromEnum(value)));
+}
+pub fn setTapButtonMap(self: *Self, id: DeviceId, value: TapButtonMap) ?Status {
+    return self.call(id, c.libinput_device_config_tap_set_button_map, @enumFromInt(@intFromEnum(value)));
+}
+pub fn setDrag(self: *Self, id: DeviceId, value: Toggle) ?Status {
+    return self.call(id, c.libinput_device_config_tap_set_drag_enabled, @enumFromInt(@intFromEnum(value)));
+}
+pub fn setDragLock(self: *Self, id: DeviceId, value: DragLock) ?Status {
+    return self.call(id, c.libinput_device_config_tap_set_drag_lock_enabled, @enumFromInt(@intFromEnum(value)));
+}
+pub fn setThreeFingerDrag(self: *Self, id: DeviceId, value: ThreeFingerDrag) ?Status {
+    return self.call(id, c.libinput_device_config_3fg_drag_set_enabled, @enumFromInt(@intFromEnum(value)));
+}
+pub fn setCalibrationMatrix(self: *Self, id: DeviceId, value: CalibrationMatrix) ?Status {
+    if (!validMatrix(value)) return .invalid;
+    return self.call(id, c.libinput_device_config_calibration_set_matrix, &value);
+}
+pub fn setAccelProfile(self: *Self, id: DeviceId, value: AccelProfile) ?Status {
+    return self.call(id, c.libinput_device_config_accel_set_profile, @enumFromInt(@intFromEnum(value)));
+}
+pub fn setAccelSpeed(self: *Self, id: DeviceId, value: f64) ?Status {
+    if (!std.math.isFinite(value) or value < -1 or value > 1) return .invalid;
+    return self.call(id, c.libinput_device_config_accel_set_speed, value);
+}
+pub fn applyAccelConfig(self: *Self, id: DeviceId, config: *const AccelConfig) ?Status {
+    return self.call(id, c.libinput_device_config_accel_apply, @as(*c.struct_libinput_config_accel, @ptrCast(@alignCast(config.native))));
+}
+pub fn setNaturalScroll(self: *Self, id: DeviceId, value: Toggle) ?Status {
+    return self.call(id, c.libinput_device_config_scroll_set_natural_scroll_enabled, @intFromEnum(value));
+}
+pub fn setLeftHanded(self: *Self, id: DeviceId, value: Toggle) ?Status {
+    return self.call(id, c.libinput_device_config_left_handed_set, @intFromEnum(value));
+}
+pub fn setClickMethod(self: *Self, id: DeviceId, value: ClickMethod) ?Status {
+    return self.call(id, c.libinput_device_config_click_set_method, @enumFromInt(@intFromEnum(value)));
+}
+pub fn setClickfingerButtonMap(self: *Self, id: DeviceId, value: ClickfingerButtonMap) ?Status {
+    return self.call(id, c.libinput_device_config_click_set_clickfinger_button_map, @enumFromInt(@intFromEnum(value)));
+}
+pub fn setMiddleEmulation(self: *Self, id: DeviceId, value: Toggle) ?Status {
+    return self.call(id, c.libinput_device_config_middle_emulation_set_enabled, @enumFromInt(@intFromEnum(value)));
+}
+pub fn setScrollMethod(self: *Self, id: DeviceId, value: ScrollMethod) ?Status {
+    return self.call(id, c.libinput_device_config_scroll_set_method, @enumFromInt(@intFromEnum(value)));
+}
+pub fn setScrollButton(self: *Self, id: DeviceId, value: u32) ?Status {
+    return self.call(id, c.libinput_device_config_scroll_set_button, value);
+}
+pub fn setScrollButtonLock(self: *Self, id: DeviceId, value: Toggle) ?Status {
+    return self.call(id, c.libinput_device_config_scroll_set_button_lock, @enumFromInt(@intFromEnum(value)));
+}
+pub fn setDwt(self: *Self, id: DeviceId, value: Toggle) ?Status {
+    return self.call(id, c.libinput_device_config_dwt_set_enabled, @enumFromInt(@intFromEnum(value)));
+}
+pub fn setDwtp(self: *Self, id: DeviceId, value: Toggle) ?Status {
+    return self.call(id, c.libinput_device_config_dwtp_set_enabled, @enumFromInt(@intFromEnum(value)));
+}
+pub fn setRotation(self: *Self, id: DeviceId, value: u32) ?Status {
+    if (value >= 360) return .invalid;
+    return self.call(id, c.libinput_device_config_rotation_set_angle, value);
+}
+
+fn call(self: *Self, id: DeviceId, function: anytype, argument: anytype) ?Status {
+    const device = self.findInputDeviceById(id) orelse return null;
+    return statusFromNative(function(device.libinput_device, argument));
+}
+
 pub fn retarget(self: *Self, size: render.Size, listener: Listener) void {
     std.debug.assert(size.width > 0 and size.height > 0);
     self.size = size;
@@ -473,6 +687,7 @@ fn addInputDevice(
     try self.input_devices.append(self.allocator, .{
         .info = .{
             .id = id,
+            .physical_id = physicalId(libinput_device),
             .device_type = device_type,
             .name = name_copy,
         },
@@ -880,6 +1095,45 @@ fn clampCoordinate(value: f64, dimension: u32) f64 {
     return std.math.clamp(value, 0, @as(f64, @floatFromInt(dimension - 1)));
 }
 
+fn physicalId(device: *c.struct_libinput_device) PhysicalDeviceId {
+    return @intFromPtr(device);
+}
+
+fn statusFromNative(status: c.enum_libinput_config_status) Status {
+    return switch (status) {
+        c.LIBINPUT_CONFIG_STATUS_SUCCESS => .success,
+        c.LIBINPUT_CONFIG_STATUS_UNSUPPORTED => .unsupported,
+        c.LIBINPUT_CONFIG_STATUS_INVALID => .invalid,
+        else => unreachable,
+    };
+}
+
+fn nativeEnum(comptime T: type, value: anytype) T {
+    return @enumFromInt(@intFromEnum(value));
+}
+
+fn setting(comptime T: type, default: anytype, current: @TypeOf(default)) Setting(T) {
+    return .{ .default = nativeEnum(T, default), .current = nativeEnum(T, current) };
+}
+
+fn settingBool(default: c_int, current: c_int) Setting(Toggle) {
+    return .{
+        .default = if (default == 0) .disabled else .enabled,
+        .current = if (current == 0) .disabled else .enabled,
+    };
+}
+
+fn validMatrix(matrix: CalibrationMatrix) bool {
+    for (matrix) |value| if (!std.math.isFinite(value)) return false;
+    return true;
+}
+
+fn validAccelPoints(step: f64, points: []const f64) bool {
+    if (!std.math.isFinite(step) or step <= 0 or points.len == 0) return false;
+    for (points) |point| if (!std.math.isFinite(point)) return false;
+    return true;
+}
+
 fn virtualTerminalForKey(key: u32) ?u32 {
     return switch (key) {
         c.KEY_F1...c.KEY_F10 => key - c.KEY_F1 + 1,
@@ -901,4 +1155,25 @@ test "native pointer coordinates stay inside the output" {
     try std.testing.expectEqual(@as(f64, 0), clampCoordinate(-5, 100));
     try std.testing.expectEqual(@as(f64, 99), clampCoordinate(120, 100));
     try std.testing.expectEqual(@as(f64, 42.5), clampCoordinate(42.5, 100));
+}
+
+test "libinput configuration status mapping" {
+    try std.testing.expectEqual(Status.success, statusFromNative(c.LIBINPUT_CONFIG_STATUS_SUCCESS));
+    try std.testing.expectEqual(Status.unsupported, statusFromNative(c.LIBINPUT_CONFIG_STATUS_UNSUPPORTED));
+    try std.testing.expectEqual(Status.invalid, statusFromNative(c.LIBINPUT_CONFIG_STATUS_INVALID));
+}
+
+test "typed configuration enums match libinput semantics" {
+    try std.testing.expectEqual(@as(u3, c.LIBINPUT_CONFIG_ACCEL_PROFILE_CUSTOM), @intFromEnum(AccelProfile.custom));
+    try std.testing.expectEqual(@as(u2, c.LIBINPUT_CONFIG_DRAG_LOCK_ENABLED_STICKY), @intFromEnum(DragLock.sticky));
+    try std.testing.expectEqual(@as(u3, c.LIBINPUT_CONFIG_SCROLL_ON_BUTTON_DOWN), @intFromEnum(ScrollMethod.on_button_down));
+}
+
+test "configuration value validation" {
+    try std.testing.expect(validMatrix(.{ 1, 0, 0, 0, 1, 0 }));
+    try std.testing.expect(!validMatrix(.{ 1, 0, std.math.nan(f32), 0, 1, 0 }));
+    try std.testing.expect(validAccelPoints(0.5, &.{ 0, 1, 2 }));
+    try std.testing.expect(!validAccelPoints(0, &.{1}));
+    try std.testing.expect(!validAccelPoints(1, &.{}));
+    try std.testing.expect(!validAccelPoints(1, &.{std.math.inf(f64)}));
 }

@@ -33,6 +33,7 @@ const ManagerResource = struct {
 pub const Device = struct {
     manager: *Self,
     id: NativeInput.DeviceId,
+    physical_id: NativeInput.PhysicalDeviceId,
     device_type: NativeInput.DeviceType,
     name: [:0]u8,
     connected: bool = true,
@@ -434,6 +435,7 @@ fn deviceAdded(context: *anyopaque, info: NativeInput.DeviceInfo) void {
     device.* = .{
         .manager = self,
         .id = info.id,
+        .physical_id = info.physical_id,
         .device_type = info.device_type,
         .name = name,
     };
