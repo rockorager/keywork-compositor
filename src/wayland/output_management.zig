@@ -798,7 +798,7 @@ test "connected head storage survives disable and reconnect lifetimes" {
 
     var context: u8 = 0;
     var output: DrmOutput = undefined;
-    output.init(std.testing.io, .{
+    output.init(std.testing.allocator, std.testing.io, .{
         .context = &context,
         .fd = testDeviceFd,
         .active = testDeviceActive,

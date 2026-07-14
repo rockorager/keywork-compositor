@@ -18,12 +18,15 @@ const log = std.log.scoped(.drm);
 const buffer_count = 2;
 const description_capacity = 512;
 
+allocator: std.mem.Allocator,
 io: std.Io,
 device_access: DeviceAccess,
 listener: ?Listener,
 old_crtc: ?*c.drmModeCrtc,
 buffers: [buffer_count]Buffer,
 mode: c.drmModeModeInfo,
+mode_index: usize,
+modes: []Mode,
 size: render.Size,
 physical_size: render.Size,
 scale: render.Scale,
@@ -58,13 +61,29 @@ const Buffer = struct {
 };
 
 pub const Selection = struct {
-    mode: c.drmModeModeInfo,
-    size: render.Size,
+    modes: []Mode,
+    mode_index: usize,
     physical_size: render.Size,
     connector_id: u32,
     connector_type: u32,
     connector_type_id: u32,
     crtc_id: u32,
+};
+
+pub const Mode = struct {
+    value: c.drmModeModeInfo,
+    preferred: bool,
+
+    pub fn size(self: Mode) render.Size {
+        return .{ .width = self.value.hdisplay, .height = self.value.vdisplay };
+    }
+
+    pub fn refreshMillihertz(self: Mode) i32 {
+        return @intCast(@min(
+            @as(u64, self.value.vrefresh) * 1000,
+            std.math.maxInt(i32),
+        ));
+    }
 };
 
 pub const DeviceAccess = struct {
@@ -84,16 +103,20 @@ const event_context: c.drmEventContext = .{
 
 pub fn init(
     self: *Self,
+    allocator: std.mem.Allocator,
     io: std.Io,
     device_access: DeviceAccess,
 ) void {
     self.* = .{
+        .allocator = allocator,
         .io = io,
         .device_access = device_access,
         .listener = null,
         .old_crtc = null,
         .buffers = .{ .{}, .{} },
         .mode = std.mem.zeroes(c.drmModeModeInfo),
+        .mode_index = 0,
+        .modes = &.{},
         .size = .{ .width = 0, .height = 0 },
         .physical_size = .{ .width = 0, .height = 0 },
         .scale = .{},
@@ -123,6 +146,7 @@ pub fn deinit(self: *Self) void {
     std.debug.assert(self.listener == null);
     std.debug.assert(self.old_crtc == null);
     self.clearIdentity();
+    self.allocator.free(self.modes);
     self.* = undefined;
 }
 
@@ -161,6 +185,15 @@ pub fn refreshMillihertz(self: *const Self) i32 {
         @as(u64, self.mode.vrefresh) * 1000,
         std.math.maxInt(i32),
     ));
+}
+
+pub fn availableModes(self: *const Self) []const Mode {
+    return self.modes;
+}
+
+pub fn currentModeIndex(self: *const Self) usize {
+    std.debug.assert(self.mode_index < self.modes.len);
+    return self.mode_index;
 }
 
 pub fn logicalSize(self: *const Self) render.Size {
@@ -233,13 +266,21 @@ pub fn present(self: *Self) !?presentation.Info {
 }
 
 pub fn activate(self: *Self, fd: std.posix.fd_t, selection: Selection, device_path: []const u8) !void {
-    if (self.size.width != 0 and (!std.meta.eql(self.size, selection.size) or
+    std.debug.assert(selection.modes.len > 0);
+    std.debug.assert(selection.mode_index < selection.modes.len);
+    const selected_mode = selection.modes[selection.mode_index];
+    const selected_size = selected_mode.size();
+    if (self.size.width != 0 and (!std.meta.eql(self.size, selected_size) or
         self.connector_id != selection.connector_id))
     {
         return error.OutputChanged;
     }
-    self.mode = selection.mode;
-    self.size = selection.size;
+    const modes = try self.allocator.dupe(Mode, selection.modes);
+    self.allocator.free(self.modes);
+    self.modes = modes;
+    self.mode_index = selection.mode_index;
+    self.mode = selected_mode.value;
+    self.size = selected_size;
     self.physical_size = selection.physical_size;
     self.connector_id = selection.connector_id;
     self.crtc_id = selection.crtc_id;
@@ -401,6 +442,35 @@ pub fn setEnabled(self: *Self, fd: std.posix.fd_t, enabled: bool) !void {
     for (&self.buffers) |*buffer| destroyBuffer(fd, buffer);
 }
 
+pub fn setMode(self: *Self, fd: std.posix.fd_t, mode_index: usize) !void {
+    if (mode_index >= self.modes.len) return error.InvalidMode;
+    if (mode_index == self.mode_index) return;
+    if (self.pending != null) return error.OutputBusy;
+    const mode = self.modes[mode_index];
+    const size = mode.size();
+
+    if (self.enabled) {
+        var buffers: [buffer_count]Buffer = .{ .{}, .{} };
+        errdefer for (&buffers) |*buffer| destroyBuffer(fd, buffer);
+        for (&buffers) |*buffer| try createBuffer(fd, size, buffer);
+        self.acquired = null;
+        if (c.drmModeSetCrtc(fd, self.crtc_id, 0, 0, 0, null, 0, null) != 0) {
+            return error.DisableFailed;
+        }
+        self.notifyDeactivated();
+        const old_buffers = self.buffers;
+        self.buffers = buffers;
+        for (&old_buffers) |*buffer| destroyBuffer(fd, buffer);
+        self.displayed = null;
+        self.mode_set = false;
+    }
+
+    self.mode_index = mode_index;
+    self.mode = mode.value;
+    self.size = size;
+    self.refresh_nanoseconds = refreshNanoseconds(self.mode);
+}
+
 fn availableBuffer(self: *const Self) ?usize {
     for (0..buffer_count) |index| {
         if (self.displayed == index or self.pending == index) continue;
@@ -470,7 +540,10 @@ pub fn selectOutputs(
     defer c.drmModeFreeResources(resources);
     if (resources.*.count_crtcs <= 0) return error.NoCrtc;
     var selections: std.ArrayList(Selection) = .empty;
-    errdefer selections.deinit(allocator);
+    errdefer {
+        for (selections.items) |selection| allocator.free(selection.modes);
+        selections.deinit(allocator);
+    }
     var claimed: u32 = 0;
 
     // Reserve working routes before assigning CRTCs to newly connected heads.
@@ -524,11 +597,19 @@ pub fn selectOutputs(
         claimed |= @as(u32, 1) << @intCast(crtc_index);
         const crtc_id = resources.*.crtcs[crtc_index];
         const mode_count: usize = @intCast(connector.*.count_modes);
-        const modes = connector.*.modes[0..mode_count];
-        const mode = modes[preferredModeIndex(modes)];
-        try selections.append(allocator, .{
-            .mode = mode,
-            .size = .{ .width = mode.hdisplay, .height = mode.vdisplay },
+        const connector_modes = connector.*.modes[0..mode_count];
+        const modes = try allocator.alloc(Mode, mode_count);
+        for (connector_modes, modes) |mode, *stored| stored.* = .{
+            .value = mode,
+            .preferred = mode.type & c.DRM_MODE_TYPE_PREFERRED != 0,
+        };
+        const mode_index = if (existing_output) |output|
+            findModeIndex(modes, output.mode) orelse preferredModeIndex(connector_modes)
+        else
+            preferredModeIndex(connector_modes);
+        selections.append(allocator, .{
+            .modes = modes,
+            .mode_index = mode_index,
             .physical_size = .{
                 .width = @max(connector.*.mmWidth, 1),
                 .height = @max(connector.*.mmHeight, 1),
@@ -537,9 +618,17 @@ pub fn selectOutputs(
             .connector_type = connector.*.connector_type,
             .connector_type_id = connector.*.connector_type_id,
             .crtc_id = crtc_id,
-        });
+        }) catch |err| {
+            allocator.free(modes);
+            return err;
+        };
     }
     return selections.toOwnedSlice(allocator);
+}
+
+pub fn deinitSelections(allocator: std.mem.Allocator, selections: []Selection) void {
+    for (selections) |selection| allocator.free(selection.modes);
+    allocator.free(selections);
 }
 
 fn findOutput(outputs: []const *Self, connector_id: u32) ?*Self {
@@ -582,6 +671,13 @@ fn preferredModeIndex(modes: []const c.drmModeModeInfo) usize {
         if (mode.type & c.DRM_MODE_TYPE_PREFERRED != 0) return index;
     }
     return 0;
+}
+
+fn findModeIndex(modes: []const Mode, target: c.drmModeModeInfo) ?usize {
+    for (modes, 0..) |mode, index| {
+        if (std.meta.eql(mode.value, target)) return index;
+    }
+    return null;
 }
 
 fn refreshNanoseconds(mode: c.drmModeModeInfo) u32 {
@@ -696,7 +792,7 @@ test "DRM mode refresh converts to presentation period" {
 test "DRM scale preserves mode pixels and derives logical size" {
     var context: u8 = 0;
     var output: Self = undefined;
-    output.init(std.testing.io, .{
+    output.init(std.testing.allocator, std.testing.io, .{
         .context = &context,
         .fd = testDeviceFd,
         .active = testDeviceActive,

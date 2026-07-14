@@ -104,6 +104,15 @@ pub fn setOutputEnabled(self: *Self, output: *DrmOutput, enabled: bool) !void {
     try output.setEnabled(self.device.?.fd, enabled);
 }
 
+pub fn setOutputMode(self: *Self, output: *DrmOutput, mode_index: usize) !void {
+    if (self.failed or self.device == null or !self.session.isActive()) {
+        return error.SessionInactive;
+    }
+    if (self.findOutput(output.connector_id) != output) return error.UnknownOutput;
+    try self.waitOutputIdle(output);
+    try output.setMode(self.device.?.fd, mode_index);
+}
+
 fn waitOutputIdle(self: *Self, output: *DrmOutput) !void {
     const fd = self.device.?.fd;
     var attempts: u8 = 0;
@@ -136,7 +145,7 @@ pub fn clearListener(self: *Self) void {
 fn newOutput(self: *Self, fd: std.posix.fd_t, selection: DrmOutput.Selection) !*DrmOutput {
     const output = try self.allocator.create(DrmOutput);
     errdefer self.allocator.destroy(output);
-    output.init(self.io, .{ .context = self, .fd = accessFd, .active = accessActive, .fail = accessFail });
+    output.init(self.allocator, self.io, .{ .context = self, .fd = accessFd, .active = accessActive, .fail = accessFail });
     errdefer output.deinit();
     try output.activate(fd, selection, self.device_path.?);
     return output;
@@ -159,7 +168,7 @@ fn activate(self: *Self) !void {
         device.fd,
         self.active_outputs.items,
     );
-    defer self.allocator.free(selections);
+    defer DrmOutput.deinitSelections(self.allocator, selections);
     log.info("found {d} usable connected DRM output(s)", .{selections.len});
     if (!self.initialized and selections.len == 0) return error.NoConnectedOutput;
 
@@ -223,14 +232,16 @@ fn reconcile(self: *Self) !void {
         device.fd,
         self.active_outputs.items,
     );
-    defer self.allocator.free(selections);
+    defer DrmOutput.deinitSelections(self.allocator, selections);
     var topology_changed = selections.len != self.active_outputs.items.len;
     for (selections) |selection| {
         const output = self.findOutput(selection.connector_id) orelse {
             topology_changed = true;
             continue;
         };
-        if (!std.meta.eql(output.size, selection.size) or output.crtc_id != selection.crtc_id) {
+        if (!std.meta.eql(output.size, selection.modes[selection.mode_index].size()) or
+            output.crtc_id != selection.crtc_id)
+        {
             return error.OutputChanged;
         }
     }
