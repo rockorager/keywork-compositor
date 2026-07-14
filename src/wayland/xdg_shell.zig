@@ -699,6 +699,39 @@ pub fn popupKeyboardFocus(self: *Self) ?Surface.Id {
     return xdg_surface.surface_id;
 }
 
+pub fn popupRootLayerSurface(
+    self: *Self,
+    surface_id: Surface.Id,
+) ?Scene.LayerSurfaceId {
+    var popup: ?*PopupState = null;
+    var iterator = self.popups.iterator();
+    while (iterator.next()) |entry| {
+        const xdg_surface = self.xdg_surfaces.get(entry.value.xdg_surface_id) orelse continue;
+        if (std.meta.eql(xdg_surface.surface_id, surface_id)) {
+            popup = entry.value;
+            break;
+        }
+    }
+
+    var remaining = self.popups.len();
+    while (popup) |current| {
+        if (remaining == 0) return null;
+        remaining -= 1;
+        const parent_id = switch (current.parent) {
+            .layer_surface => |id| return id,
+            .unattached => return null,
+            .xdg_surface => |id| id,
+        };
+        const parent = self.xdg_surfaces.get(parent_id) orelse return null;
+        const parent_popup_id = switch (parent.role orelse return null) {
+            .toplevel => return null,
+            .popup => |id| id,
+        };
+        popup = self.popups.get(parent_popup_id);
+    }
+    return null;
+}
+
 pub fn dismissPopupGrab(self: *Self) void {
     var current = self.topGrabbedPopup();
     while (current) |id| {

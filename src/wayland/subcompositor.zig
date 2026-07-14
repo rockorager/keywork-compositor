@@ -169,6 +169,15 @@ pub fn reverseStackIterator(self: *Self, surface_id: Surface.Id) ReverseStackIte
     };
 }
 
+pub fn rootSurface(self: *Self, surface_id: Surface.Id) Surface.Id {
+    var root = surface_id;
+    while (self.by_surface.get(root)) |id| {
+        const state = self.subsurfaces.get(id) orelse break;
+        root = state.parent_id;
+    }
+    return root;
+}
+
 fn requestRepaint(self: *Self) void {
     if (self.repaint_listener) |listener| listener.request(listener.context);
 }

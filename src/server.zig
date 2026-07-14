@@ -8,6 +8,7 @@ const presentation = @import("presentation.zig");
 const Compositor = @import("wayland/compositor.zig");
 const Subcompositor = @import("wayland/subcompositor.zig");
 const XdgShell = @import("wayland/xdg_shell.zig");
+const LayerShell = @import("wayland/layer_shell.zig");
 const Seat = @import("wayland/seat.zig");
 const DataDevice = @import("wayland/data_device.zig");
 const PrimarySelection = @import("wayland/primary_selection.zig");
@@ -36,6 +37,7 @@ compositor: Compositor,
 subcompositor: Subcompositor,
 scene: Scene,
 xdg_shell: XdgShell,
+layer_shell: LayerShell,
 seat: Seat,
 data_device: DataDevice,
 primary_selection: PrimarySelection,
@@ -75,6 +77,7 @@ pub fn create(
         .subcompositor = undefined,
         .scene = undefined,
         .xdg_shell = undefined,
+        .layer_shell = undefined,
         .seat = undefined,
         .data_device = undefined,
         .primary_selection = undefined,
@@ -174,6 +177,16 @@ pub fn create(
         self.render_output.size(),
     );
     errdefer self.xdg_shell.deinit();
+    try self.layer_shell.init(
+        allocator,
+        display,
+        &self.output,
+        &self.scene,
+        &self.seat,
+        &self.xdg_shell,
+        self.compositor.surfaceStore(),
+    );
+    errdefer self.layer_shell.deinit();
     try self.xdg_activation.init(allocator, io, display, &self.seat);
     errdefer self.xdg_activation.deinit();
     try self.data_device.init(allocator, display, &self.seat);
@@ -218,6 +231,7 @@ pub fn destroy(self: *Self) void {
     self.primary_selection.deinit();
     self.data_device.deinit();
     self.xdg_activation.deinit();
+    self.layer_shell.deinit();
     self.xdg_shell.deinit();
     self.scene.deinit();
     self.subcompositor.deinit();
@@ -377,6 +391,14 @@ fn pointerButton(
     state: wl.Pointer.ButtonState,
 ) void {
     const self: *Self = @ptrCast(@alignCast(context));
+    if (state == .pressed) {
+        const focused = if (self.seat.pointerFocusedSurface()) |surface_id|
+            self.subcompositor.rootSurface(surface_id)
+        else
+            null;
+        self.layer_shell.pointerPressed(focused);
+        requestRepaint(self);
+    }
     if (state == .pressed and self.xdg_shell.hasPopupGrab() and
         self.seat.pointerFocusedSurface() == null)
     {
@@ -738,7 +760,9 @@ fn renderFrame(self: *Self) renderer_types.Renderer.Error!void {
     self.submitLayerPopups();
     if (cursor) |info| self.submitSurfaceTree(info.surface_id);
     if (presented) |info| outputPresented(self, info);
-    const keyboard_focus = self.xdg_shell.popupKeyboardFocus() orelse
+    const keyboard_focus = self.layer_shell.keyboardFocus(
+        self.xdg_shell.popupKeyboardFocus(),
+    ) orelse
         self.scene.focusedSurface() orelse if (!self.window_manager.hasActiveManager())
         self.scene.topWindowSurface()
     else

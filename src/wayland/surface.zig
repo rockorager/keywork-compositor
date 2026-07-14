@@ -191,6 +191,12 @@ pub fn resourceFor(store: *Store, id: Id) ?*wl.Surface {
     return surface_state.resource;
 }
 
+pub fn currentLogicalSize(store: *Store, id: Id) ?render_types.Size {
+    const surface_state = store.get(id) orelse return null;
+    const buffer = surface_state.current_buffer orelse return null;
+    return buffer.logical_size;
+}
+
 pub const RoleError = error{
     AlreadyAssigned,
     AlreadyReserved,
@@ -239,6 +245,7 @@ pub fn setViewportDestination(self: *Self, destination: ?render_types.Size) void
 pub const Role = enum {
     xdg_toplevel,
     xdg_popup,
+    layer_surface,
     subsurface,
     cursor,
     river_decoration,
