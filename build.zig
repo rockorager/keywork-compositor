@@ -15,6 +15,7 @@ pub fn build(b: *std.Build) void {
     scanner.addSystemProtocol("unstable/primary-selection/primary-selection-unstable-v1.xml");
     scanner.addSystemProtocol("stable/viewporter/viewporter.xml");
     scanner.addSystemProtocol("staging/fractional-scale/fractional-scale-v1.xml");
+    scanner.addSystemProtocol("stable/presentation-time/presentation-time.xml");
     scanner.addCustomProtocol(river.path("protocol/river-window-management-v1.xml"));
     scanner.generate("wl_compositor", 6);
     scanner.generate("wl_subcompositor", 1);
@@ -27,6 +28,7 @@ pub fn build(b: *std.Build) void {
     scanner.generate("zwp_primary_selection_device_manager_v1", 1);
     scanner.generate("wp_viewporter", 1);
     scanner.generate("wp_fractional_scale_manager_v1", 1);
+    scanner.generate("wp_presentation", 2);
     scanner.generate("river_window_manager_v1", 5);
 
     const wayland = b.createModule(.{

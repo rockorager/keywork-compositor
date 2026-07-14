@@ -6,10 +6,12 @@ const std = @import("std");
 const wayland = @import("wayland");
 const HeadlessOutput = @import("headless.zig");
 const NestedOutput = @import("nested_wayland.zig");
+const presentation = @import("../presentation.zig");
 const render = @import("../render/types.zig");
 
 const wl = wayland.server.wl;
 
+io: std.Io,
 backend: Backend,
 
 const Backend = union(enum) {
@@ -33,6 +35,7 @@ pub fn init(
     kind: Kind,
     listener: Listener,
 ) !void {
+    self.io = io;
     switch (kind) {
         .headless => self.backend = .{ .headless = try HeadlessOutput.init(allocator, output_size) },
         .nested => {
@@ -78,6 +81,28 @@ pub fn clientScale(self: *const Self) u32 {
     };
 }
 
+pub fn ready(self: *const Self) bool {
+    return switch (self.backend) {
+        .headless => true,
+        .nested => |*output| output.ready(),
+    };
+}
+
+pub fn repaintDelayMilliseconds(self: *const Self) i32 {
+    return switch (self.backend) {
+        .headless => 16,
+        // A zero-delay libwayland timer is disarmed rather than immediate.
+        .nested => 1,
+    };
+}
+
+pub fn presentationClockId(self: *const Self) u32 {
+    return switch (self.backend) {
+        .headless => presentation.monotonic_clock_id,
+        .nested => |*output| output.presentationClockId(),
+    };
+}
+
 pub fn acquire(self: *Self) ?render.PixelBuffer {
     return switch (self.backend) {
         .headless => |*output| output.target(),
@@ -92,9 +117,12 @@ pub fn cancel(self: *Self) void {
     }
 }
 
-pub fn present(self: *Self) !void {
-    switch (self.backend) {
-        .headless => {},
-        .nested => |*output| try output.present(),
-    }
+pub fn present(self: *Self) !?presentation.Info {
+    return switch (self.backend) {
+        .headless => presentation.Info.now(self.io),
+        .nested => |*output| blk: {
+            try output.present();
+            break :blk null;
+        },
+    };
 }

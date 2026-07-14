@@ -4,6 +4,7 @@ const Self = @This();
 
 const std = @import("std");
 const wayland = @import("wayland");
+const presentation = @import("../presentation.zig");
 const render = @import("../render/types.zig");
 const Surface = @import("surface.zig");
 
@@ -14,6 +15,7 @@ global: *wl.Global,
 size: render.Size,
 physical_size: render.Size,
 scale: i32,
+refresh_millihertz: i32,
 resources: std.ArrayList(*wl.Output),
 surfaces: *Surface.Store,
 
@@ -46,6 +48,7 @@ pub fn init(
         .size = size,
         .physical_size = physical_size,
         .scale = @intCast(scale),
+        .refresh_millihertz = 60_000,
         .resources = .empty,
         .surfaces = surfaces,
     };
@@ -68,6 +71,23 @@ pub fn logicalSize(self: *const Self) render.Size {
 
 pub fn ownsResource(self: *Self, resource: *wl.Output) bool {
     return resource.getUserData() == @as(?*anyopaque, @ptrCast(self));
+}
+
+pub fn boundResources(self: *const Self) []const *wl.Output {
+    return self.resources.items;
+}
+
+pub fn setRefresh(self: *Self, info: presentation.Info) void {
+    const refresh_millihertz: i32 = @intCast(@min(
+        info.refreshMillihertz(),
+        std.math.maxInt(i32),
+    ));
+    if (self.refresh_millihertz == refresh_millihertz) return;
+    self.refresh_millihertz = refresh_millihertz;
+    for (self.resources.items) |resource| {
+        self.sendMode(resource);
+        if (resource.getVersion() >= wl.Output.done_since_version) resource.sendDone();
+    }
 }
 
 pub fn configureSurface(self: *Self, surface: *wl.Surface) void {
@@ -94,12 +114,7 @@ fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
     };
     resource.setHandler(*Self, handleRequest, handleDestroy, self);
     resource.sendGeometry(0, 0, 0, 0, .unknown, "keywork", "headless", .normal);
-    resource.sendMode(
-        .{ .current = true, .preferred = true },
-        @intCast(self.physical_size.width),
-        @intCast(self.physical_size.height),
-        60_000,
-    );
+    self.sendMode(resource);
     if (version >= wl.Output.scale_since_version) resource.sendScale(self.scale);
     if (version >= wl.Output.name_since_version) {
         resource.sendName("HEADLESS-1");
@@ -112,6 +127,15 @@ fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
             entry.value.resource.sendEnter(resource);
         }
     }
+}
+
+fn sendMode(self: *const Self, resource: *wl.Output) void {
+    resource.sendMode(
+        .{ .current = true, .preferred = true },
+        @intCast(self.physical_size.width),
+        @intCast(self.physical_size.height),
+        self.refresh_millihertz,
+    );
 }
 
 fn handleRequest(resource: *wl.Output, request: wl.Output.Request, _: *Self) void {

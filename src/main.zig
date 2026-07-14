@@ -54,6 +54,7 @@ test {
     _ = @import("backend/headless.zig");
     _ = @import("backend/nested_wayland.zig");
     _ = @import("backend/output.zig");
+    _ = @import("presentation.zig");
     _ = @import("region.zig");
     _ = @import("scene.zig");
     _ = @import("slot_map.zig");
@@ -65,6 +66,7 @@ test {
     _ = @import("wayland/output.zig");
     _ = @import("wayland/data_device.zig");
     _ = @import("wayland/primary_selection.zig");
+    _ = @import("wayland/presentation.zig");
     _ = @import("wayland/fractional_scale.zig");
     _ = @import("wayland/viewporter.zig");
     _ = @import("wayland/xdg_shell.zig");

@@ -4,6 +4,7 @@ const Self = @This();
 
 const std = @import("std");
 const wayland = @import("wayland");
+const presentation = @import("../presentation.zig");
 const render = @import("../render/types.zig");
 
 const client = wayland.client;
@@ -16,6 +17,7 @@ const buffer_count = 3;
 const scale_roundtrip_limit = 8;
 const max_render_scale_120 = 480;
 
+io: std.Io,
 display: ?*wl.Display,
 registry: ?*wl.Registry,
 compositor: ?*wl.Compositor,
@@ -23,6 +25,8 @@ shm: ?*wl.Shm,
 wm_base: ?*xdg.WmBase,
 viewporter: ?*wp.Viewporter,
 fractional_scale_manager: ?*wp.FractionalScaleManagerV1,
+presentation_manager: ?*wp.Presentation,
+presentation_clock_id: ?u32,
 seat: ?*wl.Seat,
 keyboard: ?*wl.Keyboard,
 pointer: ?*wl.Pointer,
@@ -31,6 +35,8 @@ viewport: ?*wp.Viewport,
 fractional_scale: ?*wp.FractionalScaleV1,
 xdg_surface: ?*xdg.Surface,
 toplevel: ?*xdg.Toplevel,
+frame_callback: ?*wl.Callback,
+presentation_feedback: ?*wp.PresentationFeedback,
 event_source: ?*server_wl.EventSource,
 mapping: ?[]align(std.heap.page_size_min) u8,
 buffers: [buffer_count]Buffer,
@@ -42,13 +48,14 @@ preferred_scale_received: bool,
 scale_locked: bool,
 listener: Listener,
 acquired: ?usize,
-waiting_for_buffer: bool,
 configured: bool,
 failed: bool,
 
 pub const Listener = struct {
     context: *anyopaque,
-    repaint: *const fn (*anyopaque) void,
+    ready: *const fn (*anyopaque) void,
+    presented: *const fn (*anyopaque, presentation.Info) void,
+    discarded: *const fn (*anyopaque) void,
     close: *const fn (*anyopaque) void,
     keyboard_available: *const fn (*anyopaque, bool) void,
     keyboard_keymap: *const fn (*anyopaque, wl.Keyboard.KeymapFormat, std.posix.fd_t, u32) void,
@@ -86,10 +93,7 @@ const Buffer = struct {
             .release => {
                 std.debug.assert(self.busy);
                 self.busy = false;
-                if (self.owner.waiting_for_buffer) {
-                    self.owner.waiting_for_buffer = false;
-                    self.owner.listener.repaint(self.owner.listener.context);
-                }
+                self.owner.notifyReady();
             },
         }
     }
@@ -109,6 +113,7 @@ pub fn init(
     }
 
     self.* = .{
+        .io = io,
         .display = null,
         .registry = null,
         .compositor = null,
@@ -116,6 +121,8 @@ pub fn init(
         .wm_base = null,
         .viewporter = null,
         .fractional_scale_manager = null,
+        .presentation_manager = null,
+        .presentation_clock_id = null,
         .seat = null,
         .keyboard = null,
         .pointer = null,
@@ -124,6 +131,8 @@ pub fn init(
         .fractional_scale = null,
         .xdg_surface = null,
         .toplevel = null,
+        .frame_callback = null,
+        .presentation_feedback = null,
         .event_source = null,
         .mapping = null,
         .buffers = undefined,
@@ -135,7 +144,6 @@ pub fn init(
         .scale_locked = false,
         .listener = listener,
         .acquired = null,
-        .waiting_for_buffer = false,
         .configured = false,
         .failed = false,
     };
@@ -157,6 +165,10 @@ pub fn init(
     if (display.roundtrip() != .SUCCESS) return error.ParentDisplayFailed;
     if (self.compositor == null or self.shm == null or self.wm_base == null) {
         return error.MissingParentGlobal;
+    }
+    if (self.presentation_manager != null) {
+        if (display.roundtrip() != .SUCCESS) return error.ParentDisplayFailed;
+        if (self.presentation_clock_id == null) return error.ParentDisplayFailed;
     }
 
     const surface = try self.compositor.?.createSurface();
@@ -201,6 +213,8 @@ pub fn init(
 
 pub fn deinit(self: *Self) void {
     if (self.event_source) |source| source.remove();
+    if (self.presentation_feedback) |feedback| feedback.destroy();
+    if (self.frame_callback) |callback| callback.destroy();
     self.destroyBuffers();
     if (self.toplevel) |toplevel| toplevel.destroy();
     if (self.xdg_surface) |xdg_surface| xdg_surface.destroy();
@@ -211,6 +225,7 @@ pub fn deinit(self: *Self) void {
     if (self.keyboard) |keyboard| releaseKeyboard(keyboard);
     if (self.seat) |seat| releaseSeat(seat);
     if (self.wm_base) |wm_base| wm_base.destroy();
+    if (self.presentation_manager) |manager| manager.destroy();
     if (self.fractional_scale_manager) |manager| manager.destroy();
     if (self.viewporter) |viewporter| viewporter.destroy();
     if (self.shm) |shm| shm.destroy();
@@ -222,7 +237,7 @@ pub fn deinit(self: *Self) void {
 
 pub fn acquire(self: *Self) ?render.PixelBuffer {
     std.debug.assert(self.acquired == null);
-    if (!self.configured or self.failed) return null;
+    if (!self.ready()) return null;
     for (&self.buffers, 0..) |*buffer, index| {
         if (buffer.busy) continue;
         self.acquired = index;
@@ -232,8 +247,20 @@ pub fn acquire(self: *Self) ?render.PixelBuffer {
             .pixels = buffer.pixels,
         };
     }
-    self.waiting_for_buffer = true;
     return null;
+}
+
+pub fn ready(self: *const Self) bool {
+    if (!self.configured or self.failed or self.frame_callback != null or
+        self.presentation_feedback != null) return false;
+    for (&self.buffers) |buffer| {
+        if (!buffer.busy) return true;
+    }
+    return false;
+}
+
+pub fn presentationClockId(self: *const Self) u32 {
+    return self.presentation_clock_id orelse presentation.monotonic_clock_id;
 }
 
 pub fn cancel(self: *Self) void {
@@ -241,13 +268,33 @@ pub fn cancel(self: *Self) void {
 }
 
 pub fn present(self: *Self) !void {
+    std.debug.assert(self.frame_callback == null);
+    std.debug.assert(self.presentation_feedback == null);
     const index = self.acquired orelse return error.NoAcquiredBuffer;
     const buffer = &self.buffers[index];
     const resource = buffer.resource orelse return error.ParentDisplayFailed;
+    const surface = self.surface orelse return error.ParentDisplayFailed;
+
+    const frame_callback = try surface.frame();
+    self.frame_callback = frame_callback;
+    errdefer {
+        frame_callback.destroy();
+        self.frame_callback = null;
+    }
+    frame_callback.setListener(*Self, handleFrameEvent, self);
+
+    if (self.presentation_manager) |manager| {
+        const feedback = try manager.feedback(surface);
+        self.presentation_feedback = feedback;
+        errdefer {
+            feedback.destroy();
+            self.presentation_feedback = null;
+        }
+        feedback.setListener(*Self, handlePresentationFeedbackEvent, self);
+    }
+
     buffer.busy = true;
     self.acquired = null;
-
-    const surface = self.surface orelse return error.ParentDisplayFailed;
     surface.attach(resource, 0, 0);
     surface.damageBuffer(
         0,
@@ -401,6 +448,19 @@ fn handleRegistryEvent(_: *wl.Registry, event: wl.Registry.Event, self: *Self) v
                         return;
                     };
                 }
+            } else if (std.mem.eql(u8, interface, std.mem.span(wp.Presentation.interface.name))) {
+                if (self.presentation_manager == null) {
+                    const manager = self.registry.?.bind(
+                        global.name,
+                        wp.Presentation,
+                        @min(global.version, wp.Presentation.generated_version),
+                    ) catch {
+                        self.failed = true;
+                        return;
+                    };
+                    self.presentation_manager = manager;
+                    manager.setListener(*Self, handlePresentationEvent, self);
+                }
             } else if (std.mem.eql(u8, interface, std.mem.span(wl.Seat.interface.name))) {
                 if (self.seat == null) {
                     const seat = self.registry.?.bind(
@@ -417,6 +477,68 @@ fn handleRegistryEvent(_: *wl.Registry, event: wl.Registry.Event, self: *Self) v
             }
         },
         .global_remove => {},
+    }
+}
+
+fn handlePresentationEvent(
+    _: *wp.Presentation,
+    event: wp.Presentation.Event,
+    self: *Self,
+) void {
+    switch (event) {
+        .clock_id => |clock| self.presentation_clock_id = clock.clk_id,
+    }
+}
+
+fn handleFrameEvent(callback: *wl.Callback, event: wl.Callback.Event, self: *Self) void {
+    switch (event) {
+        .done => {
+            std.debug.assert(self.frame_callback == callback);
+            callback.destroy();
+            self.frame_callback = null;
+            if (self.presentation_manager == null) {
+                self.listener.presented(self.listener.context, .now(self.io));
+            }
+            self.notifyReady();
+        },
+    }
+}
+
+fn handlePresentationFeedbackEvent(
+    feedback: *wp.PresentationFeedback,
+    event: wp.PresentationFeedback.Event,
+    self: *Self,
+) void {
+    switch (event) {
+        .sync_output => {},
+        .presented => |presented| {
+            std.debug.assert(self.presentation_feedback == feedback);
+            feedback.destroy();
+            self.presentation_feedback = null;
+            self.listener.presented(self.listener.context, .{
+                .timestamp = .{
+                    .seconds = @as(u64, presented.tv_sec_hi) << 32 | presented.tv_sec_lo,
+                    .nanoseconds = presented.tv_nsec,
+                },
+                .refresh_nanoseconds = presented.refresh,
+                .sequence = @as(u64, presented.seq_hi) << 32 | presented.seq_lo,
+                .flags = .{
+                    .vsync = presented.flags.vsync,
+                    .hardware_clock = presented.flags.hw_clock,
+                    .hardware_completion = presented.flags.hw_completion,
+                    // Child surfaces were composited into our parent buffer.
+                    .zero_copy = false,
+                },
+            });
+            self.notifyReady();
+        },
+        .discarded => {
+            std.debug.assert(self.presentation_feedback == feedback);
+            feedback.destroy();
+            self.presentation_feedback = null;
+            self.listener.discarded(self.listener.context);
+            self.notifyReady();
+        },
     }
 }
 
@@ -633,4 +755,8 @@ fn fail(self: *Self) void {
     if (self.failed) return;
     self.failed = true;
     self.listener.close(self.listener.context);
+}
+
+fn notifyReady(self: *Self) void {
+    if (self.ready()) self.listener.ready(self.listener.context);
 }

@@ -4,12 +4,14 @@ const Self = @This();
 
 const std = @import("std");
 const wayland = @import("wayland");
+const presentation = @import("presentation.zig");
 const Compositor = @import("wayland/compositor.zig");
 const Subcompositor = @import("wayland/subcompositor.zig");
 const XdgShell = @import("wayland/xdg_shell.zig");
 const Seat = @import("wayland/seat.zig");
 const DataDevice = @import("wayland/data_device.zig");
 const PrimarySelection = @import("wayland/primary_selection.zig");
+const PresentationProtocol = @import("wayland/presentation.zig");
 const FractionalScale = @import("wayland/fractional_scale.zig");
 const Output = @import("wayland/output.zig");
 const OutputBackend = @import("backend/output.zig");
@@ -34,13 +36,14 @@ xdg_shell: XdgShell,
 seat: Seat,
 data_device: DataDevice,
 primary_selection: PrimarySelection,
+presentation_protocol: PresentationProtocol,
 fractional_scale: FractionalScale,
 viewporter: Viewporter,
 window_manager: WindowManager,
 renderer: renderer_types.Renderer,
 render_timer: *wl.EventSource,
-repaint_pending: bool,
-frame_time_milliseconds: u32,
+repaint_needed: bool,
+render_scheduled: bool,
 socket_buffer: [11]u8,
 listening: bool,
 
@@ -69,13 +72,14 @@ pub fn create(
         .seat = undefined,
         .data_device = undefined,
         .primary_selection = undefined,
+        .presentation_protocol = undefined,
         .fractional_scale = undefined,
         .viewporter = undefined,
         .window_manager = undefined,
         .renderer = try renderer_types.Renderer.init(allocator, renderer_kind),
         .render_timer = undefined,
-        .repaint_pending = false,
-        .frame_time_milliseconds = 0,
+        .repaint_needed = false,
+        .render_scheduled = false,
         .socket_buffer = undefined,
         .listening = false,
     };
@@ -92,7 +96,9 @@ pub fn create(
         output_kind,
         .{
             .context = self,
-            .repaint = requestRepaint,
+            .ready = outputReady,
+            .presented = outputPresented,
+            .discarded = outputDiscarded,
             .close = closeOutput,
             .keyboard_available = keyboardAvailable,
             .keyboard_keymap = keyboardKeymap,
@@ -126,6 +132,14 @@ pub fn create(
     );
     errdefer self.output.deinit();
     self.compositor.setOutput(&self.output);
+    try self.presentation_protocol.init(
+        allocator,
+        display,
+        self.compositor.surfaceStore(),
+        &self.output,
+        self.render_output.presentationClockId(),
+    );
+    errdefer self.presentation_protocol.deinit();
     try self.viewporter.init(allocator, display);
     errdefer self.viewporter.deinit();
     try self.fractional_scale.init(
@@ -193,6 +207,7 @@ pub fn destroy(self: *Self) void {
     self.subcompositor.deinit();
     self.fractional_scale.deinit();
     self.viewporter.deinit();
+    self.presentation_protocol.deinit();
     self.output.deinit();
     self.render_output.deinit();
     self.seat.deinit();
@@ -224,13 +239,35 @@ pub fn terminate(self: *Self) void {
 
 fn requestRepaint(context: *anyopaque) void {
     const self: *Self = @ptrCast(@alignCast(context));
-    if (self.repaint_pending) return;
-    self.render_timer.timerUpdate(16) catch |err| {
+    self.repaint_needed = true;
+    self.scheduleRepaint();
+}
+
+fn scheduleRepaint(self: *Self) void {
+    if (!self.repaint_needed or self.render_scheduled or !self.render_output.ready()) return;
+    self.render_timer.timerUpdate(self.render_output.repaintDelayMilliseconds()) catch |err| {
         log.err("failed to schedule repaint: {t}", .{err});
         self.terminate();
         return;
     };
-    self.repaint_pending = true;
+    self.render_scheduled = true;
+}
+
+fn outputReady(context: *anyopaque) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.scheduleRepaint();
+}
+
+fn outputPresented(context: *anyopaque, info: presentation.Info) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.output.setRefresh(info);
+    Surface.finishPresentation(self.compositor.surfaceStore(), info);
+}
+
+fn outputDiscarded(context: *anyopaque) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    Surface.discardPresentation(self.compositor.surfaceStore());
+    requestRepaint(context);
 }
 
 fn closeOutput(context: *anyopaque) void {
@@ -535,16 +572,22 @@ fn pointInRoundedRect(x: f64, y: f64, rect: render.Rect, requested_radius: u32) 
 }
 
 fn handleRenderTimer(self: *Self) c_int {
-    self.repaint_pending = false;
+    self.render_scheduled = false;
+    if (!self.repaint_needed or !self.render_output.ready()) return 0;
+    self.repaint_needed = false;
     self.renderFrame() catch |err| {
         log.err("output frame failed: {t}", .{err});
         self.terminate();
     };
+    self.scheduleRepaint();
     return 0;
 }
 
 fn renderFrame(self: *Self) renderer_types.Renderer.Error!void {
-    const pixel_target = self.render_output.acquire() orelse return;
+    const pixel_target = self.render_output.acquire() orelse {
+        self.repaint_needed = true;
+        return;
+    };
     errdefer self.render_output.cancel();
     const output_size = self.render_output.size();
     const target = self.renderer.makeTarget(pixel_target);
@@ -590,9 +633,8 @@ fn renderFrame(self: *Self) renderer_types.Renderer.Error!void {
         );
     }
 
-    self.render_output.present() catch return error.InvalidTarget;
+    const presented = self.render_output.present() catch return error.InvalidTarget;
 
-    self.frame_time_milliseconds +%= 16;
     fullscreen_reached = top_fullscreen == null;
     nodes = self.scene.nodeIterator();
     while (nodes.next()) |entry| switch (entry) {
@@ -602,17 +644,18 @@ fn renderFrame(self: *Self) renderer_types.Renderer.Error!void {
                 if (!std.meta.eql(window_entry.id, id)) continue;
                 fullscreen_reached = true;
             }
-            self.finishWindowDecorations(window_entry.id, .below);
-            self.finishSurfaceTree(window_entry.window.surface_id);
-            self.finishWindowDecorations(window_entry.id, .above);
-            self.finishWindowPopups(window_entry.id);
+            self.submitWindowDecorations(window_entry.id, .below);
+            self.submitSurfaceTree(window_entry.window.surface_id);
+            self.submitWindowDecorations(window_entry.id, .above);
+            self.submitWindowPopups(window_entry.id);
         },
         .shell_surface => |shell_entry| {
             if (!fullscreen_reached or !shell_entry.shell_surface.mapped) continue;
-            self.finishSurfaceTree(shell_entry.shell_surface.surface_id);
+            self.submitSurfaceTree(shell_entry.shell_surface.surface_id);
         },
     };
-    if (cursor) |info| self.finishSurfaceTree(info.surface_id);
+    if (cursor) |info| self.submitSurfaceTree(info.surface_id);
+    if (presented) |info| outputPresented(self, info);
     const keyboard_focus = self.xdg_shell.popupKeyboardFocus() orelse
         self.scene.focusedSurface() orelse if (!self.window_manager.hasActiveManager())
         self.scene.topWindowSurface()
@@ -916,21 +959,17 @@ fn windowContentRect(window: *const Scene.Window, content_size: render.Size) ?re
     return content_rect.intersection(clip_box.translated(window.position.x, window.position.y));
 }
 
-fn finishSurfaceTree(self: *Self, surface_id: Surface.Id) void {
+fn submitSurfaceTree(self: *Self, surface_id: Surface.Id) void {
     if (Surface.currentBuffer(self.compositor.surfaceStore(), surface_id) == null) return;
 
     var stack = self.subcompositor.stackIterator(surface_id);
     while (stack.next()) |entry| switch (entry) {
-        .parent => Surface.sendFrameDoneFor(
-            self.compositor.surfaceStore(),
-            surface_id,
-            self.frame_time_milliseconds,
-        ),
-        .child => |child| self.finishSurfaceTree(child.surface_id),
+        .parent => Surface.submitPresentationFor(self.compositor.surfaceStore(), surface_id),
+        .child => |child| self.submitSurfaceTree(child.surface_id),
     };
 }
 
-fn finishWindowDecorations(
+fn submitWindowDecorations(
     self: *Self,
     window_id: Scene.Id,
     layer: Scene.DecorationLayer,
@@ -938,15 +977,15 @@ fn finishWindowDecorations(
     var decorations = self.scene.decorationIterator(window_id, layer);
     while (decorations.next()) |entry| {
         if (!entry.decoration.mapped) continue;
-        self.finishSurfaceTree(entry.decoration.surface_id);
+        self.submitSurfaceTree(entry.decoration.surface_id);
     }
 }
 
-fn finishWindowPopups(self: *Self, window_id: Scene.Id) void {
+fn submitWindowPopups(self: *Self, window_id: Scene.Id) void {
     var popups = self.scene.popupIterator(window_id);
     while (popups.next()) |entry| {
         if (!entry.popup.mapped) continue;
-        self.finishSurfaceTree(entry.popup.surface_id);
+        self.submitSurfaceTree(entry.popup.surface_id);
     }
 }
 
