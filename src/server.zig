@@ -204,7 +204,8 @@ pub fn create(
         self.compositor.surfaceStore(),
         &self.scene,
         &self.seat,
-        render_output.backend.size(),
+        &self.outputs,
+        render_output.protocol_id,
     );
     errdefer self.xdg_shell.deinit();
     try self.layer_shell.init(

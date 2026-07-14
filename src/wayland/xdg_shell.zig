@@ -9,6 +9,7 @@ const Scene = @import("../scene.zig");
 const Seat = @import("seat.zig");
 const slot_map = @import("../slot_map.zig");
 const Surface = @import("surface.zig");
+const OutputLayout = @import("output_layout.zig");
 
 const wl = wayland.server.wl;
 const xdg = wayland.server.xdg;
@@ -19,7 +20,8 @@ display: *wl.Server,
 surface_store: *Surface.Store,
 scene: *Scene,
 seat: *Seat,
-output_size: render.Size,
+outputs: *OutputLayout,
+default_output_id: OutputLayout.Id,
 global: *wl.Global,
 decoration_global: *wl.Global,
 bindings: BindingStore,
@@ -293,7 +295,8 @@ pub fn init(
     surface_store: *Surface.Store,
     scene: *Scene,
     seat: *Seat,
-    output_size: render.Size,
+    outputs: *OutputLayout,
+    default_output_id: OutputLayout.Id,
 ) !void {
     self.* = .{
         .allocator = allocator,
@@ -301,7 +304,8 @@ pub fn init(
         .surface_store = surface_store,
         .scene = scene,
         .seat = seat,
-        .output_size = output_size,
+        .outputs = outputs,
+        .default_output_id = default_output_id,
         .global = undefined,
         .decoration_global = undefined,
         .bindings = .{},
@@ -871,7 +875,35 @@ fn popupPlacement(
     {
         return error.InvalidPositioner;
     }
-    return placePopup(rules, parent.position, self.output_size);
+    return placePopup(
+        rules,
+        parent.position,
+        self.popupOutputBounds(parent.position, parent.geometry.size),
+    );
+}
+
+fn popupOutputBounds(
+    self: *Self,
+    parent_position: Scene.Position,
+    parent_size: render.Size,
+) render.Rect {
+    const parent_rect: render.Rect = .{
+        .x = parent_position.x,
+        .y = parent_position.y,
+        .width = parent_size.width,
+        .height = parent_size.height,
+    };
+    var selected = self.outputs.get(self.default_output_id).?.logicalRect();
+    var selected_area: u64 = 0;
+    var outputs = self.outputs.iterator();
+    while (outputs.next()) |entry| {
+        const intersection = parent_rect.intersection(entry.output.logicalRect()) orelse continue;
+        const area = @as(u64, intersection.width) * intersection.height;
+        if (area <= selected_area) continue;
+        selected = entry.output.logicalRect();
+        selected_area = area;
+    }
+    return selected;
 }
 
 fn sendPopupConfigure(
@@ -2253,50 +2285,52 @@ const ToplevelResource = struct {
 fn placePopup(
     rules: PositionerRules,
     parent_position: Scene.Position,
-    output_size: render.Size,
+    output_bounds: render.Rect,
 ) PopupPlacement {
     const size = rules.size.?;
     var width: i64 = size.width;
     var height: i64 = size.height;
     const parent_x: i64 = parent_position.x;
     const parent_y: i64 = parent_position.y;
-    const output_width: i64 = output_size.width;
-    const output_height: i64 = output_size.height;
+    const output_left: i64 = output_bounds.x;
+    const output_top: i64 = output_bounds.y;
+    const output_right = output_left + output_bounds.width;
+    const output_bottom = output_top + output_bounds.height;
     const local = popupPosition(rules, false, false);
     var global_x = parent_x + local.x;
     var global_y = parent_y + local.y;
 
-    if (rules.adjustment.flip_x and axisConstrained(global_x, width, output_width)) {
+    if (rules.adjustment.flip_x and axisConstrained(global_x, width, output_left, output_right)) {
         const flipped = popupPosition(rules, true, false);
         const flipped_global = parent_x + flipped.x;
-        if (!axisConstrained(flipped_global, width, output_width)) {
+        if (!axisConstrained(flipped_global, width, output_left, output_right)) {
             global_x = flipped_global;
         }
     }
-    if (rules.adjustment.flip_y and axisConstrained(global_y, height, output_height)) {
+    if (rules.adjustment.flip_y and axisConstrained(global_y, height, output_top, output_bottom)) {
         const flipped = popupPosition(rules, false, true);
         const flipped_global = parent_y + flipped.y;
-        if (!axisConstrained(flipped_global, height, output_height)) {
+        if (!axisConstrained(flipped_global, height, output_top, output_bottom)) {
             global_y = flipped_global;
         }
     }
 
-    if (rules.adjustment.slide_x and axisConstrained(global_x, width, output_width)) {
-        global_x = std.math.clamp(global_x, @as(i64, 0), @max(output_width - width, 0));
+    if (rules.adjustment.slide_x and axisConstrained(global_x, width, output_left, output_right)) {
+        global_x = std.math.clamp(global_x, output_left, @max(output_right - width, output_left));
     }
-    if (rules.adjustment.slide_y and axisConstrained(global_y, height, output_height)) {
-        global_y = std.math.clamp(global_y, @as(i64, 0), @max(output_height - height, 0));
+    if (rules.adjustment.slide_y and axisConstrained(global_y, height, output_top, output_bottom)) {
+        global_y = std.math.clamp(global_y, output_top, @max(output_bottom - height, output_top));
     }
 
-    if (rules.adjustment.resize_x and axisConstrained(global_x, width, output_width)) {
-        const left = std.math.clamp(global_x, @as(i64, 0), @max(output_width - 1, 0));
-        const right = std.math.clamp(global_x + width, left + 1, @max(output_width, left + 1));
+    if (rules.adjustment.resize_x and axisConstrained(global_x, width, output_left, output_right)) {
+        const left = std.math.clamp(global_x, output_left, @max(output_right - 1, output_left));
+        const right = std.math.clamp(global_x + width, left + 1, @max(output_right, left + 1));
         global_x = left;
         width = right - left;
     }
-    if (rules.adjustment.resize_y and axisConstrained(global_y, height, output_height)) {
-        const top = std.math.clamp(global_y, @as(i64, 0), @max(output_height - 1, 0));
-        const bottom = std.math.clamp(global_y + height, top + 1, @max(output_height, top + 1));
+    if (rules.adjustment.resize_y and axisConstrained(global_y, height, output_top, output_bottom)) {
+        const top = std.math.clamp(global_y, output_top, @max(output_bottom - 1, output_top));
+        const bottom = std.math.clamp(global_y + height, top + 1, @max(output_bottom, top + 1));
         global_y = top;
         height = bottom - top;
     }
@@ -2403,8 +2437,8 @@ fn flipGravity(
     return result;
 }
 
-fn axisConstrained(position: i64, size: i64, boundary: i64) bool {
-    return position < 0 or position + size > boundary;
+fn axisConstrained(position: i64, size: i64, minimum: i64, maximum: i64) bool {
+    return position < minimum or position + size > maximum;
 }
 
 fn clampI32(value: i64) i32 {
@@ -2474,7 +2508,7 @@ test "xdg positioner derives popup geometry from anchor and gravity" {
         .anchor = .bottom_left,
         .gravity = .bottom_right,
         .offset = .{ .x = 3, .y = 4 },
-    }, .{ .x = 100, .y = 50 }, .{ .width = 1280, .height = 720 });
+    }, .{ .x = 100, .y = 50 }, .{ .x = 0, .y = 0, .width = 1280, .height = 720 });
 
     try std.testing.expectEqual(Scene.Position{ .x = 13, .y = 64 }, placement.position);
     try std.testing.expectEqual(Dimensions{ .width = 120, .height = 80 }, placement.dimensions);
@@ -2487,7 +2521,7 @@ test "xdg positioner flips before sliding constrained popups" {
         .anchor = .right,
         .gravity = .right,
         .adjustment = .{ .flip_x = true, .slide_y = true },
-    }, .{ .x = 1150, .y = 650 }, .{ .width = 1280, .height = 720 });
+    }, .{ .x = 2430, .y = 450 }, .{ .x = 1280, .y = -200, .width = 1280, .height = 720 });
 
     try std.testing.expectEqual(Scene.Position{ .x = -120, .y = -30 }, placement.position);
     try std.testing.expectEqual(Dimensions{ .width = 200, .height = 100 }, placement.dimensions);
@@ -2500,7 +2534,7 @@ test "xdg positioner resizes a popup to the output boundary" {
         .anchor = .top_left,
         .gravity = .bottom_right,
         .adjustment = .{ .resize_x = true, .resize_y = true },
-    }, .{}, .{ .width = 320, .height = 200 });
+    }, .{}, .{ .x = 0, .y = 0, .width = 320, .height = 200 });
 
     try std.testing.expectEqual(Scene.Position{}, placement.position);
     try std.testing.expectEqual(Dimensions{ .width = 320, .height = 200 }, placement.dimensions);
