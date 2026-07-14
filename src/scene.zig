@@ -11,6 +11,8 @@ allocator: std.mem.Allocator,
 windows: Store,
 decorations: DecorationStore,
 shell_surfaces: ShellSurfaceStore,
+layer_surfaces: LayerSurfaceStore,
+layer_stacks: [layer_count]std.ArrayList(LayerSurfaceId),
 popups: PopupStore,
 popup_stack: std.ArrayList(PopupId),
 stack: std.ArrayList(NodeId),
@@ -22,8 +24,12 @@ pub const DecorationStore = slot_map.SlotMap(Decoration, enum { scene_decoration
 pub const DecorationId = DecorationStore.Id;
 pub const ShellSurfaceStore = slot_map.SlotMap(ShellSurface, enum { scene_shell_surface });
 pub const ShellSurfaceId = ShellSurfaceStore.Id;
+pub const LayerSurfaceStore = slot_map.SlotMap(LayerSurface, enum { scene_layer_surface });
+pub const LayerSurfaceId = LayerSurfaceStore.Id;
 pub const PopupStore = slot_map.SlotMap(Popup, enum { scene_popup });
 pub const PopupId = PopupStore.Id;
+
+const layer_count = @typeInfo(Layer).@"enum".fields.len;
 
 pub const NodeId = union(enum) {
     window: Id,
@@ -111,6 +117,20 @@ pub const Decoration = struct {
 pub const ShellSurface = struct {
     surface_id: Surface.Id,
     position: Position = .{},
+    mapped: bool = false,
+};
+
+pub const Layer = enum {
+    background,
+    bottom,
+    top,
+    overlay,
+};
+
+pub const LayerSurface = struct {
+    surface_id: Surface.Id,
+    position: Position = .{},
+    layer: Layer,
     mapped: bool = false,
 };
 
@@ -216,6 +236,45 @@ pub const ReverseNodeIterator = struct {
     }
 };
 
+pub const LayerSurfaceIterator = struct {
+    scene: *Self,
+    layer: Layer,
+    index: usize = 0,
+
+    pub const Entry = struct {
+        id: LayerSurfaceId,
+        layer_surface: *LayerSurface,
+    };
+
+    pub fn next(self: *LayerSurfaceIterator) ?Entry {
+        const stack = self.scene.layer_stacks[layerIndex(self.layer)].items;
+        while (self.index < stack.len) {
+            const id = stack[self.index];
+            self.index += 1;
+            const layer_surface = self.scene.layer_surfaces.get(id) orelse continue;
+            return .{ .id = id, .layer_surface = layer_surface };
+        }
+        return null;
+    }
+};
+
+pub const ReverseLayerSurfaceIterator = struct {
+    scene: *Self,
+    layer: Layer,
+    index: usize,
+
+    pub fn next(self: *ReverseLayerSurfaceIterator) ?LayerSurfaceIterator.Entry {
+        const stack = self.scene.layer_stacks[layerIndex(self.layer)].items;
+        while (self.index > 0) {
+            self.index -= 1;
+            const id = stack[self.index];
+            const layer_surface = self.scene.layer_surfaces.get(id) orelse continue;
+            return .{ .id = id, .layer_surface = layer_surface };
+        }
+        return null;
+    }
+};
+
 pub const DecorationIterator = struct {
     inner: DecorationStore.Iterator,
     window_id: Id,
@@ -286,6 +345,8 @@ pub fn init(self: *Self, allocator: std.mem.Allocator) void {
         .windows = .{},
         .decorations = .{},
         .shell_surfaces = .{},
+        .layer_surfaces = .{},
+        .layer_stacks = @splat(.empty),
         .popups = .{},
         .popup_stack = .empty,
         .stack = .empty,
@@ -297,12 +358,18 @@ pub fn deinit(self: *Self) void {
     std.debug.assert(self.windows.len() == 0);
     std.debug.assert(self.decorations.len() == 0);
     std.debug.assert(self.shell_surfaces.len() == 0);
+    std.debug.assert(self.layer_surfaces.len() == 0);
     std.debug.assert(self.popups.len() == 0);
     std.debug.assert(self.popup_stack.items.len == 0);
     std.debug.assert(self.stack.items.len == 0);
     self.windows.deinit(self.allocator);
     self.decorations.deinit(self.allocator);
     self.shell_surfaces.deinit(self.allocator);
+    self.layer_surfaces.deinit(self.allocator);
+    for (&self.layer_stacks) |*stack| {
+        std.debug.assert(stack.items.len == 0);
+        stack.deinit(self.allocator);
+    }
     self.popups.deinit(self.allocator);
     self.popup_stack.deinit(self.allocator);
     self.stack.deinit(self.allocator);
@@ -382,6 +449,62 @@ pub fn setShellSurfacePosition(self: *Self, id: ShellSurfaceId, position: Positi
 pub fn shellSurfaceCommitted(self: *Self, id: ShellSurfaceId) void {
     const shell_surface = self.shell_surfaces.get(id) orelse return;
     if (shell_surface.mapped) self.requestRepaint();
+}
+
+pub fn addLayerSurface(
+    self: *Self,
+    surface_id: Surface.Id,
+    layer: Layer,
+) error{OutOfMemory}!LayerSurfaceId {
+    const id = try self.layer_surfaces.insert(self.allocator, .{
+        .surface_id = surface_id,
+        .layer = layer,
+    });
+    errdefer _ = self.layer_surfaces.remove(id);
+    try self.layer_stacks[layerIndex(layer)].append(self.allocator, id);
+    return id;
+}
+
+pub fn removeLayerSurface(self: *Self, id: LayerSurfaceId) void {
+    const layer_surface = self.layer_surfaces.remove(id) orelse return;
+    removeLayerSurfaceFromStack(self, id, layer_surface.layer);
+    if (layer_surface.mapped) self.requestRepaint();
+}
+
+pub fn setLayerSurfaceMapped(self: *Self, id: LayerSurfaceId, mapped: bool) void {
+    const layer_surface = self.layer_surfaces.get(id) orelse return;
+    if (layer_surface.mapped == mapped) return;
+    layer_surface.mapped = mapped;
+    self.requestRepaint();
+}
+
+pub fn setLayerSurfacePosition(
+    self: *Self,
+    id: LayerSurfaceId,
+    position: Position,
+) void {
+    const layer_surface = self.layer_surfaces.get(id) orelse return;
+    if (std.meta.eql(layer_surface.position, position)) return;
+    layer_surface.position = position;
+    if (layer_surface.mapped) self.requestRepaint();
+}
+
+pub fn setLayerSurfaceLayer(
+    self: *Self,
+    id: LayerSurfaceId,
+    layer: Layer,
+) error{OutOfMemory}!void {
+    const layer_surface = self.layer_surfaces.get(id) orelse return;
+    if (layer_surface.layer == layer) return;
+    try self.layer_stacks[layerIndex(layer)].append(self.allocator, id);
+    removeLayerSurfaceFromStack(self, id, layer_surface.layer);
+    layer_surface.layer = layer;
+    if (layer_surface.mapped) self.requestRepaint();
+}
+
+pub fn layerSurfaceCommitted(self: *Self, id: LayerSurfaceId) void {
+    const layer_surface = self.layer_surfaces.get(id) orelse return;
+    if (layer_surface.mapped) self.requestRepaint();
 }
 
 pub fn addPopup(
@@ -621,6 +744,21 @@ pub fn reverseNodeIterator(self: *Self) ReverseNodeIterator {
     return .{ .scene = self, .index = self.stack.items.len };
 }
 
+pub fn layerSurfaceIterator(self: *Self, layer: Layer) LayerSurfaceIterator {
+    return .{ .scene = self, .layer = layer };
+}
+
+pub fn reverseLayerSurfaceIterator(
+    self: *Self,
+    layer: Layer,
+) ReverseLayerSurfaceIterator {
+    return .{
+        .scene = self,
+        .layer = layer,
+        .index = self.layer_stacks[layerIndex(layer)].items.len,
+    };
+}
+
 pub fn decorationIterator(
     self: *Self,
     window_id: Id,
@@ -698,6 +836,24 @@ pub fn topWindowSurface(self: *Self) ?Surface.Id {
 
 fn requestRepaint(self: *Self) void {
     if (self.repaint_listener) |listener| listener.request(listener.context);
+}
+
+fn layerIndex(layer: Layer) usize {
+    return @intFromEnum(layer);
+}
+
+fn removeLayerSurfaceFromStack(
+    self: *Self,
+    id: LayerSurfaceId,
+    layer: Layer,
+) void {
+    const stack = &self.layer_stacks[layerIndex(layer)];
+    for (stack.items, 0..) |candidate, index| {
+        if (!std.meta.eql(candidate, id)) continue;
+        _ = stack.orderedRemove(index);
+        return;
+    }
+    unreachable;
 }
 
 fn firstWindowPopup(self: *Self, window_id: Id) ?PopupId {
@@ -944,6 +1100,51 @@ test "scene interleaves shell surfaces and windows through node handles" {
 
     scene.removeShellSurface(shell_surface);
     scene.removeWindow(window);
+}
+
+test "scene keeps layer surfaces in fixed independent stacks" {
+    var scene: Self = undefined;
+    scene.init(std.testing.allocator);
+    defer scene.deinit();
+
+    const background = try scene.addLayerSurface(
+        .{ .index = 1, .generation = 1 },
+        .background,
+    );
+    const first_top = try scene.addLayerSurface(
+        .{ .index = 2, .generation = 1 },
+        .top,
+    );
+    const second_top = try scene.addLayerSurface(
+        .{ .index = 3, .generation = 1 },
+        .top,
+    );
+    scene.setLayerSurfacePosition(first_top, .{ .x = 20, .y = 30 });
+    scene.setLayerSurfaceMapped(first_top, true);
+
+    var top = scene.layerSurfaceIterator(.top);
+    const first = top.next().?;
+    try std.testing.expect(std.meta.eql(first_top, first.id));
+    try std.testing.expectEqual(Position{ .x = 20, .y = 30 }, first.layer_surface.position);
+    try std.testing.expect(first.layer_surface.mapped);
+    try std.testing.expect(std.meta.eql(second_top, top.next().?.id));
+    try std.testing.expectEqual(@as(?LayerSurfaceIterator.Entry, null), top.next());
+
+    var reverse_top = scene.reverseLayerSurfaceIterator(.top);
+    try std.testing.expect(std.meta.eql(second_top, reverse_top.next().?.id));
+    try std.testing.expect(std.meta.eql(first_top, reverse_top.next().?.id));
+    try std.testing.expectEqual(
+        @as(?LayerSurfaceIterator.Entry, null),
+        reverse_top.next(),
+    );
+
+    try scene.setLayerSurfaceLayer(first_top, .overlay);
+    try std.testing.expectEqual(@as(usize, 1), scene.layer_stacks[layerIndex(.top)].items.len);
+    try std.testing.expectEqual(@as(usize, 1), scene.layer_stacks[layerIndex(.overlay)].items.len);
+
+    scene.removeLayerSurface(background);
+    scene.removeLayerSurface(first_top);
+    scene.removeLayerSurface(second_top);
 }
 
 test "scene attaches decoration handles to windows" {

@@ -435,7 +435,11 @@ fn pointerFocus(self: *Self, x: f64, y: f64) ?Seat.PointerFocus {
 }
 
 fn scenePointerFocus(self: *Self, x: f64, y: f64) ?Seat.PointerFocus {
+    if (self.hitTestLayer(.overlay, x, y)) |focus| return focus;
     const fullscreen = self.scene.topFullscreen();
+    if (fullscreen == null) {
+        if (self.hitTestLayer(.top, x, y)) |focus| return focus;
+    }
     var nodes = self.scene.reverseNodeIterator();
     while (nodes.next()) |entry| switch (entry) {
         .window => |window_entry| {
@@ -456,6 +460,24 @@ fn scenePointerFocus(self: *Self, x: f64, y: f64) ?Seat.PointerFocus {
             )) |focus| return focus;
         },
     };
+    if (fullscreen != null) return null;
+    if (self.hitTestLayer(.bottom, x, y)) |focus| return focus;
+    if (self.hitTestLayer(.background, x, y)) |focus| return focus;
+    return null;
+}
+
+fn hitTestLayer(self: *Self, layer: Scene.Layer, x: f64, y: f64) ?Seat.PointerFocus {
+    var surfaces = self.scene.reverseLayerSurfaceIterator(layer);
+    while (surfaces.next()) |entry| {
+        const layer_surface = entry.layer_surface;
+        if (!layer_surface.mapped) continue;
+        if (self.hitTestSurface(
+            layer_surface.surface_id,
+            layer_surface.position,
+            x,
+            y,
+        )) |focus| return focus;
+    }
     return null;
 }
 
@@ -614,7 +636,10 @@ fn renderFrame(self: *Self) renderer_types.Renderer.Error!void {
     };
     try self.renderCommands(output_size, &clear_command, target);
 
+    try self.renderLayerSurfaces(.background, target);
+    try self.renderLayerSurfaces(.bottom, target);
     const top_fullscreen = self.scene.topFullscreen();
+    if (top_fullscreen != null) try self.renderLayerSurfaces(.top, target);
     var fullscreen_reached = top_fullscreen == null;
     var nodes = self.scene.nodeIterator();
     while (nodes.next()) |entry| switch (entry) {
@@ -638,6 +663,8 @@ fn renderFrame(self: *Self) renderer_types.Renderer.Error!void {
             );
         },
     };
+    if (top_fullscreen == null) try self.renderLayerSurfaces(.top, target);
+    try self.renderLayerSurfaces(.overlay, target);
 
     const cursor = self.seat.cursorInfo();
     if (cursor) |info| {
@@ -653,6 +680,9 @@ fn renderFrame(self: *Self) renderer_types.Renderer.Error!void {
 
     const presented = self.render_output.present() catch return error.InvalidTarget;
 
+    self.submitLayerSurfaces(.background);
+    self.submitLayerSurfaces(.bottom);
+    if (top_fullscreen != null) self.submitLayerSurfaces(.top);
     fullscreen_reached = top_fullscreen == null;
     nodes = self.scene.nodeIterator();
     while (nodes.next()) |entry| switch (entry) {
@@ -672,6 +702,8 @@ fn renderFrame(self: *Self) renderer_types.Renderer.Error!void {
             self.submitSurfaceTree(shell_entry.shell_surface.surface_id);
         },
     };
+    if (top_fullscreen == null) self.submitLayerSurfaces(.top);
+    self.submitLayerSurfaces(.overlay);
     if (cursor) |info| self.submitSurfaceTree(info.surface_id);
     if (presented) |info| outputPresented(self, info);
     const keyboard_focus = self.xdg_shell.popupKeyboardFocus() orelse
@@ -680,6 +712,35 @@ fn renderFrame(self: *Self) renderer_types.Renderer.Error!void {
     else
         null;
     self.seat.setKeyboardFocus(keyboard_focus);
+}
+
+fn renderLayerSurfaces(
+    self: *Self,
+    layer: Scene.Layer,
+    target: renderer_types.Target,
+) renderer_types.Renderer.Error!void {
+    var surfaces = self.scene.layerSurfaceIterator(layer);
+    while (surfaces.next()) |entry| {
+        const layer_surface = entry.layer_surface;
+        if (!layer_surface.mapped) continue;
+        try self.renderSurfaceTree(
+            layer_surface.surface_id,
+            layer_surface.position.x,
+            layer_surface.position.y,
+            null,
+            null,
+            target,
+        );
+    }
+}
+
+fn submitLayerSurfaces(self: *Self, layer: Scene.Layer) void {
+    var surfaces = self.scene.layerSurfaceIterator(layer);
+    while (surfaces.next()) |entry| {
+        if (entry.layer_surface.mapped) {
+            self.submitSurfaceTree(entry.layer_surface.surface_id);
+        }
+    }
 }
 
 fn renderCommands(
