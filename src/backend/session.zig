@@ -58,6 +58,10 @@ pub fn init(
     errdefer _ = c.libseat_close_seat(self.seat);
     const fd = c.libseat_get_fd(self.seat);
     if (fd < 0) return error.GetSeatFdFailed;
+    while (!self.active and !self.failed) {
+        if (c.libseat_dispatch(self.seat, -1) < 0) return error.DispatchFailed;
+    }
+    if (self.failed) return error.DispatchFailed;
     self.event_source = try event_loop.addFd(
         *Self,
         fd,
@@ -117,8 +121,8 @@ pub fn openDevice(self: *Self, path: [:0]const u8) !Device {
 
 pub fn closeDevice(self: *Self, device: Device) !void {
     std.debug.assert(self.device_count > 0);
-    if (c.libseat_close_device(self.seat, device.id) < 0) return error.CloseDeviceFailed;
     self.device_count -= 1;
+    if (c.libseat_close_device(self.seat, device.id) < 0) return error.CloseDeviceFailed;
 }
 
 fn handleEvent(_: c_int, mask: wl.EventMask, self: *Self) c_int {

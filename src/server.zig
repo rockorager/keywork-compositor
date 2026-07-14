@@ -25,6 +25,7 @@ const XdgActivation = @import("wayland/xdg_activation.zig");
 const Output = @import("wayland/output.zig");
 const OutputLayout = @import("wayland/output_layout.zig");
 const OutputBackend = @import("backend/output.zig");
+const Session = @import("backend/session.zig");
 const renderer_types = @import("render/renderer.zig");
 const render = @import("render/types.zig");
 const Scene = @import("scene.zig");
@@ -37,6 +38,8 @@ const log = std.log.scoped(.server);
 
 allocator: std.mem.Allocator,
 display: *wl.Server,
+session: Session,
+session_initialized: bool,
 render_outputs: RenderOutputStore,
 primary_render_output: RenderOutputId,
 outputs: OutputLayout,
@@ -117,6 +120,8 @@ pub fn create(
     self.* = .{
         .allocator = allocator,
         .display = display,
+        .session = undefined,
+        .session_initialized = false,
         .render_outputs = .{},
         .primary_render_output = undefined,
         .outputs = undefined,
@@ -145,6 +150,11 @@ pub fn create(
     };
     errdefer self.render_outputs.deinit(allocator);
     errdefer self.renderer.deinit();
+    if (output_kind == .drm) {
+        try self.session.init(allocator, display.getEventLoop());
+        self.session_initialized = true;
+    }
+    errdefer if (self.session_initialized) self.session.deinit();
     try self.compositor.init(allocator, display);
     errdefer self.compositor.deinit();
     self.outputs.init(allocator, display, self.compositor.surfaceStore());
@@ -155,14 +165,17 @@ pub fn create(
         .kind = output_kind,
         .size = .{ .width = 1280, .height = 720 },
         .name = switch (output_kind) {
+            .drm => "DRM-1",
             .headless => "HEADLESS-1",
             .nested => "NESTED-1",
         },
         .description = switch (output_kind) {
+            .drm => "Keywork DRM output",
             .headless => "Keywork headless output",
             .nested => "Keywork nested output",
         },
         .model = switch (output_kind) {
+            .drm => "drm-kms",
             .headless => "headless",
             .nested => "nested-wayland",
         },
@@ -325,6 +338,7 @@ pub fn destroy(self: *Self) void {
     self.render_outputs.deinit(allocator);
     self.seat.deinit();
     self.compositor.deinit();
+    if (self.session_initialized) self.session.deinit();
     self.renderer.deinit();
     self.display.destroy();
     allocator.destroy(self);
@@ -351,6 +365,7 @@ fn addRenderOutput(
         self.display,
         config.size,
         config.kind,
+        if (self.session_initialized) &self.session else null,
         .{
             .context = render_output,
             .ready = outputReady,
