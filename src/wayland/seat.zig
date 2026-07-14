@@ -441,6 +441,10 @@ pub fn pointerFocusedSurface(self: *const Self) ?Surface.Id {
     return focus.surface_id;
 }
 
+pub fn pointerFocus(self: *const Self) ?PointerFocus {
+    return self.pointer_focus;
+}
+
 pub fn pointerFocusedClient(self: *const Self) ?*wl.Client {
     const focus = self.pointer_focus orelse return null;
     const resource = Surface.resourceFor(self.surface_store, focus.surface_id) orelse return null;

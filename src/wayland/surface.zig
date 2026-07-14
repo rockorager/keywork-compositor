@@ -421,6 +421,21 @@ pub fn acceptsInput(store: *Store, id: Id, x: f64, y: f64) bool {
     );
 }
 
+pub fn copyCurrentInputRegion(store: *Store, id: Id, destination: *Region) Region.Error!void {
+    destination.clear();
+    const surface_state = store.get(id) orelse return;
+    const buffer = surface_state.current_buffer orelse return;
+    try destination.add(
+        0,
+        0,
+        @intCast(buffer.logical_size.width),
+        @intCast(buffer.logical_size.height),
+    );
+    if (!surface_state.current_input.infinite) {
+        try destination.intersectWith(&surface_state.current_input.value);
+    }
+}
+
 pub fn sendFrameDoneFor(store: *Store, id: Id, time_milliseconds: u32) void {
     const surface_state = store.get(id) orelse return;
     while (true) {

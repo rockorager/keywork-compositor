@@ -466,16 +466,17 @@
       "interfaces": [
         {
           "name": "zwp_pointer_constraints_v1",
-          "current_version": null,
+          "current_version": 1,
           "target_version": 1
         }
       ],
-      "status": "not_started",
+      "status": "done",
       "privileged": false,
       "blocked_by": [
         "relative-pointer",
         "wl-seat"
-      ]
+      ],
+      "status_detail": "Version 1 supports focus-gated persistent and one-shot pointer locks and confinement, commit-buffered region and cursor-hint state, effective input-region intersection, and non-rectangular edge-sliding confinement. Locked pointers suppress absolute motion while relative motion continues; native pointer accumulation is synchronized after clipping."
     },
     {
       "id": "idle-inhibit",

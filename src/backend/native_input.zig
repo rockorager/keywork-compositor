@@ -189,6 +189,12 @@ pub fn retarget(self: *Self, size: render.Size, listener: Listener) void {
     self.pointer_y = @min(self.pointer_y, @as(f64, @floatFromInt(size.height - 1)));
 }
 
+pub fn setPointerPosition(self: *Self, x: f64, y: f64) void {
+    std.debug.assert(self.initialized);
+    self.pointer_x = clampCoordinate(x, self.size.width);
+    self.pointer_y = clampCoordinate(y, self.size.height);
+}
+
 fn installKeymap(self: *Self) !void {
     const text_pointer = c.xkb_keymap_get_as_string(
         self.xkb_keymap,

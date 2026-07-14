@@ -14,6 +14,7 @@ const LayerShell = @import("wayland/layer_shell.zig");
 const SinglePixelBuffer = @import("wayland/single_pixel_buffer.zig");
 const CursorShape = @import("wayland/cursor_shape.zig");
 const RelativePointer = @import("wayland/relative_pointer.zig");
+const PointerConstraints = @import("wayland/pointer_constraints.zig");
 const Seat = @import("wayland/seat.zig");
 const DataDevice = @import("wayland/data_device.zig");
 const PrimarySelection = @import("wayland/primary_selection.zig");
@@ -60,6 +61,7 @@ output_management_initialized: bool,
 single_pixel_buffer: SinglePixelBuffer,
 cursor_shape: CursorShape,
 relative_pointer: RelativePointer,
+pointer_constraints: PointerConstraints,
 compositor: Compositor,
 subcompositor: Subcompositor,
 scene: Scene,
@@ -154,6 +156,7 @@ pub fn create(
         .single_pixel_buffer = undefined,
         .cursor_shape = undefined,
         .relative_pointer = undefined,
+        .pointer_constraints = undefined,
         .compositor = undefined,
         .subcompositor = undefined,
         .scene = undefined,
@@ -249,6 +252,13 @@ pub fn create(
     errdefer self.cursor_shape.deinit();
     try self.relative_pointer.init(allocator, display, &self.seat);
     errdefer self.relative_pointer.deinit();
+    try self.pointer_constraints.init(
+        allocator,
+        display,
+        &self.seat,
+        self.compositor.surfaceStore(),
+    );
+    errdefer self.pointer_constraints.deinit();
     try self.presentation_protocol.init(
         allocator,
         display,
@@ -419,6 +429,7 @@ pub fn destroy(self: *Self) void {
     self.fractional_scale.deinit();
     self.viewporter.deinit();
     self.presentation_protocol.deinit();
+    self.pointer_constraints.deinit();
     self.relative_pointer.deinit();
     self.cursor_shape.deinit();
     self.single_pixel_buffer.deinit();
@@ -968,7 +979,10 @@ fn keyboardRepeatInfo(context: *anyopaque, rate: i32, delay: i32) void {
 
 fn pointerAvailable(context: *anyopaque, available: bool) void {
     const self = serverForOutput(context);
-    if (!available) self.data_device.cancel();
+    if (!available) {
+        self.pointer_constraints.deactivateAll();
+        self.data_device.cancel();
+    }
     self.seat.setPointerAvailable(available);
 }
 
@@ -978,21 +992,25 @@ fn pointerEnter(context: *anyopaque, x: f64, y: f64) void {
     const point = output.globalPoint(x, y);
     const route = self.pointerRoute(point.x, point.y);
     if (self.data_device.isDragging()) {
+        self.pointer_constraints.deactivateAll();
         self.seat.pointerEnter(point.x, point.y, null);
         self.data_device.pointerEntered(route.focus);
         self.window_manager.pointerMoved(null);
         return;
     }
+    if (self.window_manager.pointerGrabbed()) self.pointer_constraints.deactivateAll();
     self.seat.pointerEnter(
         point.x,
         point.y,
         if (self.window_manager.pointerGrabbed()) null else route.focus,
     );
     self.window_manager.pointerMoved(if (self.window_manager.pointerGrabbed()) null else route.root);
+    self.pointer_constraints.syncFocus();
 }
 
 fn pointerLeave(context: *anyopaque) void {
     const self = serverForOutput(context);
+    self.pointer_constraints.deactivateAll();
     self.data_device.pointerLeft();
     self.seat.pointerLeave();
     self.window_manager.pointerMoved(null);
@@ -1001,21 +1019,44 @@ fn pointerLeave(context: *anyopaque) void {
 fn pointerMotion(context: *anyopaque, time: u32, x: f64, y: f64) void {
     const output: *RenderOutput = @ptrCast(@alignCast(context));
     const self = output.server;
-    const point = output.globalPoint(x, y);
-    const route = self.pointerRoute(point.x, point.y);
+    const target = output.globalPoint(x, y);
     if (self.data_device.isDragging()) {
-        self.seat.pointerMotion(time, point.x, point.y, null);
+        self.pointer_constraints.deactivateAll();
+        const route = self.pointerRoute(target.x, target.y);
+        self.seat.pointerMotion(time, target.x, target.y, null);
         self.data_device.pointerMotion(time, route.focus);
         self.window_manager.pointerMoved(null);
         return;
     }
+    if (self.window_manager.pointerGrabbed()) {
+        self.pointer_constraints.deactivateAll();
+        self.seat.pointerMotion(time, target.x, target.y, null);
+        self.window_manager.pointerMoved(null);
+        return;
+    }
+    const motion = self.pointer_constraints.constrainMotion(.{ .x = target.x, .y = target.y });
+    if (motion.point.x != target.x or motion.point.y != target.y) {
+        self.synchronizeBackendPointer(output, motion.point.x, motion.point.y);
+    }
+    if (motion.locked) return;
+    const route = self.pointerRoute(motion.point.x, motion.point.y);
     self.seat.pointerMotion(
         time,
-        point.x,
-        point.y,
-        if (self.window_manager.pointerGrabbed()) null else route.focus,
+        motion.point.x,
+        motion.point.y,
+        route.focus,
     );
-    self.window_manager.pointerMoved(if (self.window_manager.pointerGrabbed()) null else route.root);
+    self.window_manager.pointerMoved(route.root);
+    self.pointer_constraints.syncFocus();
+}
+
+fn synchronizeBackendPointer(self: *Self, output: *RenderOutput, x: f64, y: f64) void {
+    if (!self.native_input_initialized) return;
+    const position = self.outputs.get(output.protocol_id).?.logicalPosition();
+    self.native_input.setPointerPosition(
+        x - @as(f64, @floatFromInt(position.x)),
+        y - @as(f64, @floatFromInt(position.y)),
+    );
 }
 
 fn pointerRelativeMotion(
@@ -1051,6 +1092,7 @@ fn pointerButton(
     else
         null;
     if (self.window_manager.pointerButton(button, state, root)) {
+        self.pointer_constraints.deactivateAll();
         self.seat.suppressPointerFocus(true);
         return;
     }
@@ -1076,6 +1118,7 @@ fn pointerButton(
 
 fn dragStarted(context: *anyopaque) void {
     const self: *Self = @ptrCast(@alignCast(context));
+    self.pointer_constraints.deactivateAll();
     const position = self.seat.pointerPosition() orelse return;
     const route = self.pointerRoute(position.x, position.y);
     self.seat.suppressPointerFocus(true);
@@ -1093,6 +1136,7 @@ fn dragEnded(context: *anyopaque) void {
         if (self.window_manager.pointerGrabbed()) null else route.focus,
     );
     self.window_manager.pointerMoved(if (self.window_manager.pointerGrabbed()) null else route.root);
+    self.pointer_constraints.syncFocus();
 }
 
 fn pointerAxis(context: *anyopaque, time: u32, axis: wl.Pointer.Axis, value: wl.Fixed) void {
