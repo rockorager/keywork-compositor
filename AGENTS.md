@@ -83,3 +83,9 @@ const output = try writer.toOwnedSlice();
 - Add assertions at API boundaries and state transitions; avoid trivial assertions.
 - Keep functions small and push pure computation into helpers.
 - Comments should explain why, not what.
+
+## Licensing Boundary
+
+- Keywork is MIT-licensed and uses River only as a source of MIT-licensed protocol XML files.
+- Do not inspect, copy, or adapt River's GPL-3.0-only compositor implementation, including files under `zig-pkg/river-*/river/`.
+- Implement River protocol behavior from the protocol XML and other permissively licensed specifications or documentation.
