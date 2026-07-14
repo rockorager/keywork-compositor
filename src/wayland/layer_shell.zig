@@ -1,4 +1,4 @@
-//! wlr-layer-shell protocol and single-output policy mechanics.
+//! wlr-layer-shell protocol and output-local policy mechanics.
 
 const Self = @This();
 
@@ -18,7 +18,7 @@ const zwlr = wayland.server.zwlr;
 allocator: std.mem.Allocator,
 display: *wl.Server,
 outputs: *OutputLayout,
-output_id: OutputLayout.Id,
+default_output_id: OutputLayout.Id,
 scene: *Scene,
 seat: *Seat,
 xdg_shell: *XdgShell,
@@ -59,6 +59,7 @@ const State = struct {
     adapter: *Adapter,
     surface_id: Surface.Id,
     scene_id: Scene.LayerSurfaceId,
+    output_id: OutputLayout.Id,
     initial_layer: zwlr.LayerShellV1.Layer,
     pending: StateValue,
     current: StateValue,
@@ -73,18 +74,18 @@ const Adapter = struct { shell: *Self, id: Id, resource: ?*zwlr.LayerSurfaceV1, 
 
 pub fn init(self: *Self, allocator: std.mem.Allocator, display: *wl.Server, outputs: *OutputLayout, output_id: OutputLayout.Id, scene: *Scene, seat: *Seat, xdg_shell: *XdgShell, surfaces: *Surface.Store) !void {
     const output = outputs.get(output_id) orelse unreachable;
-    const size = output.logicalSize();
+    const bounds = outputBounds(output);
     self.* = .{
         .allocator = allocator,
         .display = display,
         .outputs = outputs,
-        .output_id = output_id,
+        .default_output_id = output_id,
         .scene = scene,
         .seat = seat,
         .xdg_shell = xdg_shell,
         .surfaces = surfaces,
         .global = try wl.Global.create(display, zwlr.LayerShellV1, 5, *Self, self, bind),
-        .usable_area = .{ .x = 0, .y = 0, .width = @intCast(size.width), .height = @intCast(size.height) },
+        .usable_area = bounds,
     };
 }
 
@@ -97,10 +98,6 @@ pub fn deinit(self: *Self) void {
 
 pub fn usableArea(self: *const Self) Rect {
     return self.usable_area;
-}
-
-fn resolveOutput(self: *Self) *Output {
-    return self.outputs.get(self.output_id) orelse unreachable;
 }
 
 pub fn setPolicyListener(self: *Self, listener: PolicyListener) void {
@@ -228,10 +225,10 @@ const CreateError = error{
 };
 fn createSurface(self: *Self, manager: *zwlr.LayerShellV1, r: anytype) CreateError!void {
     if (!validLayer(r.layer)) return error.InvalidLayer;
-    if (r.output) |resource| {
+    const output_id = if (r.output) |resource| output: {
         const output = self.outputs.findResource(resource) orelse return error.InvalidOutput;
-        if (!std.meta.eql(output.id, self.output_id)) return error.InvalidOutput;
-    }
+        break :output output.id;
+    } else self.default_output_id;
     if (!std.unicode.utf8ValidateSlice(std.mem.span(r.namespace))) {
         return error.InvalidNamespace;
     }
@@ -245,7 +242,7 @@ fn createSurface(self: *Self, manager: *zwlr.LayerShellV1, r: anytype) CreateErr
     const scene_id = self.scene.addLayerSurface(surface.handle(), sceneLayer(r.layer)) catch return error.OutOfMemory;
     errdefer self.scene.removeLayerSurface(scene_id);
     const value: StateValue = .{ .layer = r.layer };
-    const id = self.states.insert(self.allocator, .{ .adapter = adapter, .surface_id = surface.handle(), .scene_id = scene_id, .initial_layer = r.layer, .pending = value, .current = value }) catch return error.OutOfMemory;
+    const id = self.states.insert(self.allocator, .{ .adapter = adapter, .surface_id = surface.handle(), .scene_id = scene_id, .output_id = output_id, .initial_layer = r.layer, .pending = value, .current = value }) catch return error.OutOfMemory;
     adapter.* = .{ .shell = self, .id = id, .resource = null, .surface = surface };
     const protocol = zwlr.LayerSurfaceV1.create(manager.getClient(), manager.getVersion(), r.id) catch {
         self.remove(id);
@@ -350,18 +347,28 @@ fn afterCommit(context: *anyopaque, info: Surface.CommitInfo) void {
 }
 
 fn arrange(self: *Self) void {
-    const size = self.resolveOutput().logicalSize();
-    var usable: Rect = .{ .x = 0, .y = 0, .width = @intCast(size.width), .height = @intCast(size.height) };
+    var outputs = self.outputs.iterator();
+    while (outputs.next()) |entry| {
+        const usable = self.arrangeOutput(entry.id, entry.output);
+        if (std.meta.eql(entry.id, self.default_output_id)) self.usable_area = usable;
+    }
+    self.notifyPolicy();
+}
+
+fn arrangeOutput(self: *Self, output_id: OutputLayout.Id, output: *Output) Rect {
+    const output_bounds = outputBounds(output);
+    var usable = output_bounds;
     var pass: u2 = 0;
     while (pass < 2) : (pass += 1) {
         var it = self.states.iterator();
         while (it.next()) |entry| {
             const state = entry.value;
+            if (!std.meta.eql(state.output_id, output_id)) continue;
             if (state.awaiting_initial_commit) continue;
             if (!state.configured and state.adapter.surface.?.state().has_committed == false) continue;
             const edge = exclusiveEdge(state.current);
             if ((pass == 0) != (state.current.zone > 0 and edge != null)) continue;
-            const bounds: Rect = if (state.current.zone == -1) .{ .x = 0, .y = 0, .width = @intCast(size.width), .height = @intCast(size.height) } else usable;
+            const bounds = if (state.current.zone == -1) output_bounds else usable;
             const hint = place(bounds, state.current, null);
             const actual: ?[2]i32 = if (state.mapped) if (Surface.currentLogicalSize(self.surfaces, state.surface_id)) |logical|
                 .{ @intCast(logical.width), @intCast(logical.height) }
@@ -387,8 +394,17 @@ fn arrange(self: *Self) void {
             }
         }
     }
-    self.usable_area = usable;
-    self.notifyPolicy();
+    return usable;
+}
+
+fn outputBounds(output: *const Output) Rect {
+    const rect = output.logicalRect();
+    return .{
+        .x = rect.x,
+        .y = rect.y,
+        .width = @intCast(rect.width),
+        .height = @intCast(rect.height),
+    };
 }
 
 fn resourceDestroyed(_: *zwlr.LayerSurfaceV1, adapter: *Adapter) void {
@@ -592,5 +608,19 @@ test "geometry ignores margins on unanchored edges" {
     try std.testing.expectEqual(
         Rect{ .x = 350, .y = 275, .width = 100, .height = 50 },
         place(.{ .x = 0, .y = 0, .width = 800, .height = 600 }, state, null),
+    );
+}
+
+test "geometry preserves a non-zero output origin" {
+    const state: StateValue = .{
+        .layer = .top,
+        .width = 100,
+        .height = 50,
+        .anchor = .{ .top = true, .left = true },
+        .margins = .{ .top = 5, .left = 10 },
+    };
+    try std.testing.expectEqual(
+        Rect{ .x = 1290, .y = -195, .width = 100, .height = 50 },
+        place(.{ .x = 1280, .y = -200, .width = 800, .height = 600 }, state, null),
     );
 }
