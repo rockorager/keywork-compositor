@@ -15,6 +15,7 @@ const LayerShell = @import("wayland/layer_shell.zig");
 const SinglePixelBuffer = @import("wayland/single_pixel_buffer.zig");
 const ContentType = @import("wayland/content_type.zig");
 const SecurityContext = @import("wayland/security_context.zig");
+const SessionLock = @import("wayland/session_lock.zig");
 const CursorShape = @import("wayland/cursor_shape.zig");
 const RelativePointer = @import("wayland/relative_pointer.zig");
 const PointerConstraints = @import("wayland/pointer_constraints.zig");
@@ -66,6 +67,8 @@ output_management_initialized: bool,
 single_pixel_buffer: SinglePixelBuffer,
 content_type: ContentType,
 security_context: SecurityContext,
+session_lock: SessionLock,
+session_lock_initialized: bool,
 cursor_shape: CursorShape,
 relative_pointer: RelativePointer,
 pointer_constraints: PointerConstraints,
@@ -101,6 +104,7 @@ const RenderOutput = struct {
     timer: ?*wl.EventSource,
     repaint_needed: bool,
     render_scheduled: bool,
+    lock_frame_pending: bool,
 
     const Point = struct { x: f64, y: f64 };
 
@@ -166,6 +170,8 @@ pub fn create(
         .single_pixel_buffer = undefined,
         .content_type = undefined,
         .security_context = undefined,
+        .session_lock = undefined,
+        .session_lock_initialized = false,
         .cursor_shape = undefined,
         .relative_pointer = undefined,
         .pointer_constraints = undefined,
@@ -267,6 +273,23 @@ pub fn create(
     errdefer self.content_type.deinit();
     try self.security_context.init(allocator, display);
     errdefer self.security_context.deinit();
+    try self.session_lock.init(
+        allocator,
+        display,
+        &self.outputs,
+        self.compositor.surfaceStore(),
+        &self.security_context,
+        .{
+            .context = self,
+            .state_changed = sessionLockStateChanged,
+            .repaint = requestRepaint,
+        },
+    );
+    self.session_lock_initialized = true;
+    errdefer {
+        self.session_lock.deinit();
+        self.session_lock_initialized = false;
+    }
     try self.cursor_shape.init(allocator, display, &self.seat);
     errdefer self.cursor_shape.deinit();
     try self.relative_pointer.init(allocator, display, &self.seat);
@@ -460,6 +483,8 @@ pub fn destroy(self: *Self) void {
     self.pointer_constraints.deinit();
     self.relative_pointer.deinit();
     self.cursor_shape.deinit();
+    self.session_lock.deinit();
+    self.session_lock_initialized = false;
     self.security_context.deinit();
     self.content_type.deinit();
     self.single_pixel_buffer.deinit();
@@ -494,6 +519,7 @@ fn addRenderOutput(
         .timer = null,
         .repaint_needed = false,
         .render_scheduled = false,
+        .lock_frame_pending = false,
     };
     try render_output.backend.init(
         self.allocator,
@@ -531,6 +557,7 @@ fn addRenderOutput(
     if (self.window_manager_initialized) {
         try self.window_manager.outputAdded(render_output.protocol_id);
     }
+    if (self.session_lock_initialized) self.session_lock.refreshOutputs();
     render_output.repaint_needed = true;
     self.scheduleRepaint(render_output);
     return id;
@@ -584,6 +611,10 @@ fn removeRenderOutput(self: *Self, id: RenderOutputId) bool {
     Surface.discardPresentation(self.compositor.surfaceStore(), protocol_output);
     if (self.xdg_output_initialized) self.xdg_output.removeOutput(protocol_output);
     std.debug.assert(self.outputs.remove(render_output.protocol_id));
+    if (self.session_lock_initialized) {
+        self.session_lock.outputRemoved(render_output.protocol_id);
+        self.session_lock.refreshOutputs();
+    }
     render_output.backend.deinit();
     self.allocator.destroy(render_output);
     return true;
@@ -684,7 +715,10 @@ fn setDrmOutputConfiguration(
             backendListener(render_output.output),
         );
     }
-    if (position_changed or dimensions_changed) self.layer_shell.refresh();
+    if (position_changed or dimensions_changed) {
+        self.layer_shell.refresh();
+        self.session_lock.refreshOutputs();
+    }
 }
 
 fn enableDrmOutput(self: *Self, drm_output: *DrmOutput, position: Output.Position) !void {
@@ -891,6 +925,32 @@ fn requestRepaint(context: *anyopaque) void {
     }
 }
 
+fn sessionLockStateChanged(context: *anyopaque, locked: bool) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.pointer_constraints.deactivateAll();
+    self.data_device.cancel();
+    self.seat.touchCancel();
+    self.seat.suppressPointerFocus(true);
+    self.window_manager.pointerMoved(null);
+    self.xdg_shell.dismissPopupGrab();
+    if (locked) {
+        self.virtual_keyboard.setInhibited(true);
+        self.input_method.setInhibited(true);
+        self.seat.setKeyboardFocus(null);
+    } else {
+        self.seat.setKeyboardFocus(null);
+        self.input_method.setInhibited(false);
+        self.virtual_keyboard.setInhibited(false);
+        if (self.seat.pointerPosition()) |position| {
+            self.seat.pointerEnter(
+                position.x,
+                position.y,
+                self.pointerFocus(position.x, position.y),
+            );
+        }
+    }
+}
+
 fn inputMethodSurfacePosition(context: *anyopaque, surface_id: Surface.Id) ?InputMethod.Position {
     const self: *Self = @ptrCast(@alignCast(context));
     const position = self.scene.surfacePosition(surface_id) orelse return null;
@@ -928,11 +988,16 @@ fn outputPresented(context: *anyopaque, info: presentation.Info) void {
     const protocol_output = self.outputs.get(output.protocol_id).?;
     protocol_output.setRefresh(info);
     Surface.finishPresentation(self.compositor.surfaceStore(), protocol_output, info);
+    if (output.lock_frame_pending) {
+        output.lock_frame_pending = false;
+        self.session_lock.outputPresented(output.protocol_id);
+    }
 }
 
 fn outputDiscarded(context: *anyopaque) void {
     const output: *RenderOutput = @ptrCast(@alignCast(context));
     const self = output.server;
+    output.lock_frame_pending = false;
     Surface.discardPresentation(
         self.compositor.surfaceStore(),
         self.outputs.get(output.protocol_id).?,
@@ -1021,6 +1086,11 @@ fn pointerEnter(context: *anyopaque, x: f64, y: f64) void {
     const self = output.server;
     const point = output.globalPoint(x, y);
     const route = self.pointerRoute(point.x, point.y);
+    if (self.session_lock.isLocked()) {
+        self.seat.pointerEnter(point.x, point.y, route.focus);
+        self.window_manager.pointerMoved(null);
+        return;
+    }
     if (self.data_device.isDragging()) {
         self.pointer_constraints.deactivateAll();
         self.seat.pointerEnter(point.x, point.y, null);
@@ -1050,6 +1120,16 @@ fn pointerMotion(context: *anyopaque, time: u32, x: f64, y: f64) void {
     const output: *RenderOutput = @ptrCast(@alignCast(context));
     const self = output.server;
     const target = output.globalPoint(x, y);
+    if (self.session_lock.isLocked()) {
+        self.seat.pointerMotion(
+            time,
+            target.x,
+            target.y,
+            self.pointerFocus(target.x, target.y),
+        );
+        self.window_manager.pointerMoved(null);
+        return;
+    }
     if (self.data_device.isDragging()) {
         self.pointer_constraints.deactivateAll();
         const route = self.pointerRoute(target.x, target.y);
@@ -1108,6 +1188,20 @@ fn pointerButton(
     state: wl.Pointer.ButtonState,
 ) void {
     const self = serverForOutput(context);
+    if (self.session_lock.isLocked()) {
+        if (state == .pressed) {
+            const focused = if (self.seat.pointerFocusedSurface()) |surface_id|
+                self.subcompositor.rootSurface(surface_id)
+            else
+                null;
+            self.session_lock.pointerPressed(focused);
+        }
+        _ = self.seat.pointerButton(time, button, state) catch {
+            log.err("failed to store pointer button state", .{});
+            self.terminate();
+        };
+        return;
+    }
     if (self.data_device.isDragging()) {
         const grab_ended = self.seat.pointerButton(time, button, state) catch {
             log.err("failed to store pointer button state", .{});
@@ -1218,6 +1312,16 @@ fn touchDown(context: *anyopaque, time: u32, id: i32, x: f64, y: f64) void {
     const self = output.server;
     const point = output.globalPoint(x, y);
     const focus = self.pointerFocus(point.x, point.y);
+    if (self.session_lock.isLocked()) {
+        if (focus) |target| {
+            self.session_lock.pointerPressed(self.subcompositor.rootSurface(target.surface_id));
+        }
+        self.seat.touchDown(time, id, point.x, point.y, focus) catch {
+            log.err("failed to store touch point", .{});
+            self.terminate();
+        };
+        return;
+    }
     if (focus) |target| {
         self.layer_shell.pointerPressed(self.subcompositor.rootSurface(target.surface_id));
         requestRepaint(self);
@@ -1275,6 +1379,18 @@ fn touchOrientation(context: *anyopaque, id: i32, orientation: f64) void {
 }
 
 fn pointerFocus(self: *Self, x: f64, y: f64) ?Seat.PointerFocus {
+    if (self.session_lock.isLocked()) {
+        var outputs = self.outputs.iterator();
+        while (outputs.next()) |entry| {
+            if (!pointInRect(x, y, entry.output.logicalRect())) continue;
+            const info = self.session_lock.surfaceForOutput(entry.id) orelse return null;
+            return self.hitTestSurface(info.surface_id, .{
+                .x = info.position.x,
+                .y = info.position.y,
+            }, x, y);
+        }
+        return null;
+    }
     const focus = self.scenePointerFocus(x, y);
     if (focus) |candidate| {
         if (self.xdg_shell.hasPopupGrab() and
@@ -1292,7 +1408,12 @@ fn pointerRoute(self: *Self, x: f64, y: f64) WindowManager.PointerRoute {
     const focus = self.pointerFocus(x, y);
     return .{
         .focus = focus,
-        .root = if (focus) |value| self.subcompositor.rootSurface(value.surface_id) else self.borderRoot(x, y),
+        .root = if (focus) |value|
+            self.subcompositor.rootSurface(value.surface_id)
+        else if (self.session_lock.isLocked())
+            null
+        else
+            self.borderRoot(x, y),
     };
 }
 
@@ -1611,10 +1732,12 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
         .output = output,
         .target = self.renderer.makeTarget(pixel_target),
     };
-    const clear_command = [_]render.Command{
-        .{ .clear = render.Color.rgba(24, 24, 27, 255) },
-    };
+    const clear_command = [_]render.Command{.{ .clear = if (self.session_lock.isLocked())
+        render.Color.rgba(0, 0, 0, 255)
+    else
+        render.Color.rgba(24, 24, 27, 255) }};
     try self.renderCommands(&frame, &clear_command);
+    if (self.session_lock.isLocked()) return self.renderSessionLockFrame(&frame);
 
     try self.renderLayerSurfaces(&frame, .background);
     try self.renderLayerSurfaces(&frame, .bottom);
@@ -1740,6 +1863,63 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
     else
         null;
     self.seat.setKeyboardFocus(keyboard_focus);
+}
+
+fn renderSessionLockFrame(
+    self: *Self,
+    frame: *const OutputFrame,
+) renderer_types.Renderer.Error!void {
+    const lock_surface = self.session_lock.surfaceForOutput(frame.render_output.protocol_id);
+    if (lock_surface) |info| {
+        try self.renderSurfaceTree(
+            frame,
+            info.surface_id,
+            info.position.x,
+            info.position.y,
+            null,
+            null,
+        );
+    }
+
+    const cursor = self.sessionLockCursorInfo();
+    if (cursor) |info| switch (info) {
+        .surface => |surface| try self.renderSurfaceTree(
+            frame,
+            surface.surface_id,
+            surface.x,
+            surface.y,
+            null,
+            null,
+        ),
+        .shape => |shape| {
+            const command = [_]render.Command{.{ .image = .{
+                .x = shape.x,
+                .y = shape.y,
+                .size = shape.buffer.size,
+                .buffer = shape.buffer,
+            } }};
+            try self.renderCommands(frame, &command);
+        },
+    };
+
+    const presented = frame.render_output.backend.present() catch return error.InvalidTarget;
+    frame.render_output.lock_frame_pending = true;
+    frame.output.endFrame();
+    if (lock_surface) |info| self.submitSurfaceTree(frame.output, info.surface_id);
+    if (cursor) |info| switch (info) {
+        .surface => |surface| self.submitSurfaceTree(frame.output, surface.surface_id),
+        .shape => {},
+    };
+    self.finishRepaintIfIdle();
+    if (presented) |info| outputPresented(frame.render_output, info);
+    self.seat.setKeyboardFocus(self.session_lock.keyboardFocus());
+}
+
+fn sessionLockCursorInfo(self: *Self) ?Seat.CursorInfo {
+    const surface_id = self.seat.pointerFocusedSurface() orelse return null;
+    const root = self.subcompositor.rootSurface(surface_id);
+    if (!self.session_lock.ownsSurface(root)) return null;
+    return self.seat.cursorInfo();
 }
 
 fn finishRepaintIfIdle(self: *Self) void {

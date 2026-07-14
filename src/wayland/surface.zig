@@ -72,6 +72,7 @@ pub const State = struct {
     has_cached_state: bool,
     role: ?Role,
     has_committed: bool,
+    has_committed_buffer: bool,
 
     fn init(resource: *wl.Surface) State {
         return .{
@@ -116,6 +117,7 @@ pub const State = struct {
             .has_cached_state = false,
             .role = null,
             .has_committed = false,
+            .has_committed_buffer = false,
         };
     }
 
@@ -285,6 +287,7 @@ pub const Role = enum {
     xdg_toplevel,
     xdg_popup,
     layer_surface,
+    session_lock,
     subsurface,
     cursor,
     drag_icon,
@@ -361,7 +364,7 @@ pub fn assignedRole(self: *Self) ?Role {
 }
 
 pub fn hasBufferAttachedOrCommitted(self: *Self) bool {
-    return self.pending_attachment.hasBuffer() or self.state().current_buffer != null;
+    return self.pending_attachment.hasBuffer() or self.state().has_committed_buffer;
 }
 
 pub fn releaseRole(self: *Self, context: *anyopaque) void {
@@ -734,6 +737,7 @@ fn applyPending(self: *Self, commit_info: CommitInfo) void {
     surface_state.pending_surface_damage.clear();
     surface_state.pending_buffer_damage.clear();
     surface_state.has_committed = true;
+    if (applied_info.has_buffer) surface_state.has_committed_buffer = true;
     if (surface_state.presentation_output != null) surface_state.commit_after_submission = true;
     discardCommitFeedbacks(surface_state, .active);
     for (surface_state.callbacks.items) |callback| {
@@ -823,6 +827,11 @@ fn cachePending(self: *Self) bool {
     surface_state.pending_buffer_damage.clear();
     surface_state.has_cached_state = true;
     surface_state.has_committed = true;
+    const cached_has_buffer = if (surface_state.cached_attachment_changed)
+        surface_state.cached_buffer != null
+    else
+        surface_state.current_buffer != null;
+    if (cached_has_buffer) surface_state.has_committed_buffer = true;
     for (surface_state.callbacks.items) |callback| {
         if (callback.state == .pending) callback.state = .cached;
     }

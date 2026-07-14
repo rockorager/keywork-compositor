@@ -16,6 +16,13 @@ io: std.Io,
 global: *wl.Global,
 seat: *Seat,
 devices: std.ArrayList(*Device),
+inhibited: bool,
+deferred_keymap: ?DeferredKeymap,
+
+const DeferredKeymap = struct {
+    fd: std.posix.fd_t,
+    size: u32,
+};
 
 pub fn init(
     self: *Self,
@@ -37,14 +44,37 @@ pub fn init(
         ),
         .seat = seat,
         .devices = .empty,
+        .inhibited = false,
+        .deferred_keymap = null,
     };
 }
 
 pub fn deinit(self: *Self) void {
     std.debug.assert(self.devices.items.len == 0);
     self.global.destroy();
+    if (self.deferred_keymap) |keymap| {
+        const file: std.Io.File = .{ .handle = keymap.fd, .flags = .{ .nonblocking = false } };
+        file.close(self.io);
+    }
     self.devices.deinit(self.allocator);
     self.* = undefined;
+}
+
+pub fn setInhibited(self: *Self, inhibited: bool) void {
+    if (self.inhibited == inhibited) return;
+    self.inhibited = inhibited;
+    if (!inhibited) {
+        if (self.deferred_keymap) |keymap| {
+            self.deferred_keymap = null;
+            self.seat.setKeymap(.xkb_v1, keymap.fd, keymap.size);
+        }
+        return;
+    }
+    for (self.devices.items) |device| {
+        while (device.pressed_keys.pop()) |key_code| {
+            self.seat.virtualKey(0, key_code, .released) catch unreachable;
+        }
+    }
 }
 
 fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
@@ -114,6 +144,7 @@ const Device = struct {
             .key => |key| self.sendKey(resource, key.time, key.key, key.state),
             .modifiers => |modifiers| {
                 if (!self.requireKeymap(resource)) return;
+                if (self.manager.inhibited) return;
                 self.manager.seat.setVirtualModifiers(
                     modifiers.mods_depressed,
                     modifiers.mods_latched,
@@ -139,7 +170,18 @@ const Device = struct {
             resource.getClient().postImplementationError("invalid virtual keyboard keymap");
             return;
         }
-        self.manager.seat.setKeymap(.xkb_v1, fd, size);
+        if (self.manager.inhibited) {
+            if (self.manager.deferred_keymap) |old| {
+                const old_file: std.Io.File = .{
+                    .handle = old.fd,
+                    .flags = .{ .nonblocking = false },
+                };
+                old_file.close(self.manager.io);
+            }
+            self.manager.deferred_keymap = .{ .fd = fd, .size = size };
+        } else {
+            self.manager.seat.setKeymap(.xkb_v1, fd, size);
+        }
         self.has_keymap = true;
         if (!self.registered) {
             self.registered = true;
@@ -155,6 +197,7 @@ const Device = struct {
         state_value: u32,
     ) void {
         if (!self.requireKeymap(resource)) return;
+        if (self.manager.inhibited) return;
         const state: wl.Keyboard.KeyState = switch (state_value) {
             @intFromEnum(wl.Keyboard.KeyState.released) => .released,
             @intFromEnum(wl.Keyboard.KeyState.pressed) => .pressed,

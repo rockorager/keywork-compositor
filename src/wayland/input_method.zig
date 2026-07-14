@@ -23,6 +23,7 @@ methods: std.ArrayList(*Method),
 active_method: ?*Method,
 popups: std.ArrayList(*Popup),
 next_grab_token: u64,
+inhibited: bool,
 
 pub const Position = struct {
     x: i32 = 0,
@@ -98,6 +99,7 @@ pub fn init(
         .active_method = null,
         .popups = .empty,
         .next_grab_token = 1,
+        .inhibited = false,
     };
     errdefer self.methods.deinit(allocator);
     errdefer self.popups.deinit(allocator);
@@ -130,6 +132,26 @@ pub fn reversePopupIterator(self: *Self) ReversePopupIterator {
 
 pub fn refreshPopups(self: *Self) void {
     self.updatePopups();
+}
+
+pub fn setInhibited(self: *Self, inhibited: bool) void {
+    if (self.inhibited == inhibited) return;
+    self.inhibited = inhibited;
+    if (inhibited) {
+        if (self.active_method) |method| if (method.active_grab) |grab| {
+            grab.active = false;
+            method.active_grab = null;
+            self.seat.clearKeyboardGrab(grab, false);
+        };
+    }
+    self.syncTextInput();
+    if (!inhibited) {
+        const method = self.active_method orelse return;
+        if (!method.available or method.active_grab != null or method.grabs.items.len == 0) return;
+        const grab = method.grabs.items[method.grabs.items.len - 1];
+        grab.active = true;
+        grab.activate();
+    }
 }
 
 fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
@@ -367,7 +389,7 @@ const KeyboardGrab = struct {
         self.* = .{
             .method = method,
             .resource = resource,
-            .active = usable and method.active_grab == null,
+            .active = usable and !method.manager.inhibited and method.active_grab == null,
             .token = method.manager.next_grab_token,
         };
         method.manager.next_grab_token +%= 1;
@@ -396,7 +418,7 @@ const KeyboardGrab = struct {
             _ = method.grabs.orderedRemove(index);
             break;
         }
-        const replacement = if (self.active and method.available and
+        const replacement = if (self.active and !method.manager.inhibited and method.available and
             method.manager.active_method == method and method.grabs.items.len > 0)
             method.grabs.items[method.grabs.items.len - 1]
         else
@@ -637,7 +659,7 @@ fn textInputChanged(context: *anyopaque) void {
 
 fn syncTextInput(self: *Self) void {
     const method = self.active_method orelse return;
-    const active = self.text_input.activeState();
+    const active = if (self.inhibited) null else self.text_input.activeState();
     if (active == null) {
         if (method.client_active) {
             method.resource.sendDeactivate();

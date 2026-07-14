@@ -21,6 +21,7 @@ event_loop: *wl.EventLoop,
 global: *wl.Global,
 contexts: std.ArrayList(*Context),
 clients: std.AutoHashMapUnmanaged(*const wl.Client, *ClientContext),
+restricted_globals: std.ArrayList(*wl.Global),
 
 pub const Metadata = struct {
     sandbox_engine: ?[:0]const u8,
@@ -43,7 +44,9 @@ pub fn init(self: *Self, allocator: std.mem.Allocator, display: *wl.Server) !voi
         ),
         .contexts = .empty,
         .clients = .empty,
+        .restricted_globals = .empty,
     };
+    errdefer self.restricted_globals.deinit(allocator);
     display.setGlobalFilter(*Self, globalFilter, self);
 }
 
@@ -56,6 +59,8 @@ pub fn deinit(self: *Self) void {
     }
     self.display.setGlobalFilter(*Self, allowAllGlobals, self);
     self.global.destroy();
+    std.debug.assert(self.restricted_globals.items.len == 0);
+    self.restricted_globals.deinit(self.allocator);
     self.clients.deinit(self.allocator);
     self.contexts.deinit(self.allocator);
     self.* = undefined;
@@ -66,8 +71,26 @@ pub fn metadataForClient(self: *const Self, client: *const wl.Client) ?Metadata 
     return context.metadata();
 }
 
+pub fn restrictGlobal(self: *Self, global: *wl.Global) error{OutOfMemory}!void {
+    for (self.restricted_globals.items) |candidate| std.debug.assert(candidate != global);
+    try self.restricted_globals.append(self.allocator, global);
+}
+
+pub fn unrestrictGlobal(self: *Self, global: *wl.Global) void {
+    for (self.restricted_globals.items, 0..) |candidate, index| {
+        if (candidate != global) continue;
+        _ = self.restricted_globals.orderedRemove(index);
+        return;
+    }
+    unreachable;
+}
+
 fn globalFilter(client: *const wl.Client, global: *const wl.Global, self: *Self) bool {
-    if (global == self.global and self.clients.contains(client)) return false;
+    if (!self.clients.contains(client)) return true;
+    if (global == self.global) return false;
+    for (self.restricted_globals.items) |restricted| {
+        if (global == restricted) return false;
+    }
     return true;
 }
 

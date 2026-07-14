@@ -710,18 +710,19 @@
       "interfaces": [
         {
           "name": "ext_session_lock_manager_v1",
-          "current_version": null,
+          "current_version": 1,
           "target_version": 1
         }
       ],
-      "status": "not_started",
+      "status": "done",
       "privileged": true,
       "blocked_by": [
         "security-context",
         "wl-compositor",
         "wl-output",
         "wl-seat"
-      ]
+      ],
+      "status_detail": "Version 1 implements exclusive lock acquisition and orphaned-lock recovery, one exact-size lock surface per output, configure and role validation, locked-frame presentation barriers across all outputs, secure blanking, hotplug and output reconfiguration, lock-only rendering and input routing, and explicit unlock. Sandboxed security-context clients cannot see the privileged global; input-method grabs and virtual keyboards are inhibited while locked."
     },
     {
       "id": "idle-notify",
