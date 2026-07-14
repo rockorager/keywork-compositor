@@ -52,13 +52,19 @@ pub const Renderer = union(enum) {
         if (frame.scale.numerator == 0 or frame.scale.numerator > std.math.maxInt(i32)) {
             return error.InvalidTarget;
         }
-        if (frame.scale.numerator == render_types.Scale.denominator) {
+        const translated = frame.origin.x != 0 or frame.origin.y != 0;
+        const scaled = frame.scale.numerator != render_types.Scale.denominator;
+        if (!translated and !scaled) {
             return self.renderDirect(frame, target);
         }
 
         const physical_size = frame.scale.apply(frame.size) catch return error.InvalidTarget;
         for (frame.commands) |command| {
-            const commands = [_]render_types.Command{scaleCommand(command, frame.scale)};
+            const local_command = translateCommand(command, frame.origin);
+            const commands = [_]render_types.Command{if (scaled)
+                scaleCommand(local_command, frame.scale)
+            else
+                local_command};
             try self.renderDirect(.{ .size = physical_size, .commands = &commands }, target);
         }
     }
@@ -80,6 +86,63 @@ pub const Renderer = union(enum) {
         };
     }
 };
+
+fn translateCommand(
+    command: render_types.Command,
+    origin: render_types.Position,
+) render_types.Command {
+    return switch (command) {
+        .clear => |color| .{ .clear = color },
+        .solid_rect => |solid| .{ .solid_rect = .{
+            .rect = translateRect(solid.rect, origin),
+            .color = solid.color,
+            .clip = if (solid.clip) |clip| translateRect(clip, origin) else null,
+        } },
+        .shadow => |shadow| .{ .shadow = .{
+            .rect = translateRect(shadow.rect, origin),
+            .corner_radius = shadow.corner_radius,
+            .blur_radius = shadow.blur_radius,
+            .spread = shadow.spread,
+            .color = shadow.color,
+            .clip = if (shadow.clip) |clip| translateRect(clip, origin) else null,
+        } },
+        .backdrop_blur => |blur| .{ .backdrop_blur = .{
+            .rect = translateRect(blur.rect, origin),
+            .corner_radius = blur.corner_radius,
+            .radius = blur.radius,
+            .clip = if (blur.clip) |clip| translateRect(clip, origin) else null,
+        } },
+        .image => |image| .{ .image = .{
+            .x = translateCoordinate(image.x, origin.x),
+            .y = translateCoordinate(image.y, origin.y),
+            .size = image.size,
+            .buffer = image.buffer,
+            .source = image.source,
+            .rounded_clip = if (image.rounded_clip) |clip| .{
+                .rect = translateRect(clip.rect, origin),
+                .radius = clip.radius,
+            } else null,
+            .clip = if (image.clip) |clip| translateRect(clip, origin) else null,
+        } },
+    };
+}
+
+fn translateRect(rect: render_types.Rect, origin: render_types.Position) render_types.Rect {
+    return .{
+        .x = translateCoordinate(rect.x, origin.x),
+        .y = translateCoordinate(rect.y, origin.y),
+        .width = rect.width,
+        .height = rect.height,
+    };
+}
+
+fn translateCoordinate(value: i32, origin: i32) i32 {
+    return @intCast(std.math.clamp(
+        @as(i64, value) - origin,
+        std.math.minInt(i32),
+        std.math.maxInt(i32),
+    ));
+}
 
 fn scaleCommand(command: render_types.Command, scale: render_types.Scale) render_types.Command {
     std.debug.assert(scale.numerator > 0 and scale.numerator <= std.math.maxInt(i32));
@@ -208,6 +271,37 @@ test "renderer scales logical commands into a physical target" {
     try std.testing.expectEqual(@as(u32, 0xff000000), output.pixel(1, 1));
     try std.testing.expectEqual(@as(u32, 0xffff0000), output.pixel(2, 1));
     try std.testing.expectEqual(@as(u32, 0xff000000), output.pixel(2, 2));
+}
+
+test "renderer translates global commands into an output-local target" {
+    const size: render_types.Size = .{ .width = 2, .height = 1 };
+    var output = try headless.init(std.testing.allocator, size);
+    defer output.deinit();
+    const commands = [_]render_types.Command{
+        .{ .clear = render_types.Color.rgba(0, 0, 0, 255) },
+        .{ .solid_rect = .{
+            .rect = .{ .x = 10, .y = -4, .width = 1, .height = 1 },
+            .color = render_types.Color.rgba(255, 0, 0, 255),
+        } },
+        .{ .solid_rect = .{
+            .rect = .{ .x = 11, .y = -4, .width = 1, .height = 1 },
+            .color = render_types.Color.rgba(0, 255, 0, 255),
+        } },
+    };
+
+    var renderer = try Renderer.init(std.testing.allocator, .cpu);
+    defer renderer.deinit();
+    try renderer.render(
+        .{
+            .size = size,
+            .commands = &commands,
+            .origin = .{ .x = 10, .y = -4 },
+        },
+        .{ .cpu = output.target() },
+    );
+
+    try std.testing.expectEqual(@as(u32, 0xffff0000), output.pixel(0, 0));
+    try std.testing.expectEqual(@as(u32, 0xff00ff00), output.pixel(1, 0));
 }
 
 test "fractional rendering preserves an exact-scale image" {

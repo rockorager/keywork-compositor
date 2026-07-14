@@ -1257,10 +1257,12 @@ fn renderCommands(
     frame: *const OutputFrame,
     commands: []const render.Command,
 ) renderer_types.Renderer.Error!void {
+    const position = frame.output.logicalPosition();
     try self.renderer.render(.{
         .size = frame.render_output.backend.size(),
         .commands = commands,
         .scale = frame.render_output.backend.renderScale(),
+        .origin = .{ .x = position.x, .y = position.y },
     }, frame.target);
 }
 

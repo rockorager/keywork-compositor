@@ -11,6 +11,11 @@ pub const Size = struct {
     }
 };
 
+pub const Position = struct {
+    x: i32 = 0,
+    y: i32 = 0,
+};
+
 pub const Scale = struct {
     numerator: u32 = denominator,
 
@@ -178,6 +183,8 @@ pub const Frame = struct {
     size: Size,
     commands: []const Command,
     scale: Scale = .{},
+    /// Global logical coordinate rendered at the target's top-left corner.
+    origin: Position = .{},
 };
 
 /// A CPU-addressable ARGB8888 target. Rows may contain padding.
