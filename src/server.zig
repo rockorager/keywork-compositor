@@ -9,6 +9,7 @@ const Subcompositor = @import("subcompositor.zig");
 const XdgShell = @import("xdg_shell.zig");
 const Seat = @import("seat.zig");
 const DataDevice = @import("data_device.zig");
+const PrimarySelection = @import("primary_selection.zig");
 const FractionalScale = @import("fractional_scale.zig");
 const Output = @import("output.zig");
 const OutputBackend = @import("output_backend.zig");
@@ -32,6 +33,7 @@ scene: Scene,
 xdg_shell: XdgShell,
 seat: Seat,
 data_device: DataDevice,
+primary_selection: PrimarySelection,
 fractional_scale: FractionalScale,
 viewporter: Viewporter,
 window_manager: WindowManager,
@@ -66,6 +68,7 @@ pub fn create(
         .xdg_shell = undefined,
         .seat = undefined,
         .data_device = undefined,
+        .primary_selection = undefined,
         .fractional_scale = undefined,
         .viewporter = undefined,
         .window_manager = undefined,
@@ -146,6 +149,8 @@ pub fn create(
     errdefer self.xdg_shell.deinit();
     try self.data_device.init(allocator, display, &self.seat);
     errdefer self.data_device.deinit();
+    try self.primary_selection.init(allocator, display, &self.seat);
+    errdefer self.primary_selection.deinit();
     try self.window_manager.init(
         allocator,
         display,
@@ -181,6 +186,7 @@ pub fn destroy(self: *Self) void {
     self.render_timer.remove();
     self.display.destroyClients();
     self.window_manager.deinit();
+    self.primary_selection.deinit();
     self.data_device.deinit();
     self.xdg_shell.deinit();
     self.scene.deinit();

@@ -21,7 +21,7 @@ pointer_available: bool,
 keymap: ?Keymap,
 repeat_info: RepeatInfo,
 repaint_listener: ?RepaintListener,
-keyboard_focus_listener: ?KeyboardFocusListener,
+keyboard_focus_listeners: std.ArrayList(KeyboardFocusListener),
 parent_focused: bool,
 focus: ?Surface.Id,
 pointer_focus: ?PointerFocus,
@@ -115,7 +115,7 @@ pub fn init(
         .keymap = null,
         .repeat_info = .{},
         .repaint_listener = null,
-        .keyboard_focus_listener = null,
+        .keyboard_focus_listeners = .empty,
         .parent_focused = false,
         .focus = null,
         .pointer_focus = null,
@@ -134,6 +134,7 @@ pub fn init(
     errdefer self.keyboard_resources.deinit(allocator);
     errdefer self.pointer_resources.deinit(allocator);
     errdefer self.pressed_keys.deinit(allocator);
+    errdefer self.keyboard_focus_listeners.deinit(allocator);
     self.global = try wl.Global.create(display, wl.Seat, 10, *Self, self, bind);
 }
 
@@ -143,9 +144,10 @@ pub fn deinit(self: *Self) void {
     std.debug.assert(self.pointer_resources.items.len == 0);
     std.debug.assert(self.cursor_surface_count == 0);
     std.debug.assert(self.repaint_listener == null);
-    std.debug.assert(self.keyboard_focus_listener == null);
+    std.debug.assert(self.keyboard_focus_listeners.items.len == 0);
     self.global.destroy();
     if (self.keymap) |keymap| keymap.file.close(self.io);
+    self.keyboard_focus_listeners.deinit(self.allocator);
     self.pressed_keys.deinit(self.allocator);
     self.pointer_resources.deinit(self.allocator);
     self.keyboard_resources.deinit(self.allocator);
@@ -171,14 +173,23 @@ pub fn clearRepaintListener(self: *Self) void {
     self.repaint_listener = null;
 }
 
-pub fn setKeyboardFocusListener(self: *Self, listener: KeyboardFocusListener) void {
-    std.debug.assert(self.keyboard_focus_listener == null);
-    self.keyboard_focus_listener = listener;
+pub fn addKeyboardFocusListener(
+    self: *Self,
+    listener: KeyboardFocusListener,
+) error{OutOfMemory}!void {
+    for (self.keyboard_focus_listeners.items) |existing| {
+        std.debug.assert(existing.context != listener.context);
+    }
+    try self.keyboard_focus_listeners.append(self.allocator, listener);
 }
 
-pub fn clearKeyboardFocusListener(self: *Self) void {
-    std.debug.assert(self.keyboard_focus_listener != null);
-    self.keyboard_focus_listener = null;
+pub fn removeKeyboardFocusListener(self: *Self, context: *anyopaque) void {
+    for (self.keyboard_focus_listeners.items, 0..) |listener, index| {
+        if (listener.context != context) continue;
+        _ = self.keyboard_focus_listeners.orderedRemove(index);
+        return;
+    }
+    unreachable;
 }
 
 pub fn acceptsUserActionSerial(
@@ -201,6 +212,10 @@ pub fn acceptsSelectionSerial(self: *Self, client: *wl.Client, serial: u32) bool
 pub fn acceptsClientUserActionSerial(self: *const Self, client: *wl.Client, serial: u32) bool {
     const action = self.last_user_action orelse return false;
     return action.client == client and action.serial == serial;
+}
+
+pub fn serialIsOlder(candidate: u32, current: u32) bool {
+    return candidate -% current > std.math.maxInt(u32) / 2;
 }
 
 pub fn pointerFocusedSurface(self: *const Self) ?Surface.Id {
@@ -810,7 +825,7 @@ fn recordSelectionSerial(self: *Self, client: *wl.Client, serial: u32) void {
 }
 
 fn notifyKeyboardFocus(self: *Self) void {
-    if (self.keyboard_focus_listener) |listener| {
+    for (self.keyboard_focus_listeners.items) |listener| {
         listener.changed(listener.context, self.keyboardFocusedClient());
     }
 }
@@ -878,4 +893,12 @@ test "cursor position accounts for hotspot and fractional motion" {
         std.math.minInt(i32),
         cursorCoordinate(-0.25, std.math.maxInt(i32)),
     );
+}
+
+test "protocol serial ordering handles wraparound" {
+    try std.testing.expect(!serialIsOlder(10, 10));
+    try std.testing.expect(!serialIsOlder(11, 10));
+    try std.testing.expect(serialIsOlder(9, 10));
+    try std.testing.expect(!serialIsOlder(1, std.math.maxInt(u32)));
+    try std.testing.expect(serialIsOlder(std.math.maxInt(u32), 1));
 }

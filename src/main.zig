@@ -63,6 +63,7 @@ test {
     _ = @import("subcompositor.zig");
     _ = @import("seat.zig");
     _ = @import("data_device.zig");
+    _ = @import("primary_selection.zig");
     _ = @import("xdg_shell.zig");
     _ = @import("window_manager.zig");
     _ = @import("server.zig");
