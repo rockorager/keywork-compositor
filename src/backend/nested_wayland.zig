@@ -30,6 +30,7 @@ presentation_clock_id: ?u32,
 seat: ?*wl.Seat,
 keyboard: ?*wl.Keyboard,
 pointer: ?*wl.Pointer,
+touch: ?*wl.Touch,
 surface: ?*wl.Surface,
 viewport: ?*wp.Viewport,
 fractional_scale: ?*wp.FractionalScaleV1,
@@ -80,6 +81,14 @@ pub const Listener = struct {
         wl.Pointer.Axis,
         wl.Pointer.AxisRelativeDirection,
     ) void,
+    touch_available: *const fn (*anyopaque, bool) void,
+    touch_down: *const fn (*anyopaque, u32, i32, f64, f64) void,
+    touch_up: *const fn (*anyopaque, u32, i32) void,
+    touch_motion: *const fn (*anyopaque, u32, i32, f64, f64) void,
+    touch_frame: *const fn (*anyopaque) void,
+    touch_cancel: *const fn (*anyopaque) void,
+    touch_shape: *const fn (*anyopaque, i32, f64, f64) void,
+    touch_orientation: *const fn (*anyopaque, i32, f64) void,
 };
 
 const Buffer = struct {
@@ -126,6 +135,7 @@ pub fn init(
         .seat = null,
         .keyboard = null,
         .pointer = null,
+        .touch = null,
         .surface = null,
         .viewport = null,
         .fractional_scale = null,
@@ -220,6 +230,7 @@ pub fn deinit(self: *Self) void {
     if (self.xdg_surface) |xdg_surface| xdg_surface.destroy();
     if (self.fractional_scale) |fractional_scale| fractional_scale.destroy();
     if (self.viewport) |viewport| viewport.destroy();
+    if (self.touch) |touch| releaseTouch(touch);
     if (self.surface) |surface| surface.destroy();
     if (self.pointer) |pointer| releasePointer(pointer);
     if (self.keyboard) |keyboard| releaseKeyboard(keyboard);
@@ -594,6 +605,17 @@ fn handleSeatEvent(seat: *wl.Seat, event: wl.Seat.Event, self: *Self) void {
                 if (self.pointer) |pointer| releasePointer(pointer);
                 self.pointer = null;
             }
+            if (capabilities.capabilities.touch and self.touch == null) {
+                const touch = seat.getTouch() catch {
+                    self.fail();
+                    return;
+                };
+                self.touch = touch;
+                touch.setListener(*Self, handleTouchEvent, self);
+            } else if (!capabilities.capabilities.touch) {
+                if (self.touch) |touch| releaseTouch(touch);
+                self.touch = null;
+            }
             self.listener.keyboard_available(
                 self.listener.context,
                 capabilities.capabilities.keyboard,
@@ -601,6 +623,10 @@ fn handleSeatEvent(seat: *wl.Seat, event: wl.Seat.Event, self: *Self) void {
             self.listener.pointer_available(
                 self.listener.context,
                 capabilities.capabilities.pointer,
+            );
+            self.listener.touch_available(
+                self.listener.context,
+                capabilities.capabilities.touch,
             );
         },
         .name => {},
@@ -698,6 +724,46 @@ fn handleKeyboardEvent(_: *wl.Keyboard, event: wl.Keyboard.Event, self: *Self) v
     }
 }
 
+fn handleTouchEvent(_: *wl.Touch, event: wl.Touch.Event, self: *Self) void {
+    switch (event) {
+        .down => |down| {
+            if (down.surface == null or down.surface.? != self.surface) return;
+            self.listener.touch_down(
+                self.listener.context,
+                down.time,
+                down.id,
+                down.x.toDouble(),
+                down.y.toDouble(),
+            );
+        },
+        .up => |up| self.listener.touch_up(
+            self.listener.context,
+            up.time,
+            up.id,
+        ),
+        .motion => |motion| self.listener.touch_motion(
+            self.listener.context,
+            motion.time,
+            motion.id,
+            motion.x.toDouble(),
+            motion.y.toDouble(),
+        ),
+        .frame => self.listener.touch_frame(self.listener.context),
+        .cancel => self.listener.touch_cancel(self.listener.context),
+        .shape => |shape| self.listener.touch_shape(
+            self.listener.context,
+            shape.id,
+            shape.major.toDouble(),
+            shape.minor.toDouble(),
+        ),
+        .orientation => |orientation| self.listener.touch_orientation(
+            self.listener.context,
+            orientation.id,
+            orientation.orientation.toDouble(),
+        ),
+    }
+}
+
 fn releaseKeyboard(keyboard: *wl.Keyboard) void {
     if (keyboard.getVersion() >= wl.Keyboard.release_since_version) {
         keyboard.release();
@@ -711,6 +777,14 @@ fn releasePointer(pointer: *wl.Pointer) void {
         pointer.release();
     } else {
         pointer.destroy();
+    }
+}
+
+fn releaseTouch(touch: *wl.Touch) void {
+    if (touch.getVersion() >= wl.Touch.release_since_version) {
+        touch.release();
+    } else {
+        touch.destroy();
     }
 }
 

@@ -14,10 +14,20 @@ display: *wl.Server,
 global: *wl.Global,
 surface_store: *Surface.Store,
 seat_resources: std.ArrayList(*wl.Seat),
-keyboard_resources: std.ArrayList(*wl.Keyboard),
-pointer_resources: std.ArrayList(*wl.Pointer),
+keyboard_resources: std.ArrayList(KeyboardResource),
+pointer_resources: std.ArrayList(PointerResource),
+touch_resources: std.ArrayList(TouchResource),
+next_touch_resource_generation: u64,
+// Input objects created before a capability is re-added must remain inert.
+keyboard_capability_generation: u64,
+pointer_capability_generation: u64,
+touch_capability_generation: u64,
+keyboard_ever_available: bool,
+pointer_ever_available: bool,
+touch_ever_available: bool,
 keyboard_available: bool,
 pointer_available: bool,
+touch_available: bool,
 keymap: ?Keymap,
 repeat_info: RepeatInfo,
 repaint_listener: ?RepaintListener,
@@ -26,6 +36,8 @@ parent_focused: bool,
 focus: ?Surface.Id,
 pointer_focus: ?PointerFocus,
 pointer_position: ?PointerPosition,
+touch_points: std.ArrayList(TouchPoint),
+touch_frame_resources: std.ArrayList(*wl.Touch),
 latest_pointer_enter: ?UserAction,
 active_cursor: ?ActiveCursor,
 cursor_controller: ?CursorController,
@@ -65,6 +77,35 @@ const UserAction = struct {
 const PointerPosition = struct {
     x: f64,
     y: f64,
+};
+
+const TouchPoint = struct {
+    id: i32,
+    target: ?Target,
+
+    const Target = struct {
+        surface_id: Surface.Id,
+        client: *wl.Client,
+        offset_x: f64,
+        offset_y: f64,
+        max_resource_generation: u64,
+    };
+};
+
+const TouchResource = struct {
+    resource: *wl.Touch,
+    generation: u64,
+    capability_generation: u64,
+};
+
+const KeyboardResource = struct {
+    resource: *wl.Keyboard,
+    capability_generation: u64,
+};
+
+const PointerResource = struct {
+    resource: *wl.Pointer,
+    capability_generation: u64,
 };
 
 const ActiveCursor = struct {
@@ -116,8 +157,17 @@ pub fn init(
         .seat_resources = .empty,
         .keyboard_resources = .empty,
         .pointer_resources = .empty,
+        .touch_resources = .empty,
+        .next_touch_resource_generation = 0,
+        .keyboard_capability_generation = 0,
+        .pointer_capability_generation = 0,
+        .touch_capability_generation = 0,
+        .keyboard_ever_available = false,
+        .pointer_ever_available = false,
+        .touch_ever_available = false,
         .keyboard_available = false,
         .pointer_available = false,
+        .touch_available = false,
         .keymap = null,
         .repeat_info = .{},
         .repaint_listener = null,
@@ -126,6 +176,8 @@ pub fn init(
         .focus = null,
         .pointer_focus = null,
         .pointer_position = null,
+        .touch_points = .empty,
+        .touch_frame_resources = .empty,
         .latest_pointer_enter = null,
         .active_cursor = null,
         .cursor_controller = null,
@@ -140,6 +192,9 @@ pub fn init(
     errdefer self.seat_resources.deinit(allocator);
     errdefer self.keyboard_resources.deinit(allocator);
     errdefer self.pointer_resources.deinit(allocator);
+    errdefer self.touch_resources.deinit(allocator);
+    errdefer self.touch_points.deinit(allocator);
+    errdefer self.touch_frame_resources.deinit(allocator);
     errdefer self.pressed_keys.deinit(allocator);
     errdefer self.keyboard_focus_listeners.deinit(allocator);
     self.global = try wl.Global.create(display, wl.Seat, 10, *Self, self, bind);
@@ -149,6 +204,7 @@ pub fn deinit(self: *Self) void {
     std.debug.assert(self.seat_resources.items.len == 0);
     std.debug.assert(self.keyboard_resources.items.len == 0);
     std.debug.assert(self.pointer_resources.items.len == 0);
+    std.debug.assert(self.touch_resources.items.len == 0);
     std.debug.assert(self.cursor_surface_count == 0);
     std.debug.assert(self.repaint_listener == null);
     std.debug.assert(self.keyboard_focus_listeners.items.len == 0);
@@ -156,6 +212,9 @@ pub fn deinit(self: *Self) void {
     if (self.keymap) |keymap| keymap.file.close(self.io);
     self.keyboard_focus_listeners.deinit(self.allocator);
     self.pressed_keys.deinit(self.allocator);
+    self.touch_frame_resources.deinit(self.allocator);
+    self.touch_points.deinit(self.allocator);
+    self.touch_resources.deinit(self.allocator);
     self.pointer_resources.deinit(self.allocator);
     self.keyboard_resources.deinit(self.allocator);
     self.seat_resources.deinit(self.allocator);
@@ -235,6 +294,10 @@ pub fn activationSurfaceFocused(self: *const Self, surface_id: Surface.Id) bool 
     if (self.pointer_focus) |focus| {
         if (std.meta.eql(focus.surface_id, surface_id)) return true;
     }
+    for (self.touch_points.items) |point| {
+        const target = point.target orelse continue;
+        if (std.meta.eql(target.surface_id, surface_id)) return true;
+    }
     return false;
 }
 
@@ -305,13 +368,39 @@ pub fn setKeyboardAvailable(self: *Self, available: bool) void {
     const old_capability = self.hasKeyboardCapability();
     if (!available) self.parentKeyboardLeave();
     self.keyboard_available = available;
-    if (old_capability != self.hasKeyboardCapability()) self.broadcastCapabilities();
+    const new_capability = self.hasKeyboardCapability();
+    if (!old_capability and new_capability) {
+        beginCapabilityGeneration(
+            &self.keyboard_capability_generation,
+            &self.keyboard_ever_available,
+        );
+    }
+    if (old_capability != new_capability) self.broadcastCapabilities();
 }
 
 pub fn setPointerAvailable(self: *Self, available: bool) void {
     if (self.pointer_available == available) return;
     if (!available) self.pointerLeave();
     self.pointer_available = available;
+    if (available) {
+        beginCapabilityGeneration(
+            &self.pointer_capability_generation,
+            &self.pointer_ever_available,
+        );
+    }
+    self.broadcastCapabilities();
+}
+
+pub fn setTouchAvailable(self: *Self, available: bool) void {
+    if (self.touch_available == available) return;
+    if (!available) self.touchCancel();
+    self.touch_available = available;
+    if (available) {
+        beginCapabilityGeneration(
+            &self.touch_capability_generation,
+            &self.touch_ever_available,
+        );
+    }
     self.broadcastCapabilities();
 }
 
@@ -329,10 +418,18 @@ pub fn setKeymap(
         .file = .{ .handle = fd, .flags = .{ .nonblocking = false } },
         .size = size,
     };
-    if (old_capability != self.hasKeyboardCapability()) self.broadcastCapabilities();
-    for (self.keyboard_resources.items) |resource| {
-        self.sendKeymap(resource);
-        self.sendRepeatInfo(resource);
+    const new_capability = self.hasKeyboardCapability();
+    if (!old_capability and new_capability) {
+        beginCapabilityGeneration(
+            &self.keyboard_capability_generation,
+            &self.keyboard_ever_available,
+        );
+    }
+    if (old_capability != new_capability) self.broadcastCapabilities();
+    for (self.keyboard_resources.items) |entry| {
+        if (!self.keyboardResourceActive(entry)) continue;
+        self.sendKeymap(entry.resource);
+        self.sendRepeatInfo(entry.resource);
     }
     if (old_focus == null and self.keyboardFocusedClient() != null) {
         self.notifyKeyboardFocus();
@@ -343,7 +440,9 @@ pub fn setKeymap(
 pub fn setRepeatInfo(self: *Self, rate: i32, delay: i32) void {
     std.debug.assert(rate >= 0 and delay >= 0);
     self.repeat_info = .{ .rate = rate, .delay = delay };
-    for (self.keyboard_resources.items) |resource| self.sendRepeatInfo(resource);
+    for (self.keyboard_resources.items) |entry| {
+        if (self.keyboardResourceActive(entry)) self.sendRepeatInfo(entry.resource);
+    }
 }
 
 pub fn setKeyboardFocus(self: *Self, focus: ?Surface.Id) void {
@@ -400,7 +499,9 @@ pub fn key(
     if (!self.parent_focused or self.keymap == null) return;
     const serial = self.display.nextSerial();
     if (state == .pressed) self.recordUserAction(surface.getClient(), serial);
-    for (self.keyboard_resources.items) |resource| {
+    for (self.keyboard_resources.items) |entry| {
+        if (!self.keyboardResourceActive(entry)) continue;
+        const resource = entry.resource;
         if (resource.getClient() != surface.getClient()) continue;
         if (state == .repeated and resource.getVersion() < 10) continue;
         resource.sendKey(serial, time, key_code, state);
@@ -423,8 +524,11 @@ pub fn setModifiers(
     const surface = self.focusedSurface() orelse return;
     if (!self.parent_focused or self.keymap == null) return;
     const serial = self.display.nextSerial();
-    for (self.keyboard_resources.items) |resource| {
-        if (resource.getClient() == surface.getClient()) self.sendModifiers(resource, serial);
+    for (self.keyboard_resources.items) |entry| {
+        if (!self.keyboardResourceActive(entry)) continue;
+        if (entry.resource.getClient() == surface.getClient()) {
+            self.sendModifiers(entry.resource, serial);
+        }
     }
 }
 
@@ -455,7 +559,9 @@ pub fn pointerButton(
     const surface = self.pointerSurface() orelse return;
     const serial = self.display.nextSerial();
     if (state == .pressed) self.recordUserAction(surface.getClient(), serial);
-    for (self.pointer_resources.items) |resource| {
+    for (self.pointer_resources.items) |entry| {
+        if (!self.pointerResourceActive(entry)) continue;
+        const resource = entry.resource;
         if (resource.getClient() == surface.getClient()) {
             resource.sendButton(serial, time, button, state);
         }
@@ -464,14 +570,18 @@ pub fn pointerButton(
 
 pub fn pointerAxis(self: *Self, time: u32, axis: wl.Pointer.Axis, value: wl.Fixed) void {
     const surface = self.pointerSurface() orelse return;
-    for (self.pointer_resources.items) |resource| {
+    for (self.pointer_resources.items) |entry| {
+        if (!self.pointerResourceActive(entry)) continue;
+        const resource = entry.resource;
         if (resource.getClient() == surface.getClient()) resource.sendAxis(time, axis, value);
     }
 }
 
 pub fn pointerFrame(self: *Self) void {
     const surface = self.pointerSurface() orelse return;
-    for (self.pointer_resources.items) |resource| {
+    for (self.pointer_resources.items) |entry| {
+        if (!self.pointerResourceActive(entry)) continue;
+        const resource = entry.resource;
         if (resource.getClient() == surface.getClient() and
             resource.getVersion() >= wl.Pointer.frame_since_version)
         {
@@ -482,7 +592,9 @@ pub fn pointerFrame(self: *Self) void {
 
 pub fn pointerAxisSource(self: *Self, source: wl.Pointer.AxisSource) void {
     const surface = self.pointerSurface() orelse return;
-    for (self.pointer_resources.items) |resource| {
+    for (self.pointer_resources.items) |entry| {
+        if (!self.pointerResourceActive(entry)) continue;
+        const resource = entry.resource;
         if (resource.getClient() == surface.getClient() and
             resource.getVersion() >= wl.Pointer.axis_source_since_version)
         {
@@ -493,7 +605,9 @@ pub fn pointerAxisSource(self: *Self, source: wl.Pointer.AxisSource) void {
 
 pub fn pointerAxisStop(self: *Self, time: u32, axis: wl.Pointer.Axis) void {
     const surface = self.pointerSurface() orelse return;
-    for (self.pointer_resources.items) |resource| {
+    for (self.pointer_resources.items) |entry| {
+        if (!self.pointerResourceActive(entry)) continue;
+        const resource = entry.resource;
         if (resource.getClient() == surface.getClient() and
             resource.getVersion() >= wl.Pointer.axis_stop_since_version)
         {
@@ -504,7 +618,9 @@ pub fn pointerAxisStop(self: *Self, time: u32, axis: wl.Pointer.Axis) void {
 
 pub fn pointerAxisDiscrete(self: *Self, axis: wl.Pointer.Axis, discrete: i32) void {
     const surface = self.pointerSurface() orelse return;
-    for (self.pointer_resources.items) |resource| {
+    for (self.pointer_resources.items) |entry| {
+        if (!self.pointerResourceActive(entry)) continue;
+        const resource = entry.resource;
         if (resource.getClient() == surface.getClient() and
             resource.getVersion() >= wl.Pointer.axis_discrete_since_version and
             resource.getVersion() < wl.Pointer.axis_value120_since_version)
@@ -516,7 +632,9 @@ pub fn pointerAxisDiscrete(self: *Self, axis: wl.Pointer.Axis, discrete: i32) vo
 
 pub fn pointerAxisValue120(self: *Self, axis: wl.Pointer.Axis, value120: i32) void {
     const surface = self.pointerSurface() orelse return;
-    for (self.pointer_resources.items) |resource| {
+    for (self.pointer_resources.items) |entry| {
+        if (!self.pointerResourceActive(entry)) continue;
+        const resource = entry.resource;
         if (resource.getClient() == surface.getClient() and
             resource.getVersion() >= wl.Pointer.axis_value120_since_version)
         {
@@ -531,11 +649,174 @@ pub fn pointerAxisRelativeDirection(
     direction: wl.Pointer.AxisRelativeDirection,
 ) void {
     const surface = self.pointerSurface() orelse return;
-    for (self.pointer_resources.items) |resource| {
+    for (self.pointer_resources.items) |entry| {
+        if (!self.pointerResourceActive(entry)) continue;
+        const resource = entry.resource;
         if (resource.getClient() == surface.getClient() and
             resource.getVersion() >= wl.Pointer.axis_relative_direction_since_version)
         {
             resource.sendAxisRelativeDirection(axis, direction);
+        }
+    }
+}
+
+pub fn touchDown(
+    self: *Self,
+    time: u32,
+    id: i32,
+    x: f64,
+    y: f64,
+    focus: ?PointerFocus,
+) error{OutOfMemory}!void {
+    if (!self.touch_available or self.findTouchPoint(id) != null) return;
+    try self.touch_points.ensureUnusedCapacity(self.allocator, 1);
+
+    const target: ?TouchPoint.Target = if (focus) |candidate| target: {
+        const surface = Surface.resourceFor(self.surface_store, candidate.surface_id) orelse
+            break :target null;
+        const max_resource_generation = self.latestTouchResourceGeneration(
+            surface.getClient(),
+        ) orelse break :target null;
+        break :target .{
+            .surface_id = candidate.surface_id,
+            .client = surface.getClient(),
+            .offset_x = x - candidate.x,
+            .offset_y = y - candidate.y,
+            .max_resource_generation = max_resource_generation,
+        };
+    } else null;
+    self.touch_points.appendAssumeCapacity(.{ .id = id, .target = target });
+
+    const destination = target orelse return;
+    const surface = Surface.resourceFor(self.surface_store, destination.surface_id) orelse return;
+    const serial = self.display.nextSerial();
+    self.recordUserAction(destination.client, serial);
+    for (self.touch_resources.items) |entry| {
+        if (!self.touchResourceActive(entry)) continue;
+        const resource = entry.resource;
+        if (touchResourceInSequence(entry.generation, destination.max_resource_generation) and
+            resource.getClient() == destination.client)
+        {
+            try self.markTouchFrame(resource);
+            resource.sendDown(
+                serial,
+                time,
+                surface,
+                id,
+                fixed(x - destination.offset_x),
+                fixed(y - destination.offset_y),
+            );
+        }
+    }
+}
+
+pub fn touchUp(self: *Self, time: u32, id: i32) error{OutOfMemory}!void {
+    if (!self.touch_available) return;
+    const index = self.findTouchPoint(id) orelse return;
+    const point = self.touch_points.items[index];
+    if (point.target) |target| {
+        const serial = self.display.nextSerial();
+        for (self.touch_resources.items) |entry| {
+            if (!self.touchResourceActive(entry)) continue;
+            const resource = entry.resource;
+            if (touchResourceInSequence(entry.generation, target.max_resource_generation) and
+                resource.getClient() == target.client)
+            {
+                try self.markTouchFrame(resource);
+                resource.sendUp(serial, time, id);
+            }
+        }
+    }
+    _ = self.touch_points.orderedRemove(index);
+}
+
+pub fn touchMotion(
+    self: *Self,
+    time: u32,
+    id: i32,
+    x: f64,
+    y: f64,
+) error{OutOfMemory}!void {
+    if (!self.touch_available) return;
+    const point = self.touchPoint(id) orelse return;
+    const target = point.target orelse return;
+    for (self.touch_resources.items) |entry| {
+        if (!self.touchResourceActive(entry)) continue;
+        const resource = entry.resource;
+        if (touchResourceInSequence(entry.generation, target.max_resource_generation) and
+            resource.getClient() == target.client)
+        {
+            try self.markTouchFrame(resource);
+            resource.sendMotion(
+                time,
+                id,
+                fixed(x - target.offset_x),
+                fixed(y - target.offset_y),
+            );
+        }
+    }
+}
+
+pub fn touchFrame(self: *Self) void {
+    for (self.touch_frame_resources.items) |resource| resource.sendFrame();
+    self.touch_frame_resources.clearRetainingCapacity();
+}
+
+pub fn touchCancel(self: *Self) void {
+    for (self.touch_resources.items) |entry| {
+        if (!self.touchResourceActive(entry)) continue;
+        for (self.touch_points.items) |point| {
+            const target = point.target orelse continue;
+            if (!touchResourceInSequence(entry.generation, target.max_resource_generation)) continue;
+            if (entry.resource.getClient() != target.client) continue;
+            entry.resource.sendCancel();
+            break;
+        }
+    }
+    self.touch_points.clearRetainingCapacity();
+    self.touch_frame_resources.clearRetainingCapacity();
+}
+
+pub fn touchShape(self: *Self, id: i32, major: f64, minor: f64) error{OutOfMemory}!void {
+    if (!self.touch_available) return;
+    const point = self.touchPoint(id) orelse return;
+    const target = point.target orelse return;
+    if (!self.hasTouchResourceVersion(
+        target.client,
+        wl.Touch.shape_since_version,
+        target.max_resource_generation,
+    )) return;
+    for (self.touch_resources.items) |entry| {
+        if (!self.touchResourceActive(entry)) continue;
+        const resource = entry.resource;
+        if (touchResourceInSequence(entry.generation, target.max_resource_generation) and
+            resource.getClient() == target.client and
+            resource.getVersion() >= wl.Touch.shape_since_version)
+        {
+            try self.markTouchFrame(resource);
+            resource.sendShape(id, fixed(major), fixed(minor));
+        }
+    }
+}
+
+pub fn touchOrientation(self: *Self, id: i32, orientation: f64) error{OutOfMemory}!void {
+    if (!self.touch_available) return;
+    const point = self.touchPoint(id) orelse return;
+    const target = point.target orelse return;
+    if (!self.hasTouchResourceVersion(
+        target.client,
+        wl.Touch.orientation_since_version,
+        target.max_resource_generation,
+    )) return;
+    for (self.touch_resources.items) |entry| {
+        if (!self.touchResourceActive(entry)) continue;
+        const resource = entry.resource;
+        if (touchResourceInSequence(entry.generation, target.max_resource_generation) and
+            resource.getClient() == target.client and
+            resource.getVersion() >= wl.Touch.orientation_since_version)
+        {
+            try self.markTouchFrame(resource);
+            resource.sendOrientation(id, fixed(orientation));
         }
     }
 }
@@ -558,12 +839,18 @@ fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
 fn handleRequest(resource: *wl.Seat, request: wl.Seat.Request, self: *Self) void {
     switch (request) {
         .release => resource.destroy(),
-        .get_keyboard => |get| self.createKeyboard(resource, get.id),
-        .get_pointer => |get| self.createPointer(resource, get.id),
-        .get_touch => resource.postError(
-            .missing_capability,
-            "seat does not currently provide this input capability",
-        ),
+        .get_keyboard => |get| if (self.keyboard_ever_available)
+            self.createKeyboard(resource, get.id)
+        else
+            resource.postError(.missing_capability, "seat has never had a keyboard capability"),
+        .get_pointer => |get| if (self.pointer_ever_available)
+            self.createPointer(resource, get.id)
+        else
+            resource.postError(.missing_capability, "seat has never had a pointer capability"),
+        .get_touch => |get| if (self.touch_ever_available)
+            self.createTouch(resource, get.id)
+        else
+            resource.postError(.missing_capability, "seat has never had a touch capability"),
     }
 }
 
@@ -581,12 +868,17 @@ fn createKeyboard(self: *Self, seat: *wl.Seat, id: u32) void {
         seat.postNoMemory();
         return;
     };
-    self.keyboard_resources.append(self.allocator, resource) catch {
+    const entry: KeyboardResource = .{
+        .resource = resource,
+        .capability_generation = self.keyboard_capability_generation,
+    };
+    self.keyboard_resources.append(self.allocator, entry) catch {
         resource.postNoMemory();
         resource.destroy();
         return;
     };
     resource.setHandler(*Self, handleKeyboardRequest, handleKeyboardDestroy, self);
+    if (!self.keyboardResourceActive(entry)) return;
     if (self.keymap == null) return;
     self.sendKeymap(resource);
     self.sendRepeatInfo(resource);
@@ -603,12 +895,17 @@ fn createPointer(self: *Self, seat: *wl.Seat, id: u32) void {
         seat.postNoMemory();
         return;
     };
-    self.pointer_resources.append(self.allocator, resource) catch {
+    const entry: PointerResource = .{
+        .resource = resource,
+        .capability_generation = self.pointer_capability_generation,
+    };
+    self.pointer_resources.append(self.allocator, entry) catch {
         resource.postNoMemory();
         resource.destroy();
         return;
     };
     resource.setHandler(*Self, handlePointerRequest, handlePointerDestroy, self);
+    if (!self.pointerResourceActive(entry)) return;
     const surface = self.pointerSurface() orelse return;
     if (resource.getClient() == surface.getClient()) {
         const serial = self.display.nextSerial();
@@ -621,6 +918,25 @@ fn createPointer(self: *Self, seat: *wl.Seat, id: u32) void {
     }
 }
 
+fn createTouch(self: *Self, seat: *wl.Seat, id: u32) void {
+    const resource = wl.Touch.create(seat.getClient(), seat.getVersion(), id) catch {
+        seat.postNoMemory();
+        return;
+    };
+    const generation = self.next_touch_resource_generation;
+    self.touch_resources.append(self.allocator, .{
+        .resource = resource,
+        .generation = generation,
+        .capability_generation = self.touch_capability_generation,
+    }) catch {
+        resource.postNoMemory();
+        resource.destroy();
+        return;
+    };
+    self.next_touch_resource_generation = std.math.add(u64, generation, 1) catch unreachable;
+    resource.setHandler(*Self, handleTouchRequest, handleTouchDestroy, self);
+}
+
 fn handleKeyboardRequest(resource: *wl.Keyboard, request: wl.Keyboard.Request, _: *Self) void {
     switch (request) {
         .release => resource.destroy(),
@@ -629,7 +945,7 @@ fn handleKeyboardRequest(resource: *wl.Keyboard, request: wl.Keyboard.Request, _
 
 fn handleKeyboardDestroy(resource: *wl.Keyboard, self: *Self) void {
     for (self.keyboard_resources.items, 0..) |candidate, index| {
-        if (candidate != resource) continue;
+        if (candidate.resource != resource) continue;
         _ = self.keyboard_resources.orderedRemove(index);
         return;
     }
@@ -638,7 +954,7 @@ fn handleKeyboardDestroy(resource: *wl.Keyboard, self: *Self) void {
 
 fn handlePointerRequest(resource: *wl.Pointer, request: wl.Pointer.Request, self: *Self) void {
     switch (request) {
-        .set_cursor => |set| self.setCursor(
+        .set_cursor => |set| if (self.pointerResourceIsActive(resource)) self.setCursor(
             resource,
             set.serial,
             set.surface,
@@ -651,8 +967,36 @@ fn handlePointerRequest(resource: *wl.Pointer, request: wl.Pointer.Request, self
 
 fn handlePointerDestroy(resource: *wl.Pointer, self: *Self) void {
     for (self.pointer_resources.items, 0..) |candidate, index| {
-        if (candidate != resource) continue;
+        if (candidate.resource != resource) continue;
         _ = self.pointer_resources.orderedRemove(index);
+        return;
+    }
+    unreachable;
+}
+
+fn handleTouchRequest(resource: *wl.Touch, request: wl.Touch.Request, _: *Self) void {
+    switch (request) {
+        .release => resource.destroy(),
+    }
+}
+
+fn handleTouchDestroy(resource: *wl.Touch, self: *Self) void {
+    const client = resource.getClient();
+    for (self.touch_frame_resources.items, 0..) |candidate, index| {
+        if (candidate != resource) continue;
+        _ = self.touch_frame_resources.orderedRemove(index);
+        break;
+    }
+    for (self.touch_resources.items, 0..) |candidate, index| {
+        if (candidate.resource != resource) continue;
+        _ = self.touch_resources.orderedRemove(index);
+        for (self.touch_resources.items) |remaining| {
+            if (remaining.resource.getClient() == client) return;
+        }
+        for (self.touch_points.items) |*point| {
+            const target = point.target orelse continue;
+            if (target.client == client) point.target = null;
+        }
         return;
     }
     unreachable;
@@ -666,10 +1010,97 @@ fn hasKeyboardCapability(self: *const Self) bool {
     return self.keyboard_available and self.keymap != null;
 }
 
+fn keyboardResourceActive(self: *const Self, entry: KeyboardResource) bool {
+    return capabilityResourceActive(
+        self.hasKeyboardCapability(),
+        self.keyboard_capability_generation,
+        entry.capability_generation,
+    );
+}
+
+fn pointerResourceActive(self: *const Self, entry: PointerResource) bool {
+    return capabilityResourceActive(
+        self.pointer_available,
+        self.pointer_capability_generation,
+        entry.capability_generation,
+    );
+}
+
+fn pointerResourceIsActive(self: *const Self, resource: *wl.Pointer) bool {
+    for (self.pointer_resources.items) |entry| {
+        if (entry.resource == resource) return self.pointerResourceActive(entry);
+    }
+    return false;
+}
+
+fn touchResourceActive(self: *const Self, entry: TouchResource) bool {
+    return capabilityResourceActive(
+        self.touch_available,
+        self.touch_capability_generation,
+        entry.capability_generation,
+    );
+}
+
+fn beginCapabilityGeneration(generation: *u64, ever_available: *bool) void {
+    generation.* = std.math.add(u64, generation.*, 1) catch unreachable;
+    ever_available.* = true;
+}
+
+fn capabilityResourceActive(available: bool, current: u64, resource: u64) bool {
+    return available and resource == current;
+}
+
+fn findTouchPoint(self: *const Self, id: i32) ?usize {
+    for (self.touch_points.items, 0..) |point, index| {
+        if (point.id == id) return index;
+    }
+    return null;
+}
+
+fn touchPoint(self: *const Self, id: i32) ?*const TouchPoint {
+    return &self.touch_points.items[self.findTouchPoint(id) orelse return null];
+}
+
+fn latestTouchResourceGeneration(self: *const Self, client: *wl.Client) ?u64 {
+    var latest: ?u64 = null;
+    for (self.touch_resources.items) |entry| {
+        if (!self.touchResourceActive(entry)) continue;
+        if (entry.resource.getClient() == client) latest = entry.generation;
+    }
+    return latest;
+}
+
+fn hasTouchResourceVersion(
+    self: *const Self,
+    client: *wl.Client,
+    version: u32,
+    max_generation: u64,
+) bool {
+    for (self.touch_resources.items) |entry| {
+        if (self.touchResourceActive(entry) and
+            touchResourceInSequence(entry.generation, max_generation) and
+            entry.resource.getClient() == client and
+            entry.resource.getVersion() >= version) return true;
+    }
+    return false;
+}
+
+fn markTouchFrame(self: *Self, resource: *wl.Touch) error{OutOfMemory}!void {
+    for (self.touch_frame_resources.items) |pending| {
+        if (pending == resource) return;
+    }
+    try self.touch_frame_resources.append(self.allocator, resource);
+}
+
+fn touchResourceInSequence(generation: u64, max_generation: u64) bool {
+    return generation <= max_generation;
+}
+
 fn capabilities(self: *const Self) wl.Seat.Capability {
     return .{
         .keyboard = self.hasKeyboardCapability(),
         .pointer = self.pointer_available,
+        .touch = self.touch_available,
     };
 }
 
@@ -693,7 +1124,9 @@ fn sendEnter(self: *Self) void {
     const surface = self.focusedSurface() orelse return;
     const serial = self.display.nextSerial();
     self.recordSelectionSerial(surface.getClient(), serial);
-    for (self.keyboard_resources.items) |resource| {
+    for (self.keyboard_resources.items) |entry| {
+        if (!self.keyboardResourceActive(entry)) continue;
+        const resource = entry.resource;
         if (resource.getClient() == surface.getClient()) {
             self.sendEnterTo(resource, surface, serial);
         }
@@ -709,7 +1142,9 @@ fn sendEnterTo(self: *Self, resource: *wl.Keyboard, surface: *wl.Surface, serial
 fn sendLeave(self: *Self) void {
     const surface = self.focusedSurface() orelse return;
     const serial = self.display.nextSerial();
-    for (self.keyboard_resources.items) |resource| {
+    for (self.keyboard_resources.items) |entry| {
+        if (!self.keyboardResourceActive(entry)) continue;
+        const resource = entry.resource;
         if (resource.getClient() == surface.getClient()) resource.sendLeave(serial, surface);
     }
 }
@@ -742,7 +1177,9 @@ fn updatePointerFocus(self: *Self, focus: ?PointerFocus, motion_time: ?u32) void
     const time = motion_time orelse return;
     const surface = self.pointerSurface() orelse return;
     const position = self.pointer_focus orelse return;
-    for (self.pointer_resources.items) |resource| {
+    for (self.pointer_resources.items) |entry| {
+        if (!self.pointerResourceActive(entry)) continue;
+        const resource = entry.resource;
         if (resource.getClient() == surface.getClient()) {
             resource.sendMotion(time, fixed(position.x), fixed(position.y));
         }
@@ -761,7 +1198,9 @@ fn sendPointerEnter(self: *Self) void {
         .client = surface.getClient(),
         .serial = serial,
     };
-    for (self.pointer_resources.items) |resource| {
+    for (self.pointer_resources.items) |entry| {
+        if (!self.pointerResourceActive(entry)) continue;
+        const resource = entry.resource;
         if (resource.getClient() == surface.getClient()) {
             self.sendPointerEnterTo(resource, surface, serial);
         }
@@ -781,7 +1220,9 @@ fn sendPointerEnterTo(
 fn sendPointerLeave(self: *Self) void {
     const surface = self.pointerSurface() orelse return;
     const serial = self.display.nextSerial();
-    for (self.pointer_resources.items) |resource| {
+    for (self.pointer_resources.items) |entry| {
+        if (!self.pointerResourceActive(entry)) continue;
+        const resource = entry.resource;
         if (resource.getClient() != surface.getClient()) continue;
         resource.sendLeave(serial, surface);
         if (resource.getVersion() >= wl.Pointer.frame_since_version) resource.sendFrame();
@@ -986,4 +1427,24 @@ test "protocol serial ordering handles wraparound" {
     try std.testing.expect(serialIsOlder(9, 10));
     try std.testing.expect(!serialIsOlder(1, std.math.maxInt(u32)));
     try std.testing.expect(serialIsOlder(std.math.maxInt(u32), 1));
+}
+
+test "seat capability generations invalidate existing input resources" {
+    var generation: u64 = 0;
+    var ever_available = false;
+
+    beginCapabilityGeneration(&generation, &ever_available);
+    try std.testing.expect(ever_available);
+    try std.testing.expect(capabilityResourceActive(true, generation, generation));
+    try std.testing.expect(!capabilityResourceActive(false, generation, generation));
+
+    const previous = generation;
+    beginCapabilityGeneration(&generation, &ever_available);
+    try std.testing.expect(!capabilityResourceActive(true, generation, previous));
+    try std.testing.expect(capabilityResourceActive(true, generation, generation));
+}
+
+test "touch resources bound after down do not join the contact sequence" {
+    try std.testing.expect(touchResourceInSequence(4, 4));
+    try std.testing.expect(!touchResourceInSequence(5, 4));
 }

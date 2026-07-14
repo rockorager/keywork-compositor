@@ -84,10 +84,10 @@
           "target_version": 10
         }
       ],
-      "status": "in_progress",
+      "status": "done",
       "privileged": false,
       "blocked_by": [],
-      "status_detail": "Keyboard and pointer events, focus, and client cursor surfaces are implemented; touch support remains."
+      "status_detail": "Version 10 keyboard, pointer, and touch capabilities are implemented, including focus, client cursor surfaces, multi-contact touch routing, cancellation, frames, shape, orientation, and nested input forwarding."
     },
     {
       "id": "wl-data-device-manager",

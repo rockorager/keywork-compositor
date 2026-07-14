@@ -137,6 +137,14 @@ pub fn create(
             .pointer_axis_discrete = pointerAxisDiscrete,
             .pointer_axis_value120 = pointerAxisValue120,
             .pointer_axis_relative_direction = pointerAxisRelativeDirection,
+            .touch_available = touchAvailable,
+            .touch_down = touchDown,
+            .touch_up = touchUp,
+            .touch_motion = touchMotion,
+            .touch_frame = touchFrame,
+            .touch_cancel = touchCancel,
+            .touch_shape = touchShape,
+            .touch_orientation = touchOrientation,
         },
     );
     errdefer self.render_output.deinit();
@@ -477,6 +485,68 @@ fn pointerAxisRelativeDirection(
 ) void {
     const self: *Self = @ptrCast(@alignCast(context));
     self.seat.pointerAxisRelativeDirection(axis, direction);
+}
+
+fn touchAvailable(context: *anyopaque, available: bool) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.seat.setTouchAvailable(available);
+}
+
+fn touchDown(context: *anyopaque, time: u32, id: i32, x: f64, y: f64) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const focus = self.pointerFocus(x, y);
+    if (focus) |target| {
+        self.layer_shell.pointerPressed(self.subcompositor.rootSurface(target.surface_id));
+        requestRepaint(self);
+    } else if (self.xdg_shell.hasPopupGrab()) {
+        self.xdg_shell.dismissPopupGrab();
+    }
+    self.seat.touchDown(time, id, x, y, focus) catch {
+        log.err("failed to store touch point", .{});
+        self.terminate();
+    };
+}
+
+fn touchUp(context: *anyopaque, time: u32, id: i32) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.seat.touchUp(time, id) catch {
+        log.err("failed to finish touch point", .{});
+        self.terminate();
+    };
+}
+
+fn touchMotion(context: *anyopaque, time: u32, id: i32, x: f64, y: f64) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.seat.touchMotion(time, id, x, y) catch {
+        log.err("failed to update touch point", .{});
+        self.terminate();
+    };
+}
+
+fn touchFrame(context: *anyopaque) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.seat.touchFrame();
+}
+
+fn touchCancel(context: *anyopaque) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.seat.touchCancel();
+}
+
+fn touchShape(context: *anyopaque, id: i32, major: f64, minor: f64) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.seat.touchShape(id, major, minor) catch {
+        log.err("failed to update touch shape", .{});
+        self.terminate();
+    };
+}
+
+fn touchOrientation(context: *anyopaque, id: i32, orientation: f64) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.seat.touchOrientation(id, orientation) catch {
+        log.err("failed to update touch orientation", .{});
+        self.terminate();
+    };
 }
 
 fn pointerFocus(self: *Self, x: f64, y: f64) ?Seat.PointerFocus {
