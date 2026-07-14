@@ -10,9 +10,6 @@ const Surface = @import("surface.zig");
 
 const wl = wayland.server.wl;
 
-pub const output_name = "HEADLESS-1";
-pub const output_description = "Keywork virtual output";
-
 allocator: std.mem.Allocator,
 global: *wl.Global,
 position: Position,
@@ -20,6 +17,10 @@ size: render.Size,
 physical_size: render.Size,
 scale: i32,
 refresh_millihertz: i32,
+name_value: [:0]u8,
+description_value: [:0]u8,
+make: [:0]u8,
+model: [:0]u8,
 resources: std.ArrayList(*wl.Output),
 surfaces: *Surface.Store,
 memberships: std.ArrayList(Membership),
@@ -30,12 +31,24 @@ pub const Position = struct {
     y: i32 = 0,
 };
 
+pub const Config = struct {
+    position: Position = .{},
+    size: render.Size,
+    physical_size: render.Size,
+    scale: u32,
+    name: []const u8,
+    description: []const u8,
+    make: []const u8 = "keywork",
+    model: []const u8,
+};
+
 const Membership = struct {
     surface_id: Surface.Id,
     visible: bool,
 };
 
 pub const Error = error{
+    OutOfMemory,
     InvalidDimensions,
     GlobalCreateFailed,
 };
@@ -44,29 +57,40 @@ pub fn init(
     self: *Self,
     allocator: std.mem.Allocator,
     display: *wl.Server,
-    position: Position,
-    size: render.Size,
-    physical_size: render.Size,
-    scale: u32,
+    config: Config,
     surfaces: *Surface.Store,
 ) Error!void {
-    if (size.width == 0 or size.height == 0 or
-        size.width > std.math.maxInt(i32) or size.height > std.math.maxInt(i32) or
-        scale == 0 or scale > std.math.maxInt(i32) or
-        physical_size.width == 0 or physical_size.height == 0 or
-        physical_size.width > std.math.maxInt(i32) or
-        physical_size.height > std.math.maxInt(i32))
+    if (config.size.width == 0 or config.size.height == 0 or
+        config.size.width > std.math.maxInt(i32) or config.size.height > std.math.maxInt(i32) or
+        config.scale == 0 or config.scale > std.math.maxInt(i32) or
+        config.physical_size.width == 0 or config.physical_size.height == 0 or
+        config.physical_size.width > std.math.maxInt(i32) or
+        config.physical_size.height > std.math.maxInt(i32))
     {
         return error.InvalidDimensions;
     }
+
+    const name_value = try allocator.dupeSentinel(u8, config.name, 0);
+    errdefer allocator.free(name_value);
+    const description_value = try allocator.dupeSentinel(u8, config.description, 0);
+    errdefer allocator.free(description_value);
+    const make = try allocator.dupeSentinel(u8, config.make, 0);
+    errdefer allocator.free(make);
+    const model = try allocator.dupeSentinel(u8, config.model, 0);
+    errdefer allocator.free(model);
+
     self.* = .{
         .allocator = allocator,
         .global = try wl.Global.create(display, wl.Output, 4, *Self, self, bind),
-        .position = position,
-        .size = size,
-        .physical_size = physical_size,
-        .scale = @intCast(scale),
+        .position = config.position,
+        .size = config.size,
+        .physical_size = config.physical_size,
+        .scale = @intCast(config.scale),
         .refresh_millihertz = 60_000,
+        .name_value = name_value,
+        .description_value = description_value,
+        .make = make,
+        .model = model,
         .resources = .empty,
         .surfaces = surfaces,
         .memberships = .empty,
@@ -80,6 +104,10 @@ pub fn deinit(self: *Self) void {
     self.global.destroy();
     self.resources.deinit(self.allocator);
     self.memberships.deinit(self.allocator);
+    self.allocator.free(self.model);
+    self.allocator.free(self.make);
+    self.allocator.free(self.description_value);
+    self.allocator.free(self.name_value);
     self.* = undefined;
 }
 
@@ -102,6 +130,14 @@ pub fn logicalRect(self: *const Self) render.Rect {
         .width = self.size.width,
         .height = self.size.height,
     };
+}
+
+pub fn name(self: *const Self) [:0]const u8 {
+    return self.name_value;
+}
+
+pub fn description(self: *const Self) [:0]const u8 {
+    return self.description_value;
 }
 
 pub fn ownsResource(self: *Self, resource: *wl.Output) bool {
@@ -200,15 +236,15 @@ fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
         0,
         0,
         .unknown,
-        "keywork",
-        "headless",
+        self.make,
+        self.model,
         .normal,
     );
     self.sendMode(resource);
     if (version >= wl.Output.scale_since_version) resource.sendScale(self.scale);
     if (version >= wl.Output.name_since_version) {
-        resource.sendName(output_name);
-        resource.sendDescription(output_description);
+        resource.sendName(self.name_value);
+        resource.sendDescription(self.description_value);
     }
     if (version >= wl.Output.done_since_version) resource.sendDone();
     for (self.memberships.items) |membership| {
@@ -252,10 +288,14 @@ test "frame membership removes surfaces which are no longer visible" {
     try output.init(
         std.testing.allocator,
         display,
-        .{},
-        .{ .width = 1280, .height = 720 },
-        .{ .width = 1280, .height = 720 },
-        1,
+        .{
+            .size = .{ .width = 1280, .height = 720 },
+            .physical_size = .{ .width = 1280, .height = 720 },
+            .scale = 1,
+            .name = "HEADLESS-1",
+            .description = "Keywork headless output",
+            .model = "headless",
+        },
         &surfaces,
     );
     defer output.deinit();
@@ -280,10 +320,14 @@ test "cancelled frame preserves existing membership" {
     try output.init(
         std.testing.allocator,
         display,
-        .{},
-        .{ .width = 1280, .height = 720 },
-        .{ .width = 1280, .height = 720 },
-        1,
+        .{
+            .size = .{ .width = 1280, .height = 720 },
+            .physical_size = .{ .width = 1280, .height = 720 },
+            .scale = 1,
+            .name = "HEADLESS-1",
+            .description = "Keywork headless output",
+            .model = "headless",
+        },
         &surfaces,
     );
     defer output.deinit();

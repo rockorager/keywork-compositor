@@ -77,8 +77,8 @@ fn createOutput(
     resource.sendLogicalPosition(position.x, position.y);
     resource.sendLogicalSize(@intCast(size.width), @intCast(size.height));
     if (resource.getVersion() >= zxdg.OutputV1.name_since_version) {
-        resource.sendName(Output.output_name);
-        resource.sendDescription(Output.output_description);
+        resource.sendName(output.name());
+        resource.sendDescription(output.description());
     }
     if (resource.getVersion() < 3) {
         resource.sendDone();

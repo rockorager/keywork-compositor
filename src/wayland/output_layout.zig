@@ -4,7 +4,6 @@ const Self = @This();
 
 const std = @import("std");
 const wayland = @import("wayland");
-const render = @import("../render/types.zig");
 const slot_map = @import("../slot_map.zig");
 const Output = @import("output.zig");
 const Surface = @import("surface.zig");
@@ -19,12 +18,7 @@ outputs: Store,
 const Store = slot_map.SlotMap(*Output, enum { output });
 pub const Id = Store.Id;
 
-pub const Config = struct {
-    position: Output.Position = .{},
-    size: render.Size,
-    physical_size: render.Size,
-    scale: u32,
-};
+pub const Config = Output.Config;
 
 pub const Entry = struct {
     id: Id,
@@ -61,15 +55,17 @@ pub fn deinit(self: *Self) void {
 }
 
 pub fn add(self: *Self, config: Config) !Id {
+    var outputs = self.iterator();
+    while (outputs.next()) |entry| {
+        if (std.mem.eql(u8, entry.output.name(), config.name)) return error.DuplicateName;
+    }
+
     const output = try self.allocator.create(Output);
     errdefer self.allocator.destroy(output);
     try output.init(
         self.allocator,
         self.display,
-        config.position,
-        config.size,
-        config.physical_size,
-        config.scale,
+        config,
         self.surfaces,
     );
     errdefer output.deinit();
@@ -120,6 +116,9 @@ test "output handles are stable across additions and stale after removal" {
         .size = .{ .width = 1280, .height = 720 },
         .physical_size = .{ .width = 1280, .height = 720 },
         .scale = 1,
+        .name = "HEADLESS-1",
+        .description = "Keywork headless output",
+        .model = "headless",
     });
     const first_output = layout.get(first).?;
     const second = try layout.add(.{
@@ -127,10 +126,24 @@ test "output handles are stable across additions and stale after removal" {
         .size = .{ .width = 1920, .height = 1080 },
         .physical_size = .{ .width = 3840, .height = 2160 },
         .scale = 2,
+        .name = "HEADLESS-2",
+        .description = "Keywork headless output 2",
+        .model = "headless",
     });
 
     try std.testing.expect(layout.get(first).? == first_output);
+    try std.testing.expectEqualStrings("HEADLESS-1", layout.get(first).?.name());
+    try std.testing.expectEqualStrings("HEADLESS-2", layout.get(second).?.name());
     try std.testing.expectEqual(Output.Position{ .x = 1280 }, layout.get(second).?.logicalPosition());
+    try std.testing.expectError(error.DuplicateName, layout.add(.{
+        .position = .{ .x = 3200 },
+        .size = .{ .width = 1024, .height = 768 },
+        .physical_size = .{ .width = 1024, .height = 768 },
+        .scale = 1,
+        .name = "HEADLESS-2",
+        .description = "Duplicate output",
+        .model = "headless",
+    }));
     try std.testing.expect(layout.remove(first));
     try std.testing.expectEqual(@as(?*Output, null), layout.get(first));
     try std.testing.expect(layout.remove(second));

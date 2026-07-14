@@ -180,6 +180,18 @@ pub fn create(
         .size = self.render_output.backend.size(),
         .physical_size = self.render_output.backend.physicalSize(),
         .scale = self.render_output.backend.clientScale(),
+        .name = switch (output_kind) {
+            .headless => "HEADLESS-1",
+            .nested => "NESTED-1",
+        },
+        .description = switch (output_kind) {
+            .headless => "Keywork headless output",
+            .nested => "Keywork nested output",
+        },
+        .model = switch (output_kind) {
+            .headless => "headless",
+            .nested => "nested-wayland",
+        },
     });
     errdefer std.debug.assert(self.outputs.remove(self.render_output.protocol_id));
     try self.xdg_output.init(display, &self.outputs);
