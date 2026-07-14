@@ -111,6 +111,14 @@ pub fn name(self: *const Self) [:0]const u8 {
     return if (value == null) "" else std.mem.span(value);
 }
 
+pub fn switchSession(self: *Self, session: u32) !void {
+    std.debug.assert(session > 0 and session <= std.math.maxInt(c_int));
+    if (!self.isActive()) return error.SessionInactive;
+    if (c.libseat_switch_session(self.seat, @intCast(session)) < 0) {
+        return error.SwitchSessionFailed;
+    }
+}
+
 pub fn openDevice(self: *Self, path: [:0]const u8) !Device {
     if (!self.isActive()) return error.SessionInactive;
     var fd: c_int = -1;

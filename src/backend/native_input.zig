@@ -45,6 +45,7 @@ right_ctrl_pressed: bool,
 left_alt_pressed: bool,
 right_alt_pressed: bool,
 launcher_enter_pressed: bool,
+session_switch_key: ?u32,
 suspended: bool,
 initialized: bool,
 failed: bool,
@@ -105,6 +106,7 @@ pub fn init(
         .left_alt_pressed = false,
         .right_alt_pressed = false,
         .launcher_enter_pressed = false,
+        .session_switch_key = null,
         .suspended = false,
         .initialized = false,
         .failed = false,
@@ -332,13 +334,26 @@ fn keyboardKey(self: *Self, event: *c.struct_libinput_event_keyboard) void {
     if (key == c.KEY_RIGHTCTRL) self.right_ctrl_pressed = pressed;
     if (key == c.KEY_LEFTALT) self.left_alt_pressed = pressed;
     if (key == c.KEY_RIGHTALT) self.right_alt_pressed = pressed;
-    if (pressed and key == c.KEY_BACKSPACE and
-        (self.left_ctrl_pressed or self.right_ctrl_pressed) and
+    if (!pressed and self.session_switch_key == key) {
+        self.session_switch_key = null;
+        return;
+    }
+    if (pressed and (self.left_ctrl_pressed or self.right_ctrl_pressed) and
         (self.left_alt_pressed or self.right_alt_pressed))
     {
-        log.warn("Ctrl+Alt+Backspace requested compositor exit", .{});
-        self.listener.close(self.listener.context);
-        return;
+        if (key == c.KEY_BACKSPACE) {
+            log.warn("Ctrl+Alt+Backspace requested compositor exit", .{});
+            self.listener.close(self.listener.context);
+            return;
+        }
+        if (virtualTerminalForKey(key)) |session| {
+            self.session_switch_key = key;
+            log.info("requesting switch to VT {d}", .{session});
+            self.session.switchSession(session) catch |err| {
+                log.err("failed to switch to VT {d}: {t}", .{ session, err });
+            };
+            return;
+        }
     }
     if (key == c.KEY_ENTER) {
         if (pressed and (self.left_meta_pressed or self.right_meta_pressed)) {
@@ -395,6 +410,7 @@ fn resetKeyboardState(self: *Self) !void {
     self.left_alt_pressed = false;
     self.right_alt_pressed = false;
     self.launcher_enter_pressed = false;
+    self.session_switch_key = null;
     self.listener.keyboard_modifiers(self.listener.context, 0, 0, 0, 0);
 }
 
@@ -613,6 +629,23 @@ fn closeRestricted(fd: c_int, data: ?*anyopaque) callconv(.c) void {
 fn clampCoordinate(value: f64, dimension: u32) f64 {
     std.debug.assert(dimension > 0);
     return std.math.clamp(value, 0, @as(f64, @floatFromInt(dimension - 1)));
+}
+
+fn virtualTerminalForKey(key: u32) ?u32 {
+    return switch (key) {
+        c.KEY_F1...c.KEY_F10 => key - c.KEY_F1 + 1,
+        c.KEY_F11 => 11,
+        c.KEY_F12 => 12,
+        else => null,
+    };
+}
+
+test "function keys map to virtual terminals" {
+    try std.testing.expectEqual(@as(?u32, 1), virtualTerminalForKey(c.KEY_F1));
+    try std.testing.expectEqual(@as(?u32, 10), virtualTerminalForKey(c.KEY_F10));
+    try std.testing.expectEqual(@as(?u32, 11), virtualTerminalForKey(c.KEY_F11));
+    try std.testing.expectEqual(@as(?u32, 12), virtualTerminalForKey(c.KEY_F12));
+    try std.testing.expectEqual(@as(?u32, null), virtualTerminalForKey(c.KEY_ENTER));
 }
 
 test "native pointer coordinates stay inside the output" {
