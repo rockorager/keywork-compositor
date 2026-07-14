@@ -438,6 +438,14 @@ fn launchMonstar(self: *Self) void {
 }
 
 fn pointerMotion(self: *Self, event: *c.struct_libinput_event_pointer) void {
+    self.listener.pointer_relative_motion(
+        self.listener.context,
+        c.libinput_event_pointer_get_time_usec(event),
+        c.libinput_event_pointer_get_dx(event),
+        c.libinput_event_pointer_get_dy(event),
+        c.libinput_event_pointer_get_dx_unaccelerated(event),
+        c.libinput_event_pointer_get_dy_unaccelerated(event),
+    );
     self.pointer_x = clampCoordinate(
         self.pointer_x + c.libinput_event_pointer_get_dx(event),
         self.size.width,

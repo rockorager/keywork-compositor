@@ -18,6 +18,7 @@ seat_resources: std.ArrayList(*wl.Seat),
 keyboard_resources: std.ArrayList(KeyboardResource),
 pointer_resources: std.ArrayList(PointerResource),
 touch_resources: std.ArrayList(TouchResource),
+next_pointer_resource_generation: u64,
 next_touch_resource_generation: u64,
 // Input objects created before a capability is re-added must remain inert.
 keyboard_capability_generation: u64,
@@ -115,6 +116,7 @@ const KeyboardResource = struct {
 
 const PointerResource = struct {
     resource: *wl.Pointer,
+    generation: u64,
     capability_generation: u64,
 };
 
@@ -145,6 +147,11 @@ pub const PointerFocus = struct {
     surface_id: Surface.Id,
     x: f64,
     y: f64,
+};
+
+pub const PointerHandle = struct {
+    resource: *wl.Pointer,
+    generation: u64,
 };
 
 pub const ShapeCursor = struct {
@@ -203,6 +210,7 @@ pub fn init(
         .keyboard_resources = .empty,
         .pointer_resources = .empty,
         .touch_resources = .empty,
+        .next_pointer_resource_generation = 0,
         .next_touch_resource_generation = 0,
         .keyboard_capability_generation = 0,
         .pointer_capability_generation = 0,
@@ -283,16 +291,21 @@ pub fn ownsResource(self: *Self, resource: *wl.Seat) bool {
     return resource.getUserData() == @as(?*anyopaque, @ptrCast(self));
 }
 
-pub fn ownsPointerResource(self: *const Self, resource: *wl.Pointer) bool {
+pub fn pointerHandle(self: *const Self, resource: *wl.Pointer) ?PointerHandle {
     for (self.pointer_resources.items) |entry| {
-        if (entry.resource == resource) return true;
+        if (entry.resource == resource) return .{
+            .resource = resource,
+            .generation = entry.generation,
+        };
     }
-    return false;
+    return null;
 }
 
-pub fn pointerResourceIsActive(self: *const Self, resource: *wl.Pointer) bool {
+pub fn pointerHandleIsActive(self: *const Self, handle: PointerHandle) bool {
     for (self.pointer_resources.items) |entry| {
-        if (entry.resource == resource) return self.pointerResourceActive(entry);
+        if (entry.resource == handle.resource and entry.generation == handle.generation) {
+            return self.pointerResourceActive(entry);
+        }
     }
     return false;
 }
@@ -426,6 +439,12 @@ pub fn serialIsOlder(candidate: u32, current: u32) bool {
 pub fn pointerFocusedSurface(self: *const Self) ?Surface.Id {
     const focus = self.pointer_focus orelse return null;
     return focus.surface_id;
+}
+
+pub fn pointerFocusedClient(self: *const Self) ?*wl.Client {
+    const focus = self.pointer_focus orelse return null;
+    const resource = Surface.resourceFor(self.surface_store, focus.surface_id) orelse return null;
+    return resource.getClient();
 }
 
 pub fn pointerPosition(self: *const Self) ?struct { x: f64, y: f64 } {
@@ -1100,8 +1119,10 @@ fn createPointer(self: *Self, seat: *wl.Seat, id: u32) void {
         seat.postNoMemory();
         return;
     };
+    const generation = self.next_pointer_resource_generation;
     const entry: PointerResource = .{
         .resource = resource,
+        .generation = generation,
         .capability_generation = self.pointer_capability_generation,
     };
     self.pointer_resources.append(self.allocator, entry) catch {
@@ -1109,6 +1130,7 @@ fn createPointer(self: *Self, seat: *wl.Seat, id: u32) void {
         resource.destroy();
         return;
     };
+    self.next_pointer_resource_generation = std.math.add(u64, generation, 1) catch unreachable;
     resource.setHandler(*Self, handlePointerRequest, handlePointerDestroy, self);
     if (!self.pointerResourceActive(entry)) return;
     const surface = self.pointerSurface() orelse return;
@@ -1229,6 +1251,11 @@ fn pointerResourceActive(self: *const Self, entry: PointerResource) bool {
         self.pointer_capability_generation,
         entry.capability_generation,
     );
+}
+
+fn pointerResourceIsActive(self: *const Self, resource: *wl.Pointer) bool {
+    const handle = self.pointerHandle(resource) orelse return false;
+    return self.pointerHandleIsActive(handle);
 }
 
 fn touchResourceActive(self: *const Self, entry: TouchResource) bool {

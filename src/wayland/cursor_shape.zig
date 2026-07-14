@@ -77,7 +77,7 @@ fn handleManagerRequest(
             self,
             resource,
             get.cursor_shape_device,
-            if (self.seat.ownsPointerResource(get.pointer)) get.pointer else null,
+            self.seat.pointerHandle(get.pointer),
         ) catch resource.postNoMemory(),
         // Keywork does not advertise tablet-v2 yet, so a client cannot supply a
         // live tablet tool. Keep the device inert until tablet support lands.
@@ -127,13 +127,13 @@ fn cursor(self: *Self, client: *wl.Client, shape: Shape) ?Seat.ShapeCursor {
 const Device = struct {
     manager: *Self,
     client: *wl.Client,
-    pointer: ?*wl.Pointer,
+    pointer: ?Seat.PointerHandle,
 
     fn create(
         manager: *Self,
         manager_resource: *wp.CursorShapeManagerV1,
         id: u32,
-        pointer: ?*wl.Pointer,
+        pointer: ?Seat.PointerHandle,
     ) !void {
         const resource = try wp.CursorShapeDeviceV1.create(
             manager_resource.getClient(),
@@ -167,7 +167,7 @@ const Device = struct {
                     return;
                 }
                 const pointer = self.pointer orelse return;
-                if (!self.manager.seat.pointerResourceIsActive(pointer)) return;
+                if (!self.manager.seat.pointerHandleIsActive(pointer)) return;
                 const cursor_image = self.manager.cursor(self.client, set.shape) orelse return;
                 self.manager.seat.setCursorShape(self.client, set.serial, cursor_image);
             },

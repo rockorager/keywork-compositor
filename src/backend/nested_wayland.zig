@@ -11,6 +11,7 @@ const client = wayland.client;
 const wl = client.wl;
 const xdg = client.xdg;
 const wp = client.wp;
+const zwp = client.zwp;
 const server_wl = wayland.server.wl;
 
 const buffer_count = 3;
@@ -26,10 +27,12 @@ wm_base: ?*xdg.WmBase,
 viewporter: ?*wp.Viewporter,
 fractional_scale_manager: ?*wp.FractionalScaleManagerV1,
 presentation_manager: ?*wp.Presentation,
+relative_pointer_manager: ?*zwp.RelativePointerManagerV1,
 presentation_clock_id: ?u32,
 seat: ?*wl.Seat,
 keyboard: ?*wl.Keyboard,
 pointer: ?*wl.Pointer,
+relative_pointer: ?*zwp.RelativePointerV1,
 touch: ?*wl.Touch,
 surface: ?*wl.Surface,
 viewport: ?*wp.Viewport,
@@ -69,6 +72,7 @@ pub const Listener = struct {
     pointer_enter: *const fn (*anyopaque, f64, f64) void,
     pointer_leave: *const fn (*anyopaque) void,
     pointer_motion: *const fn (*anyopaque, u32, f64, f64) void,
+    pointer_relative_motion: *const fn (*anyopaque, u64, f64, f64, f64, f64) void,
     pointer_button: *const fn (*anyopaque, u32, u32, wl.Pointer.ButtonState) void,
     pointer_axis: *const fn (*anyopaque, u32, wl.Pointer.Axis, wl.Fixed) void,
     pointer_frame: *const fn (*anyopaque) void,
@@ -131,10 +135,12 @@ pub fn init(
         .viewporter = null,
         .fractional_scale_manager = null,
         .presentation_manager = null,
+        .relative_pointer_manager = null,
         .presentation_clock_id = null,
         .seat = null,
         .keyboard = null,
         .pointer = null,
+        .relative_pointer = null,
         .touch = null,
         .surface = null,
         .viewport = null,
@@ -232,10 +238,12 @@ pub fn deinit(self: *Self) void {
     if (self.viewport) |viewport| viewport.destroy();
     if (self.touch) |touch| releaseTouch(touch);
     if (self.surface) |surface| surface.destroy();
+    if (self.relative_pointer) |relative_pointer| relative_pointer.destroy();
     if (self.pointer) |pointer| releasePointer(pointer);
     if (self.keyboard) |keyboard| releaseKeyboard(keyboard);
     if (self.seat) |seat| releaseSeat(seat);
     if (self.wm_base) |wm_base| wm_base.destroy();
+    if (self.relative_pointer_manager) |manager| manager.destroy();
     if (self.presentation_manager) |manager| manager.destroy();
     if (self.fractional_scale_manager) |manager| manager.destroy();
     if (self.viewporter) |viewporter| viewporter.destroy();
@@ -484,6 +492,22 @@ fn handleRegistryEvent(_: *wl.Registry, event: wl.Registry.Event, self: *Self) v
                     self.presentation_manager = manager;
                     manager.setListener(*Self, handlePresentationEvent, self);
                 }
+            } else if (std.mem.eql(
+                u8,
+                interface,
+                std.mem.span(zwp.RelativePointerManagerV1.interface.name),
+            )) {
+                if (self.relative_pointer_manager == null) {
+                    self.relative_pointer_manager = self.registry.?.bind(
+                        global.name,
+                        zwp.RelativePointerManagerV1,
+                        @min(global.version, zwp.RelativePointerManagerV1.generated_version),
+                    ) catch {
+                        self.failed = true;
+                        return;
+                    };
+                    self.ensureRelativePointer();
+                }
             } else if (std.mem.eql(u8, interface, std.mem.span(wl.Seat.interface.name))) {
                 if (self.seat == null) {
                     const seat = self.registry.?.bind(
@@ -580,6 +604,18 @@ fn handleFractionalScaleEvent(
     }
 }
 
+fn ensureRelativePointer(self: *Self) void {
+    if (self.relative_pointer != null) return;
+    const manager = self.relative_pointer_manager orelse return;
+    const pointer = self.pointer orelse return;
+    const relative_pointer = manager.getRelativePointer(pointer) catch {
+        self.fail();
+        return;
+    };
+    self.relative_pointer = relative_pointer;
+    relative_pointer.setListener(*Self, handleRelativePointerEvent, self);
+}
+
 fn handleSeatEvent(seat: *wl.Seat, event: wl.Seat.Event, self: *Self) void {
     switch (event) {
         .capabilities => |capabilities| {
@@ -601,7 +637,10 @@ fn handleSeatEvent(seat: *wl.Seat, event: wl.Seat.Event, self: *Self) void {
                 };
                 self.pointer = pointer;
                 pointer.setListener(*Self, handlePointerEvent, self);
+                self.ensureRelativePointer();
             } else if (!capabilities.capabilities.pointer) {
+                if (self.relative_pointer) |relative_pointer| relative_pointer.destroy();
+                self.relative_pointer = null;
                 if (self.pointer) |pointer| releasePointer(pointer);
                 self.pointer = null;
             }
@@ -686,6 +725,23 @@ fn handlePointerEvent(pointer: *wl.Pointer, event: wl.Pointer.Event, self: *Self
             self.listener.context,
             relative.axis,
             relative.direction,
+        ),
+    }
+}
+
+fn handleRelativePointerEvent(
+    _: *zwp.RelativePointerV1,
+    event: zwp.RelativePointerV1.Event,
+    self: *Self,
+) void {
+    switch (event) {
+        .relative_motion => |motion| self.listener.pointer_relative_motion(
+            self.listener.context,
+            @as(u64, motion.utime_hi) << 32 | motion.utime_lo,
+            motion.dx.toDouble(),
+            motion.dy.toDouble(),
+            motion.dx_unaccel.toDouble(),
+            motion.dy_unaccel.toDouble(),
         ),
     }
 }

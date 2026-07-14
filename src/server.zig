@@ -13,6 +13,7 @@ const XdgShell = @import("wayland/xdg_shell.zig");
 const LayerShell = @import("wayland/layer_shell.zig");
 const SinglePixelBuffer = @import("wayland/single_pixel_buffer.zig");
 const CursorShape = @import("wayland/cursor_shape.zig");
+const RelativePointer = @import("wayland/relative_pointer.zig");
 const Seat = @import("wayland/seat.zig");
 const DataDevice = @import("wayland/data_device.zig");
 const PrimarySelection = @import("wayland/primary_selection.zig");
@@ -58,6 +59,7 @@ output_management: OutputManagement,
 output_management_initialized: bool,
 single_pixel_buffer: SinglePixelBuffer,
 cursor_shape: CursorShape,
+relative_pointer: RelativePointer,
 compositor: Compositor,
 subcompositor: Subcompositor,
 scene: Scene,
@@ -151,6 +153,7 @@ pub fn create(
         .output_management_initialized = false,
         .single_pixel_buffer = undefined,
         .cursor_shape = undefined,
+        .relative_pointer = undefined,
         .compositor = undefined,
         .subcompositor = undefined,
         .scene = undefined,
@@ -244,6 +247,8 @@ pub fn create(
     errdefer self.single_pixel_buffer.deinit();
     try self.cursor_shape.init(allocator, display, &self.seat);
     errdefer self.cursor_shape.deinit();
+    try self.relative_pointer.init(allocator, display, &self.seat);
+    errdefer self.relative_pointer.deinit();
     try self.presentation_protocol.init(
         allocator,
         display,
@@ -414,6 +419,7 @@ pub fn destroy(self: *Self) void {
     self.fractional_scale.deinit();
     self.viewporter.deinit();
     self.presentation_protocol.deinit();
+    self.relative_pointer.deinit();
     self.cursor_shape.deinit();
     self.single_pixel_buffer.deinit();
     self.xdg_output.deinit();
@@ -507,6 +513,7 @@ fn backendListener(render_output: *RenderOutput) OutputBackend.Listener {
         .pointer_enter = pointerEnter,
         .pointer_leave = pointerLeave,
         .pointer_motion = pointerMotion,
+        .pointer_relative_motion = pointerRelativeMotion,
         .pointer_button = pointerButton,
         .pointer_axis = pointerAxis,
         .pointer_frame = pointerFrame,
@@ -1009,6 +1016,18 @@ fn pointerMotion(context: *anyopaque, time: u32, x: f64, y: f64) void {
         if (self.window_manager.pointerGrabbed()) null else route.focus,
     );
     self.window_manager.pointerMoved(if (self.window_manager.pointerGrabbed()) null else route.root);
+}
+
+fn pointerRelativeMotion(
+    context: *anyopaque,
+    time_usec: u64,
+    dx: f64,
+    dy: f64,
+    dx_unaccelerated: f64,
+    dy_unaccelerated: f64,
+) void {
+    const self = serverForOutput(context);
+    self.relative_pointer.motion(time_usec, dx, dy, dx_unaccelerated, dy_unaccelerated);
 }
 
 fn pointerButton(

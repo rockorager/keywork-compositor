@@ -446,15 +446,16 @@
       "interfaces": [
         {
           "name": "zwp_relative_pointer_manager_v1",
-          "current_version": null,
+          "current_version": 1,
           "target_version": 1
         }
       ],
-      "status": "not_started",
+      "status": "done",
       "privileged": false,
       "blocked_by": [
         "wl-seat"
-      ]
+      ],
+      "status_detail": "Version 1 creates focus-sharing relative pointers tied to stable wl_pointer lifetimes, emits microsecond timestamps with accelerated and unaccelerated libinput deltas before absolute cursor clipping, and forwards native relative-pointer events from a supporting parent compositor in nested mode."
     },
     {
       "id": "pointer-constraints",
