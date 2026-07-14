@@ -800,6 +800,19 @@ fn popupRootWindow(self: *Self, id: PopupId) ?WindowId {
     return null;
 }
 
+/// Resolve an xdg toplevel or popup surface to its logical root window.
+pub fn surfaceRootWindow(self: *Self, surface_id: Surface.Id) ?WindowId {
+    var iterator = self.xdg_surfaces.iterator();
+    while (iterator.next()) |entry| {
+        if (!std.meta.eql(entry.value.surface_id, surface_id)) continue;
+        return switch (entry.value.role orelse return null) {
+            .toplevel => |id| id,
+            .popup => |id| self.popupRootWindow(id),
+        };
+    }
+    return null;
+}
+
 fn isTopmostPopup(self: *Self, id: PopupId) bool {
     const popup = self.popups.get(id) orelse return true;
     var iterator = self.popups.iterator();

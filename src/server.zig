@@ -211,6 +211,7 @@ pub fn create(
         &self.scene,
         &self.xdg_shell,
         &self.layer_shell,
+        .{ .context = self, .route = routePointer },
     );
     errdefer self.window_manager.deinit();
     self.render_timer = try display.getEventLoop().addTimer(*Self, handleRenderTimer, self);
@@ -389,17 +390,22 @@ fn pointerAvailable(context: *anyopaque, available: bool) void {
 
 fn pointerEnter(context: *anyopaque, x: f64, y: f64) void {
     const self: *Self = @ptrCast(@alignCast(context));
-    self.seat.pointerEnter(x, y, self.pointerFocus(x, y));
+    const route = self.pointerRoute(x, y);
+    self.seat.pointerEnter(x, y, if (self.window_manager.pointerGrabbed()) null else route.focus);
+    self.window_manager.pointerMoved(if (self.window_manager.pointerGrabbed()) null else route.root);
 }
 
 fn pointerLeave(context: *anyopaque) void {
     const self: *Self = @ptrCast(@alignCast(context));
     self.seat.pointerLeave();
+    self.window_manager.pointerMoved(null);
 }
 
 fn pointerMotion(context: *anyopaque, time: u32, x: f64, y: f64) void {
     const self: *Self = @ptrCast(@alignCast(context));
-    self.seat.pointerMotion(time, x, y, self.pointerFocus(x, y));
+    const route = self.pointerRoute(x, y);
+    self.seat.pointerMotion(time, x, y, if (self.window_manager.pointerGrabbed()) null else route.focus);
+    self.window_manager.pointerMoved(if (self.window_manager.pointerGrabbed()) null else route.root);
 }
 
 fn pointerButton(
@@ -409,6 +415,14 @@ fn pointerButton(
     state: wl.Pointer.ButtonState,
 ) void {
     const self: *Self = @ptrCast(@alignCast(context));
+    const root = if (self.seat.pointerPosition()) |position|
+        self.pointerRoute(position.x, position.y).root
+    else
+        null;
+    if (self.window_manager.pointerButton(button, state, root)) {
+        self.seat.suppressPointerFocus(true);
+        return;
+    }
     if (state == .pressed) {
         const focused = if (self.seat.pointerFocusedSurface()) |surface_id|
             self.subcompositor.rootSurface(surface_id)
@@ -472,6 +486,50 @@ fn pointerFocus(self: *Self, x: f64, y: f64) ?Seat.PointerFocus {
             !self.xdg_shell.popupGrabOwnsSurface(candidate.surface_id)) return null;
     }
     return focus;
+}
+
+fn routePointer(context: *anyopaque, x: f64, y: f64) WindowManager.PointerRoute {
+    const self: *Self = @ptrCast(@alignCast(context));
+    return self.pointerRoute(x, y);
+}
+
+fn pointerRoute(self: *Self, x: f64, y: f64) WindowManager.PointerRoute {
+    const focus = self.pointerFocus(x, y);
+    return .{
+        .focus = focus,
+        .root = if (focus) |value| self.subcompositor.rootSurface(value.surface_id) else self.borderRoot(x, y),
+    };
+}
+
+fn borderRoot(self: *Self, x: f64, y: f64) ?Surface.Id {
+    const fullscreen = self.scene.topFullscreen();
+    var nodes = self.scene.reverseNodeIterator();
+    while (nodes.next()) |entry| switch (entry) {
+        .window => |window_entry| {
+            if (fullscreen) |fullscreen_id| {
+                if (!std.meta.eql(window_entry.id, fullscreen_id)) continue;
+            }
+            const window = window_entry.window;
+            if (!window.mapped) continue;
+            const borders = window.borders orelse continue;
+            const buffer = Surface.currentBuffer(self.compositor.surfaceStore(), window.surface_id) orelse continue;
+            const content_size = if (window.content_geometry) |geometry|
+                geometry.size
+            else
+                buffer.logical_size;
+            const content = windowContentRect(window, content_size) orelse continue;
+            var commands: [4]render.Command = undefined;
+            const clip = if (window.clip_box) |box| box.translated(window.position.x, window.position.y) else null;
+            for (makeBorderCommands(content, borders, clip, &commands)) |command| {
+                const solid = command.solid_rect;
+                const visible = if (solid.clip) |command_clip| solid.rect.intersection(command_clip) orelse continue else solid.rect;
+                if (pointInRect(x, y, visible)) return window.surface_id;
+            }
+            if (fullscreen != null) return null;
+        },
+        else => {},
+    };
+    return null;
 }
 
 fn scenePointerFocus(self: *Self, x: f64, y: f64) ?Seat.PointerFocus {
@@ -581,17 +639,24 @@ fn hitTestWindow(
             y,
         )) |focus| return focus;
     }
+    if (window.clip_box) |clip_box| {
+        if (!pointInRect(x, y, clip_box.translated(window.position.x, window.position.y))) return null;
+    }
+    var above = self.scene.decorationIterator(window_id, .above);
+    while (above.next()) |entry| if (entry.decoration.mapped) {
+        if (self.hitTestSurface(entry.decoration.surface_id, .{
+            .x = window.position.x +| entry.decoration.offset.x,
+            .y = window.position.y +| entry.decoration.offset.y,
+        }, x, y)) |focus| return focus;
+    };
     const root_buffer = Surface.currentBuffer(
         self.compositor.surfaceStore(),
         window.surface_id,
     ) orelse return null;
-    if (root_buffer.transform != .normal) return null;
     const content_geometry = window.content_geometry orelse Scene.ContentGeometry{
         .size = root_buffer.logical_size,
     };
-    if (window.clip_box) |clip_box| {
-        if (!pointInRect(x, y, clip_box.translated(window.position.x, window.position.y))) return null;
-    }
+    var test_content = root_buffer.transform == .normal;
     if (window.content_clip_box) |clip_box| {
         const content_rect: render.Rect = .{
             .x = window.position.x,
@@ -601,14 +666,14 @@ fn hitTestWindow(
         };
         const visible = content_rect.intersection(
             clip_box.translated(window.position.x, window.position.y),
-        ) orelse return null;
-        if (!pointInRect(x, y, visible)) return null;
+        );
+        test_content = test_content and if (visible) |rect| pointInRect(x, y, rect) else false;
     }
-    if (window.effects.corner_radius > 0) {
+    if (test_content and window.effects.corner_radius > 0) {
         const visible = windowContentRect(window, content_geometry.size) orelse return null;
-        if (!pointInRoundedRect(x, y, visible, window.effects.corner_radius)) return null;
+        test_content = pointInRoundedRect(x, y, visible, window.effects.corner_radius);
     }
-    return self.hitTestSurface(
+    if (test_content) if (self.hitTestSurface(
         window.surface_id,
         .{
             .x = window.position.x -| content_geometry.offset.x,
@@ -616,7 +681,15 @@ fn hitTestWindow(
         },
         x,
         y,
-    );
+    )) |focus| return focus;
+    var below = self.scene.decorationIterator(window_id, .below);
+    while (below.next()) |entry| if (entry.decoration.mapped) {
+        if (self.hitTestSurface(entry.decoration.surface_id, .{
+            .x = window.position.x +| entry.decoration.offset.x,
+            .y = window.position.y +| entry.decoration.offset.y,
+        }, x, y)) |focus| return focus;
+    };
+    return null;
 }
 
 fn hitTestSurface(
@@ -781,7 +854,7 @@ fn renderFrame(self: *Self) renderer_types.Renderer.Error!void {
     const keyboard_focus = self.layer_shell.keyboardFocus(
         self.xdg_shell.popupKeyboardFocus(),
     ) orelse
-        self.scene.focusedSurface() orelse if (!self.window_manager.hasActiveManager())
+        self.window_manager.focusedShellSurface() orelse self.scene.focusedSurface() orelse if (!self.window_manager.hasActiveManager())
         self.scene.topWindowSurface()
     else
         null;

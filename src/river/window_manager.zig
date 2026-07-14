@@ -15,7 +15,7 @@ const LayerShell = @import("../wayland/layer_shell.zig");
 const wl = wayland.server.wl;
 const river = wayland.server.river;
 
-const protocol_version = 3;
+const protocol_version = 5;
 
 allocator: std.mem.Allocator,
 display: *wl.Server,
@@ -46,6 +46,18 @@ layer_focus_sent: LayerShell.FocusClass,
 next_window_identifier: u64,
 presentation_mode: river.OutputV1.PresentationMode,
 pending_presentation_mode: ?river.OutputV1.PresentationMode,
+pointer_bindings: std.ArrayList(*PointerBinding),
+held_buttons: std.ArrayList(HeldButton),
+last_pointer_position: ?Point,
+operation: ?PointerOperation,
+pending_operation: PendingOperation,
+pending_warp: ?Point,
+focused_shell_surface: ?ShellSurfaceId,
+router: PointerRouter,
+desired_hovered: ?WindowId,
+sent_hovered: ?WindowId,
+pending_interaction: ?Interaction,
+ignore_until_release: bool,
 
 const WindowStore = slot_map.SlotMap(ManagedWindow, enum { managed_window });
 const WindowId = WindowStore.Id;
@@ -140,7 +152,43 @@ const PendingFocus = union(enum) {
     unchanged,
     clear,
     window: WindowId,
+    shell_surface: ShellSurfaceId,
 };
+
+const Point = struct { x: i32, y: i32 };
+const PointerOperation = struct { start: Point, current: Point, release_pending: bool = false, release_sent: bool = false };
+const PendingOperation = enum { unchanged, start, end };
+const HeldButton = struct { button: u32, binding: ?*PointerBinding, captured: bool };
+const Interaction = union(enum) { window: WindowId, shell_surface: ShellSurfaceId };
+pub const PointerRoute = struct { focus: ?Seat.PointerFocus, root: ?Surface.Id };
+pub const PointerRouter = struct {
+    context: *anyopaque,
+    route: *const fn (*anyopaque, f64, f64) PointerRoute,
+};
+
+fn operationDelta(operation: PointerOperation) Point {
+    return .{
+        .x = @intCast(std.math.clamp(@as(i64, operation.current.x) - operation.start.x, std.math.minInt(i32), std.math.maxInt(i32))),
+        .y = @intCast(std.math.clamp(@as(i64, operation.current.y) - operation.start.y, std.math.minInt(i32), std.math.maxInt(i32))),
+    };
+}
+
+fn pointerCoordinate(value: f64) i32 {
+    return @intFromFloat(std.math.clamp(value, @as(f64, std.math.minInt(i32)), @as(f64, std.math.maxInt(i32))));
+}
+
+fn clampPoint(point: Point, width: u32, height: u32) Point {
+    std.debug.assert(width > 0 and height > 0);
+    return .{
+        .x = std.math.clamp(point.x, 0, @as(i32, @intCast(width - 1))),
+        .y = std.math.clamp(point.y, 0, @as(i32, @intCast(height - 1))),
+    };
+}
+
+fn hasCapturedButton(buttons: []const HeldButton) bool {
+    for (buttons) |held| if (held.captured) return true;
+    return false;
+}
 
 const PendingBorders = union(enum) {
     unchanged,
@@ -231,6 +279,7 @@ pub fn init(
     scene: *Scene,
     xdg_shell: *XdgShell,
     layer_shell: *LayerShell,
+    router: PointerRouter,
 ) !void {
     self.* = .{
         .allocator = allocator,
@@ -262,6 +311,18 @@ pub fn init(
         .next_window_identifier = 1,
         .presentation_mode = .vsync,
         .pending_presentation_mode = null,
+        .pointer_bindings = .empty,
+        .held_buttons = .empty,
+        .last_pointer_position = null,
+        .operation = null,
+        .pending_operation = .unchanged,
+        .pending_warp = null,
+        .focused_shell_surface = null,
+        .router = router,
+        .desired_hovered = null,
+        .sent_hovered = null,
+        .pending_interaction = null,
+        .ignore_until_release = false,
     };
     errdefer self.windows.deinit(allocator);
     errdefer self.decorations.deinit(allocator);
@@ -307,6 +368,9 @@ pub fn deinit(self: *Self) void {
     self.shell_surfaces.deinit(self.allocator);
     self.window_requests.deinit(self.allocator);
     self.stack_operations.deinit(self.allocator);
+    std.debug.assert(self.pointer_bindings.items.len == 0);
+    self.pointer_bindings.deinit(self.allocator);
+    self.held_buttons.deinit(self.allocator);
     std.debug.assert(self.layer_bindings.items.len == 0);
     self.layer_bindings.deinit(self.allocator);
     self.layer_global.destroy();
@@ -316,6 +380,127 @@ pub fn deinit(self: *Self) void {
 
 pub fn hasActiveManager(self: *const Self) bool {
     return self.active != null;
+}
+
+pub fn focusedShellSurface(self: *Self) ?Surface.Id {
+    const id = self.focused_shell_surface orelse return null;
+    const managed = self.shell_surfaces.get(id) orelse return null;
+    return if (managed.adapter.surface) |surface| surface.handle() else null;
+}
+
+pub fn pointerGrabbed(self: *const Self) bool {
+    if (self.operation != null or self.ignore_until_release) return true;
+    return hasCapturedButton(self.held_buttons.items);
+}
+
+fn reroutePointer(self: *Self) bool {
+    const position = self.seat.pointerPosition() orelse return false;
+    const route = self.router.route(self.router.context, position.x, position.y);
+    self.seat.pointerEnter(position.x, position.y, if (self.pointerGrabbed()) null else route.focus);
+    return self.updateDesiredHover(if (self.pointerGrabbed()) null else route.root);
+}
+
+fn windowForSurface(self: *Self, root: ?Surface.Id) ?WindowId {
+    const surface_id = root orelse return null;
+    if (self.xdg_shell.surfaceRootWindow(surface_id)) |xdg_id| return self.findWindow(xdg_id);
+    var decorations = self.decorations.iterator();
+    while (decorations.next()) |entry| if (entry.value.adapter.surface) |surface| {
+        if (std.meta.eql(surface.handle(), surface_id)) return entry.value.window_id;
+    };
+    return null;
+}
+
+fn shellForSurface(self: *Self, root: ?Surface.Id) ?ShellSurfaceId {
+    const surface_id = root orelse return null;
+    var iterator = self.shell_surfaces.iterator();
+    while (iterator.next()) |entry| {
+        const surface = entry.value.adapter.surface orelse continue;
+        if (std.meta.eql(surface.handle(), surface_id)) return entry.id;
+    }
+    return null;
+}
+
+pub fn pointerMoved(self: *Self, root: ?Surface.Id) void {
+    var changed = false;
+    if (self.operation) |*operation| if (self.seat.pointerPosition()) |position| {
+        const current: Point = .{ .x = pointerCoordinate(position.x), .y = pointerCoordinate(position.y) };
+        if (!std.meta.eql(current, operation.current)) {
+            operation.current = current;
+            changed = true;
+        }
+    };
+    changed = self.updateDesiredHover(if (self.pointerGrabbed()) null else root) or changed;
+    if (changed) self.requestManage();
+}
+
+fn updateDesiredHover(self: *Self, root: ?Surface.Id) bool {
+    const next = self.windowForSurface(root);
+    if (std.meta.eql(self.desired_hovered, next)) return false;
+    self.desired_hovered = next;
+    return true;
+}
+
+/// Returns true when the physical event is intercepted by River.
+pub fn pointerButton(self: *Self, button: u32, state: wl.Pointer.ButtonState, root: ?Surface.Id) bool {
+    if (state == .pressed) {
+        var matched: ?*PointerBinding = null;
+        for (self.pointer_bindings.items) |binding| {
+            if (binding.active() and binding.enabled and binding.button == button and
+                binding.modifiers == self.seat.effectiveModifiers())
+            {
+                matched = binding;
+                break;
+            }
+        }
+        const captured = matched != null or self.pointerGrabbed();
+        self.held_buttons.append(self.allocator, .{ .button = button, .binding = matched, .captured = captured }) catch {
+            if (captured) if (self.active) |manager| manager.postNoMemory();
+            return captured;
+        };
+        if (matched) |binding| {
+            binding.pending.append(self.allocator, .pressed) catch {
+                if (self.active) |manager| manager.postNoMemory();
+                return true;
+            };
+            _ = self.updateDesiredHover(null);
+            self.requestManage();
+            return true;
+        }
+        if (!captured and self.active != null) {
+            self.pending_interaction = if (self.windowForSurface(root)) |id|
+                .{ .window = id }
+            else if (self.shellForSurface(root)) |id|
+                .{ .shell_surface = id }
+            else
+                null;
+            if (self.pending_interaction != null) self.requestManage();
+        }
+        return captured;
+    }
+    for (self.held_buttons.items, 0..) |held, index| {
+        if (held.button != button) continue;
+        const was_grabbed = self.pointerGrabbed();
+        _ = self.held_buttons.orderedRemove(index);
+        var needs_manage = false;
+        if (held.binding) |binding| if (binding.active()) binding.pending.append(self.allocator, .released) catch {
+            if (self.active) |manager| manager.postNoMemory();
+        };
+        if (held.binding != null) needs_manage = true;
+        if (self.operation) |*operation| if (self.held_buttons.items.len == 0 and !operation.release_pending and !operation.release_sent) {
+            operation.release_pending = true;
+            needs_manage = true;
+        };
+        const swallowed = held.captured or was_grabbed;
+        if (self.held_buttons.items.len == 0 and self.ignore_until_release) {
+            self.ignore_until_release = false;
+        }
+        if (was_grabbed and !self.pointerGrabbed()) {
+            needs_manage = self.reroutePointer() or needs_manage;
+        }
+        if (needs_manage) self.requestManage();
+        return swallowed;
+    }
+    return self.pointerGrabbed();
 }
 
 fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
@@ -332,6 +517,7 @@ fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
 
     self.active = resource;
     self.session_generation +%= 1;
+    if (resource.getVersion() >= 4) self.seat.setUnfocusedCursorController(resource.getClient());
     for (self.layer_bindings.items) |binding| binding.beginSession(if (binding.resource.getClient() == resource.getClient()) self.session_generation else null);
     self.createOutput(resource) catch {
         resource.postNoMemory();
@@ -351,6 +537,7 @@ fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
         };
         self.xdg_shell.setWindowVisible(xdg_id, false);
     }
+    _ = self.reroutePointer();
     self.requestManage();
 }
 
@@ -468,6 +655,38 @@ fn sendPendingState(self: *Self, manager: *river.WindowManagerV1) !void {
         window.metadata_dirty = false;
     }
 
+    if (self.seat_resource) |seat_resource| {
+        if (!std.meta.eql(self.sent_hovered, self.desired_hovered)) {
+            if (self.sent_hovered != null) seat_resource.sendPointerLeave();
+            self.sent_hovered = null;
+            if (self.desired_hovered) |id| if (self.windows.get(id)) |window| if (window.resource) |resource| {
+                seat_resource.sendPointerEnter(resource);
+                self.sent_hovered = id;
+            };
+        }
+        if (self.pending_interaction) |interaction| switch (interaction) {
+            .window => |id| if (self.windows.get(id)) |window| if (window.resource) |resource| seat_resource.sendWindowInteraction(resource),
+            .shell_surface => |id| if (self.shell_surfaces.get(id)) |shell| seat_resource.sendShellSurfaceInteraction(shell.adapter.resource),
+        };
+        self.pending_interaction = null;
+        if (self.operation) |*operation| {
+            const delta = operationDelta(operation.*);
+            seat_resource.sendOpDelta(delta.x, delta.y);
+            if (operation.release_pending and !operation.release_sent) {
+                seat_resource.sendOpRelease();
+                operation.release_pending = false;
+                operation.release_sent = true;
+            }
+        }
+    }
+    for (self.pointer_bindings.items) |binding| {
+        for (binding.pending.items) |event| switch (event) {
+            .pressed => binding.resource.sendPressed(),
+            .released => binding.resource.sendReleased(),
+        };
+        binding.pending.clearRetainingCapacity();
+    }
+
     for (self.window_requests.items) |pending| {
         const window = self.windows.get(pending.id) orelse continue;
         const resource = window.resource orelse continue;
@@ -491,6 +710,15 @@ fn sendPendingState(self: *Self, manager: *river.WindowManagerV1) !void {
         }
     }
     self.window_requests.clearRetainingCapacity();
+    if (self.seat_resource) |seat_resource| if (seat_resource.getVersion() >= 2) {
+        if (self.seat.pointerPosition()) |position| {
+            const point: Point = .{ .x = pointerCoordinate(position.x), .y = pointerCoordinate(position.y) };
+            if (self.last_pointer_position == null or !std.meta.eql(self.last_pointer_position.?, point)) {
+                seat_resource.sendPointerPosition(point.x, point.y);
+                self.last_pointer_position = point;
+            }
+        }
+    };
 }
 
 fn createWindowResource(
@@ -547,8 +775,41 @@ fn finishManage(self: *Self, manager: *river.WindowManagerV1) void {
         .unchanged => self.focused,
         .clear => null,
         .window => |id| if (self.windows.get(id) != null) id else null,
+        .shell_surface => null,
+    };
+    const focused_shell_surface = switch (self.pending_focus) {
+        .unchanged => self.focused_shell_surface,
+        .shell_surface => |id| if (self.shell_surfaces.get(id) != null) id else null,
+        else => null,
     };
     self.pending_focus = .unchanged;
+    switch (self.pending_operation) {
+        .unchanged => {},
+        .start => if (self.operation == null) if (self.seat.pointerPosition()) |position| {
+            const point: Point = .{ .x = pointerCoordinate(position.x), .y = pointerCoordinate(position.y) };
+            self.operation = .{ .start = point, .current = point };
+            self.desired_hovered = null;
+            self.seat.suppressPointerFocus(true);
+            self.seat.restoreUnfocusedCursor();
+            self.requestManage();
+        },
+        .end => if (self.operation != null) {
+            self.operation = null;
+            self.ignore_until_release = self.held_buttons.items.len != 0;
+            if (!self.ignore_until_release and self.reroutePointer()) self.requestManage();
+        },
+    }
+    self.pending_operation = .unchanged;
+    if (self.pending_warp) |requested| {
+        const size = self.output.logicalSize();
+        const point = clampPoint(requested, size.width, size.height);
+        const route = self.router.route(self.router.context, @floatFromInt(point.x), @floatFromInt(point.y));
+        self.seat.pointerEnter(@floatFromInt(point.x), @floatFromInt(point.y), if (self.pointerGrabbed()) null else route.focus);
+        self.pointerMoved(if (self.pointerGrabbed()) null else route.root);
+        self.pending_warp = null;
+    }
+    self.seat.suppressPointerFocus(self.pointerGrabbed());
+    self.focused_shell_surface = focused_shell_surface;
 
     var configure_count: u32 = 0;
     var iterator = self.windows.iterator();
@@ -730,6 +991,7 @@ fn finishRender(self: *Self, manager: *river.WindowManagerV1) void {
         },
     };
     self.stack_operations.clearRetainingCapacity();
+    if (self.reroutePointer()) self.requestManage();
     switch (self.sequence.finishRender()) {
         .invalid => unreachable,
         .idle => {},
@@ -1026,6 +1288,17 @@ const LayerSeat = struct {
 
 fn releaseManager(self: *Self) void {
     for (self.layer_bindings.items) |binding| binding.beginSession(null);
+    for (self.pointer_bindings.items) |binding| binding.pending.clearRetainingCapacity();
+    var held_index: usize = 0;
+    while (held_index < self.held_buttons.items.len) {
+        const held = &self.held_buttons.items[held_index];
+        if (held.captured) {
+            held.binding = null;
+            held_index += 1;
+        } else {
+            _ = self.held_buttons.orderedRemove(held_index);
+        }
+    }
     self.active = null;
     self.output_resource = null;
     self.seat_resource = null;
@@ -1036,8 +1309,25 @@ fn releaseManager(self: *Self) void {
     self.pending_focus = .unchanged;
     self.presentation_mode = .vsync;
     self.pending_presentation_mode = null;
+    self.seat.setUnfocusedCursorController(null);
+    self.operation = null;
+    self.pending_operation = .unchanged;
+    self.pending_warp = null;
+    self.focused_shell_surface = null;
+    self.desired_hovered = null;
+    self.sent_hovered = null;
+    self.pending_interaction = null;
+    self.ignore_until_release = self.held_buttons.items.len != 0;
+    self.last_pointer_position = null;
     self.releaseWindows();
     self.releaseShellSurfaces();
+    const position = self.seat.pointerPosition() orelse return;
+    const route = self.router.route(self.router.context, position.x, position.y);
+    self.seat.pointerEnter(
+        position.x,
+        position.y,
+        if (self.pointerGrabbed()) null else route.focus,
+    );
 }
 
 fn releaseWindows(self: *Self) void {
@@ -1204,6 +1494,9 @@ fn removeWindow(self: *Self, xdg_id: XdgShell.WindowId) void {
     const id = self.findWindow(xdg_id) orelse return;
     const window = self.windows.get(id) orelse return;
     if (window.resource) |resource| resource.sendClosed();
+    if (self.desired_hovered) |hovered| {
+        if (std.meta.eql(hovered, id)) self.desired_hovered = null;
+    }
     if (self.focused) |focused| {
         if (std.meta.eql(focused, id)) self.focused = null;
     }
@@ -1788,6 +2081,7 @@ const ShellSurfaceResource = struct {
 
     fn surfaceDestroyed(context: *anyopaque) void {
         const self: *ShellSurfaceResource = @ptrCast(@alignCast(context));
+        self.clearFocus();
         self.surface = null;
         self.synchronized_commit_requested = false;
         self.synchronized_commit_cached = false;
@@ -1829,10 +2123,27 @@ const ShellSurfaceResource = struct {
     }
 
     fn handleDestroy(_: *river.ShellSurfaceV1, self: *ShellSurfaceResource) void {
+        self.clearFocus();
         self.detach();
         if (self.surface) |surface| surface.releaseRole(self);
         _ = self.manager.shell_surfaces.remove(self.id);
         self.allocator.destroy(self);
+    }
+
+    fn clearFocus(self: *ShellSurfaceResource) void {
+        var changed = false;
+        if (self.manager.focused_shell_surface) |id| if (std.meta.eql(id, self.id)) {
+            self.manager.focused_shell_surface = null;
+            changed = true;
+        };
+        switch (self.manager.pending_focus) {
+            .shell_surface => |id| if (std.meta.eql(id, self.id)) {
+                self.manager.pending_focus = .clear;
+                changed = true;
+            },
+            else => {},
+        }
+        if (changed) self.manager.requestManage();
     }
 };
 
@@ -2141,18 +2452,27 @@ const SeatResource = struct {
             .focus_shell_surface => |focus| {
                 if (!self.requireManage(manager_resource)) return;
                 if (self.manager.layer_focus_sent == .exclusive) return;
-                if (!self.resolveShellSurface(focus.shell_surface)) return;
+                const id = self.resolveShellSurface(focus.shell_surface) orelse return;
                 _ = self.manager.layer_shell.relinquishNonExclusiveFocus();
-                self.manager.pending_focus = .clear;
+                self.manager.pending_focus = .{ .shell_surface = id };
             },
-            .op_start_pointer, .op_end => {
-                _ = self.requireManage(manager_resource);
+            .op_start_pointer => {
+                if (self.requireManage(manager_resource) and self.manager.operation == null and
+                    self.manager.pending_operation != .end) self.manager.pending_operation = .start;
             },
-            .get_pointer_binding => resource.getClient().postImplementationError(
-                "river seat operation is not implemented",
-            ),
+            .op_end => {
+                if (self.requireManage(manager_resource)) self.manager.pending_operation = .end;
+            },
+            .get_pointer_binding => |get| PointerBinding.create(
+                self.manager,
+                get.id,
+                get.button,
+                @bitCast(get.modifiers),
+            ) catch resource.postNoMemory(),
             .set_xcursor_theme => {},
-            .pointer_warp => _ = self.requireManage(manager_resource),
+            .pointer_warp => |warp| if (self.requireManage(manager_resource)) {
+                self.manager.pending_warp = .{ .x = warp.x, .y = warp.y };
+            },
         }
     }
 
@@ -2168,12 +2488,13 @@ const SeatResource = struct {
     fn resolveShellSurface(
         self: *SeatResource,
         resource: *river.ShellSurfaceV1,
-    ) bool {
-        const data = resource.getUserData() orelse return false;
+    ) ?ShellSurfaceId {
+        const data = resource.getUserData() orelse return null;
         const shell_surface: *ShellSurfaceResource = @ptrCast(@alignCast(data));
         if (shell_surface.manager != self.manager or
-            shell_surface.owner_generation != self.owner_generation) return false;
-        return self.manager.shell_surfaces.get(shell_surface.id) != null;
+            shell_surface.owner_generation != self.owner_generation) return null;
+        if (self.manager.shell_surfaces.get(shell_surface.id) == null) return null;
+        return shell_surface.id;
     }
 
     fn requireManage(self: *SeatResource, manager: *river.WindowManagerV1) bool {
@@ -2185,6 +2506,62 @@ const SeatResource = struct {
     fn handleDestroy(resource: *river.SeatV1, self: *SeatResource) void {
         if (self.manager.seat_resource == resource) self.manager.seat_resource = null;
         self.allocator.destroy(self);
+    }
+};
+
+const PointerBinding = struct {
+    manager: *Self,
+    resource: *river.PointerBindingV1,
+    owner_generation: u64,
+    button: u32,
+    modifiers: u32,
+    enabled: bool = false,
+    pending: std.ArrayList(enum { pressed, released }) = .empty,
+
+    fn create(manager: *Self, id: u32, button: u32, modifiers: u32) !void {
+        const resource = try river.PointerBindingV1.create(manager.active.?.getClient(), manager.active.?.getVersion(), id);
+        errdefer resource.destroy();
+        const self = try manager.allocator.create(PointerBinding);
+        errdefer manager.allocator.destroy(self);
+        self.* = .{
+            .manager = manager,
+            .resource = resource,
+            .owner_generation = manager.session_generation,
+            .button = button,
+            .modifiers = modifiers & 0xed,
+        };
+        try manager.pointer_bindings.append(manager.allocator, self);
+        resource.setHandler(*PointerBinding, PointerBinding.handleRequest, PointerBinding.handleDestroy, self);
+    }
+
+    fn active(self: *PointerBinding) bool {
+        return self.manager.active != null and self.manager.session_generation == self.owner_generation;
+    }
+
+    fn handleRequest(resource: *river.PointerBindingV1, request: river.PointerBindingV1.Request, self: *PointerBinding) void {
+        switch (request) {
+            .destroy => resource.destroy(),
+            .enable, .disable => {
+                if (!self.active()) return;
+                if (self.manager.sequence.state != .manage) {
+                    self.manager.active.?.postError(.sequence_order, "pointer binding request outside a manage sequence");
+                    return;
+                }
+                self.enabled = request == .enable;
+            },
+        }
+    }
+
+    fn handleDestroy(_: *river.PointerBindingV1, self: *PointerBinding) void {
+        for (self.manager.held_buttons.items) |*held| {
+            if (held.binding == self) held.binding = null;
+        }
+        for (self.manager.pointer_bindings.items, 0..) |binding, index| if (binding == self) {
+            _ = self.manager.pointer_bindings.orderedRemove(index);
+            break;
+        };
+        self.pending.deinit(self.manager.allocator);
+        self.manager.allocator.destroy(self);
     }
 };
 
@@ -2232,4 +2609,27 @@ test "river color components retain full-range endpoints" {
     try std.testing.expectEqual(@as(u8, 0), protocolColorComponent(0));
     try std.testing.expectEqual(@as(u8, 128), protocolColorComponent(0x80808080));
     try std.testing.expectEqual(@as(u8, 255), protocolColorComponent(std.math.maxInt(u32)));
+}
+
+test "pointer coordinates clamp to output pixels" {
+    try std.testing.expectEqual(Point{ .x = 0, .y = 9 }, clampPoint(.{ .x = -4, .y = 20 }, 10, 10));
+    try std.testing.expectEqual(@as(i32, -2), pointerCoordinate(-2.9));
+}
+
+test "pointer operation delta clamps cumulative subtraction" {
+    try std.testing.expectEqual(Point{ .x = std.math.maxInt(i32), .y = std.math.minInt(i32) }, operationDelta(.{
+        .start = .{ .x = std.math.minInt(i32), .y = std.math.maxInt(i32) },
+        .current = .{ .x = std.math.maxInt(i32), .y = std.math.minInt(i32) },
+    }));
+}
+
+test "ordinary held buttons do not create a River pointer grab" {
+    const buttons = [_]HeldButton{
+        .{ .button = 0x110, .binding = null, .captured = false },
+        .{ .button = 0x111, .binding = null, .captured = false },
+    };
+    try std.testing.expect(!hasCapturedButton(&buttons));
+    try std.testing.expect(hasCapturedButton(&.{
+        .{ .button = 0x110, .binding = null, .captured = true },
+    }));
 }

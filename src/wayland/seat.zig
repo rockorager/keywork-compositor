@@ -28,6 +28,7 @@ pointer_focus: ?PointerFocus,
 pointer_position: ?PointerPosition,
 latest_pointer_enter: ?UserAction,
 active_cursor: ?ActiveCursor,
+cursor_controller: ?CursorController,
 cursor_surface_count: usize,
 pressed_keys: std.ArrayList(u32),
 modifiers: Modifiers,
@@ -70,6 +71,11 @@ const ActiveCursor = struct {
     surface_id: Surface.Id,
     hotspot_x: i32,
     hotspot_y: i32,
+};
+
+const CursorController = struct {
+    client: *wl.Client,
+    cursor: ?ActiveCursor,
 };
 
 pub const PointerFocus = struct {
@@ -122,6 +128,7 @@ pub fn init(
         .pointer_position = null,
         .latest_pointer_enter = null,
         .active_cursor = null,
+        .cursor_controller = null,
         .cursor_surface_count = 0,
         .pressed_keys = .empty,
         .modifiers = .{},
@@ -243,6 +250,38 @@ pub fn serialIsOlder(candidate: u32, current: u32) bool {
 pub fn pointerFocusedSurface(self: *const Self) ?Surface.Id {
     const focus = self.pointer_focus orelse return null;
     return focus.surface_id;
+}
+
+pub fn pointerPosition(self: *const Self) ?struct { x: f64, y: f64 } {
+    const position = self.pointer_position orelse return null;
+    return .{ .x = position.x, .y = position.y };
+}
+
+pub fn effectiveModifiers(self: *const Self) u32 {
+    return (self.modifiers.depressed | self.modifiers.latched) & 0xed;
+}
+
+/// Set the client allowed to own the cursor while pointer focus is absent.
+/// This is also the generic ownership query point for cursor-shape protocols.
+pub fn setUnfocusedCursorController(self: *Self, client: ?*wl.Client) void {
+    if (client == null) {
+        self.cursor_controller = null;
+    } else if (self.cursor_controller == null or self.cursor_controller.?.client != client.?) {
+        self.cursor_controller = .{ .client = client.?, .cursor = null };
+    }
+    if (self.pointer_focus == null) self.restoreControllerCursor();
+}
+
+pub fn isUnfocusedCursorController(self: *const Self, client: *wl.Client) bool {
+    return if (self.cursor_controller) |controller| controller.client == client else false;
+}
+
+pub fn suppressPointerFocus(self: *Self, suppress: bool) void {
+    if (suppress) self.updatePointerFocus(null, null);
+}
+
+pub fn restoreUnfocusedCursor(self: *Self) void {
+    self.restoreControllerCursor();
 }
 
 pub fn keyboardFocusedClient(self: *Self) ?*wl.Client {
@@ -696,6 +735,7 @@ fn updatePointerFocus(self: *Self, focus: ?PointerFocus, motion_time: ?u32) void
         self.pointer_focus = focus;
         self.latest_pointer_enter = null;
         self.sendPointerEnter();
+        if (focus == null) self.restoreControllerCursor();
         return;
     }
     self.pointer_focus = focus;
@@ -784,8 +824,9 @@ fn setCursor(
         break :cursor surface;
     } else null;
 
-    const enter = self.latest_pointer_enter orelse return;
-    if (enter.client != pointer.getClient() or enter.serial != serial) return;
+    const controller = self.isUnfocusedCursorController(pointer.getClient());
+    const enter = self.latest_pointer_enter;
+    if (!controller and (enter == null or enter.?.client != pointer.getClient() or enter.?.serial != serial)) return;
     const focused_client = if (self.pointerSurface()) |surface|
         surface.getClient() == pointer.getClient()
     else
@@ -794,13 +835,26 @@ fn setCursor(
         if (cursor_surface) |surface| std.meta.eql(cursor.surface_id, surface.handle()) else false
     else
         false;
-    if (!focused_client and !current_surface) return;
+    if (!controller and !focused_client and !current_surface) return;
 
-    self.active_cursor = if (cursor_surface) |surface| .{
+    const requested: ?ActiveCursor = if (cursor_surface) |surface| .{
         .surface_id = surface.handle(),
         .hotspot_x = hotspot_x,
         .hotspot_y = hotspot_y,
     } else null;
+    if (controller) {
+        self.cursor_controller.?.cursor = requested;
+        if (self.pointer_focus) |focus| {
+            const focused_surface = self.surface_store.get(focus.surface_id);
+            if (focused_surface == null or focused_surface.?.resource.getClient() != pointer.getClient()) return;
+        }
+    }
+    self.active_cursor = requested;
+    self.requestRepaint();
+}
+
+fn restoreControllerCursor(self: *Self) void {
+    self.active_cursor = if (self.cursor_controller) |controller| controller.cursor else null;
     self.requestRepaint();
 }
 
@@ -811,19 +865,28 @@ fn clearCursor(self: *Self) void {
 }
 
 fn cursorSurfaceCommitted(self: *Self, id: Surface.Id, info: Surface.CommitInfo) void {
-    const cursor = if (self.active_cursor) |*cursor|
-        if (std.meta.eql(cursor.surface_id, id)) cursor else return
-    else
-        return;
-    cursor.hotspot_x -|= info.offset_x;
-    cursor.hotspot_y -|= info.offset_y;
-    self.requestRepaint();
+    var repaint = false;
+    if (self.active_cursor) |*cursor| if (std.meta.eql(cursor.surface_id, id)) {
+        cursor.hotspot_x -|= info.offset_x;
+        cursor.hotspot_y -|= info.offset_y;
+        repaint = true;
+    };
+    if (self.cursor_controller) |*controller| if (controller.cursor) |*remembered| {
+        if (std.meta.eql(remembered.surface_id, id)) {
+            remembered.hotspot_x -|= info.offset_x;
+            remembered.hotspot_y -|= info.offset_y;
+        }
+    };
+    if (repaint) self.requestRepaint();
 }
 
 fn cursorSurfaceDestroyed(self: *Self, id: Surface.Id) void {
     if (self.active_cursor) |cursor| {
         if (std.meta.eql(cursor.surface_id, id)) self.clearCursor();
     }
+    if (self.cursor_controller) |*controller| if (controller.cursor) |cursor| {
+        if (std.meta.eql(cursor.surface_id, id)) controller.cursor = null;
+    };
 }
 
 fn requestRepaint(self: *Self) void {
