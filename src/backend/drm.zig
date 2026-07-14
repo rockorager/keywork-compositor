@@ -33,7 +33,7 @@ acquired: ?usize,
 pending: ?usize,
 displayed: ?usize,
 mode_set: bool,
-failed: bool,
+retired: bool,
 
 pub const Listener = NestedOutput.Listener;
 
@@ -94,7 +94,7 @@ pub fn init(
         .pending = null,
         .displayed = null,
         .mode_set = false,
-        .failed = false,
+        .retired = false,
     };
 }
 
@@ -119,7 +119,7 @@ pub fn name(self: *const Self) []const u8 {
 }
 
 pub fn ready(self: *const Self) bool {
-    if (self.failed or !self.device_access.active(self.device_access.context) or
+    if (!self.device_access.active(self.device_access.context) or
         self.acquired != null or self.pending != null) return false;
     return self.availableBuffer() != null;
 }
@@ -144,7 +144,7 @@ pub fn cancel(self: *Self) void {
 pub fn present(self: *Self) !?presentation.Info {
     const index = self.acquired orelse return error.NoAcquiredBuffer;
     const fd = self.device_access.fd(self.device_access.context) orelse return error.SessionInactive;
-    if (!self.device_access.active(self.device_access.context) or self.failed) return error.SessionInactive;
+    if (!self.device_access.active(self.device_access.context)) return error.SessionInactive;
     const buffer = &self.buffers[index];
 
     if (!self.mode_set) {
@@ -185,7 +185,7 @@ pub fn present(self: *Self) !?presentation.Info {
 
 pub fn activate(self: *Self, fd: std.posix.fd_t, selection: Selection, device_path: []const u8) !void {
     if (self.size.width != 0 and (!std.meta.eql(self.size, selection.size) or
-        self.connector_id != selection.connector_id or self.crtc_id != selection.crtc_id))
+        self.connector_id != selection.connector_id))
     {
         return error.OutputChanged;
     }
@@ -194,6 +194,7 @@ pub fn activate(self: *Self, fd: std.posix.fd_t, selection: Selection, device_pa
     self.physical_size = selection.physical_size;
     self.connector_id = selection.connector_id;
     self.crtc_id = selection.crtc_id;
+    self.retired = false;
     const connector_type = c.drmModeGetConnectorTypeName(selection.connector_type);
     const type_name = if (connector_type == null) "Unknown" else std.mem.span(connector_type);
     const name_value = try std.fmt.bufPrint(
@@ -225,8 +226,8 @@ pub fn activate(self: *Self, fd: std.posix.fd_t, selection: Selection, device_pa
         try createBuffer(fd, self.size, buffer);
     }
     log.info(
-        "activated {s} on {s} at {d}x{d}",
-        .{ self.name(), device_path, self.size.width, self.size.height },
+        "activated connector {s} ({d}) on {s} at {d}x{d}, CRTC {d}",
+        .{ self.name(), self.connector_id, device_path, self.size.width, self.size.height, self.crtc_id },
     );
 }
 
@@ -252,18 +253,6 @@ pub fn deactivate(self: *Self, fd: std.posix.fd_t) void {
     }
 }
 
-pub fn beginFail(self: *Self, err: anyerror) bool {
-    if (self.failed) return false;
-    self.failed = true;
-    log.err("DRM output failed: {t}", .{err});
-    if (self.pending != null) if (self.listener) |listener| listener.discarded(listener.context);
-    return true;
-}
-
-pub fn notifyClose(self: *Self) void {
-    if (self.listener) |listener| listener.close(listener.context);
-}
-
 fn availableBuffer(self: *const Self) ?usize {
     for (0..buffer_count) |index| {
         if (self.displayed == index or self.pending == index) continue;
@@ -281,6 +270,11 @@ pub fn notifyDeactivated(self: *Self) void {
     if (self.listener) |listener| listener.discarded(listener.context);
 }
 
+pub fn retire(self: *Self) void {
+    self.retired = true;
+    self.pending = null;
+}
+
 pub fn dispatchEvent(_: *Self, fd: std.posix.fd_t) !void {
     var context = event_context;
     if (c.drmHandleEvent(fd, &context) != 0) return error.EventDispatchFailed;
@@ -295,6 +289,7 @@ fn handlePageFlip(
 ) callconv(.c) void {
     const self: *Self = @ptrCast(@alignCast(data.?));
     const pending = self.pending orelse {
+        if (self.retired) return;
         self.device_access.fail(self.device_access.context, error.UnexpectedPageFlip);
         return;
     };
@@ -318,10 +313,32 @@ fn handlePageFlip(
     listener.ready(listener.context);
 }
 
-pub fn selectOutput(fd: std.posix.fd_t) !Selection {
+pub fn selectOutputs(
+    allocator: std.mem.Allocator,
+    fd: std.posix.fd_t,
+    existing_outputs: []const *Self,
+) ![]Selection {
     const resources = c.drmModeGetResources(fd) orelse return error.GetResourcesFailed;
     defer c.drmModeFreeResources(resources);
     if (resources.*.count_crtcs <= 0) return error.NoCrtc;
+    var selections: std.ArrayList(Selection) = .empty;
+    errdefer selections.deinit(allocator);
+    var claimed: u32 = 0;
+
+    // Reserve working routes before assigning CRTCs to newly connected heads.
+    // Otherwise connector enumeration order can steal an active output's CRTC.
+    for (existing_outputs) |output| {
+        const connector = c.drmModeGetConnector(fd, output.connector_id) orelse continue;
+        defer c.drmModeFreeConnector(connector);
+        if (connector.*.connection != c.DRM_MODE_CONNECTED or connector.*.count_modes <= 0) {
+            continue;
+        }
+        const possible_crtcs = c.drmModeConnectorGetPossibleCrtcs(fd, connector);
+        const index = crtcIndex(resources, output.crtc_id) orelse continue;
+        if (crtcIndexPossible(possible_crtcs, index)) {
+            claimed |= @as(u32, 1) << @intCast(index);
+        }
+    }
 
     const connector_count: usize = @intCast(@max(resources.*.count_connectors, 0));
     for (0..connector_count) |connector_index| {
@@ -334,11 +351,34 @@ pub fn selectOutput(fd: std.posix.fd_t) !Selection {
             connector.*.count_modes <= 0) continue;
 
         const possible_crtcs = c.drmModeConnectorGetPossibleCrtcs(fd, connector);
-        const crtc_id = selectCrtc(fd, resources, connector, possible_crtcs) orelse continue;
+        const existing_output = findOutput(existing_outputs, connector.*.connector_id);
+        var preferred_crtc: ?u32 = null;
+        if (connector.*.encoder_id != 0) {
+            const encoder = c.drmModeGetEncoder(fd, connector.*.encoder_id);
+            if (encoder) |value| {
+                defer c.drmModeFreeEncoder(value);
+                preferred_crtc = value.*.crtc_id;
+            }
+        }
+        const existing_crtc_index = if (existing_output) |output| existing: {
+            const index = crtcIndex(resources, output.crtc_id) orelse break :existing null;
+            break :existing if (crtcIndexPossible(possible_crtcs, index)) index else null;
+        } else null;
+        const crtc_index = existing_crtc_index orelse selectCrtcIndex(
+            resources,
+            possible_crtcs,
+            preferred_crtc,
+            claimed,
+        ) orelse {
+            log.warn("skipping connector {d}: no unclaimed compatible CRTC", .{connector.*.connector_id});
+            continue;
+        };
+        claimed |= @as(u32, 1) << @intCast(crtc_index);
+        const crtc_id = resources.*.crtcs[crtc_index];
         const mode_count: usize = @intCast(connector.*.count_modes);
         const modes = connector.*.modes[0..mode_count];
         const mode = modes[preferredModeIndex(modes)];
-        return .{
+        try selections.append(allocator, .{
             .mode = mode,
             .size = .{ .width = mode.hdisplay, .height = mode.vdisplay },
             .physical_size = .{
@@ -349,77 +389,43 @@ pub fn selectOutput(fd: std.posix.fd_t) !Selection {
             .connector_type = connector.*.connector_type,
             .connector_type_id = connector.*.connector_type_id,
             .crtc_id = crtc_id,
-        };
+        });
     }
-    return error.NoConnectedOutput;
+    return selections.toOwnedSlice(allocator);
 }
 
-pub fn connectorAvailable(fd: std.posix.fd_t, connector_id: u32, size: render.Size) bool {
-    const connector = c.drmModeGetConnector(fd, connector_id) orelse return false;
-    defer c.drmModeFreeConnector(connector);
-    if (connector.*.connection != c.DRM_MODE_CONNECTED or connector.*.count_modes <= 0) {
-        return false;
-    }
-    const mode_count: usize = @intCast(connector.*.count_modes);
-    for (connector.*.modes[0..mode_count]) |mode| {
-        if (mode.hdisplay == size.width and mode.vdisplay == size.height) return true;
-    }
-    return false;
-}
-
-fn selectCrtc(
-    fd: std.posix.fd_t,
-    resources: *c.drmModeRes,
-    connector: *c.drmModeConnector,
-    possible_crtcs: u32,
-) ?u32 {
-    if (connector.*.encoder_id != 0) {
-        const encoder = c.drmModeGetEncoder(fd, connector.*.encoder_id);
-        if (encoder) |value| {
-            defer c.drmModeFreeEncoder(value);
-            if (crtcPossible(resources, possible_crtcs, value.*.crtc_id)) {
-                return value.*.crtc_id;
-            }
-        }
-    }
-
-    const crtc_count: usize = @intCast(@max(resources.*.count_crtcs, 0));
-    for (0..crtc_count) |crtc_index| {
-        if (!crtcIndexPossible(possible_crtcs, crtc_index)) continue;
-        const crtc_id = resources.*.crtcs[crtc_index];
-        if (!crtcInUse(fd, resources, crtc_id)) return crtc_id;
-    }
-    for (0..crtc_count) |crtc_index| {
-        if (crtcIndexPossible(possible_crtcs, crtc_index)) {
-            return resources.*.crtcs[crtc_index];
-        }
-    }
+fn findOutput(outputs: []const *Self, connector_id: u32) ?*Self {
+    for (outputs) |output| if (output.connector_id == connector_id) return output;
     return null;
 }
 
-fn crtcPossible(resources: *c.drmModeRes, possible_crtcs: u32, crtc_id: u32) bool {
+fn crtcIndex(resources: *c.drmModeRes, crtc_id: u32) ?usize {
+    const count: usize = @intCast(@max(resources.*.count_crtcs, 0));
+    for (0..count) |index| if (resources.*.crtcs[index] == crtc_id) return index;
+    return null;
+}
+
+fn selectCrtcIndex(
+    resources: *c.drmModeRes,
+    possible_crtcs: u32,
+    preferred_crtc: ?u32,
+    claimed: u32,
+) ?usize {
     const crtc_count: usize = @intCast(@max(resources.*.count_crtcs, 0));
-    for (0..crtc_count) |index| {
-        if (resources.*.crtcs[index] == crtc_id) {
-            return crtcIndexPossible(possible_crtcs, index);
-        }
+    if (preferred_crtc) |preferred| for (0..crtc_count) |index| {
+        if (resources.*.crtcs[index] == preferred and crtcIndexPossible(possible_crtcs, index) and
+            claimed & (@as(u32, 1) << @intCast(index)) == 0) return index;
+    };
+    for (0..crtc_count) |crtc_index| {
+        if (!crtcIndexPossible(possible_crtcs, crtc_index)) continue;
+        if (claimed & (@as(u32, 1) << @intCast(crtc_index)) == 0) return crtc_index;
     }
-    return false;
+    return null;
 }
 
 fn crtcIndexPossible(possible_crtcs: u32, index: usize) bool {
     return index < @bitSizeOf(u32) and
         possible_crtcs & (@as(u32, 1) << @intCast(index)) != 0;
-}
-
-fn crtcInUse(fd: std.posix.fd_t, resources: *c.drmModeRes, crtc_id: u32) bool {
-    const encoder_count: usize = @intCast(@max(resources.*.count_encoders, 0));
-    for (0..encoder_count) |encoder_index| {
-        const encoder = c.drmModeGetEncoder(fd, resources.*.encoders[encoder_index]) orelse continue;
-        defer c.drmModeFreeEncoder(encoder);
-        if (encoder.*.crtc_id == crtc_id) return true;
-    }
-    return false;
 }
 
 fn preferredModeIndex(modes: []const c.drmModeModeInfo) usize {
@@ -532,4 +538,14 @@ test "DRM discovery only accepts primary nodes" {
     try std.testing.expect(isPrimaryNode("/dev/dri/card12"));
     try std.testing.expect(!isPrimaryNode("/dev/dri/renderD128"));
     try std.testing.expect(!isPrimaryNode("/sys/class/drm/card0-DP-1"));
+}
+
+test "CRTC selection preserves preferred and never selects claimed" {
+    var ids = [_]u32{ 10, 20, 30 };
+    var resources = std.mem.zeroes(c.drmModeRes);
+    resources.count_crtcs = ids.len;
+    resources.crtcs = &ids;
+    try std.testing.expectEqual(@as(?usize, 1), selectCrtcIndex(&resources, 0b111, 20, 0));
+    try std.testing.expectEqual(@as(?usize, 0), selectCrtcIndex(&resources, 0b111, 20, 0b010));
+    try std.testing.expectEqual(@as(?usize, null), selectCrtcIndex(&resources, 0b011, null, 0b011));
 }

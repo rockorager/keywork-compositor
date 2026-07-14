@@ -366,6 +366,12 @@ fn resolveOutput(self: *Self) *Output {
     return self.outputs.get(self.output_id) orelse unreachable;
 }
 
+pub fn setDefaultOutput(self: *Self, output_id: OutputLayout.Id) void {
+    std.debug.assert(self.outputs.get(output_id) != null);
+    self.output_id = output_id;
+    self.layer_area = self.layer_shell.usableArea();
+}
+
 fn outputResource(self: *Self, output_id: OutputLayout.Id) ?*river.OutputV1 {
     for (self.output_resources.items) |output_resource| {
         if (output_resource.owner_generation != self.session_generation) continue;

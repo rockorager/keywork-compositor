@@ -181,6 +181,14 @@ pub fn setEnvironMap(self: *Self, environ_map: *const std.process.Environ.Map) v
     self.environ_map = environ_map;
 }
 
+pub fn retarget(self: *Self, size: render.Size, listener: Listener) void {
+    std.debug.assert(size.width > 0 and size.height > 0);
+    self.size = size;
+    self.listener = listener;
+    self.pointer_x = @min(self.pointer_x, @as(f64, @floatFromInt(size.width - 1)));
+    self.pointer_y = @min(self.pointer_y, @as(f64, @floatFromInt(size.height - 1)));
+}
+
 fn installKeymap(self: *Self) !void {
     const text_pointer = c.xkb_keymap_get_as_string(
         self.xkb_keymap,

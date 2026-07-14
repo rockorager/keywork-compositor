@@ -51,6 +51,12 @@ pub fn deinit(self: *Self) void {
     self.* = undefined;
 }
 
+pub fn setDefaultOutput(self: *Self, output_id: OutputLayout.Id) void {
+    std.debug.assert(self.outputs.get(output_id) != null);
+    self.default_output_id = output_id;
+    self.refresh();
+}
+
 fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
     const resource = wp.FractionalScaleManagerV1.create(client, version, id) catch {
         client.postNoMemory();

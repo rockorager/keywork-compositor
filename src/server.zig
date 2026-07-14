@@ -26,6 +26,7 @@ const Output = @import("wayland/output.zig");
 const OutputLayout = @import("wayland/output_layout.zig");
 const OutputBackend = @import("backend/output.zig");
 const DrmDevice = @import("backend/drm_device.zig");
+const DrmOutput = @import("backend/drm.zig");
 const NativeInput = @import("backend/native_input.zig");
 const Session = @import("backend/session.zig");
 const renderer_types = @import("render/renderer.zig");
@@ -102,6 +103,7 @@ const RenderOutputConfig = struct {
     description: []const u8,
     make: []const u8 = "keywork",
     model: []const u8,
+    drm_output: ?*DrmOutput = null,
 };
 
 const OutputFrame = struct {
@@ -181,26 +183,27 @@ pub fn create(
     errdefer self.outputs.deinit();
     try self.seat.init(allocator, io, display, self.compositor.surfaceStore());
     errdefer self.seat.deinit();
-    const render_output_id = try self.addRenderOutput(io, .{
+    var render_output_id: RenderOutputId = undefined;
+    errdefer {
+        var it = self.render_outputs.iterator();
+        while (it.next()) |entry| std.debug.assert(self.removeRenderOutput(entry.id));
+    }
+    if (output_kind == .drm) {
+        const drm_outputs = self.drm_device.outputs();
+        if (drm_outputs.len == 0) return error.NoConnectedOutput;
+        var x: i32 = 0;
+        for (drm_outputs, 0..) |drm_output, index| {
+            const id = try self.addRenderOutput(io, .{ .kind = .drm, .size = drm_output.size, .position = .{ .x = x }, .name = "DRM", .description = "Keywork DRM output", .model = "drm-kms", .drm_output = drm_output });
+            if (index == 0) render_output_id = id;
+            x += @intCast(drm_output.size.width);
+        }
+    } else render_output_id = try self.addRenderOutput(io, .{
         .kind = output_kind,
         .size = .{ .width = 1280, .height = 720 },
-        .name = switch (output_kind) {
-            .drm => "DRM-1",
-            .headless => "HEADLESS-1",
-            .nested => "NESTED-1",
-        },
-        .description = switch (output_kind) {
-            .drm => "Keywork DRM output",
-            .headless => "Keywork headless output",
-            .nested => "Keywork nested output",
-        },
-        .model = switch (output_kind) {
-            .drm => "drm-kms",
-            .headless => "headless",
-            .nested => "nested-wayland",
-        },
+        .name = if (output_kind == .headless) "HEADLESS-1" else "NESTED-1",
+        .description = if (output_kind == .headless) "Keywork headless output" else "Keywork nested output",
+        .model = if (output_kind == .headless) "headless" else "nested-wayland",
     });
-    errdefer std.debug.assert(self.removeRenderOutput(render_output_id));
     self.primary_render_output = render_output_id;
     const render_output = self.render_outputs.get(render_output_id).?.*;
     try self.xdg_output.init(display, &self.outputs);
@@ -331,11 +334,19 @@ pub fn create(
     }
     requestRepaint(self);
 
+    if (output_kind == .drm) self.drm_device.setListener(.{
+        .context = self,
+        .added = drmOutputAdded,
+        .removing = drmOutputRemoving,
+        .failed = drmDeviceFailed,
+    });
+
     return self;
 }
 
 pub fn destroy(self: *Self) void {
     const allocator = self.allocator;
+    if (self.drm_device_initialized) self.drm_device.clearListener();
     self.data_device.cancel();
     if (self.native_input_initialized) self.native_input.deinit();
     self.layer_shell.clearRepaintListener();
@@ -398,7 +409,7 @@ fn addRenderOutput(
         self.display,
         config.size,
         config.kind,
-        if (self.drm_device_initialized) &self.drm_device else null,
+        config.drm_output,
         backendListener(render_output),
     );
     errdefer render_output.backend.deinit();
@@ -472,6 +483,67 @@ fn removeRenderOutput(self: *Self, id: RenderOutputId) bool {
     render_output.backend.deinit();
     self.allocator.destroy(render_output);
     return true;
+}
+
+fn drmOutputAdded(context: *anyopaque, drm_output: *DrmOutput) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    var right: i32 = 0;
+    var iterator = self.render_outputs.iterator();
+    while (iterator.next()) |entry| {
+        const output = entry.value.*;
+        const position = self.outputs.get(output.protocol_id).?.logicalPosition();
+        right = @max(right, position.x + @as(i32, @intCast(output.backend.size().width)));
+    }
+    _ = self.addRenderOutput(self.native_input.io, .{
+        .kind = .drm,
+        .size = drm_output.size,
+        .position = .{ .x = right },
+        .name = "DRM",
+        .description = "Keywork DRM output",
+        .model = "drm-kms",
+        .drm_output = drm_output,
+    }) catch return self.terminate();
+    requestRepaint(self);
+}
+
+fn drmOutputRemoving(context: *anyopaque, drm_output: *DrmOutput) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    var removed_id: ?RenderOutputId = null;
+    var iterator = self.render_outputs.iterator();
+    while (iterator.next()) |entry| if (entry.value.*.backend.drmOutput() == drm_output) {
+        removed_id = entry.id;
+        break;
+    };
+    const id = removed_id orelse return;
+    if (self.render_outputs.count == 1) {
+        if (self.native_input_initialized) {
+            self.native_input.deinit();
+            self.native_input_initialized = false;
+        }
+        std.debug.assert(self.removeRenderOutput(id));
+        self.terminate();
+        return;
+    }
+    if (std.meta.eql(id, self.primary_render_output)) {
+        iterator = self.render_outputs.iterator();
+        while (iterator.next()) |entry| if (!std.meta.eql(entry.id, id)) {
+            self.primary_render_output = entry.id;
+            const replacement = entry.value.*;
+            self.fractional_scale.setDefaultOutput(replacement.protocol_id);
+            self.xdg_shell.setDefaultOutput(replacement.protocol_id);
+            self.layer_shell.setDefaultOutput(replacement.protocol_id);
+            self.window_manager.setDefaultOutput(replacement.protocol_id);
+            self.native_input.retarget(replacement.backend.size(), backendListener(replacement));
+            break;
+        };
+    }
+    std.debug.assert(self.removeRenderOutput(id));
+    requestRepaint(self);
+}
+
+fn drmDeviceFailed(context: *anyopaque) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.terminate();
 }
 
 fn stopRenderOutput(render_output: *RenderOutput) void {

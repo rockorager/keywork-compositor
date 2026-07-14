@@ -1,4 +1,4 @@
-//! Shared DRM device and session ownership.
+//! Shared DRM device, connector outputs, and session ownership.
 
 const Self = @This();
 
@@ -16,6 +16,7 @@ const wl = wayland.server.wl;
 const log = std.log.scoped(.drm);
 
 allocator: std.mem.Allocator,
+io: std.Io,
 session: *Session,
 session_listener: Session.Listener,
 event_loop: *wl.EventLoop,
@@ -25,19 +26,24 @@ udev_monitor: ?*c.struct_udev_monitor,
 hotplug_source: ?*wl.EventSource,
 device_path: ?[:0]u8,
 device: ?Session.Device,
-output: DrmOutput,
+active_outputs: std.ArrayList(*DrmOutput),
+retired_outputs: std.ArrayList(*DrmOutput),
+listener: ?Listener,
 initialized: bool,
 failed: bool,
 
-const OpenedDevice = struct {
-    device: Session.Device,
-    selection: DrmOutput.Selection,
+pub const Listener = struct {
+    context: *anyopaque,
+    added: *const fn (*anyopaque, *DrmOutput) void,
+    removing: *const fn (*anyopaque, *DrmOutput) void,
+    failed: *const fn (*anyopaque) void,
 };
 
 pub fn init(self: *Self, allocator: std.mem.Allocator, io: std.Io, event_loop: *wl.EventLoop, session: *Session, device_path: ?[]const u8) !void {
     const path = if (device_path) |value| try allocator.dupeSentinel(u8, value, 0) else null;
     self.* = .{
         .allocator = allocator,
+        .io = io,
         .session = session,
         .session_listener = .{ .context = self, .activated = handleSessionActivated, .deactivated = handleSessionDeactivated, .failed = handleSessionFailed },
         .event_loop = event_loop,
@@ -47,13 +53,19 @@ pub fn init(self: *Self, allocator: std.mem.Allocator, io: std.Io, event_loop: *
         .hotplug_source = null,
         .device_path = path,
         .device = null,
-        .output = undefined,
+        .active_outputs = .empty,
+        .retired_outputs = .empty,
+        .listener = null,
         .initialized = false,
         .failed = false,
     };
-    self.output.init(io, .{ .context = self, .fd = accessFd, .active = accessActive, .fail = accessFail });
-    errdefer self.output.deinit();
     errdefer if (self.device_path) |value| allocator.free(value);
+    errdefer {
+        self.destroyList(&self.active_outputs);
+        self.destroyList(&self.retired_outputs);
+        self.active_outputs.deinit(allocator);
+        self.retired_outputs.deinit(allocator);
+    }
     try session.addListener(&self.session_listener);
     errdefer session.removeListener(&self.session_listener);
     if (!session.isActive()) return error.SessionInactive;
@@ -64,47 +76,161 @@ pub fn init(self: *Self, allocator: std.mem.Allocator, io: std.Io, event_loop: *
 }
 
 pub fn deinit(self: *Self) void {
+    self.listener = null;
     self.initialized = false;
     self.session.removeListener(&self.session_listener);
     self.deinitHotplugMonitor();
     self.deactivate();
-    self.output.deinit();
+    self.destroyList(&self.active_outputs);
+    self.active_outputs.deinit(self.allocator);
+    self.retired_outputs.deinit(self.allocator);
     if (self.device_path) |value| self.allocator.free(value);
     self.* = undefined;
 }
 
+pub fn outputs(self: *Self) []const *DrmOutput {
+    return self.active_outputs.items;
+}
+
+pub fn setListener(self: *Self, listener: Listener) void {
+    std.debug.assert(self.listener == null);
+    self.listener = listener;
+}
+
+pub fn clearListener(self: *Self) void {
+    self.listener = null;
+}
+
+fn newOutput(self: *Self, fd: std.posix.fd_t, selection: DrmOutput.Selection) !*DrmOutput {
+    const output = try self.allocator.create(DrmOutput);
+    errdefer self.allocator.destroy(output);
+    output.init(self.io, .{ .context = self, .fd = accessFd, .active = accessActive, .fail = accessFail });
+    errdefer output.deinit();
+    try output.activate(fd, selection, self.device_path.?);
+    return output;
+}
+
 fn activate(self: *Self) !void {
     std.debug.assert(self.device == null);
-    const opened = if (self.device_path) |path| try self.openDevice(path) else try self.discoverDevice();
-    self.device = opened.device;
-    errdefer {
-        self.session.closeDevice(opened.device) catch {};
-        self.device = null;
+    const device = if (self.device_path) |path| try self.openDevice(path) else try self.discoverDevice();
+    self.device = device;
+    errdefer self.deactivate();
+    const selections = try DrmOutput.selectOutputs(
+        self.allocator,
+        device.fd,
+        self.active_outputs.items,
+    );
+    defer self.allocator.free(selections);
+    if (!self.initialized and selections.len == 0) return error.NoConnectedOutput;
+
+    // Existing connector objects remain stable across a VT switch.
+    for (selections) |selection| {
+        const existing = self.findOutput(selection.connector_id);
+        if (existing) |output| {
+            try output.activate(device.fd, selection, self.device_path.?);
+        } else {
+            const output = try self.newOutput(device.fd, selection);
+            self.active_outputs.append(self.allocator, output) catch |err| {
+                output.deactivate(device.fd);
+                output.deinit();
+                self.allocator.destroy(output);
+                return err;
+            };
+            if (self.initialized) if (self.listener) |listener| listener.added(listener.context, output);
+        }
     }
-    try self.output.activate(opened.device.fd, opened.selection, self.device_path.?);
-    errdefer self.output.deactivate(opened.device.fd);
-    self.event_source = try self.event_loop.addFd(*Self, opened.device.fd, .{ .readable = true }, handleDrmEvent, self);
+    var index = self.active_outputs.items.len;
+    while (index > 0) {
+        index -= 1;
+        const output = self.active_outputs.items[index];
+        var found = false;
+        for (selections) |selection| if (selection.connector_id == output.connector_id) {
+            found = true;
+            break;
+        };
+        if (!found) self.removeAt(index, device.fd);
+    }
+    self.event_source = try self.event_loop.addFd(*Self, device.fd, .{ .readable = true }, handleDrmEvent, self);
 }
 
 fn deactivate(self: *Self) void {
+    for (self.active_outputs.items) |output| output.notifyDeactivated();
     if (self.event_source) |source| {
         source.remove();
         self.event_source = null;
     }
     const device = self.device orelse return;
-    self.output.deactivate(device.fd);
+    for (self.active_outputs.items) |output| output.deactivate(device.fd);
     self.session.closeDevice(device) catch |err| log.err("failed to close DRM device: {t}", .{err});
     self.device = null;
+    self.destroyList(&self.retired_outputs);
 }
 
-fn openDevice(self: *Self, path: [:0]const u8) !OpenedDevice {
+fn removeAt(self: *Self, index: usize, fd: std.posix.fd_t) void {
+    const output = self.active_outputs.items[index];
+    if (self.listener) |listener| listener.removing(listener.context, output);
+    output.deactivate(fd);
+    output.retire();
+    self.retired_outputs.append(self.allocator, output) catch return self.fail(error.OutOfMemory);
+    _ = self.active_outputs.orderedRemove(index);
+}
+
+fn reconcile(self: *Self) !void {
+    const device = self.device.?;
+    const selections = try DrmOutput.selectOutputs(
+        self.allocator,
+        device.fd,
+        self.active_outputs.items,
+    );
+    defer self.allocator.free(selections);
+    for (selections) |selection| if (self.findOutput(selection.connector_id)) |output| {
+        if (!std.meta.eql(output.size, selection.size) or output.crtc_id != selection.crtc_id)
+            return error.OutputChanged;
+    };
+    for (selections) |selection| if (self.findOutput(selection.connector_id) == null) {
+        const output = try self.newOutput(device.fd, selection);
+        self.active_outputs.append(self.allocator, output) catch |err| {
+            output.deactivate(device.fd);
+            output.deinit();
+            self.allocator.destroy(output);
+            return err;
+        };
+        if (self.listener) |listener| listener.added(listener.context, output);
+    };
+    var index = self.active_outputs.items.len;
+    while (index > 0) {
+        index -= 1;
+        const output = self.active_outputs.items[index];
+        var found = false;
+        for (selections) |selection| if (selection.connector_id == output.connector_id) {
+            found = true;
+            break;
+        };
+        if (!found) self.removeAt(index, device.fd);
+    }
+}
+
+fn findOutput(self: *Self, connector_id: u32) ?*DrmOutput {
+    for (self.active_outputs.items) |output| if (output.connector_id == connector_id) return output;
+    return null;
+}
+
+fn destroyList(self: *Self, list: *std.ArrayList(*DrmOutput)) void {
+    for (list.items) |output| {
+        output.deinit();
+        self.allocator.destroy(output);
+    }
+    list.clearRetainingCapacity();
+}
+
+fn openDevice(self: *Self, path: [:0]const u8) !Session.Device {
     const device = try self.session.openDevice(path);
     errdefer self.session.closeDevice(device) catch {};
     if (c.drmIsKMS(device.fd) != 1) return error.NotKmsDevice;
-    return .{ .device = device, .selection = try DrmOutput.selectOutput(device.fd) };
+    return device;
 }
 
-fn discoverDevice(self: *Self) !OpenedDevice {
+fn discoverDevice(self: *Self) !Session.Device {
     const udev = c.udev_new() orelse return error.UdevContextFailed;
     defer _ = c.udev_unref(udev);
     const enumerate = c.udev_enumerate_new(udev) orelse return error.UdevEnumerateFailed;
@@ -117,12 +243,12 @@ fn discoverDevice(self: *Self) !OpenedDevice {
         defer _ = c.udev_device_unref(udev_device);
         const path = std.mem.span(c.udev_device_get_devnode(udev_device) orelse continue);
         if (!DrmOutput.isPrimaryNode(path)) continue;
-        const opened = self.openDevice(path) catch continue;
+        const device = self.openDevice(path) catch continue;
         self.device_path = self.allocator.dupeSentinel(u8, path, 0) catch |err| {
-            self.session.closeDevice(opened.device) catch {};
+            self.session.closeDevice(device) catch {};
             return err;
         };
-        return opened;
+        return device;
     }
     return error.NoDrmDevice;
 }
@@ -162,26 +288,23 @@ fn deinitHotplugMonitor(self: *Self) void {
 }
 
 fn fail(self: *Self, err: anyerror) void {
-    if (!self.output.beginFail(err)) return;
+    if (self.failed) return;
     self.failed = true;
+    log.err("DRM device failed: {t}", .{err});
     self.deinitHotplugMonitor();
     self.deactivate();
-    if (self.initialized) self.output.notifyClose();
+    if (self.initialized) if (self.listener) |listener| listener.failed(listener.context);
 }
 
 fn handleSessionActivated(context: *anyopaque) void {
     const self: *Self = @ptrCast(@alignCast(context));
     if (self.failed) return;
-    self.activate() catch |err| {
-        self.fail(err);
-        return;
-    };
-    if (self.initialized) self.output.notifyReady();
+    self.activate() catch |err| return self.fail(err);
+    if (self.initialized) for (self.active_outputs.items) |output| output.notifyReady();
 }
 
 fn handleSessionDeactivated(context: *anyopaque) void {
     const self: *Self = @ptrCast(@alignCast(context));
-    self.output.notifyDeactivated();
     self.deactivate();
 }
 
@@ -191,7 +314,9 @@ fn handleSessionFailed(context: *anyopaque) void {
 }
 
 fn handleDrmEvent(_: c_int, mask: wl.EventMask, self: *Self) c_int {
-    if (mask.hangup or mask.@"error") self.fail(error.DeviceDisconnected) else if (mask.readable) self.output.dispatchEvent(self.device.?.fd) catch |err| self.fail(err);
+    if (mask.hangup or mask.@"error") self.fail(error.DeviceDisconnected) else if (mask.readable) if (self.device) |device| {
+        if (self.active_outputs.items.len > 0) self.active_outputs.items[0].dispatchEvent(device.fd) catch |err| self.fail(err);
+    };
     return 0;
 }
 
@@ -206,7 +331,7 @@ fn handleHotplugEvent(_: c_int, mask: wl.EventMask, self: *Self) c_int {
         received = true;
         _ = c.udev_device_unref(device);
     }
-    if (received) if (self.device) |device| if (!DrmOutput.connectorAvailable(device.fd, self.output.connector_id, self.output.size)) self.fail(error.OutputDisconnected);
+    if (received and self.device != null) self.reconcile() catch |err| self.fail(err);
     return 0;
 }
 

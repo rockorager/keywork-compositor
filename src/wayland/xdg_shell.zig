@@ -342,6 +342,11 @@ pub fn deinit(self: *Self) void {
     self.* = undefined;
 }
 
+pub fn setDefaultOutput(self: *Self, output_id: OutputLayout.Id) void {
+    std.debug.assert(self.outputs.get(output_id) != null);
+    self.default_output_id = output_id;
+}
+
 pub fn setWindowListener(self: *Self, listener: WindowListener) void {
     std.debug.assert(self.window_listener == null);
     self.window_listener = listener;

@@ -5,7 +5,6 @@ const Self = @This();
 const std = @import("std");
 const wayland = @import("wayland");
 const DrmOutput = @import("drm.zig");
-const DrmDevice = @import("drm_device.zig");
 const HeadlessOutput = @import("headless.zig");
 const NestedOutput = @import("nested_wayland.zig");
 const presentation = @import("../presentation.zig");
@@ -37,13 +36,13 @@ pub fn init(
     display: *wl.Server,
     output_size: render.Size,
     kind: Kind,
-    drm_device: ?*DrmDevice,
+    drm_output: ?*DrmOutput,
     listener: Listener,
 ) !void {
     self.io = io;
     switch (kind) {
         .drm => {
-            const output = &(drm_device orelse return error.MissingDrmDevice).output;
+            const output = drm_output orelse return error.MissingDrmOutput;
             output.attach(listener);
             self.backend = .{ .drm = output };
         },
@@ -53,6 +52,13 @@ pub fn init(
             try self.backend.nested.init(io, display, output_size, listener);
         },
     }
+}
+
+pub fn drmOutput(self: *const Self) ?*DrmOutput {
+    return switch (self.backend) {
+        .drm => |output| output,
+        else => null,
+    };
 }
 
 pub fn name(self: *const Self, fallback: []const u8) []const u8 {

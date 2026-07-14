@@ -100,6 +100,12 @@ pub fn usableArea(self: *const Self) Rect {
     return self.usable_area;
 }
 
+pub fn setDefaultOutput(self: *Self, output_id: OutputLayout.Id) void {
+    std.debug.assert(self.outputs.get(output_id) != null);
+    self.default_output_id = output_id;
+    self.arrange();
+}
+
 pub fn setPolicyListener(self: *Self, listener: PolicyListener) void {
     self.policy_listener = listener;
     self.notifyPolicy();
