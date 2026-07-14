@@ -821,7 +821,7 @@ fn pointerRoute(self: *Self, x: f64, y: f64) WindowManager.PointerRoute {
 }
 
 fn borderRoot(self: *Self, x: f64, y: f64) ?Surface.Id {
-    const fullscreen = self.scene.topFullscreen();
+    const fullscreen = self.topFullscreenAtPoint(x, y);
     var nodes = self.scene.reverseNodeIterator();
     while (nodes.next()) |entry| switch (entry) {
         .window => |window_entry| {
@@ -863,7 +863,7 @@ fn scenePointerFocus(self: *Self, x: f64, y: f64) ?Seat.PointerFocus {
     }
     if (self.hitTestLayerPopups(x, y)) |focus| return focus;
     if (self.hitTestLayer(.overlay, x, y)) |focus| return focus;
-    const fullscreen = self.scene.topFullscreen();
+    const fullscreen = self.topFullscreenAtPoint(x, y);
     if (fullscreen == null) {
         if (self.hitTestLayer(.top, x, y)) |focus| return focus;
     }
@@ -890,6 +890,32 @@ fn scenePointerFocus(self: *Self, x: f64, y: f64) ?Seat.PointerFocus {
     if (fullscreen != null) return null;
     if (self.hitTestLayer(.bottom, x, y)) |focus| return focus;
     if (self.hitTestLayer(.background, x, y)) |focus| return focus;
+    return null;
+}
+
+fn topFullscreenAtPoint(self: *Self, x: f64, y: f64) ?Scene.Id {
+    var outputs = self.outputs.iterator();
+    while (outputs.next()) |entry| {
+        const output_rect = entry.output.logicalRect();
+        if (pointInRect(x, y, output_rect)) return self.topFullscreenForOutput(output_rect);
+    }
+    return null;
+}
+
+fn topFullscreenForOutput(self: *Self, output_rect: render.Rect) ?Scene.Id {
+    var nodes = self.scene.reverseNodeIterator();
+    while (nodes.next()) |entry| switch (entry) {
+        .window => |window_entry| {
+            const window = window_entry.window;
+            if (!window.mapped or !window.fullscreen) continue;
+            if (window.clip_box) |clip_box| {
+                const global_clip = clip_box.translated(window.position.x, window.position.y);
+                if (global_clip.intersection(output_rect) == null) continue;
+            }
+            return window_entry.id;
+        },
+        .shell_surface => {},
+    };
     return null;
 }
 
@@ -1116,7 +1142,7 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
 
     try self.renderLayerSurfaces(&frame, .background);
     try self.renderLayerSurfaces(&frame, .bottom);
-    const top_fullscreen = self.scene.topFullscreen();
+    const top_fullscreen = self.topFullscreenForOutput(output.logicalRect());
     if (top_fullscreen != null) try self.renderLayerSurfaces(&frame, .top);
     var fullscreen_reached = top_fullscreen == null;
     var nodes = self.scene.nodeIterator();
@@ -1697,6 +1723,37 @@ test "server adds and removes independent render outputs" {
         Output.Position{ .x = 1280 },
         server.outputs.get(second.protocol_id).?.logicalPosition(),
     );
+}
+
+test "fullscreen selection is isolated to each output" {
+    const server = try Self.create(std.testing.allocator, std.testing.io, .cpu, .headless);
+    defer server.destroy();
+
+    const first = try server.scene.addWindow(.{ .index = 100, .generation = 1 });
+    defer server.scene.removeWindow(first);
+    server.scene.setMapped(first, true);
+    server.scene.setFullscreen(first, true);
+    server.scene.setClipBox(first, .{ .x = 0, .y = 0, .width = 1280, .height = 720 });
+
+    const second = try server.scene.addWindow(.{ .index = 101, .generation = 1 });
+    defer server.scene.removeWindow(second);
+    server.scene.setPosition(second, .{ .x = 1280 });
+    server.scene.setMapped(second, true);
+    server.scene.setFullscreen(second, true);
+    server.scene.setClipBox(second, .{ .x = 0, .y = 0, .width = 640, .height = 480 });
+
+    try std.testing.expectEqual(first, server.topFullscreenForOutput(.{
+        .x = 0,
+        .y = 0,
+        .width = 1280,
+        .height = 720,
+    }).?);
+    try std.testing.expectEqual(second, server.topFullscreenForOutput(.{
+        .x = 1280,
+        .y = 0,
+        .width = 640,
+        .height = 480,
+    }).?);
 }
 
 test "window borders occupy only requested exterior edges and corners" {

@@ -29,7 +29,7 @@ scene: *Scene,
 xdg_shell: *XdgShell,
 layer_shell: *LayerShell,
 active: ?*river.WindowManagerV1,
-output_resource: ?*river.OutputV1,
+output_resources: std.ArrayList(*OutputResource),
 seat_resource: ?*river.SeatV1,
 session_generation: u64,
 sequence: Sequence,
@@ -85,7 +85,7 @@ const ManagedWindow = struct {
     requested_dimensions: XdgShell.Dimensions = .{ .width = 0, .height = 0 },
     requested_configuration: XdgShell.ToplevelConfigure = .{},
     sent_configuration: XdgShell.ToplevelConfigure = .{},
-    fullscreen_output: bool = false,
+    fullscreen_output: ?OutputLayout.Id = null,
     fullscreen_dimensions_pending: bool = false,
     configure: ConfigureState = .idle,
     dimensions_pending: bool = false,
@@ -133,7 +133,7 @@ const PendingWindowRequest = struct {
         show_window_menu: struct { x: i32, y: i32 },
         maximize,
         unmaximize,
-        fullscreen: bool,
+        fullscreen: ?OutputLayout.Id,
         exit_fullscreen,
         minimize,
     };
@@ -296,7 +296,7 @@ pub fn init(
         .xdg_shell = xdg_shell,
         .layer_shell = layer_shell,
         .active = null,
-        .output_resource = null,
+        .output_resources = .empty,
         .seat_resource = null,
         .session_generation = 0,
         .sequence = .{},
@@ -333,6 +333,7 @@ pub fn init(
     errdefer self.shell_surfaces.deinit(allocator);
     errdefer self.window_requests.deinit(allocator);
     errdefer self.stack_operations.deinit(allocator);
+    errdefer self.output_resources.deinit(allocator);
     self.global = try wl.Global.create(
         display,
         river.WindowManagerV1,
@@ -365,6 +366,18 @@ fn resolveOutput(self: *Self) *Output {
     return self.outputs.get(self.output_id) orelse unreachable;
 }
 
+fn outputResource(self: *Self, output_id: OutputLayout.Id) ?*river.OutputV1 {
+    for (self.output_resources.items) |output_resource| {
+        if (output_resource.owner_generation != self.session_generation) continue;
+        if (std.meta.eql(output_resource.output_id, output_id)) return output_resource.resource;
+    }
+    return null;
+}
+
+fn fullscreenOutput(self: *Self, window: *const ManagedWindow) ?*Output {
+    return self.outputs.get(window.fullscreen_output orelse return null);
+}
+
 pub fn deinit(self: *Self) void {
     self.layer_shell.clearPolicyListener();
     self.xdg_shell.clearWindowListener();
@@ -376,6 +389,8 @@ pub fn deinit(self: *Self) void {
     self.shell_surfaces.deinit(self.allocator);
     self.window_requests.deinit(self.allocator);
     self.stack_operations.deinit(self.allocator);
+    std.debug.assert(self.output_resources.items.len == 0);
+    self.output_resources.deinit(self.allocator);
     std.debug.assert(self.pointer_bindings.items.len == 0);
     self.pointer_bindings.deinit(self.allocator);
     self.held_buttons.deinit(self.allocator);
@@ -527,7 +542,8 @@ fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
     self.session_generation +%= 1;
     if (resource.getVersion() >= 4) self.seat.setUnfocusedCursorController(resource.getClient());
     for (self.layer_bindings.items) |binding| binding.beginSession(if (binding.resource.getClient() == resource.getClient()) self.session_generation else null);
-    self.createOutput(resource) catch {
+    var outputs = self.outputs.iterator();
+    while (outputs.next()) |entry| self.createOutput(resource, entry.id, entry.output) catch {
         resource.postNoMemory();
         return;
     };
@@ -710,9 +726,10 @@ fn sendPendingState(self: *Self, manager: *river.WindowManagerV1) !void {
             },
             .maximize => resource.sendMaximizeRequested(),
             .unmaximize => resource.sendUnmaximizeRequested(),
-            .fullscreen => |preferred_output| resource.sendFullscreenRequested(
-                if (preferred_output) self.output_resource else null,
-            ),
+            .fullscreen => |preferred_output| resource.sendFullscreenRequested(if (preferred_output) |id|
+                self.outputResource(id)
+            else
+                null),
             .exit_fullscreen => resource.sendExitFullscreenRequested(),
             .minimize => resource.sendMinimizeRequested(),
         }
@@ -837,8 +854,8 @@ fn finishManage(self: *Self, manager: *river.WindowManagerV1) void {
         if (!report_dimensions and !configuration_changed and
             !info.decoration_configure_requested) continue;
         const proposed_dimensions = entry.value.proposed_dimensions;
-        const dimensions = if (entry.value.fullscreen_output) fullscreen: {
-            const size = self.resolveOutput().logicalSize();
+        const dimensions = if (self.fullscreenOutput(entry.value)) |output| fullscreen: {
+            const size = output.logicalSize();
             break :fullscreen XdgShell.Dimensions{
                 .width = @intCast(size.width),
                 .height = @intCast(size.height),
@@ -858,7 +875,7 @@ fn finishManage(self: *Self, manager: *river.WindowManagerV1) void {
         if (report_dimensions) {
             entry.value.proposed_dimensions = null;
             entry.value.fullscreen_dimensions_pending = false;
-            if (!entry.value.fullscreen_output and proposed_dimensions != null) {
+            if (entry.value.fullscreen_output == null and proposed_dimensions != null) {
                 entry.value.requested_dimensions = dimensions;
             }
         }
@@ -921,19 +938,23 @@ fn finishRender(self: *Self, manager: *river.WindowManagerV1) void {
     var iterator = self.windows.iterator();
     while (iterator.next()) |entry| {
         if (entry.value.pending_position) |position| {
-            if (!entry.value.fullscreen_output) {
+            if (entry.value.fullscreen_output == null) {
                 self.xdg_shell.setWindowPosition(entry.value.xdg_id, position);
             }
             entry.value.pending_position = null;
         }
-        if (entry.value.fullscreen_output) {
-            self.xdg_shell.setWindowPosition(entry.value.xdg_id, .{});
+        if (self.fullscreenOutput(entry.value)) |output| {
+            const position = output.logicalPosition();
+            self.xdg_shell.setWindowPosition(entry.value.xdg_id, .{
+                .x = position.x,
+                .y = position.y,
+            });
         }
         self.xdg_shell.setWindowFocused(
             entry.value.xdg_id,
             if (self.focused) |id| std.meta.eql(id, entry.id) else false,
         );
-        self.xdg_shell.setWindowFullscreen(entry.value.xdg_id, entry.value.fullscreen_output);
+        self.xdg_shell.setWindowFullscreen(entry.value.xdg_id, entry.value.fullscreen_output != null);
         switch (entry.value.pending_borders) {
             .unchanged => {},
             .set => |borders| {
@@ -955,8 +976,8 @@ fn finishRender(self: *Self, manager: *river.WindowManagerV1) void {
                 entry.value.pending_content_clip_box = .unchanged;
             },
         }
-        if (entry.value.fullscreen_output) {
-            const size = self.resolveOutput().logicalSize();
+        if (self.fullscreenOutput(entry.value)) |output| {
+            const size = output.logicalSize();
             self.xdg_shell.setWindowBorders(entry.value.xdg_id, null);
             self.xdg_shell.setWindowClipBox(entry.value.xdg_id, .{
                 .x = 0,
@@ -1308,7 +1329,6 @@ fn releaseManager(self: *Self) void {
         }
     }
     self.active = null;
-    self.output_resource = null;
     self.seat_resource = null;
     self.sequence.reset();
     self.window_requests.clearRetainingCapacity();
@@ -1486,9 +1506,9 @@ fn windowRequest(
         .maximize => .maximize,
         .unmaximize => .unmaximize,
         .fullscreen => |output| .{ .fullscreen = if (output) |resource|
-            self.resolveOutput().ownsResource(resource)
+            if (self.outputs.findResource(resource)) |entry| entry.id else null
         else
-            false },
+            null },
         .exit_fullscreen => .exit_fullscreen,
         .minimize => .minimize,
     };
@@ -1634,13 +1654,12 @@ const WindowResource = struct {
             },
             .fullscreen => |fullscreen| {
                 if (!self.requireManage(manager_resource)) return;
-                if (!self.resolveOutput(fullscreen.output)) return;
-                window.fullscreen_output = true;
+                window.fullscreen_output = self.resolveOutput(fullscreen.output) orelse return;
                 window.fullscreen_dimensions_pending = true;
             },
             .exit_fullscreen => {
                 if (!self.requireManage(manager_resource)) return;
-                window.fullscreen_output = false;
+                window.fullscreen_output = null;
             },
             .get_node => |get| NodeResource.createWindow(
                 self.manager,
@@ -1740,11 +1759,13 @@ const WindowResource = struct {
         return self.manager.active;
     }
 
-    fn resolveOutput(self: *WindowResource, resource: *river.OutputV1) bool {
-        const data = resource.getUserData() orelse return false;
+    fn resolveOutput(self: *WindowResource, resource: *river.OutputV1) ?OutputLayout.Id {
+        const data = resource.getUserData() orelse return null;
         const output: *OutputResource = @ptrCast(@alignCast(data));
-        return output.manager == self.manager and
-            output.owner_generation == self.owner_generation;
+        if (output.manager != self.manager or
+            output.owner_generation != self.owner_generation) return null;
+        if (self.manager.outputs.get(output.output_id) == null) return null;
+        return output.output_id;
     }
 
     fn requireManage(self: *WindowResource, manager: *river.WindowManagerV1) bool {
@@ -2329,7 +2350,12 @@ const NodeResource = struct {
     }
 };
 
-fn createOutput(self: *Self, manager: *river.WindowManagerV1) !void {
+fn createOutput(
+    self: *Self,
+    manager: *river.WindowManagerV1,
+    output_id: OutputLayout.Id,
+    output: *Output,
+) !void {
     const resource = try river.OutputV1.create(
         manager.getClient(),
         manager.getVersion(),
@@ -2343,12 +2369,13 @@ fn createOutput(self: *Self, manager: *river.WindowManagerV1) !void {
         .allocator = self.allocator,
         .manager = self,
         .owner_generation = self.session_generation,
+        .output_id = output_id,
+        .resource = resource,
     };
+    try self.output_resources.append(self.allocator, adapter);
     resource.setHandler(*OutputResource, OutputResource.handleRequest, OutputResource.handleDestroy, adapter);
 
-    self.output_resource = resource;
     manager.sendOutput(resource);
-    const output = self.resolveOutput();
     resource.sendWlOutput(output.globalName(manager.getClient()));
     const position = output.logicalPosition();
     resource.sendPosition(position.x, position.y);
@@ -2385,6 +2412,8 @@ const OutputResource = struct {
     allocator: std.mem.Allocator,
     manager: *Self,
     owner_generation: u64,
+    output_id: OutputLayout.Id,
+    resource: *river.OutputV1,
 
     fn handleRequest(
         resource: *river.OutputV1,
@@ -2426,7 +2455,12 @@ const OutputResource = struct {
     }
 
     fn handleDestroy(resource: *river.OutputV1, self: *OutputResource) void {
-        if (self.manager.output_resource == resource) self.manager.output_resource = null;
+        std.debug.assert(self.resource == resource);
+        for (self.manager.output_resources.items, 0..) |candidate, index| {
+            if (candidate != self) continue;
+            _ = self.manager.output_resources.orderedRemove(index);
+            break;
+        }
         self.allocator.destroy(self);
     }
 };
