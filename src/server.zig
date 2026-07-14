@@ -10,6 +10,7 @@ const Compositor = @import("wayland/compositor.zig");
 const Subcompositor = @import("wayland/subcompositor.zig");
 const XdgOutput = @import("wayland/xdg_output.zig");
 const XdgShell = @import("wayland/xdg_shell.zig");
+const XdgForeign = @import("wayland/xdg_foreign.zig");
 const LayerShell = @import("wayland/layer_shell.zig");
 const SinglePixelBuffer = @import("wayland/single_pixel_buffer.zig");
 const CursorShape = @import("wayland/cursor_shape.zig");
@@ -69,6 +70,7 @@ compositor: Compositor,
 subcompositor: Subcompositor,
 scene: Scene,
 xdg_shell: XdgShell,
+xdg_foreign: XdgForeign,
 layer_shell: LayerShell,
 seat: Seat,
 data_device: DataDevice,
@@ -166,6 +168,7 @@ pub fn create(
         .subcompositor = undefined,
         .scene = undefined,
         .xdg_shell = undefined,
+        .xdg_foreign = undefined,
         .layer_shell = undefined,
         .seat = undefined,
         .data_device = undefined,
@@ -301,6 +304,8 @@ pub fn create(
         render_output.protocol_id,
     );
     errdefer self.xdg_shell.deinit();
+    try self.xdg_foreign.init(allocator, io, display, &self.xdg_shell);
+    errdefer self.xdg_foreign.deinit();
     try self.layer_shell.init(
         allocator,
         display,
@@ -432,6 +437,7 @@ pub fn destroy(self: *Self) void {
     self.data_device.deinit();
     self.xdg_activation.deinit();
     self.layer_shell.deinit();
+    self.xdg_foreign.deinit();
     self.xdg_shell.deinit();
     self.scene.deinit();
     self.subcompositor.deinit();

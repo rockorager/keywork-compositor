@@ -528,20 +528,21 @@
       "interfaces": [
         {
           "name": "zxdg_exporter_v2",
-          "current_version": null,
+          "current_version": 1,
           "target_version": 1
         },
         {
           "name": "zxdg_importer_v2",
-          "current_version": null,
+          "current_version": 1,
           "target_version": 1
         }
       ],
-      "status": "not_started",
+      "status": "done",
       "privileged": false,
       "blocked_by": [
         "xdg-shell"
-      ]
+      ],
+      "status_detail": "Version 2 interfaces at version 1 export xdg_toplevels with cryptographically random 128-bit handles, support repeated cross-client imports, apply the same mapped-parent and cycle semantics as xdg_toplevel.set_parent, and revoke owned relationships when imported/exported objects or target toplevels disappear. Direct and foreign child-parent references are also cleared when a parent window is destroyed."
     },
     {
       "id": "content-type",

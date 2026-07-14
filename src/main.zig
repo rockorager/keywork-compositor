@@ -105,6 +105,7 @@ test {
     _ = @import("wayland/pointer_constraints.zig");
     _ = @import("wayland/idle_inhibit.zig");
     _ = @import("wayland/xdg_activation.zig");
+    _ = @import("wayland/xdg_foreign.zig");
     _ = @import("wayland/xdg_output.zig");
     _ = @import("wayland/viewporter.zig");
     _ = @import("wayland/xdg_shell.zig");

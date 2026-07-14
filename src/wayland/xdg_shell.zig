@@ -139,6 +139,7 @@ pub const WindowState = struct {
     scene_id: Scene.Id,
     unreliable_pid: i32,
     parent: ?WindowId = null,
+    parent_owner: ?*anyopaque = null,
     title: ?[:0]u8 = null,
     app_id: ?[:0]u8 = null,
     pending_min_size: SizeHint = .{},
@@ -170,6 +171,7 @@ pub const WindowState = struct {
         self.title = null;
         self.app_id = null;
         self.parent = null;
+        self.parent_owner = null;
         self.pending_min_size = .{};
         self.pending_max_size = .{};
         self.current_min_size = .{};
@@ -287,6 +289,15 @@ pub const WindowIterator = struct {
         return entry.id;
     }
 };
+
+pub const ToplevelInfo = struct {
+    window_id: WindowId,
+    surface_resource: *wl.Surface,
+    xdg_surface_resource: *xdg.Surface,
+    resource: *xdg.Toplevel,
+};
+
+pub const ForeignParentError = error{ InvalidSurface, InvalidParent };
 
 pub fn init(
     self: *Self,
@@ -816,6 +827,77 @@ pub fn surfaceRootWindow(self: *Self, surface_id: Surface.Id) ?WindowId {
         };
     }
     return null;
+}
+
+pub fn toplevelForSurface(self: *Self, surface_id: Surface.Id) ?ToplevelInfo {
+    var iterator = self.xdg_surfaces.iterator();
+    while (iterator.next()) |entry| {
+        if (!std.meta.eql(entry.value.surface_id, surface_id)) continue;
+        const window_id = switch (entry.value.role orelse return null) {
+            .toplevel => |id| id,
+            .popup => return null,
+        };
+        if (self.windows.get(window_id) == null) return null;
+        const resource = entry.value.toplevel_resource orelse return null;
+        const adapter: *ToplevelResource = @ptrCast(@alignCast(resource.getUserData().?));
+        return .{
+            .window_id = window_id,
+            .surface_resource = Surface.resourceFor(self.surface_store, surface_id) orelse return null,
+            .xdg_surface_resource = adapter.xdg_surface_resource.resource,
+            .resource = resource,
+        };
+    }
+    return null;
+}
+
+pub fn setForeignParent(
+    self: *Self,
+    child_surface_id: Surface.Id,
+    parent_id: WindowId,
+    owner: *anyopaque,
+) ForeignParentError!void {
+    const child_id = (self.toplevelForSurface(child_surface_id) orelse
+        return error.InvalidSurface).window_id;
+    const child = self.windows.get(child_id) orelse return error.InvalidSurface;
+    const parent = self.windows.get(parent_id) orelse return error.InvalidParent;
+    const applied_parent: ?WindowId = if (parent.mapped) parent_id else null;
+    var ancestor = applied_parent;
+    while (ancestor) |candidate| {
+        if (std.meta.eql(candidate, child_id)) return error.InvalidParent;
+        const candidate_window = self.windows.get(candidate) orelse break;
+        ancestor = candidate_window.parent;
+    }
+    child.parent = applied_parent;
+    child.parent_owner = if (applied_parent != null) owner else null;
+    self.notifyWindowMetadataChanged(child_id);
+}
+
+pub fn clearForeignParents(self: *Self, owner: *anyopaque) void {
+    var iterator = self.windows.iterator();
+    while (iterator.next()) |entry| {
+        if (entry.value.parent_owner != owner) continue;
+        entry.value.parent = null;
+        entry.value.parent_owner = null;
+        self.notifyWindowMetadataChanged(entry.id);
+    }
+}
+
+fn clearParentReferences(self: *Self, parent_id: WindowId) void {
+    var iterator = self.windows.iterator();
+    while (iterator.next()) |entry| {
+        if (entry.value.parent) |candidate| {
+            if (!std.meta.eql(candidate, parent_id)) continue;
+            entry.value.parent = null;
+            entry.value.parent_owner = null;
+            self.notifyWindowMetadataChanged(entry.id);
+        }
+    }
+}
+
+fn notifyWindowMetadataChanged(self: *Self, window_id: WindowId) void {
+    if (self.window_listener) |listener| {
+        _ = listener.metadata_changed(listener.context, window_id);
+    }
 }
 
 fn isTopmostPopup(self: *Self, id: PopupId) bool {
@@ -1391,6 +1473,7 @@ const XdgSurfaceResource = struct {
         };
         if (removed.role) |role| switch (role) {
             .toplevel => |window_id| {
+                self.shell.clearParentReferences(window_id);
                 if (self.shell.windows.remove(window_id)) |window_value| {
                     if (self.shell.window_listener) |listener| {
                         listener.destroyed(listener.context, window_id);
@@ -2173,6 +2256,7 @@ const ToplevelResource = struct {
             self.xdg_surface_resource.toplevel_resource = null;
         }
         if (self.shell.windows.remove(self.id)) |window_value| {
+            self.shell.clearParentReferences(self.id);
             if (self.shell.window_listener) |listener| {
                 listener.destroyed(listener.context, self.id);
             }
@@ -2228,9 +2312,8 @@ const ToplevelResource = struct {
             ancestor = candidate_window.parent;
         }
         window.parent = parent_id;
-        if (self.shell.window_listener) |listener| {
-            _ = listener.metadata_changed(listener.context, self.id);
-        }
+        window.parent_owner = null;
+        self.shell.notifyWindowMetadataChanged(self.id);
     }
 
     fn validMaxSize(maximum: SizeHint, minimum: SizeHint) bool {
