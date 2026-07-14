@@ -156,7 +156,7 @@ pub fn create(
     errdefer self.fractional_scale.deinit();
     try self.fixes.init(display);
     errdefer self.fixes.deinit();
-    try self.linux_dmabuf.init(allocator, display);
+    try self.linux_dmabuf.init(allocator, io, display);
     errdefer self.linux_dmabuf.deinit();
     try self.subcompositor.init(allocator, display, self.compositor.surfaceStore());
     errdefer self.subcompositor.deinit();

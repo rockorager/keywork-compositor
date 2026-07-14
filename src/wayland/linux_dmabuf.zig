@@ -13,7 +13,9 @@ const log = std.log.scoped(.linux_dmabuf);
 const linux = @cImport({
     @cInclude("libdrm/drm_fourcc.h");
     @cInclude("linux/dma-buf.h");
+    @cInclude("linux/memfd.h");
     @cInclude("sys/ioctl.h");
+    @cInclude("sys/stat.h");
 });
 
 const max_planes = 4;
@@ -23,23 +25,48 @@ const argb8888: u32 = linux.DRM_FORMAT_ARGB8888;
 const xrgb8888: u32 = linux.DRM_FORMAT_XRGB8888;
 
 allocator: std.mem.Allocator,
+io: std.Io,
 global: *wl.Global,
+feedback_state: ?FeedbackState,
 params_count: usize,
 buffer_count: usize,
+feedback_count: usize,
 
-pub fn init(self: *Self, allocator: std.mem.Allocator, display: *wl.Server) !void {
+pub fn init(
+    self: *Self,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    display: *wl.Server,
+) !void {
+    const feedback_state = FeedbackState.init(io) catch |err| unavailable: {
+        log.info("DMA-BUF feedback unavailable: {t}", .{err});
+        break :unavailable null;
+    };
+    errdefer if (feedback_state) |state| state.file.close(io);
     self.* = .{
         .allocator = allocator,
-        .global = try wl.Global.create(display, zwp.LinuxDmabufV1, 3, *Self, self, bind),
+        .io = io,
+        .global = try wl.Global.create(
+            display,
+            zwp.LinuxDmabufV1,
+            if (feedback_state == null) 3 else 5,
+            *Self,
+            self,
+            bind,
+        ),
+        .feedback_state = feedback_state,
         .params_count = 0,
         .buffer_count = 0,
+        .feedback_count = 0,
     };
 }
 
 pub fn deinit(self: *Self) void {
     std.debug.assert(self.params_count == 0);
     std.debug.assert(self.buffer_count == 0);
+    std.debug.assert(self.feedback_count == 0);
     self.global.destroy();
+    if (self.feedback_state) |state| state.file.close(self.io);
     self.* = undefined;
 }
 
@@ -71,8 +98,124 @@ fn handleRequest(
             resource.getVersion(),
             create.params_id,
         ) catch resource.postNoMemory(),
+        .get_default_feedback => |get| Feedback.create(self, resource, get.id),
+        .get_surface_feedback => |get| Feedback.create(self, resource, get.id),
     }
 }
+
+const FormatTableEntry = extern struct {
+    format: u32,
+    padding: u32,
+    modifier: u64,
+};
+
+const FeedbackState = struct {
+    device: linux.dev_t,
+    file: std.Io.File,
+
+    fn init(io: std.Io) !FeedbackState {
+        const device = findRenderDevice() orelse return error.NoRenderDevice;
+        const entries = [_]FormatTableEntry{
+            .{ .format = argb8888, .padding = 0, .modifier = linear_modifier },
+            .{ .format = xrgb8888, .padding = 0, .modifier = linear_modifier },
+        };
+        comptime std.debug.assert(@sizeOf(FormatTableEntry) == 16);
+
+        const fd = try std.posix.memfd_create(
+            "keywork-dmabuf-formats",
+            linux.MFD_CLOEXEC | linux.MFD_ALLOW_SEALING,
+        );
+        const file: std.Io.File = .{
+            .handle = fd,
+            .flags = .{ .nonblocking = false },
+        };
+        errdefer file.close(io);
+        const bytes = std.mem.asBytes(&entries);
+        try file.setLength(io, bytes.len);
+        try file.writePositionalAll(io, bytes, 0);
+        const seals = std.os.linux.F.SEAL_SHRINK | std.os.linux.F.SEAL_GROW |
+            std.os.linux.F.SEAL_WRITE | std.os.linux.F.SEAL_SEAL;
+        const seal_result = std.os.linux.fcntl(fd, std.os.linux.F.ADD_SEALS, seals);
+        if (std.posix.errno(seal_result) != .SUCCESS) return error.SealFailed;
+        return .{ .device = device, .file = file };
+    }
+};
+
+fn findRenderDevice() ?linux.dev_t {
+    for (128..192) |minor| {
+        var path_buffer: [64]u8 = undefined;
+        const path = std.fmt.bufPrintSentinel(
+            &path_buffer,
+            "/dev/dri/renderD{d}",
+            .{minor},
+            0,
+        ) catch unreachable;
+        var stat: linux.struct_stat = undefined;
+        if (linux.stat(path.ptr, &stat) < 0) continue;
+        if (stat.st_mode & linux.S_IFMT != linux.S_IFCHR) continue;
+        return stat.st_rdev;
+    }
+    return null;
+}
+
+const Feedback = struct {
+    manager: *Self,
+
+    fn create(manager: *Self, factory: *zwp.LinuxDmabufV1, id: u32) void {
+        const state = manager.feedback_state orelse unreachable;
+        const resource = zwp.LinuxDmabufFeedbackV1.create(
+            factory.getClient(),
+            factory.getVersion(),
+            id,
+        ) catch {
+            factory.postNoMemory();
+            return;
+        };
+        const self = manager.allocator.create(Feedback) catch {
+            resource.postNoMemory();
+            resource.destroy();
+            return;
+        };
+        self.* = .{ .manager = manager };
+        manager.feedback_count += 1;
+        resource.setHandler(*Feedback, Feedback.handleRequest, Feedback.handleDestroy, self);
+
+        var device = state.device;
+        var device_array: wl.Array = .{
+            .size = @sizeOf(linux.dev_t),
+            .alloc = @sizeOf(linux.dev_t),
+            .data = @ptrCast(&device),
+        };
+        var indices: [2]u16 align(4) = .{ 0, 1 };
+        var indices_array: wl.Array = .{
+            .size = @sizeOf(@TypeOf(indices)),
+            .alloc = @sizeOf(@TypeOf(indices)),
+            .data = @ptrCast(&indices),
+        };
+        resource.sendFormatTable(state.file.handle, 2 * @sizeOf(FormatTableEntry));
+        resource.sendMainDevice(&device_array);
+        resource.sendTrancheTargetDevice(&device_array);
+        resource.sendTrancheFlags(@bitCast(@as(u32, 0)));
+        resource.sendTrancheFormats(&indices_array);
+        resource.sendTrancheDone();
+        resource.sendDone();
+    }
+
+    fn handleRequest(
+        resource: *zwp.LinuxDmabufFeedbackV1,
+        request: zwp.LinuxDmabufFeedbackV1.Request,
+        _: *Feedback,
+    ) void {
+        switch (request) {
+            .destroy => resource.destroy(),
+        }
+    }
+
+    fn handleDestroy(_: *zwp.LinuxDmabufFeedbackV1, self: *Feedback) void {
+        self.manager.feedback_count -= 1;
+        self.manager.allocator.destroy(self);
+    }
+};
 
 const Plane = struct {
     fd: std.posix.fd_t,

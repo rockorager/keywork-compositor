@@ -261,7 +261,7 @@
       "interfaces": [
         {
           "name": "zwp_linux_dmabuf_v1",
-          "current_version": 3,
+          "current_version": 5,
           "target_version": 6
         }
       ],
@@ -270,7 +270,7 @@
       "blocked_by": [
         "wl-compositor"
       ],
-      "status_detail": "Version 3 imports single-plane linear ARGB8888 and XRGB8888 buffers into compositor-owned CPU snapshots with implicit synchronization; v4 feedback, multi-plane formats, non-linear modifiers, and v6 sampling-device selection remain."
+      "status_detail": "Version 5 imports single-plane linear ARGB8888 and XRGB8888 buffers into compositor-owned CPU snapshots with implicit synchronization and publishes default and per-surface feedback; multi-plane formats, non-linear modifiers, and v6 sampling-device selection remain."
     },
     {
       "id": "presentation-time",

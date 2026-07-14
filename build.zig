@@ -31,7 +31,7 @@ pub fn build(b: *std.Build) void {
     scanner.generate("wp_viewporter", 1);
     scanner.generate("wp_fractional_scale_manager_v1", 1);
     scanner.generate("wp_presentation", 2);
-    scanner.generate("zwp_linux_dmabuf_v1", 3);
+    scanner.generate("zwp_linux_dmabuf_v1", 5);
     scanner.generate("river_window_manager_v1", 5);
 
     const wayland = b.createModule(.{
