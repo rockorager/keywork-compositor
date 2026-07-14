@@ -25,6 +25,9 @@ session: *Session,
 session_listener: Session.Listener,
 event_loop: *wl.EventLoop,
 event_source: ?*wl.EventSource,
+udev: ?*c.struct_udev,
+udev_monitor: ?*c.struct_udev_monitor,
+hotplug_source: ?*wl.EventSource,
 listener: Listener,
 device_path: ?[:0]u8,
 device: ?Session.Device,
@@ -104,6 +107,9 @@ pub fn init(
         },
         .event_loop = event_loop,
         .event_source = null,
+        .udev = null,
+        .udev_monitor = null,
+        .hotplug_source = null,
         .listener = listener,
         .device_path = path,
         .device = null,
@@ -130,12 +136,15 @@ pub fn init(
     errdefer session.removeListener(&self.session_listener);
     if (!session.isActive()) return error.SessionInactive;
     if (self.failed or self.device == null) return error.DrmInitializationFailed;
+    errdefer self.deactivate();
+    try self.initHotplugMonitor();
     self.initialized = true;
 }
 
 pub fn deinit(self: *Self) void {
     self.initialized = false;
     self.session.removeListener(&self.session_listener);
+    self.deinitHotplugMonitor();
     self.deactivate();
     if (self.device_path) |value| self.allocator.free(value);
     self.* = undefined;
@@ -322,6 +331,51 @@ fn isPrimaryNode(path: []const u8) bool {
     return true;
 }
 
+fn initHotplugMonitor(self: *Self) !void {
+    const udev = c.udev_new() orelse return error.UdevContextFailed;
+    self.udev = udev;
+    errdefer {
+        _ = c.udev_unref(udev);
+        self.udev = null;
+    }
+    const monitor = c.udev_monitor_new_from_netlink(udev, "udev") orelse
+        return error.UdevMonitorFailed;
+    self.udev_monitor = monitor;
+    errdefer {
+        _ = c.udev_monitor_unref(monitor);
+        self.udev_monitor = null;
+    }
+    if (c.udev_monitor_filter_add_match_subsystem_devtype(monitor, "drm", null) != 0 or
+        c.udev_monitor_enable_receiving(monitor) != 0)
+    {
+        return error.UdevMonitorFailed;
+    }
+    const fd = c.udev_monitor_get_fd(monitor);
+    if (fd < 0) return error.UdevMonitorFailed;
+    self.hotplug_source = try self.event_loop.addFd(
+        *Self,
+        fd,
+        .{ .readable = true },
+        handleHotplugEvent,
+        self,
+    );
+}
+
+fn deinitHotplugMonitor(self: *Self) void {
+    if (self.hotplug_source) |source| {
+        source.remove();
+        self.hotplug_source = null;
+    }
+    if (self.udev_monitor) |monitor| {
+        _ = c.udev_monitor_unref(monitor);
+        self.udev_monitor = null;
+    }
+    if (self.udev) |udev| {
+        _ = c.udev_unref(udev);
+        self.udev = null;
+    }
+}
+
 fn deactivate(self: *Self) void {
     if (self.event_source) |source| {
         source.remove();
@@ -349,6 +403,7 @@ fn fail(self: *Self, err: anyerror) void {
     self.failed = true;
     log.err("DRM output failed: {t}", .{err});
     if (self.pending != null) self.listener.discarded(self.listener.context);
+    self.deinitHotplugMonitor();
     self.deactivate();
     if (self.initialized) self.listener.close(self.listener.context);
 }
@@ -391,6 +446,27 @@ fn handleDrmEvent(_: c_int, mask: wl.EventMask, self: *Self) c_int {
         var context = event_context;
         if (c.drmHandleEvent(self.device.?.fd, &context) != 0) {
             self.fail(error.EventDispatchFailed);
+        }
+    }
+    return 0;
+}
+
+fn handleHotplugEvent(_: c_int, mask: wl.EventMask, self: *Self) c_int {
+    if (mask.hangup or mask.@"error") {
+        self.fail(error.UdevMonitorFailed);
+        return 0;
+    }
+    if (!mask.readable) return 0;
+    var received = false;
+    while (c.udev_monitor_receive_device(self.udev_monitor.?)) |device| {
+        received = true;
+        _ = c.udev_device_unref(device);
+    }
+    if (received) {
+        if (self.device) |device| {
+            if (!connectorAvailable(device.fd, self.connector_id, self.size)) {
+                self.fail(error.OutputDisconnected);
+            }
         }
     }
     return 0;
@@ -461,6 +537,19 @@ fn selectOutput(fd: std.posix.fd_t) !Selection {
         };
     }
     return error.NoConnectedOutput;
+}
+
+fn connectorAvailable(fd: std.posix.fd_t, connector_id: u32, size: render.Size) bool {
+    const connector = c.drmModeGetConnector(fd, connector_id) orelse return false;
+    defer c.drmModeFreeConnector(connector);
+    if (connector.*.connection != c.DRM_MODE_CONNECTED or connector.*.count_modes <= 0) {
+        return false;
+    }
+    const mode_count: usize = @intCast(connector.*.count_modes);
+    for (connector.*.modes[0..mode_count]) |mode| {
+        if (mode.hdisplay == size.width and mode.vdisplay == size.height) return true;
+    }
+    return false;
 }
 
 fn selectCrtc(
