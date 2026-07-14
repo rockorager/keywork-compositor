@@ -6,7 +6,7 @@ const std = @import("std");
 const wayland = @import("wayland");
 const Surface = @import("surface.zig");
 const Output = @import("output.zig");
-const WaylandRegion = @import("wayland_region.zig");
+const WaylandRegion = @import("region.zig");
 
 const wl = wayland.server.wl;
 

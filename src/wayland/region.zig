@@ -4,7 +4,7 @@ const Self = @This();
 
 const std = @import("std");
 const wayland = @import("wayland");
-const Region = @import("region.zig");
+const Region = @import("../region.zig");
 
 const wl = wayland.server.wl;
 

@@ -3,7 +3,7 @@
 const Self = @This();
 
 const std = @import("std");
-const render = @import("render.zig");
+const render = @import("../render/types.zig");
 
 allocator: std.mem.Allocator,
 size: render.Size,

@@ -3,9 +3,9 @@
 const Self = @This();
 
 const std = @import("std");
-const render = @import("render.zig");
+const render = @import("render/types.zig");
 const slot_map = @import("slot_map.zig");
-const Surface = @import("surface.zig");
+const Surface = @import("wayland/surface.zig");
 
 allocator: std.mem.Allocator,
 windows: Store,

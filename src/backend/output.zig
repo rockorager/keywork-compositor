@@ -5,8 +5,8 @@ const Self = @This();
 const std = @import("std");
 const wayland = @import("wayland");
 const HeadlessOutput = @import("headless.zig");
-const NestedOutput = @import("nested_output.zig");
-const render = @import("render.zig");
+const NestedOutput = @import("nested_wayland.zig");
+const render = @import("../render/types.zig");
 
 const wl = wayland.server.wl;
 

@@ -1,35 +1,31 @@
-//! Core data-device objects tied to the compositor seat.
+//! Primary-selection transfer tied to keyboard focus.
 
 const Self = @This();
 
 const std = @import("std");
 const wayland = @import("wayland");
 const Seat = @import("seat.zig");
-const slot_map = @import("slot_map.zig");
+const slot_map = @import("../slot_map.zig");
 
 const wl = wayland.server.wl;
+const zwp = wayland.server.zwp;
 
 allocator: std.mem.Allocator,
 global: *wl.Global,
 seat: *Seat,
 sources: SourceStore,
-source_adapters: std.AutoHashMapUnmanaged(SourceId, *SourceResource),
 devices: DeviceStore,
-device_adapters: std.AutoHashMapUnmanaged(DeviceId, *DeviceResource),
 offers: OfferStore,
-offer_adapters: std.AutoHashMapUnmanaged(OfferId, *OfferResource),
 selection: ?SourceId,
 selection_serial: u32,
 focused_client: ?*wl.Client,
 
-const SourceStore = slot_map.SlotMap(SourceState, enum { data_source });
+const SourceStore = slot_map.SlotMap(SourceState, enum { primary_selection_source });
 const SourceId = SourceStore.Id;
 const SourceState = struct {
-    resource: *wl.DataSource,
+    resource: *zwp.PrimarySelectionSourceV1,
     mime_types: std.ArrayList([:0]u8) = .empty,
-    used: bool = false,
-    actions_set: bool = false,
-    dnd_actions: wl.DataDeviceManager.DndAction = .{},
+    cancelled: bool = false,
 
     fn deinit(self: *SourceState, allocator: std.mem.Allocator) void {
         for (self.mime_types.items) |mime_type| allocator.free(mime_type);
@@ -38,16 +34,15 @@ const SourceState = struct {
     }
 };
 
-const DeviceStore = slot_map.SlotMap(DeviceState, enum { data_device });
+const DeviceStore = slot_map.SlotMap(DeviceState, enum { primary_selection_device });
 const DeviceId = DeviceStore.Id;
 const DeviceState = struct {
-    resource: *wl.DataDevice,
+    resource: *zwp.PrimarySelectionDeviceV1,
 };
 
-const OfferStore = slot_map.SlotMap(OfferState, enum { data_offer });
+const OfferStore = slot_map.SlotMap(OfferState, enum { primary_selection_offer });
 const OfferId = OfferStore.Id;
 const OfferState = struct {
-    resource: *wl.DataOffer,
     device: DeviceId,
     source: ?SourceId,
 };
@@ -63,22 +58,23 @@ pub fn init(
         .global = undefined,
         .seat = seat,
         .sources = .{},
-        .source_adapters = .empty,
         .devices = .{},
-        .device_adapters = .empty,
         .offers = .{},
-        .offer_adapters = .empty,
         .selection = null,
         .selection_serial = 0,
         .focused_client = null,
     };
     errdefer self.sources.deinit(allocator);
-    errdefer self.source_adapters.deinit(allocator);
     errdefer self.devices.deinit(allocator);
-    errdefer self.device_adapters.deinit(allocator);
     errdefer self.offers.deinit(allocator);
-    errdefer self.offer_adapters.deinit(allocator);
-    self.global = try wl.Global.create(display, wl.DataDeviceManager, 3, *Self, self, bind);
+    self.global = try wl.Global.create(
+        display,
+        zwp.PrimarySelectionDeviceManagerV1,
+        1,
+        *Self,
+        self,
+        bind,
+    );
     errdefer self.global.destroy();
     try seat.addKeyboardFocusListener(.{
         .context = self,
@@ -90,22 +86,16 @@ pub fn deinit(self: *Self) void {
     self.seat.removeKeyboardFocusListener(self);
     self.global.destroy();
     std.debug.assert(self.sources.len() == 0);
-    std.debug.assert(self.source_adapters.count() == 0);
     std.debug.assert(self.devices.len() == 0);
-    std.debug.assert(self.device_adapters.count() == 0);
     std.debug.assert(self.offers.len() == 0);
-    std.debug.assert(self.offer_adapters.count() == 0);
-    self.offer_adapters.deinit(self.allocator);
     self.offers.deinit(self.allocator);
-    self.source_adapters.deinit(self.allocator);
-    self.sources.deinit(self.allocator);
-    self.device_adapters.deinit(self.allocator);
     self.devices.deinit(self.allocator);
+    self.sources.deinit(self.allocator);
     self.* = undefined;
 }
 
 fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
-    const resource = wl.DataDeviceManager.create(client, version, id) catch {
+    const resource = zwp.PrimarySelectionDeviceManagerV1.create(client, version, id) catch {
         client.postNoMemory();
         return;
     };
@@ -113,18 +103,18 @@ fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
 }
 
 fn handleRequest(
-    resource: *wl.DataDeviceManager,
-    request: wl.DataDeviceManager.Request,
+    resource: *zwp.PrimarySelectionDeviceManagerV1,
+    request: zwp.PrimarySelectionDeviceManagerV1.Request,
     self: *Self,
 ) void {
     switch (request) {
-        .create_data_source => |create| SourceResource.create(
+        .create_source => |create| SourceResource.create(
             self,
             resource.getClient(),
             resource.getVersion(),
             create.id,
         ) catch resource.postNoMemory(),
-        .get_data_device => |get| {
+        .get_device => |get| {
             if (!self.seat.ownsResource(get.seat)) {
                 resource.getClient().postImplementationError("unknown wl_seat resource");
                 return;
@@ -136,6 +126,7 @@ fn handleRequest(
                 get.id,
             ) catch resource.postNoMemory();
         },
+        .destroy => resource.destroy(),
     }
 }
 
@@ -150,7 +141,7 @@ const SourceResource = struct {
         version: u32,
         protocol_id: u32,
     ) error{ OutOfMemory, ResourceCreateFailed }!void {
-        const resource = try wl.DataSource.create(client, version, protocol_id);
+        const resource = try zwp.PrimarySelectionSourceV1.create(client, version, protocol_id);
         errdefer resource.destroy();
         const self = manager.allocator.create(SourceResource) catch return error.OutOfMemory;
         errdefer manager.allocator.destroy(self);
@@ -164,8 +155,6 @@ const SourceResource = struct {
             .manager = manager,
             .id = id,
         };
-        manager.source_adapters.put(manager.allocator, id, self) catch
-            return error.OutOfMemory;
         resource.setHandler(
             *SourceResource,
             SourceResource.handleRequest,
@@ -175,36 +164,23 @@ const SourceResource = struct {
     }
 
     fn handleRequest(
-        resource: *wl.DataSource,
-        request: wl.DataSource.Request,
+        resource: *zwp.PrimarySelectionSourceV1,
+        request: zwp.PrimarySelectionSourceV1.Request,
         self: *SourceResource,
     ) void {
         switch (request) {
             .offer => |request_offer| self.offer(resource, request_offer.mime_type),
             .destroy => resource.destroy(),
-            .set_actions => |set| {
-                const state = self.manager.sources.get(self.id) orelse return;
-                const action_bits: u32 = @bitCast(set.dnd_actions);
-                if (action_bits & ~@as(u32, 7) != 0) {
-                    resource.postError(.invalid_action_mask, "invalid drag-and-drop action mask");
-                    return;
-                }
-                if (state.actions_set) {
-                    resource.postError(.invalid_source, "drag-and-drop actions were already set");
-                    return;
-                }
-                if (state.used) {
-                    resource.postError(.invalid_source, "data source is already in use");
-                    return;
-                }
-                state.actions_set = true;
-                state.dnd_actions = set.dnd_actions;
-            },
         }
     }
 
-    fn offer(self: *SourceResource, resource: *wl.DataSource, mime_type: [*:0]const u8) void {
+    fn offer(
+        self: *SourceResource,
+        resource: *zwp.PrimarySelectionSourceV1,
+        mime_type: [*:0]const u8,
+    ) void {
         const state = self.manager.sources.get(self.id) orelse return;
+        if (state.cancelled) return;
         const value = std.mem.span(mime_type);
         for (state.mime_types.items) |existing| {
             if (std.mem.eql(u8, existing, value)) return;
@@ -219,9 +195,8 @@ const SourceResource = struct {
         };
     }
 
-    fn handleDestroy(_: *wl.DataSource, self: *SourceResource) void {
+    fn handleDestroy(_: *zwp.PrimarySelectionSourceV1, self: *SourceResource) void {
         self.manager.sourceDestroyed(self.id);
-        _ = self.manager.source_adapters.remove(self.id);
         var state = self.manager.sources.remove(self.id) orelse {
             self.allocator.destroy(self);
             return;
@@ -242,7 +217,7 @@ const DeviceResource = struct {
         version: u32,
         protocol_id: u32,
     ) error{ OutOfMemory, ResourceCreateFailed }!void {
-        const resource = try wl.DataDevice.create(client, version, protocol_id);
+        const resource = try zwp.PrimarySelectionDeviceV1.create(client, version, protocol_id);
         errdefer resource.destroy();
         const self = manager.allocator.create(DeviceResource) catch return error.OutOfMemory;
         errdefer manager.allocator.destroy(self);
@@ -256,8 +231,6 @@ const DeviceResource = struct {
             .manager = manager,
             .id = id,
         };
-        manager.device_adapters.put(manager.allocator, id, self) catch
-            return error.OutOfMemory;
         resource.setHandler(
             *DeviceResource,
             DeviceResource.handleRequest,
@@ -270,40 +243,20 @@ const DeviceResource = struct {
     }
 
     fn handleRequest(
-        resource: *wl.DataDevice,
-        request: wl.DataDevice.Request,
+        resource: *zwp.PrimarySelectionDeviceV1,
+        request: zwp.PrimarySelectionDeviceV1.Request,
         self: *DeviceResource,
     ) void {
         switch (request) {
-            .release => resource.destroy(),
-            .start_drag => |start| self.rejectDrag(resource, start.source, start.serial),
             .set_selection => |set| self.setSelection(resource, set.source, set.serial),
+            .destroy => resource.destroy(),
         }
-    }
-
-    fn rejectDrag(
-        self: *DeviceResource,
-        resource: *wl.DataDevice,
-        source_resource: ?*wl.DataSource,
-        _: u32,
-    ) void {
-        const source = source_resource orelse return;
-        const data = source.getUserData() orelse return;
-        const adapter: *SourceResource = @ptrCast(@alignCast(data));
-        if (adapter.manager != self.manager or source.getClient() != resource.getClient()) return;
-        const state = self.manager.sources.get(adapter.id) orelse return;
-        if (state.used) {
-            resource.postError(.used_source, "data source was already used");
-            return;
-        }
-        state.used = true;
-        if (source.getVersion() >= 3) source.sendCancelled();
     }
 
     fn setSelection(
         self: *DeviceResource,
-        resource: *wl.DataDevice,
-        source_resource: ?*wl.DataSource,
+        resource: *zwp.PrimarySelectionDeviceV1,
+        source_resource: ?*zwp.PrimarySelectionSourceV1,
         serial: u32,
     ) void {
         const source_id = if (source_resource) |source| source: {
@@ -311,15 +264,7 @@ const DeviceResource = struct {
             const adapter: *SourceResource = @ptrCast(@alignCast(data));
             if (adapter.manager != self.manager or source.getClient() != resource.getClient()) return;
             const state = self.manager.sources.get(adapter.id) orelse return;
-            if (state.actions_set) {
-                source.postError(.invalid_source, "drag-and-drop source used for selection");
-                return;
-            }
-            if (state.used) {
-                resource.postError(.used_source, "data source was already used");
-                return;
-            }
-            state.used = true;
+            if (state.cancelled) return;
             break :source adapter.id;
         } else null;
 
@@ -327,9 +272,8 @@ const DeviceResource = struct {
         self.manager.setSelection(source_id, serial);
     }
 
-    fn handleDestroy(_: *wl.DataDevice, self: *DeviceResource) void {
+    fn handleDestroy(_: *zwp.PrimarySelectionDeviceV1, self: *DeviceResource) void {
         self.manager.deviceDestroyed(self.id);
-        _ = self.manager.device_adapters.remove(self.id);
         _ = self.manager.devices.remove(self.id);
         self.allocator.destroy(self);
     }
@@ -346,13 +290,12 @@ const OfferResource = struct {
         version: u32,
         device_id: DeviceId,
         source_id: SourceId,
-    ) error{ OutOfMemory, ResourceCreateFailed }!*wl.DataOffer {
-        const resource = try wl.DataOffer.create(client, version, 0);
+    ) error{ OutOfMemory, ResourceCreateFailed }!*zwp.PrimarySelectionOfferV1 {
+        const resource = try zwp.PrimarySelectionOfferV1.create(client, version, 0);
         errdefer resource.destroy();
         const self = manager.allocator.create(OfferResource) catch return error.OutOfMemory;
         errdefer manager.allocator.destroy(self);
         const id = manager.offers.insert(manager.allocator, .{
-            .resource = resource,
             .device = device_id,
             .source = source_id,
         }) catch return error.OutOfMemory;
@@ -363,8 +306,6 @@ const OfferResource = struct {
             .manager = manager,
             .id = id,
         };
-        manager.offer_adapters.put(manager.allocator, id, self) catch
-            return error.OutOfMemory;
         resource.setHandler(
             *OfferResource,
             OfferResource.handleRequest,
@@ -375,12 +316,11 @@ const OfferResource = struct {
     }
 
     fn handleRequest(
-        resource: *wl.DataOffer,
-        request: wl.DataOffer.Request,
+        resource: *zwp.PrimarySelectionOfferV1,
+        request: zwp.PrimarySelectionOfferV1.Request,
         self: *OfferResource,
     ) void {
         switch (request) {
-            .accept => {},
             .receive => |receive| {
                 defer (std.Io.File{
                     .handle = receive.fd,
@@ -392,16 +332,10 @@ const OfferResource = struct {
                 source.resource.sendSend(receive.mime_type, receive.fd);
             },
             .destroy => resource.destroy(),
-            .finish => resource.postError(.invalid_finish, "selection offer cannot be finished"),
-            .set_actions => resource.postError(
-                .invalid_offer,
-                "drag-and-drop actions are invalid for a selection offer",
-            ),
         }
     }
 
-    fn handleDestroy(_: *wl.DataOffer, self: *OfferResource) void {
-        _ = self.manager.offer_adapters.remove(self.id);
+    fn handleDestroy(_: *zwp.PrimarySelectionOfferV1, self: *OfferResource) void {
         _ = self.manager.offers.remove(self.id);
         self.allocator.destroy(self);
     }
@@ -410,8 +344,10 @@ const OfferResource = struct {
 fn keyboardFocusChanged(context: *anyopaque, client: ?*wl.Client) void {
     const self: *Self = @ptrCast(@alignCast(context));
     if (self.focused_client == client) return;
+    const old_client = self.focused_client;
     self.invalidateOffers();
     self.focused_client = client;
+    if (old_client) |old| self.sendNullSelectionToClient(old);
     if (client) |focused| self.sendSelectionToClient(focused);
 }
 
@@ -426,7 +362,10 @@ fn setSelection(self: *Self, source_id: ?SourceId, serial: u32) void {
     self.selection_serial = serial;
     self.invalidateOffers();
     if (old_source) |id| {
-        if (self.sources.get(id)) |source| source.resource.sendCancelled();
+        if (self.sources.get(id)) |source| {
+            source.cancelled = true;
+            source.resource.sendCancelled();
+        }
     }
     if (self.focused_client) |client| self.sendSelectionToClient(client);
 }
@@ -441,7 +380,7 @@ fn sourceDestroyed(self: *Self, id: SourceId) void {
     if (self.selection) |selection| {
         if (!std.meta.eql(selection, id)) return;
         self.selection = null;
-        if (self.focused_client) |client| self.sendSelectionToClient(client);
+        if (self.focused_client) |client| self.sendNullSelectionToClient(client);
     }
 }
 
@@ -462,6 +401,13 @@ fn sendSelectionToClient(self: *Self, client: *wl.Client) void {
     while (iterator.next()) |entry| {
         if (entry.value.resource.getClient() != client) continue;
         self.sendSelectionToDevice(entry.id) catch entry.value.resource.postNoMemory();
+    }
+}
+
+fn sendNullSelectionToClient(self: *Self, client: *wl.Client) void {
+    var iterator = self.devices.iterator();
+    while (iterator.next()) |entry| {
+        if (entry.value.resource.getClient() == client) entry.value.resource.sendSelection(null);
     }
 }
 

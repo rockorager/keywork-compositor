@@ -4,12 +4,12 @@ const Self = @This();
 
 const std = @import("std");
 const wayland = @import("wayland");
-const Output = @import("output.zig");
-const Scene = @import("scene.zig");
-const Seat = @import("seat.zig");
-const slot_map = @import("slot_map.zig");
-const Surface = @import("surface.zig");
-const XdgShell = @import("xdg_shell.zig");
+const Output = @import("../wayland/output.zig");
+const Scene = @import("../scene.zig");
+const Seat = @import("../wayland/seat.zig");
+const slot_map = @import("../slot_map.zig");
+const Surface = @import("../wayland/surface.zig");
+const XdgShell = @import("../wayland/xdg_shell.zig");
 
 const wl = wayland.server.wl;
 const river = wayland.server.river;

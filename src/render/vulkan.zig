@@ -4,8 +4,8 @@ const Self = @This();
 
 const std = @import("std");
 const vk = @import("vulkan");
-const CpuRenderer = @import("cpu_renderer.zig");
-const render = @import("render.zig");
+const CpuRenderer = @import("cpu.zig");
+const render = @import("types.zig");
 
 loader: std.DynLib,
 instance_wrapper: vk.InstanceWrapper,

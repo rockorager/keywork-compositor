@@ -4,7 +4,7 @@ const Self = @This();
 
 const std = @import("std");
 const wayland = @import("wayland");
-const slot_map = @import("slot_map.zig");
+const slot_map = @import("../slot_map.zig");
 const Surface = @import("surface.zig");
 
 const wl = wayland.server.wl;

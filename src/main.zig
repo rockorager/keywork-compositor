@@ -1,8 +1,8 @@
 //! Application entry point.
 
 const std = @import("std");
-const OutputBackend = @import("output_backend.zig");
-const Renderer = @import("renderer.zig").Renderer;
+const OutputBackend = @import("backend/output.zig");
+const Renderer = @import("render/renderer.zig").Renderer;
 const Server = @import("server.zig");
 
 pub fn main(init: std.process.Init) !void {
@@ -47,24 +47,27 @@ fn terminate(_: c_int, server: *Server) c_int {
 }
 
 test {
-    _ = @import("render.zig");
-    _ = @import("renderer.zig");
-    _ = @import("headless.zig");
-    _ = @import("nested_output.zig");
-    _ = @import("output_backend.zig");
-    _ = @import("output.zig");
-    _ = @import("fractional_scale.zig");
-    _ = @import("viewporter.zig");
-    _ = @import("cpu_renderer.zig");
-    _ = @import("vulkan_renderer.zig");
+    _ = @import("render/types.zig");
+    _ = @import("render/renderer.zig");
+    _ = @import("render/cpu.zig");
+    _ = @import("render/vulkan.zig");
+    _ = @import("backend/headless.zig");
+    _ = @import("backend/nested_wayland.zig");
+    _ = @import("backend/output.zig");
     _ = @import("region.zig");
     _ = @import("scene.zig");
     _ = @import("slot_map.zig");
-    _ = @import("subcompositor.zig");
-    _ = @import("seat.zig");
-    _ = @import("data_device.zig");
-    _ = @import("primary_selection.zig");
-    _ = @import("xdg_shell.zig");
-    _ = @import("window_manager.zig");
+    _ = @import("wayland/compositor.zig");
+    _ = @import("wayland/surface.zig");
+    _ = @import("wayland/region.zig");
+    _ = @import("wayland/subcompositor.zig");
+    _ = @import("wayland/seat.zig");
+    _ = @import("wayland/output.zig");
+    _ = @import("wayland/data_device.zig");
+    _ = @import("wayland/primary_selection.zig");
+    _ = @import("wayland/fractional_scale.zig");
+    _ = @import("wayland/viewporter.zig");
+    _ = @import("wayland/xdg_shell.zig");
+    _ = @import("river/window_manager.zig");
     _ = @import("server.zig");
 }

@@ -1,4 +1,4 @@
-//! Renderer-independent frame data.
+//! Renderer-independent command, frame, and pixel-buffer data.
 
 const std = @import("std");
 

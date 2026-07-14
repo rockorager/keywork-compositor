@@ -4,10 +4,10 @@ const Self = @This();
 
 const std = @import("std");
 const wayland = @import("wayland");
-const Region = @import("region.zig");
-const render_types = @import("render.zig");
-const slot_map = @import("slot_map.zig");
-const WaylandRegion = @import("wayland_region.zig");
+const Region = @import("../region.zig");
+const render_types = @import("../render/types.zig");
+const slot_map = @import("../slot_map.zig");
+const WaylandRegion = @import("region.zig");
 
 const wl = wayland.server.wl;
 const wp = wayland.server.wp;

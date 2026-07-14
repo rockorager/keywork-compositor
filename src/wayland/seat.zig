@@ -1,4 +1,4 @@
-//! Wayland seat global and capability boundary.
+//! Wayland seat global, input resources, and capability boundary.
 
 const Self = @This();
 

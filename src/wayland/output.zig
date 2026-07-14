@@ -4,7 +4,7 @@ const Self = @This();
 
 const std = @import("std");
 const wayland = @import("wayland");
-const render = @import("render.zig");
+const render = @import("../render/types.zig");
 const Surface = @import("surface.zig");
 
 const wl = wayland.server.wl;

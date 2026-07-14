@@ -3,8 +3,8 @@
 const Self = @This();
 
 const std = @import("std");
-const headless = @import("headless.zig");
-const render_types = @import("render.zig");
+const headless = @import("../backend/headless.zig");
+const render_types = @import("types.zig");
 
 const pixman = @cImport({
     @cInclude("pixman.h");

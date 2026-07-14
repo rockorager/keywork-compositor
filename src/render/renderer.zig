@@ -1,10 +1,10 @@
 //! Runtime-selected renderer.
 
 const std = @import("std");
-const CpuRenderer = @import("cpu_renderer.zig");
-const VulkanRenderer = @import("vulkan_renderer.zig");
-const headless = @import("headless.zig");
-const render_types = @import("render.zig");
+const CpuRenderer = @import("cpu.zig");
+const VulkanRenderer = @import("vulkan.zig");
+const headless = @import("../backend/headless.zig");
+const render_types = @import("types.zig");
 
 pub const Target = union(enum) {
     cpu: render_types.PixelBuffer,
