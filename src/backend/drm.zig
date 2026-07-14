@@ -388,28 +388,79 @@ fn selectOutput(fd: std.posix.fd_t) !Selection {
             connector.*.count_modes <= 0) continue;
 
         const possible_crtcs = c.drmModeConnectorGetPossibleCrtcs(fd, connector);
-        const crtc_count: usize = @intCast(@max(resources.*.count_crtcs, 0));
-        for (0..crtc_count) |crtc_index| {
-            if (crtc_index >= @bitSizeOf(u32) or
-                possible_crtcs & (@as(u32, 1) << @intCast(crtc_index)) == 0) continue;
-            const mode_count: usize = @intCast(connector.*.count_modes);
-            const modes = connector.*.modes[0..mode_count];
-            const mode = modes[preferredModeIndex(modes)];
-            return .{
-                .mode = mode,
-                .size = .{ .width = mode.hdisplay, .height = mode.vdisplay },
-                .physical_size = .{
-                    .width = @max(connector.*.mmWidth, 1),
-                    .height = @max(connector.*.mmHeight, 1),
-                },
-                .connector_id = connector.*.connector_id,
-                .connector_type = connector.*.connector_type,
-                .connector_type_id = connector.*.connector_type_id,
-                .crtc_id = resources.*.crtcs[crtc_index],
-            };
-        }
+        const crtc_id = selectCrtc(fd, resources, connector, possible_crtcs) orelse continue;
+        const mode_count: usize = @intCast(connector.*.count_modes);
+        const modes = connector.*.modes[0..mode_count];
+        const mode = modes[preferredModeIndex(modes)];
+        return .{
+            .mode = mode,
+            .size = .{ .width = mode.hdisplay, .height = mode.vdisplay },
+            .physical_size = .{
+                .width = @max(connector.*.mmWidth, 1),
+                .height = @max(connector.*.mmHeight, 1),
+            },
+            .connector_id = connector.*.connector_id,
+            .connector_type = connector.*.connector_type,
+            .connector_type_id = connector.*.connector_type_id,
+            .crtc_id = crtc_id,
+        };
     }
     return error.NoConnectedOutput;
+}
+
+fn selectCrtc(
+    fd: std.posix.fd_t,
+    resources: *c.drmModeRes,
+    connector: *c.drmModeConnector,
+    possible_crtcs: u32,
+) ?u32 {
+    if (connector.*.encoder_id != 0) {
+        const encoder = c.drmModeGetEncoder(fd, connector.*.encoder_id);
+        if (encoder) |value| {
+            defer c.drmModeFreeEncoder(value);
+            if (crtcPossible(resources, possible_crtcs, value.*.crtc_id)) {
+                return value.*.crtc_id;
+            }
+        }
+    }
+
+    const crtc_count: usize = @intCast(@max(resources.*.count_crtcs, 0));
+    for (0..crtc_count) |crtc_index| {
+        if (!crtcIndexPossible(possible_crtcs, crtc_index)) continue;
+        const crtc_id = resources.*.crtcs[crtc_index];
+        if (!crtcInUse(fd, resources, crtc_id)) return crtc_id;
+    }
+    for (0..crtc_count) |crtc_index| {
+        if (crtcIndexPossible(possible_crtcs, crtc_index)) {
+            return resources.*.crtcs[crtc_index];
+        }
+    }
+    return null;
+}
+
+fn crtcPossible(resources: *c.drmModeRes, possible_crtcs: u32, crtc_id: u32) bool {
+    const crtc_count: usize = @intCast(@max(resources.*.count_crtcs, 0));
+    for (0..crtc_count) |index| {
+        if (resources.*.crtcs[index] == crtc_id) {
+            return crtcIndexPossible(possible_crtcs, index);
+        }
+    }
+    return false;
+}
+
+fn crtcIndexPossible(possible_crtcs: u32, index: usize) bool {
+    return index < @bitSizeOf(u32) and
+        possible_crtcs & (@as(u32, 1) << @intCast(index)) != 0;
+}
+
+fn crtcInUse(fd: std.posix.fd_t, resources: *c.drmModeRes, crtc_id: u32) bool {
+    const encoder_count: usize = @intCast(@max(resources.*.count_encoders, 0));
+    for (0..encoder_count) |encoder_index| {
+        const encoder = c.drmModeGetEncoder(fd, resources.*.encoders[encoder_index]) orelse continue;
+        defer c.drmModeFreeEncoder(encoder);
+        if (encoder.*.crtc_id == crtc_id) return true;
+    }
+    return false;
 }
 
 fn preferredModeIndex(modes: []const c.drmModeModeInfo) usize {
