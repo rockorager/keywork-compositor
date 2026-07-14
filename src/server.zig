@@ -44,6 +44,7 @@ const render = @import("render/types.zig");
 const Scene = @import("scene.zig");
 const Surface = @import("wayland/surface.zig");
 const Viewporter = @import("wayland/viewporter.zig");
+const InputManager = @import("river/input_manager.zig");
 const WindowManager = @import("river/window_manager.zig");
 
 const wl = wayland.server.wl;
@@ -57,6 +58,8 @@ drm_device: DrmDevice,
 drm_device_initialized: bool,
 native_input: NativeInput,
 native_input_initialized: bool,
+input_manager: InputManager,
+input_manager_initialized: bool,
 render_outputs: RenderOutputStore,
 primary_render_output: RenderOutputId,
 outputs: OutputLayout,
@@ -160,6 +163,8 @@ pub fn create(
         .drm_device_initialized = false,
         .native_input = undefined,
         .native_input_initialized = false,
+        .input_manager = undefined,
+        .input_manager_initialized = false,
         .render_outputs = .{},
         .primary_render_output = undefined,
         .outputs = undefined,
@@ -441,6 +446,24 @@ pub fn create(
             backendListener(render_output),
         );
         self.native_input_initialized = true;
+        errdefer {
+            self.native_input.deinit();
+            self.native_input_initialized = false;
+        }
+        try self.input_manager.init(
+            allocator,
+            display,
+            &self.security_context,
+            &self.native_input,
+            &self.outputs,
+            render_output.protocol_id,
+        );
+        self.input_manager_initialized = true;
+        errdefer {
+            self.input_manager.detachNativeInput();
+            self.input_manager.deinit();
+            self.input_manager_initialized = false;
+        }
     }
     requestRepaint(self);
 
@@ -458,6 +481,7 @@ pub fn destroy(self: *Self) void {
     const allocator = self.allocator;
     if (self.drm_device_initialized) self.drm_device.clearListener();
     self.data_device.cancel();
+    if (self.input_manager_initialized) self.input_manager.detachNativeInput();
     if (self.native_input_initialized) self.native_input.deinit();
     self.layer_shell.clearRepaintListener();
     self.seat.clearRepaintListener();
@@ -466,6 +490,10 @@ pub fn destroy(self: *Self) void {
     var render_outputs = self.render_outputs.iterator();
     while (render_outputs.next()) |entry| stopRenderOutput(entry.value.*);
     self.display.destroyClients();
+    if (self.input_manager_initialized) {
+        self.input_manager.deinit();
+        self.input_manager_initialized = false;
+    }
     if (self.output_management_initialized) {
         self.output_management.deinit();
         self.output_management_initialized = false;
@@ -616,6 +644,9 @@ fn removeRenderOutput(self: *Self, id: RenderOutputId) bool {
     const protocol_output = self.outputs.get(render_output.protocol_id).?;
     if (self.window_manager_initialized) {
         self.window_manager.outputRemoved(render_output.protocol_id);
+    }
+    if (self.input_manager_initialized) {
+        self.input_manager.outputRemoved(render_output.protocol_id);
     }
     Surface.discardPresentation(self.compositor.surfaceStore(), protocol_output);
     if (self.xdg_output_initialized) self.xdg_output.removeOutput(protocol_output);
@@ -774,6 +805,9 @@ fn replacePrimaryRenderOutput(self: *Self, removed_id: RenderOutputId) void {
         self.layer_shell.setDefaultOutput(replacement.protocol_id);
         self.window_manager.setDefaultOutput(replacement.protocol_id);
         self.native_input.retarget(replacement.backend.size(), backendListener(replacement));
+        if (self.input_manager_initialized) {
+            self.input_manager.targetOutputChanged(replacement.protocol_id);
+        }
         return;
     };
     unreachable;
@@ -800,6 +834,7 @@ fn drmOutputRemoving(context: *anyopaque, drm_output: *DrmOutput) void {
             if (self.output_management_initialized) self.output_management.syncHead(replacement);
         } else {
             if (self.native_input_initialized) {
+                if (self.input_manager_initialized) self.input_manager.detachNativeInput();
                 self.native_input.deinit();
                 self.native_input_initialized = false;
             }

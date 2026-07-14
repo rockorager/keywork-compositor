@@ -597,15 +597,16 @@
       "interfaces": [
         {
           "name": "river_input_manager_v1",
-          "current_version": null,
+          "current_version": 2,
           "target_version": 2
         }
       ],
-      "status": "not_started",
+      "status": "in_progress",
       "privileged": true,
       "blocked_by": [
         "wl-seat"
-      ]
+      ],
+      "status_detail": "Version 2 device discovery, hotplug lifetime, repeat, scroll-factor, and output/rectangle mapping are implemented for native libinput devices. Named seat state is tracked; routing devices through dynamically-created wl_seat globals remains to be completed."
     },
     {
       "id": "river-libinput-config",

@@ -113,6 +113,7 @@ test {
     _ = @import("wayland/viewporter.zig");
     _ = @import("wayland/xdg_shell.zig");
     _ = @import("wayland/layer_shell.zig");
+    _ = @import("river/input_manager.zig");
     _ = @import("river/window_manager.zig");
     _ = @import("server.zig");
 }

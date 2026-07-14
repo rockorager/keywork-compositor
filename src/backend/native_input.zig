@@ -34,6 +34,7 @@ environ_map: ?*const std.process.Environ.Map,
 xkb_context: *c.struct_xkb_context,
 xkb_keymap: *c.struct_xkb_keymap,
 xkb_state: *c.struct_xkb_state,
+active_repeat_info: RepeatInfo,
 size: render.Size,
 pointer_x: f64,
 pointer_y: f64,
@@ -79,6 +80,21 @@ pub const DeviceListener = struct {
 const InputDevice = struct {
     info: DeviceInfo,
     libinput_device: *c.struct_libinput_device,
+    repeat_info: RepeatInfo = .{},
+    scroll_factor: f64 = 1,
+    map: ?DeviceMap = null,
+};
+
+pub const DeviceMap = struct {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+};
+
+const RepeatInfo = struct {
+    rate: i32 = 25,
+    delay: i32 = 600,
 };
 
 pub const DeviceIterator = struct {
@@ -135,6 +151,7 @@ pub fn init(
         .xkb_context = undefined,
         .xkb_keymap = undefined,
         .xkb_state = undefined,
+        .active_repeat_info = .{},
         .size = size,
         .pointer_x = @as(f64, @floatFromInt(size.width)) / 2,
         .pointer_y = @as(f64, @floatFromInt(size.height)) / 2,
@@ -243,6 +260,29 @@ pub fn clearDeviceListener(self: *Self) void {
 
 pub fn deviceIterator(self: *const Self) DeviceIterator {
     return .{ .devices = self.input_devices.items };
+}
+
+pub fn setDeviceRepeatInfo(self: *Self, id: DeviceId, rate: i32, delay: i32) void {
+    std.debug.assert(rate >= 0 and delay >= 0);
+    const device = self.findInputDeviceById(id) orelse return;
+    if (device.info.device_type != .keyboard) return;
+    device.repeat_info = .{ .rate = rate, .delay = delay };
+}
+
+pub fn setDeviceScrollFactor(self: *Self, id: DeviceId, factor: f64) void {
+    std.debug.assert(std.math.isFinite(factor) and factor >= 0);
+    const device = self.findInputDeviceById(id) orelse return;
+    if (device.info.device_type != .pointer) return;
+    device.scroll_factor = factor;
+}
+
+pub fn setDeviceMap(self: *Self, id: DeviceId, map: ?DeviceMap) void {
+    if (map) |rectangle| {
+        std.debug.assert(rectangle.width > 0 and rectangle.height > 0);
+    }
+    const device = self.findInputDeviceById(id) orelse return;
+    if (device.info.device_type == .keyboard) return;
+    device.map = map;
 }
 
 pub fn retarget(self: *Self, size: render.Size, listener: Listener) void {
@@ -471,6 +511,18 @@ fn removeAllInputDevices(self: *Self) void {
 }
 
 fn keyboardKey(self: *Self, event: *c.struct_libinput_event_keyboard) void {
+    const base_event = c.libinput_event_keyboard_get_base_event(event);
+    const libinput_device = c.libinput_event_get_device(base_event).?;
+    if (self.findInputDevice(libinput_device, .keyboard)) |device| {
+        if (!std.meta.eql(self.active_repeat_info, device.repeat_info)) {
+            self.active_repeat_info = device.repeat_info;
+            self.listener.keyboard_repeat_info(
+                self.listener.context,
+                device.repeat_info.rate,
+                device.repeat_info.delay,
+            );
+        }
+    }
     const key = c.libinput_event_keyboard_get_key(event);
     const pressed = c.libinput_event_keyboard_get_key_state(event) == c.LIBINPUT_KEY_STATE_PRESSED;
     const seat_key_count = c.libinput_event_keyboard_get_seat_key_count(event);
@@ -604,8 +656,12 @@ fn pointerMotion(self: *Self, event: *c.struct_libinput_event_pointer) void {
 }
 
 fn pointerMotionAbsolute(self: *Self, event: *c.struct_libinput_event_pointer) void {
-    self.pointer_x = c.libinput_event_pointer_get_absolute_x_transformed(event, self.size.width);
-    self.pointer_y = c.libinput_event_pointer_get_absolute_y_transformed(event, self.size.height);
+    const map = self.eventDeviceMap(c.libinput_event_pointer_get_base_event(event).?, .pointer) orelse
+        DeviceMap{ .x = 0, .y = 0, .width = self.size.width, .height = self.size.height };
+    self.pointer_x = @as(f64, @floatFromInt(map.x)) +
+        c.libinput_event_pointer_get_absolute_x_transformed(event, map.width);
+    self.pointer_y = @as(f64, @floatFromInt(map.y)) +
+        c.libinput_event_pointer_get_absolute_y_transformed(event, map.height);
     self.listener.pointer_motion(
         self.listener.context,
         c.libinput_event_pointer_get_time(event),
@@ -649,7 +705,12 @@ fn pointerScrollAxis(
 ) void {
     if (c.libinput_event_pointer_has_axis(event, libinput_axis) == 0) return;
     const time = c.libinput_event_pointer_get_time(event);
-    const value = c.libinput_event_pointer_get_scroll_value(event, libinput_axis);
+    const base_event = c.libinput_event_pointer_get_base_event(event);
+    const factor = if (self.findInputDevice(c.libinput_event_get_device(base_event).?, .pointer)) |device|
+        device.scroll_factor
+    else
+        1;
+    const value = c.libinput_event_pointer_get_scroll_value(event, libinput_axis) * factor;
     if (value == 0 and source != .wheel) {
         self.listener.pointer_axis_stop(self.listener.context, time, axis);
         return;
@@ -661,7 +722,7 @@ fn pointerScrollAxis(
         wl.Fixed.fromDouble(value),
     );
     if (source == .wheel) {
-        const value_120 = c.libinput_event_pointer_get_scroll_value_v120(event, libinput_axis);
+        const value_120 = c.libinput_event_pointer_get_scroll_value_v120(event, libinput_axis) * factor;
         const discrete: i32 = @intFromFloat(@round(value_120 / 120));
         self.listener.pointer_axis_value120(
             self.listener.context,
@@ -675,12 +736,14 @@ fn pointerScrollAxis(
 }
 
 fn touchDown(self: *Self, event: *c.struct_libinput_event_touch) void {
+    const map = self.eventDeviceMap(c.libinput_event_touch_get_base_event(event).?, .touch) orelse
+        DeviceMap{ .x = 0, .y = 0, .width = self.size.width, .height = self.size.height };
     self.listener.touch_down(
         self.listener.context,
         c.libinput_event_touch_get_time(event),
         c.libinput_event_touch_get_seat_slot(event),
-        c.libinput_event_touch_get_x_transformed(event, self.size.width),
-        c.libinput_event_touch_get_y_transformed(event, self.size.height),
+        @as(f64, @floatFromInt(map.x)) + c.libinput_event_touch_get_x_transformed(event, map.width),
+        @as(f64, @floatFromInt(map.y)) + c.libinput_event_touch_get_y_transformed(event, map.height),
     );
 }
 
@@ -693,13 +756,42 @@ fn touchUp(self: *Self, event: *c.struct_libinput_event_touch) void {
 }
 
 fn touchMotion(self: *Self, event: *c.struct_libinput_event_touch) void {
+    const map = self.eventDeviceMap(c.libinput_event_touch_get_base_event(event).?, .touch) orelse
+        DeviceMap{ .x = 0, .y = 0, .width = self.size.width, .height = self.size.height };
     self.listener.touch_motion(
         self.listener.context,
         c.libinput_event_touch_get_time(event),
         c.libinput_event_touch_get_seat_slot(event),
-        c.libinput_event_touch_get_x_transformed(event, self.size.width),
-        c.libinput_event_touch_get_y_transformed(event, self.size.height),
+        @as(f64, @floatFromInt(map.x)) + c.libinput_event_touch_get_x_transformed(event, map.width),
+        @as(f64, @floatFromInt(map.y)) + c.libinput_event_touch_get_y_transformed(event, map.height),
     );
+}
+
+fn findInputDeviceById(self: *Self, id: DeviceId) ?*InputDevice {
+    for (self.input_devices.items) |*device| if (device.info.id == id) return device;
+    return null;
+}
+
+fn findInputDevice(
+    self: *Self,
+    libinput_device: *c.struct_libinput_device,
+    device_type: DeviceType,
+) ?*InputDevice {
+    for (self.input_devices.items) |*device| {
+        if (device.libinput_device == libinput_device and device.info.device_type == device_type) {
+            return device;
+        }
+    }
+    return null;
+}
+
+fn eventDeviceMap(
+    self: *Self,
+    event: *c.struct_libinput_event,
+    device_type: DeviceType,
+) ?DeviceMap {
+    const device = self.findInputDevice(c.libinput_event_get_device(event).?, device_type) orelse return null;
+    return device.map;
 }
 
 fn clearCapabilities(self: *Self) void {
