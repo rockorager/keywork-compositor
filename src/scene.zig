@@ -136,6 +136,7 @@ pub const LayerSurface = struct {
 
 pub const PopupParent = union(enum) {
     window: Id,
+    layer_surface: LayerSurfaceId,
     popup: PopupId,
 };
 
@@ -339,6 +340,44 @@ pub const ReversePopupIterator = struct {
     }
 };
 
+pub const LayerPopupIterator = struct {
+    scene: *Self,
+    layer_surface_id: LayerSurfaceId,
+    index: usize = 0,
+
+    pub fn next(self: *LayerPopupIterator) ?PopupIterator.Entry {
+        while (self.index < self.scene.popup_stack.items.len) {
+            const id = self.scene.popup_stack.items[self.index];
+            self.index += 1;
+            const popup = self.scene.popups.get(id) orelse continue;
+            const root = self.scene.popupRootLayerSurface(id) orelse continue;
+            if (!std.meta.eql(root, self.layer_surface_id)) continue;
+            const position = self.scene.popupGlobalPosition(id) orelse continue;
+            return .{ .id = id, .popup = popup, .position = position };
+        }
+        return null;
+    }
+};
+
+pub const ReverseLayerPopupIterator = struct {
+    scene: *Self,
+    layer_surface_id: LayerSurfaceId,
+    index: usize,
+
+    pub fn next(self: *ReverseLayerPopupIterator) ?PopupIterator.Entry {
+        while (self.index > 0) {
+            self.index -= 1;
+            const id = self.scene.popup_stack.items[self.index];
+            const popup = self.scene.popups.get(id) orelse continue;
+            const root = self.scene.popupRootLayerSurface(id) orelse continue;
+            if (!std.meta.eql(root, self.layer_surface_id)) continue;
+            const position = self.scene.popupGlobalPosition(id) orelse continue;
+            return .{ .id = id, .popup = popup, .position = position };
+        }
+        return null;
+    }
+};
+
 pub fn init(self: *Self, allocator: std.mem.Allocator) void {
     self.* = .{
         .allocator = allocator,
@@ -467,6 +506,7 @@ pub fn addLayerSurface(
 
 pub fn removeLayerSurface(self: *Self, id: LayerSurfaceId) void {
     const layer_surface = self.layer_surfaces.remove(id) orelse return;
+    while (self.firstLayerSurfacePopup(id)) |popup_id| self.removePopup(popup_id);
     removeLayerSurfaceFromStack(self, id, layer_surface.layer);
     if (layer_surface.mapped) self.requestRepaint();
 }
@@ -514,6 +554,7 @@ pub fn addPopup(
 ) error{ InvalidParent, OutOfMemory }!PopupId {
     switch (parent) {
         .window => |id| if (self.windows.get(id) == null) return error.InvalidParent,
+        .layer_surface => |id| if (self.layer_surfaces.get(id) == null) return error.InvalidParent,
         .popup => |id| if (self.popups.get(id) == null) return error.InvalidParent,
     }
     const id = try self.popups.insert(self.allocator, .{
@@ -783,9 +824,25 @@ pub fn reversePopupIterator(self: *Self, window_id: Id) ReversePopupIterator {
     };
 }
 
+pub fn layerPopupIterator(self: *Self, id: LayerSurfaceId) LayerPopupIterator {
+    return .{ .scene = self, .layer_surface_id = id };
+}
+
+pub fn reverseLayerPopupIterator(self: *Self, id: LayerSurfaceId) ReverseLayerPopupIterator {
+    return .{
+        .scene = self,
+        .layer_surface_id = id,
+        .index = self.popup_stack.items.len,
+    };
+}
+
 pub fn windowPosition(self: *Self, id: Id) ?Position {
     const window = self.windows.get(id) orelse return null;
     return window.position;
+}
+
+pub fn layerSurface(self: *Self, id: LayerSurfaceId) ?*LayerSurface {
+    return self.layer_surfaces.get(id);
 }
 
 pub fn popupPosition(self: *Self, id: PopupId) ?Position {
@@ -861,7 +918,19 @@ fn firstWindowPopup(self: *Self, window_id: Id) ?PopupId {
         const popup = self.popups.get(id) orelse continue;
         switch (popup.parent) {
             .window => |parent_id| if (std.meta.eql(parent_id, window_id)) return id,
+            .layer_surface => {},
             .popup => {},
+        }
+    }
+    return null;
+}
+
+fn firstLayerSurfacePopup(self: *Self, layer_surface_id: LayerSurfaceId) ?PopupId {
+    for (self.popup_stack.items) |id| {
+        const popup = self.popups.get(id) orelse continue;
+        switch (popup.parent) {
+            .layer_surface => |parent_id| if (std.meta.eql(parent_id, layer_surface_id)) return id,
+            .window, .popup => {},
         }
     }
     return null;
@@ -871,7 +940,7 @@ fn firstChildPopup(self: *Self, popup_id: PopupId) ?PopupId {
     for (self.popup_stack.items) |id| {
         const popup = self.popups.get(id) orelse continue;
         switch (popup.parent) {
-            .window => {},
+            .window, .layer_surface => {},
             .popup => |parent_id| if (std.meta.eql(parent_id, popup_id)) return id,
         }
     }
@@ -886,6 +955,21 @@ fn popupRootWindow(self: *Self, id: PopupId) ?Id {
             window_id
         else
             null,
+        .layer_surface => return null,
+        .popup => |popup_id| parent = (self.popups.get(popup_id) orelse return null).parent,
+    };
+    return null;
+}
+
+fn popupRootLayerSurface(self: *Self, id: PopupId) ?LayerSurfaceId {
+    var parent = (self.popups.get(id) orelse return null).parent;
+    var remaining = self.popups.len() + 1;
+    while (remaining > 0) : (remaining -= 1) switch (parent) {
+        .layer_surface => |layer_id| return if (self.layer_surfaces.get(layer_id) != null)
+            layer_id
+        else
+            null,
+        .window => return null,
         .popup => |popup_id| parent = (self.popups.get(popup_id) orelse return null).parent,
     };
     return null;
@@ -901,6 +985,12 @@ fn popupGlobalPosition(self: *Self, id: PopupId) ?Position {
             const window = self.windows.get(window_id) orelse return null;
             position.x +|= window.position.x;
             position.y +|= window.position.y;
+            return position;
+        },
+        .layer_surface => |layer_id| {
+            const layer_surface = self.layer_surfaces.get(layer_id) orelse return null;
+            position.x +|= layer_surface.position.x;
+            position.y +|= layer_surface.position.y;
             return position;
         },
         .popup => |popup_id| {
@@ -1219,6 +1309,42 @@ test "scene keeps nested popups relative to their root window" {
     try std.testing.expectEqual(@as(?PopupIterator.Entry, null), reverse.next());
 
     scene.removeWindow(window);
+    try std.testing.expectEqual(@as(usize, 0), scene.popups.len());
+    try std.testing.expectEqual(@as(usize, 0), scene.popup_stack.items.len);
+}
+
+test "scene keeps and removes popups rooted at a layer surface" {
+    var scene: Self = undefined;
+    scene.init(std.testing.allocator);
+    defer scene.deinit();
+
+    const root = try scene.addLayerSurface(
+        .{ .index = 1, .generation = 1 },
+        .overlay,
+    );
+    scene.setLayerSurfacePosition(root, .{ .x = 40, .y = 70 });
+    const parent = try scene.addPopup(
+        .{ .index = 2, .generation = 1 },
+        .{ .layer_surface = root },
+    );
+    scene.setPopupPosition(parent, .{ .x = 8, .y = 9 });
+    const child = try scene.addPopup(
+        .{ .index = 3, .generation = 1 },
+        .{ .popup = parent },
+    );
+    scene.setPopupPosition(child, .{ .x = -2, .y = 4 });
+
+    var popups = scene.layerPopupIterator(root);
+    try std.testing.expectEqual(Position{ .x = 48, .y = 79 }, popups.next().?.position);
+    try std.testing.expectEqual(Position{ .x = 46, .y = 83 }, popups.next().?.position);
+    try std.testing.expectEqual(@as(?PopupIterator.Entry, null), popups.next());
+
+    var reverse = scene.reverseLayerPopupIterator(root);
+    try std.testing.expect(std.meta.eql(child, reverse.next().?.id));
+    try std.testing.expect(std.meta.eql(parent, reverse.next().?.id));
+    try std.testing.expectEqual(@as(?PopupIterator.Entry, null), reverse.next());
+
+    scene.removeLayerSurface(root);
     try std.testing.expectEqual(@as(usize, 0), scene.popups.len());
     try std.testing.expectEqual(@as(usize, 0), scene.popup_stack.items.len);
 }

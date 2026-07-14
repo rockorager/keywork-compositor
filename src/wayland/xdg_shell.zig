@@ -113,8 +113,8 @@ const XdgSurfaceState = struct {
 
 const PopupState = struct {
     xdg_surface_id: XdgSurfaceId,
-    parent_xdg_surface_id: XdgSurfaceId,
-    scene_id: Scene.PopupId,
+    parent: PopupParent,
+    scene_id: ?Scene.PopupId,
     resource: *xdg.Popup,
     rules: PositionerRules,
     pending_configure: ?PendingPopupConfigure = null,
@@ -123,6 +123,12 @@ const PopupState = struct {
     grabbed: bool = false,
     dismissed: bool = false,
     order: u64,
+};
+
+const PopupParent = union(enum) {
+    unattached,
+    xdg_surface: XdgSurfaceId,
+    layer_surface: Scene.LayerSurfaceId,
 };
 
 pub const WindowState = struct {
@@ -358,6 +364,56 @@ pub fn windowInfo(self: *Self, id: WindowId) ?WindowInfo {
         .ready = window.ready,
         .mapped = window.mapped,
     };
+}
+
+pub const AttachPopupError = error{
+    ForeignResource,
+    AlreadyAttached,
+    InvalidLayerSurface,
+    OutOfMemory,
+};
+
+/// The layer-surface owner must dismiss these popups before unmapping or
+/// removing their parent.
+pub fn attachPopup(
+    self: *Self,
+    resource: *xdg.Popup,
+    layer_surface_id: Scene.LayerSurfaceId,
+) AttachPopupError!void {
+    const data = resource.getUserData() orelse return error.ForeignResource;
+    const adapter: *PopupResource = @ptrCast(@alignCast(data));
+    if (adapter.shell != self) return error.ForeignResource;
+    const popup = self.popups.get(adapter.id) orelse return error.ForeignResource;
+    if (popup.parent != .unattached) return error.AlreadyAttached;
+    const xdg_surface = self.xdg_surfaces.get(popup.xdg_surface_id) orelse
+        return error.ForeignResource;
+    const scene_id = self.scene.addPopup(
+        xdg_surface.surface_id,
+        .{ .layer_surface = layer_surface_id },
+    ) catch |err| switch (err) {
+        error.InvalidParent => return error.InvalidLayerSurface,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    popup.parent = .{ .layer_surface = layer_surface_id };
+    popup.scene_id = scene_id;
+}
+
+pub fn dismissLayerSurfacePopups(self: *Self, layer_surface_id: Scene.LayerSurfaceId) void {
+    while (true) {
+        var root: ?PopupId = null;
+        var iterator = self.popups.iterator();
+        while (iterator.next()) |entry| {
+            if (entry.value.dismissed) continue;
+            switch (entry.value.parent) {
+                .layer_surface => |id| if (std.meta.eql(id, layer_surface_id)) {
+                    root = entry.id;
+                    break;
+                },
+                .unattached, .xdg_surface => {},
+            }
+        }
+        self.dismissPopup(root orelse return);
+    }
 }
 
 fn contentGeometry(self: *Self, state: *const XdgSurfaceState) ?Scene.ContentGeometry {
@@ -647,7 +703,10 @@ pub fn dismissPopupGrab(self: *Self) void {
     var current = self.topGrabbedPopup();
     while (current) |id| {
         const popup = self.popups.get(id) orelse return;
-        const parent = self.xdg_surfaces.get(popup.parent_xdg_surface_id);
+        const parent = switch (popup.parent) {
+            .xdg_surface => |parent_id| self.xdg_surfaces.get(parent_id),
+            .unattached, .layer_surface => null,
+        };
         const parent_popup_id = if (parent) |state| switch (state.role orelse return) {
             .toplevel => null,
             .popup => |popup_id| popup_id,
@@ -679,7 +738,11 @@ fn popupRootWindow(self: *Self, id: PopupId) ?WindowId {
     var popup = self.popups.get(id) orelse return null;
     var remaining = self.popups.len() + 1;
     while (remaining > 0) : (remaining -= 1) {
-        const parent = self.xdg_surfaces.get(popup.parent_xdg_surface_id) orelse return null;
+        const parent_id = switch (popup.parent) {
+            .xdg_surface => |parent_id| parent_id,
+            .unattached, .layer_surface => return null,
+        };
+        const parent = self.xdg_surfaces.get(parent_id) orelse return null;
         switch (parent.role orelse return null) {
             .toplevel => |window_id| return window_id,
             .popup => |popup_id| popup = self.popups.get(popup_id) orelse return null,
@@ -692,21 +755,33 @@ fn isTopmostPopup(self: *Self, id: PopupId) bool {
     const popup = self.popups.get(id) orelse return true;
     var iterator = self.popups.iterator();
     while (iterator.next()) |entry| {
-        if (std.meta.eql(entry.value.parent_xdg_surface_id, popup.xdg_surface_id)) return false;
+        switch (entry.value.parent) {
+            .xdg_surface => |parent_id| if (std.meta.eql(parent_id, popup.xdg_surface_id)) return false,
+            .unattached, .layer_surface => {},
+        }
     }
     return true;
 }
 
 fn parentMapped(self: *Self, popup: *const PopupState) bool {
-    const parent = self.xdg_surfaces.get(popup.parent_xdg_surface_id) orelse return false;
-    return parent.mapped;
+    return switch (popup.parent) {
+        .unattached => false,
+        .xdg_surface => |id| (self.xdg_surfaces.get(id) orelse return false).mapped,
+        .layer_surface => |id| (self.scene.layerSurface(id) orelse return false).mapped,
+    };
 }
 
 fn popupParentGeometry(self: *Self, popup: *const PopupState) ?struct {
     geometry: Scene.ContentGeometry,
     position: Scene.Position,
 } {
-    const parent = self.xdg_surfaces.get(popup.parent_xdg_surface_id) orelse return null;
+    if (popup.parent == .unattached) return null;
+    if (popup.parent == .layer_surface) {
+        const layer = self.scene.layerSurface(popup.parent.layer_surface) orelse return null;
+        const buffer = Surface.currentBuffer(self.surface_store, layer.surface_id) orelse return null;
+        return .{ .geometry = .{ .size = buffer.logical_size }, .position = layer.position };
+    }
+    const parent = self.xdg_surfaces.get(popup.parent.xdg_surface) orelse return null;
     const geometry = self.contentGeometry(parent) orelse return null;
     const position = switch (parent.role orelse return null) {
         .toplevel => |window_id| window: {
@@ -715,7 +790,7 @@ fn popupParentGeometry(self: *Self, popup: *const PopupState) ?struct {
         },
         .popup => |popup_id| parent_popup: {
             const parent_popup = self.popups.get(popup_id) orelse return null;
-            break :parent_popup self.scene.popupPosition(parent_popup.scene_id) orelse return null;
+            break :parent_popup self.scene.popupPosition(parent_popup.scene_id orelse return null) orelse return null;
         },
     };
     return .{ .geometry = geometry, .position = position };
@@ -792,7 +867,7 @@ fn dismissPopup(self: *Self, id: PopupId) void {
     if (self.xdg_surfaces.get(popup.xdg_surface_id)) |xdg_surface| {
         xdg_surface.mapped = false;
     }
-    self.scene.setPopupMapped(popup.scene_id, false);
+    if (popup.scene_id) |scene_id| self.scene.setPopupMapped(scene_id, false);
     popup.resource.sendPopupDone();
 }
 
@@ -817,8 +892,12 @@ fn popupDescendsFrom(self: *Self, id: PopupId, ancestor: XdgSurfaceId) bool {
     var popup = self.popups.get(id) orelse return false;
     var remaining = self.popups.len() + 1;
     while (remaining > 0) : (remaining -= 1) {
-        if (std.meta.eql(popup.parent_xdg_surface_id, ancestor)) return true;
-        const parent = self.xdg_surfaces.get(popup.parent_xdg_surface_id) orelse return false;
+        const parent_xdg_id = switch (popup.parent) {
+            .xdg_surface => |parent_id| parent_id,
+            .unattached, .layer_surface => return false,
+        };
+        if (std.meta.eql(parent_xdg_id, ancestor)) return true;
+        const parent = self.xdg_surfaces.get(parent_xdg_id) orelse return false;
         const parent_id = switch (parent.role orelse return false) {
             .toplevel => return false,
             .popup => |popup_id| popup_id,
@@ -834,15 +913,17 @@ fn unmapPopup(self: *Self, id: PopupId) void {
     popup.mapped = false;
     popup.ready = false;
     popup.grabbed = false;
-    self.scene.setPopupMapped(popup.scene_id, false);
-    self.scene.setPopupContentGeometry(popup.scene_id, null);
+    if (popup.scene_id) |scene_id| {
+        self.scene.setPopupMapped(scene_id, false);
+        self.scene.setPopupContentGeometry(scene_id, null);
+    }
 }
 
 fn removePopupState(self: *Self, id: PopupId) void {
     const popup = self.popups.get(id) orelse return;
     self.dismissPopupsForParent(popup.xdg_surface_id);
     const removed = self.popups.remove(id) orelse return;
-    self.scene.removePopup(removed.scene_id);
+    if (removed.scene_id) |scene_id| self.scene.removePopup(scene_id);
 }
 
 fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
@@ -1265,6 +1346,16 @@ const XdgSurfaceResource = struct {
             self.resource.postError(.not_constructed, "xdg_surface committed before role creation");
             return .reject;
         }
+        if (state.role.? == .popup) {
+            const popup = self.shell.popups.get(state.role.?.popup) orelse return .reject;
+            if (popup.scene_id == null) {
+                self.wm_base_resource.postError(
+                    .invalid_popup_parent,
+                    "unattached xdg_popup committed before external parent attachment",
+                );
+                return .reject;
+            }
+        }
         if (info.has_buffer and state.toplevel_resource != null) {
             const toplevel: *ToplevelResource = @ptrCast(@alignCast(
                 state.toplevel_resource.?.getUserData().?,
@@ -1377,6 +1468,7 @@ const XdgSurfaceResource = struct {
     ) void {
         const popup = self.shell.popups.get(popup_id) orelse return;
         if (popup.dismissed) return;
+        const scene_id = popup.scene_id orelse return;
         if (info.had_buffer and !info.has_buffer) {
             self.shell.unmapPopup(popup_id);
             popup.dismissed = false;
@@ -1403,20 +1495,20 @@ const XdgSurfaceResource = struct {
                 if (popup.pending_configure) |pending| {
                     if (pending.serial == serial) {
                         popup.rules = pending.rules;
-                        self.shell.scene.setPopupPosition(popup.scene_id, pending.placement.position);
+                        self.shell.scene.setPopupPosition(scene_id, pending.placement.position);
                         popup.pending_configure = null;
                     }
                 }
                 state.last_acked_serial = null;
             }
             self.shell.scene.setPopupContentGeometry(
-                popup.scene_id,
+                scene_id,
                 self.shell.contentGeometry(state),
             );
             state.mapped = state.configured and !popup.dismissed;
             popup.mapped = state.mapped;
-            self.shell.scene.setPopupMapped(popup.scene_id, popup.mapped);
-            if (was_mapped and popup.mapped) self.shell.scene.popupCommitted(popup.scene_id);
+            self.shell.scene.setPopupMapped(scene_id, popup.mapped);
+            if (was_mapped and popup.mapped) self.shell.scene.popupCommitted(scene_id);
             return;
         }
 
@@ -1488,40 +1580,34 @@ const PopupResource = struct {
         positioner_resource: *xdg.Positioner,
     ) error{ OutOfMemory, ResourceCreateFailed }!void {
         const surface = xdg_surface.surface orelse return error.ResourceCreateFailed;
-        const parent_xdg_resource = parent_resource orelse {
-            xdg_surface.wm_base_resource.postError(
-                .invalid_popup_parent,
-                "xdg_popup requires an xdg_surface parent",
-            );
-            return error.ResourceCreateFailed;
-        };
-        if (parent_xdg_resource.getClient() != xdg_surface.resource.getClient()) {
+        if (parent_resource) |parent_xdg_resource| if (parent_xdg_resource.getClient() != xdg_surface.resource.getClient()) {
             xdg_surface.wm_base_resource.postError(
                 .invalid_popup_parent,
                 "xdg_popup parent belongs to another client",
             );
             return error.ResourceCreateFailed;
-        }
-        const parent_adapter: *XdgSurfaceResource = @ptrCast(@alignCast(
-            parent_xdg_resource.getUserData() orelse return error.ResourceCreateFailed,
-        ));
-        if (parent_adapter.shell != xdg_surface.shell or
-            std.meta.eql(parent_adapter.id, xdg_surface.id))
+        };
+        const parent_adapter: ?*XdgSurfaceResource = if (parent_resource) |parent_xdg_resource|
+            @ptrCast(@alignCast(parent_xdg_resource.getUserData() orelse return error.ResourceCreateFailed))
+        else
+            null;
+        if (parent_adapter) |adapter| if (adapter.shell != xdg_surface.shell or
+            std.meta.eql(adapter.id, xdg_surface.id))
         {
             xdg_surface.wm_base_resource.postError(
                 .invalid_popup_parent,
                 "invalid xdg_popup parent",
             );
             return error.ResourceCreateFailed;
-        }
-        const parent_state = xdg_surface.shell.xdg_surfaces.get(parent_adapter.id) orelse {
+        };
+        const parent_state = if (parent_adapter) |adapter| xdg_surface.shell.xdg_surfaces.get(adapter.id) orelse {
             xdg_surface.wm_base_resource.postError(
                 .invalid_popup_parent,
                 "xdg_popup parent no longer exists",
             );
             return error.ResourceCreateFailed;
-        };
-        const scene_parent: Scene.PopupParent = switch (parent_state.role orelse {
+        } else null;
+        const scene_parent: ?Scene.PopupParent = if (parent_state) |state| switch (state.role orelse {
             xdg_surface.wm_base_resource.postError(
                 .invalid_popup_parent,
                 "xdg_popup parent has no role",
@@ -1536,9 +1622,16 @@ const PopupResource = struct {
             .popup => |popup_id| popup: {
                 const parent_popup = xdg_surface.shell.popups.get(popup_id) orelse
                     return error.ResourceCreateFailed;
-                break :popup .{ .popup = parent_popup.scene_id };
+                const parent_scene_id = parent_popup.scene_id orelse {
+                    xdg_surface.wm_base_resource.postError(
+                        .invalid_popup_parent,
+                        "xdg_popup parent is not attached",
+                    );
+                    return error.ResourceCreateFailed;
+                };
+                break :popup .{ .popup = parent_scene_id };
             },
-        };
+        } else null;
         const rules = Positioner.fromResource(positioner_resource).rules;
         if (!rules.complete()) {
             xdg_surface.wm_base_resource.postError(
@@ -1561,16 +1654,16 @@ const PopupResource = struct {
         const self = xdg_surface.allocator.create(PopupResource) catch
             return error.OutOfMemory;
         errdefer xdg_surface.allocator.destroy(self);
-        const scene_id = xdg_surface.shell.scene.addPopup(surface.handle(), scene_parent) catch |err| switch (err) {
+        const scene_id = if (scene_parent) |parent| xdg_surface.shell.scene.addPopup(surface.handle(), parent) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.InvalidParent => return error.ResourceCreateFailed,
-        };
-        errdefer xdg_surface.shell.scene.removePopup(scene_id);
+        } else null;
+        errdefer if (scene_id) |scene_popup_id| xdg_surface.shell.scene.removePopup(scene_popup_id);
         const order = xdg_surface.shell.next_popup_order;
         xdg_surface.shell.next_popup_order +%= 1;
         const popup_id = xdg_surface.shell.popups.insert(xdg_surface.allocator, .{
             .xdg_surface_id = xdg_surface.id,
-            .parent_xdg_surface_id = parent_adapter.id,
+            .parent = if (parent_adapter) |adapter| .{ .xdg_surface = adapter.id } else .unattached,
             .scene_id = scene_id,
             .resource = resource,
             .rules = rules,
@@ -1611,14 +1704,26 @@ const PopupResource = struct {
                     resource.postError(.invalid_grab, "cannot grab a mapped xdg_popup");
                     return;
                 }
-                const parent = self.shell.xdg_surfaces.get(popup.parent_xdg_surface_id) orelse {
-                    resource.postError(.invalid_grab, "xdg_popup parent no longer exists");
-                    return;
+                const parent_role: ?XdgRole = switch (popup.parent) {
+                    .unattached => {
+                        resource.postError(.invalid_grab, "xdg_popup is not attached");
+                        return;
+                    },
+                    .layer_surface => if (self.shell.scene.layerSurface(popup.parent.layer_surface) != null)
+                        null
+                    else {
+                        resource.postError(.invalid_grab, "layer surface parent no longer exists");
+                        return;
+                    },
+                    .xdg_surface => |parent_id| (self.shell.xdg_surfaces.get(parent_id) orelse {
+                        resource.postError(.invalid_grab, "xdg_popup parent no longer exists");
+                        return;
+                    }).role orelse {
+                        resource.postError(.invalid_grab, "xdg_popup parent has no role");
+                        return;
+                    },
                 };
-                switch (parent.role orelse {
-                    resource.postError(.invalid_grab, "xdg_popup parent has no role");
-                    return;
-                }) {
+                if (parent_role) |role| switch (role) {
                     .toplevel => if (self.shell.topGrabbedPopup() != null) {
                         resource.postError(.invalid_grab, "another xdg_popup owns the grab");
                         return;
@@ -1636,6 +1741,9 @@ const PopupResource = struct {
                             return;
                         }
                     },
+                } else if (self.shell.topGrabbedPopup() != null) {
+                    resource.postError(.invalid_grab, "another xdg_popup owns the grab");
+                    return;
                 }
                 if (!self.shell.seat.acceptsUserActionSerial(
                     grab.seat,

@@ -435,6 +435,7 @@ fn pointerFocus(self: *Self, x: f64, y: f64) ?Seat.PointerFocus {
 }
 
 fn scenePointerFocus(self: *Self, x: f64, y: f64) ?Seat.PointerFocus {
+    if (self.hitTestLayerPopups(x, y)) |focus| return focus;
     if (self.hitTestLayer(.overlay, x, y)) |focus| return focus;
     const fullscreen = self.scene.topFullscreen();
     if (fullscreen == null) {
@@ -463,6 +464,35 @@ fn scenePointerFocus(self: *Self, x: f64, y: f64) ?Seat.PointerFocus {
     if (fullscreen != null) return null;
     if (self.hitTestLayer(.bottom, x, y)) |focus| return focus;
     if (self.hitTestLayer(.background, x, y)) |focus| return focus;
+    return null;
+}
+
+fn hitTestLayerPopups(self: *Self, x: f64, y: f64) ?Seat.PointerFocus {
+    inline for (.{
+        Scene.Layer.overlay,
+        Scene.Layer.top,
+        Scene.Layer.bottom,
+        Scene.Layer.background,
+    }) |layer| {
+        var roots = self.scene.reverseLayerSurfaceIterator(layer);
+        while (roots.next()) |root| {
+            var popups = self.scene.reverseLayerPopupIterator(root.id);
+            while (popups.next()) |entry| {
+                if (!entry.popup.mapped) continue;
+                const buffer = Surface.currentBuffer(
+                    self.compositor.surfaceStore(),
+                    entry.popup.surface_id,
+                ) orelse continue;
+                const geometry = entry.popup.content_geometry orelse Scene.ContentGeometry{
+                    .size = buffer.logical_size,
+                };
+                if (self.hitTestSurface(entry.popup.surface_id, .{
+                    .x = entry.position.x -| geometry.offset.x,
+                    .y = entry.position.y -| geometry.offset.y,
+                }, x, y)) |focus| return focus;
+            }
+        }
+    }
     return null;
 }
 
@@ -665,6 +695,7 @@ fn renderFrame(self: *Self) renderer_types.Renderer.Error!void {
     };
     if (top_fullscreen == null) try self.renderLayerSurfaces(.top, target);
     try self.renderLayerSurfaces(.overlay, target);
+    try self.renderLayerPopups(target);
 
     const cursor = self.seat.cursorInfo();
     if (cursor) |info| {
@@ -704,6 +735,7 @@ fn renderFrame(self: *Self) renderer_types.Renderer.Error!void {
     };
     if (top_fullscreen == null) self.submitLayerSurfaces(.top);
     self.submitLayerSurfaces(.overlay);
+    self.submitLayerPopups();
     if (cursor) |info| self.submitSurfaceTree(info.surface_id);
     if (presented) |info| outputPresented(self, info);
     const keyboard_focus = self.xdg_shell.popupKeyboardFocus() orelse
@@ -739,6 +771,55 @@ fn submitLayerSurfaces(self: *Self, layer: Scene.Layer) void {
     while (surfaces.next()) |entry| {
         if (entry.layer_surface.mapped) {
             self.submitSurfaceTree(entry.layer_surface.surface_id);
+        }
+    }
+}
+
+fn renderLayerPopups(self: *Self, target: renderer_types.Target) renderer_types.Renderer.Error!void {
+    inline for (.{
+        Scene.Layer.background,
+        Scene.Layer.bottom,
+        Scene.Layer.top,
+        Scene.Layer.overlay,
+    }) |layer| {
+        var roots = self.scene.layerSurfaceIterator(layer);
+        while (roots.next()) |root| {
+            var popups = self.scene.layerPopupIterator(root.id);
+            while (popups.next()) |entry| {
+                if (!entry.popup.mapped) continue;
+                const buffer = Surface.currentBuffer(
+                    self.compositor.surfaceStore(),
+                    entry.popup.surface_id,
+                ) orelse continue;
+                const geometry = entry.popup.content_geometry orelse Scene.ContentGeometry{
+                    .size = buffer.logical_size,
+                };
+                try self.renderSurfaceTree(
+                    entry.popup.surface_id,
+                    entry.position.x -| geometry.offset.x,
+                    entry.position.y -| geometry.offset.y,
+                    null,
+                    null,
+                    target,
+                );
+            }
+        }
+    }
+}
+
+fn submitLayerPopups(self: *Self) void {
+    inline for (.{
+        Scene.Layer.background,
+        Scene.Layer.bottom,
+        Scene.Layer.top,
+        Scene.Layer.overlay,
+    }) |layer| {
+        var roots = self.scene.layerSurfaceIterator(layer);
+        while (roots.next()) |root| {
+            var popups = self.scene.layerPopupIterator(root.id);
+            while (popups.next()) |entry| {
+                if (entry.popup.mapped) self.submitSurfaceTree(entry.popup.surface_id);
+            }
         }
     }
 }
