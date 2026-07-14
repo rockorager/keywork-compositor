@@ -196,6 +196,8 @@ pub fn create(
         var x: i32 = 0;
         for (drm_outputs, 0..) |drm_output, index| {
             std.debug.assert(drm_output.enabled);
+            drm_output.logical_x = x;
+            drm_output.logical_y = 0;
             const id = try self.addRenderOutput(io, .{ .kind = .drm, .size = drm_output.size, .position = .{ .x = x }, .name = "DRM", .description = "Keywork DRM output", .model = "drm-kms", .drm_output = drm_output });
             if (index == 0) render_output_id = id;
             x += @intCast(drm_output.size.width);
@@ -496,7 +498,6 @@ fn removeRenderOutput(self: *Self, id: RenderOutputId) bool {
 
 fn drmOutputAdded(context: *anyopaque, drm_output: *DrmOutput) void {
     const self: *Self = @ptrCast(@alignCast(context));
-    if (!drm_output.enabled) return;
     var right: i32 = 0;
     var iterator = self.render_outputs.iterator();
     while (iterator.next()) |entry| {
@@ -504,6 +505,9 @@ fn drmOutputAdded(context: *anyopaque, drm_output: *DrmOutput) void {
         const position = self.outputs.get(output.protocol_id).?.logicalPosition();
         right = @max(right, position.x + @as(i32, @intCast(output.backend.size().width)));
     }
+    drm_output.logical_x = right;
+    drm_output.logical_y = 0;
+    if (!drm_output.enabled) return;
     _ = self.addRenderOutput(self.native_input.io, .{
         .kind = .drm,
         .size = drm_output.size,
@@ -516,15 +520,80 @@ fn drmOutputAdded(context: *anyopaque, drm_output: *DrmOutput) void {
     requestRepaint(self);
 }
 
+fn findDrmRenderOutput(self: *Self, drm_output: *DrmOutput) ?struct {
+    id: RenderOutputId,
+    output: *RenderOutput,
+} {
+    var iterator = self.render_outputs.iterator();
+    while (iterator.next()) |entry| {
+        if (entry.value.*.backend.drmOutput() != drm_output) continue;
+        return .{ .id = entry.id, .output = entry.value.* };
+    }
+    return null;
+}
+
+fn setDrmOutputPosition(self: *Self, drm_output: *DrmOutput, position: Output.Position) void {
+    drm_output.logical_x = position.x;
+    drm_output.logical_y = position.y;
+    const render_output = self.findDrmRenderOutput(drm_output) orelse return;
+    const protocol_output = self.outputs.get(render_output.output.protocol_id).?;
+    protocol_output.setPosition(position);
+    self.xdg_output.refresh(protocol_output);
+}
+
+fn enableDrmOutput(self: *Self, drm_output: *DrmOutput, position: Output.Position) !void {
+    if (drm_output.enabled) {
+        self.setDrmOutputPosition(drm_output, position);
+        return;
+    }
+    try self.drm_device.setOutputEnabled(drm_output, true);
+    errdefer self.drm_device.setOutputEnabled(drm_output, false) catch {};
+    drm_output.logical_x = position.x;
+    drm_output.logical_y = position.y;
+    _ = try self.addRenderOutput(self.native_input.io, .{
+        .kind = .drm,
+        .size = drm_output.size,
+        .position = position,
+        .name = "DRM",
+        .description = "Keywork DRM output",
+        .model = "drm-kms",
+        .drm_output = drm_output,
+    });
+    requestRepaint(self);
+}
+
+fn disableDrmOutput(self: *Self, drm_output: *DrmOutput) !void {
+    if (!drm_output.enabled) return;
+    if (self.render_outputs.count <= 1) return error.LastEnabledOutput;
+    const render_output = self.findDrmRenderOutput(drm_output) orelse
+        return error.MissingRenderOutput;
+    try self.drm_device.setOutputEnabled(drm_output, false);
+    if (std.meta.eql(render_output.id, self.primary_render_output)) {
+        self.replacePrimaryRenderOutput(render_output.id);
+    }
+    std.debug.assert(self.removeRenderOutput(render_output.id));
+    requestRepaint(self);
+}
+
+fn replacePrimaryRenderOutput(self: *Self, removed_id: RenderOutputId) void {
+    var iterator = self.render_outputs.iterator();
+    while (iterator.next()) |entry| if (!std.meta.eql(entry.id, removed_id)) {
+        self.primary_render_output = entry.id;
+        const replacement = entry.value.*;
+        self.fractional_scale.setDefaultOutput(replacement.protocol_id);
+        self.xdg_shell.setDefaultOutput(replacement.protocol_id);
+        self.layer_shell.setDefaultOutput(replacement.protocol_id);
+        self.window_manager.setDefaultOutput(replacement.protocol_id);
+        self.native_input.retarget(replacement.backend.size(), backendListener(replacement));
+        return;
+    };
+    unreachable;
+}
+
 fn drmOutputRemoving(context: *anyopaque, drm_output: *DrmOutput) void {
     const self: *Self = @ptrCast(@alignCast(context));
-    var removed_id: ?RenderOutputId = null;
-    var iterator = self.render_outputs.iterator();
-    while (iterator.next()) |entry| if (entry.value.*.backend.drmOutput() == drm_output) {
-        removed_id = entry.id;
-        break;
-    };
-    const id = removed_id orelse return;
+    const render_output = self.findDrmRenderOutput(drm_output) orelse return;
+    const id = render_output.id;
     if (self.render_outputs.count == 1) {
         if (self.native_input_initialized) {
             self.native_input.deinit();
@@ -535,17 +604,7 @@ fn drmOutputRemoving(context: *anyopaque, drm_output: *DrmOutput) void {
         return;
     }
     if (std.meta.eql(id, self.primary_render_output)) {
-        iterator = self.render_outputs.iterator();
-        while (iterator.next()) |entry| if (!std.meta.eql(entry.id, id)) {
-            self.primary_render_output = entry.id;
-            const replacement = entry.value.*;
-            self.fractional_scale.setDefaultOutput(replacement.protocol_id);
-            self.xdg_shell.setDefaultOutput(replacement.protocol_id);
-            self.layer_shell.setDefaultOutput(replacement.protocol_id);
-            self.window_manager.setDefaultOutput(replacement.protocol_id);
-            self.native_input.retarget(replacement.backend.size(), backendListener(replacement));
-            break;
-        };
+        self.replacePrimaryRenderOutput(id);
     }
     std.debug.assert(self.removeRenderOutput(id));
     requestRepaint(self);

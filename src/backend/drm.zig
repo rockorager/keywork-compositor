@@ -27,6 +27,8 @@ connector_id: u32,
 crtc_id: u32,
 connector_name: [32]u8,
 connector_name_length: usize,
+logical_x: i32,
+logical_y: i32,
 refresh_nanoseconds: u32,
 presentation_clock_id: u32,
 acquired: ?usize,
@@ -89,6 +91,8 @@ pub fn init(
         .crtc_id = 0,
         .connector_name = undefined,
         .connector_name_length = 0,
+        .logical_x = 0,
+        .logical_y = 0,
         .refresh_nanoseconds = presentation.nominal_refresh_nanoseconds,
         .presentation_clock_id = presentation.monotonic_clock_id,
         .acquired = null,
@@ -118,6 +122,13 @@ pub fn detach(self: *Self) void {
 
 pub fn name(self: *const Self) []const u8 {
     return self.connector_name[0..self.connector_name_length];
+}
+
+pub fn refreshMillihertz(self: *const Self) i32 {
+    return @intCast(@min(
+        @as(u64, self.mode.vrefresh) * 1000,
+        std.math.maxInt(i32),
+    ));
 }
 
 pub fn ready(self: *const Self) bool {
