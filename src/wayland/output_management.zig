@@ -6,12 +6,14 @@ const std = @import("std");
 const wayland = @import("wayland");
 const DrmOutput = @import("../backend/drm.zig");
 const render = @import("../render/types.zig");
+const SecurityContext = @import("security_context.zig");
 
 const wl = wayland.server.wl;
 const zwlr = wayland.server.zwlr;
 
 allocator: std.mem.Allocator,
 global: *wl.Global,
+security_context: *SecurityContext,
 serial: u32,
 heads: std.ArrayList(*Head),
 managers: std.ArrayList(*ManagerResource),
@@ -102,11 +104,13 @@ pub fn init(
     allocator: std.mem.Allocator,
     display: *wl.Server,
     outputs: []const *DrmOutput,
+    security_context: *SecurityContext,
     listener: Listener,
 ) !void {
     self.* = .{
         .allocator = allocator,
         .global = undefined,
+        .security_context = security_context,
         .serial = 1,
         .heads = .empty,
         .managers = .empty,
@@ -125,6 +129,8 @@ pub fn init(
         self,
         bind,
     );
+    errdefer self.global.destroy();
+    try security_context.restrictGlobal(self.global);
 }
 
 pub fn deinit(self: *Self) void {
@@ -132,6 +138,7 @@ pub fn deinit(self: *Self) void {
     for (self.managers.items) |manager| std.debug.assert(manager.resource == null);
     for (self.head_resources.items) |resource| std.debug.assert(resource.resource == null);
     for (self.mode_resources.items) |resource| std.debug.assert(resource.resource == null);
+    self.security_context.unrestrictGlobal(self.global);
     self.global.destroy();
     self.deinitStorage();
     self.* = undefined;
@@ -904,11 +911,16 @@ test "connected head storage survives disable and reconnect lifetimes" {
     output.modes[1].value.vdisplay = 720;
     output.mode_index = 0;
 
+    var security_context: SecurityContext = undefined;
+    try security_context.init(std.testing.allocator, display);
+    defer security_context.deinit();
+
     var manager: Self = undefined;
     try manager.init(
         std.testing.allocator,
         display,
         &.{&output},
+        &security_context,
         .{ .context = &context, .apply = testApply },
     );
     defer manager.deinit();

@@ -4,6 +4,7 @@ const Self = @This();
 
 const std = @import("std");
 const wayland = @import("wayland");
+const SecurityContext = @import("security_context.zig");
 const Seat = @import("seat.zig");
 
 const wl = wayland.server.wl;
@@ -14,6 +15,7 @@ const maximum_keymap_size = 16 * 1024 * 1024;
 allocator: std.mem.Allocator,
 io: std.Io,
 global: *wl.Global,
+security_context: *SecurityContext,
 seat: *Seat,
 devices: std.ArrayList(*Device),
 inhibited: bool,
@@ -29,6 +31,7 @@ pub fn init(
     allocator: std.mem.Allocator,
     io: std.Io,
     display: *wl.Server,
+    security_context: *SecurityContext,
     seat: *Seat,
 ) !void {
     self.* = .{
@@ -42,15 +45,19 @@ pub fn init(
             self,
             bind,
         ),
+        .security_context = security_context,
         .seat = seat,
         .devices = .empty,
         .inhibited = false,
         .deferred_keymap = null,
     };
+    errdefer self.global.destroy();
+    try security_context.restrictGlobal(self.global);
 }
 
 pub fn deinit(self: *Self) void {
     std.debug.assert(self.devices.items.len == 0);
+    self.security_context.unrestrictGlobal(self.global);
     self.global.destroy();
     if (self.deferred_keymap) |keymap| {
         const file: std.Io.File = .{ .handle = keymap.fd, .flags = .{ .nonblocking = false } };

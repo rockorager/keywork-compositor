@@ -5,6 +5,7 @@ const Self = @This();
 const std = @import("std");
 const wayland = @import("wayland");
 const render = @import("../render/types.zig");
+const SecurityContext = @import("security_context.zig");
 const Seat = @import("seat.zig");
 const Surface = @import("surface.zig");
 const TextInput = @import("text_input.zig");
@@ -15,6 +16,7 @@ const zwp = wayland.server.zwp;
 allocator: std.mem.Allocator,
 display: *wl.Server,
 global: *wl.Global,
+security_context: *SecurityContext,
 seat: *Seat,
 surfaces: *Surface.Store,
 text_input: *TextInput,
@@ -82,6 +84,7 @@ pub fn init(
     self: *Self,
     allocator: std.mem.Allocator,
     display: *wl.Server,
+    security_context: *SecurityContext,
     seat: *Seat,
     surfaces: *Surface.Store,
     text_input: *TextInput,
@@ -91,6 +94,7 @@ pub fn init(
         .allocator = allocator,
         .display = display,
         .global = undefined,
+        .security_context = security_context,
         .seat = seat,
         .surfaces = surfaces,
         .text_input = text_input,
@@ -105,6 +109,8 @@ pub fn init(
     errdefer self.popups.deinit(allocator);
     self.global = try wl.Global.create(display, zwp.InputMethodManagerV2, 1, *Self, self, bind);
     errdefer self.global.destroy();
+    try security_context.restrictGlobal(self.global);
+    errdefer security_context.unrestrictGlobal(self.global);
     text_input.setListener(.{
         .context = self,
         .changed = textInputChanged,
@@ -113,6 +119,7 @@ pub fn init(
 
 pub fn deinit(self: *Self) void {
     self.text_input.clearListener();
+    self.security_context.unrestrictGlobal(self.global);
     self.global.destroy();
     std.debug.assert(self.active_method == null);
     std.debug.assert(self.methods.items.len == 0);

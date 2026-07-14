@@ -447,6 +447,52 @@ const ClientContext = struct {
     }
 };
 
+fn testGlobalBind(_: *wl.Client, _: *u8, _: u32, _: u32) void {}
+
+test "sandbox clients cannot see registered privileged globals" {
+    const display = try wl.Server.create();
+    defer display.destroy();
+
+    var manager: Self = undefined;
+    try manager.init(std.testing.allocator, display);
+    defer manager.deinit();
+
+    var context: u8 = 0;
+    const restricted = try wl.Global.create(
+        display,
+        wl.Compositor,
+        1,
+        *u8,
+        &context,
+        testGlobalBind,
+    );
+    defer restricted.destroy();
+    const unrestricted = try wl.Global.create(
+        display,
+        wl.Subcompositor,
+        1,
+        *u8,
+        &context,
+        testGlobalBind,
+    );
+    defer unrestricted.destroy();
+    try manager.restrictGlobal(restricted);
+    defer manager.unrestrictGlobal(restricted);
+
+    const client: *const wl.Client = @ptrFromInt(0x1000);
+    try std.testing.expect(globalFilter(client, restricted, &manager));
+    try manager.clients.put(
+        std.testing.allocator,
+        client,
+        @as(*ClientContext, @ptrFromInt(0x2000)),
+    );
+    defer std.debug.assert(manager.clients.remove(client));
+
+    try std.testing.expect(!globalFilter(client, manager.global, &manager));
+    try std.testing.expect(!globalFilter(client, restricted, &manager));
+    try std.testing.expect(globalFilter(client, unrestricted, &manager));
+}
+
 test "listen fd validation rejects connected sockets" {
     var sockets: [2]c_int = undefined;
     try std.testing.expectEqual(

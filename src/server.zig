@@ -218,6 +218,8 @@ pub fn create(
     }
     try self.compositor.init(allocator, display);
     errdefer self.compositor.deinit();
+    try self.security_context.init(allocator, display);
+    errdefer self.security_context.deinit();
     self.outputs.init(allocator, display, self.compositor.surfaceStore());
     errdefer self.outputs.deinit();
     try self.seat.init(allocator, io, display, self.compositor.surfaceStore());
@@ -259,6 +261,7 @@ pub fn create(
             allocator,
             display,
             self.drm_device.outputs(),
+            &self.security_context,
             .{ .context = self, .apply = applyOutputConfiguration },
         );
         self.output_management_initialized = true;
@@ -271,8 +274,6 @@ pub fn create(
     errdefer self.single_pixel_buffer.deinit();
     try self.content_type.init(allocator, display);
     errdefer self.content_type.deinit();
-    try self.security_context.init(allocator, display);
-    errdefer self.security_context.deinit();
     try self.session_lock.init(
         allocator,
         display,
@@ -377,6 +378,7 @@ pub fn create(
     try self.input_method.init(
         allocator,
         display,
+        &self.security_context,
         &self.seat,
         self.compositor.surfaceStore(),
         &self.text_input,
@@ -388,11 +390,18 @@ pub fn create(
         },
     );
     errdefer self.input_method.deinit();
-    try self.virtual_keyboard.init(allocator, io, display, &self.seat);
+    try self.virtual_keyboard.init(
+        allocator,
+        io,
+        display,
+        &self.security_context,
+        &self.seat,
+    );
     errdefer self.virtual_keyboard.deinit();
     try self.window_manager.init(
         allocator,
         display,
+        &self.security_context,
         &self.outputs,
         render_output.protocol_id,
         &self.seat,

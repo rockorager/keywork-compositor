@@ -246,11 +246,12 @@
       "status": "done",
       "privileged": true,
       "blocked_by": [
+        "security-context",
         "wl-output",
         "wl-seat",
         "xdg-shell"
       ],
-      "status_detail": "Version 5 window, output, seat, pointer binding, operation, focus, cursor ownership, transaction, and dynamic output lifecycle semantics are implemented. Async presentation is stored as a preference with backend fallback; capture counts remain zero until a capture protocol is implemented."
+      "status_detail": "Version 5 window, output, seat, pointer binding, operation, focus, cursor ownership, transaction, and dynamic output lifecycle semantics are implemented. Async presentation is stored as a preference with backend fallback; capture counts remain zero until a capture protocol is implemented. The privileged window-manager global is hidden from sandboxed security-context clients."
     },
     {
       "id": "linux-dmabuf",
@@ -372,10 +373,11 @@
       "status": "done",
       "privileged": true,
       "blocked_by": [
+        "security-context",
         "text-input-v3",
         "wl-seat"
       ],
-      "status_detail": "Version 1 implements one input method per seat with unavailable competitors, text-input-v3 activation/state/edit brokerage and serial validation, physical keyboard grabs with stable press/release routing, and cursor-relative popup roles, placement, rendering, input, and lifecycle handling. The vendored external protocol remains privileged; security-context-v1 will provide sandbox-aware registry filtering."
+      "status_detail": "Version 1 implements one input method per seat with unavailable competitors, text-input-v3 activation/state/edit brokerage and serial validation, physical keyboard grabs with stable press/release routing, and cursor-relative popup roles, placement, rendering, input, and lifecycle handling. The privileged global is hidden from sandboxed security-context clients."
     },
     {
       "id": "virtual-keyboard",
@@ -393,9 +395,10 @@
       "status": "done",
       "privileged": true,
       "blocked_by": [
+        "security-context",
         "wl-seat"
       ],
-      "status_detail": "Version 1 validates bounded NUL-terminated XKB keymaps, contributes keyboard capability only after keymap setup, injects tracked key and modifier state into the focused client, releases held keys on destruction, and bypasses input-method keyboard grabs to avoid feeding synthetic input back to its source. The external MIT protocol XML remains privileged; security-context-v1 will provide sandbox-aware registry filtering."
+      "status_detail": "Version 1 validates bounded NUL-terminated XKB keymaps, contributes keyboard capability only after keymap setup, injects tracked key and modifier state into the focused client, releases held keys on destruction, and bypasses input-method keyboard grabs to avoid feeding synthetic input back to its source. The privileged global is hidden from sandboxed security-context clients."
     },
     {
       "id": "cursor-shape",
@@ -679,9 +682,10 @@
       "privileged": true,
       "blocked_by": [
         "river-window-management",
+        "security-context",
         "wlr-layer-shell"
       ],
-      "status_detail": "Version 1 ties support to the active window-manager session, reports coalesced usable-area and layer-focus state in manage sequences, validates output and seat extensions, and enforces layer focus policy."
+      "status_detail": "Version 1 ties support to the active window-manager session, reports coalesced usable-area and layer-focus state in manage sequences, validates output and seat extensions, and enforces layer focus policy. The privileged global is hidden from sandboxed security-context clients."
     },
     {
       "id": "security-context",
@@ -699,7 +703,7 @@
       "status": "done",
       "privileged": false,
       "blocked_by": [],
-      "status_detail": "Version 1 validates and owns listening sockets, commits immutable sandbox-engine/application/instance metadata, accepts context-tagged Wayland clients until close-fd hangup, preserves listeners after the creating client disconnects, tracks metadata for each accepted client until disconnect, and prevents nested security contexts through global filtering and bind-time validation."
+      "status_detail": "Version 1 validates and owns listening sockets, commits immutable sandbox-engine/application/instance metadata, accepts context-tagged Wayland clients until close-fd hangup, preserves listeners after the creating client disconnects, tracks metadata for each accepted client until disconnect, prevents nested security contexts, and centrally filters every implemented privileged global from sandboxed clients."
     },
     {
       "id": "session-lock",
@@ -912,13 +916,13 @@
           "target_version": 4
         }
       ],
-      "status": "in_progress",
+      "status": "done",
       "privileged": true,
       "blocked_by": [
         "security-context",
         "wl-output"
       ],
-      "status_detail": "Version 4 head discovery, EDID make/model/serial identity, complete DRM mode advertisement and selection, hotplug lifecycles, stale-serial cancellation, complete test/apply transactions, positions, fractional scales, and native DRM enable/disable are implemented for Kanshi. Mode and scale changes update scanout buffers, logical geometry, rendering, input bounds, wl_output, xdg-output, fractional-scale, layer-shell, and River output state, with transactional rollback on failure. Unsupported custom modes, transforms, and adaptive sync are rejected. The global is temporarily visible to all clients until security-context authorization is implemented."
+      "status_detail": "Version 4 head discovery, EDID make/model/serial identity, complete DRM mode advertisement and selection, hotplug lifecycles, stale-serial cancellation, complete test/apply transactions, positions, fractional scales, and native DRM enable/disable are implemented for Kanshi. Mode and scale changes update scanout buffers, logical geometry, rendering, input bounds, wl_output, xdg-output, fractional-scale, layer-shell, and River output state, with transactional rollback on failure. Unsupported custom modes, transforms, and adaptive sync are rejected. The privileged global is hidden from sandboxed security-context clients."
     },
     {
       "id": "wlr-output-power-management",

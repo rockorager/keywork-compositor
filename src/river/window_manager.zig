@@ -7,6 +7,7 @@ const wayland = @import("wayland");
 const Output = @import("../wayland/output.zig");
 const OutputLayout = @import("../wayland/output_layout.zig");
 const Scene = @import("../scene.zig");
+const SecurityContext = @import("../wayland/security_context.zig");
 const Seat = @import("../wayland/seat.zig");
 const slot_map = @import("../slot_map.zig");
 const Surface = @import("../wayland/surface.zig");
@@ -22,6 +23,7 @@ allocator: std.mem.Allocator,
 display: *wl.Server,
 global: *wl.Global,
 layer_global: *wl.Global,
+security_context: *SecurityContext,
 outputs: *OutputLayout,
 output_id: OutputLayout.Id,
 seat: *Seat,
@@ -276,6 +278,7 @@ pub fn init(
     self: *Self,
     allocator: std.mem.Allocator,
     display: *wl.Server,
+    security_context: *SecurityContext,
     outputs: *OutputLayout,
     output_id: OutputLayout.Id,
     seat: *Seat,
@@ -289,6 +292,7 @@ pub fn init(
         .display = display,
         .global = undefined,
         .layer_global = undefined,
+        .security_context = security_context,
         .outputs = outputs,
         .output_id = output_id,
         .seat = seat,
@@ -343,8 +347,12 @@ pub fn init(
         bind,
     );
     errdefer self.global.destroy();
+    try security_context.restrictGlobal(self.global);
+    errdefer security_context.unrestrictGlobal(self.global);
     self.layer_global = try wl.Global.create(display, river.LayerShellV1, 1, *Self, self, bindLayerShell);
     errdefer self.layer_global.destroy();
+    try security_context.restrictGlobal(self.layer_global);
+    errdefer security_context.unrestrictGlobal(self.layer_global);
     self.configure_timer = try display.getEventLoop().addTimer(*Self, handleConfigureTimeout, self);
     xdg_shell.setWindowListener(.{
         .context = self,
@@ -451,7 +459,9 @@ pub fn deinit(self: *Self) void {
     self.held_buttons.deinit(self.allocator);
     std.debug.assert(self.layer_bindings.items.len == 0);
     self.layer_bindings.deinit(self.allocator);
+    self.security_context.unrestrictGlobal(self.layer_global);
     self.layer_global.destroy();
+    self.security_context.unrestrictGlobal(self.global);
     self.global.destroy();
     self.* = undefined;
 }
