@@ -10,6 +10,7 @@ const Subcompositor = @import("wayland/subcompositor.zig");
 const XdgOutput = @import("wayland/xdg_output.zig");
 const XdgShell = @import("wayland/xdg_shell.zig");
 const LayerShell = @import("wayland/layer_shell.zig");
+const SinglePixelBuffer = @import("wayland/single_pixel_buffer.zig");
 const Seat = @import("wayland/seat.zig");
 const DataDevice = @import("wayland/data_device.zig");
 const PrimarySelection = @import("wayland/primary_selection.zig");
@@ -35,6 +36,7 @@ display: *wl.Server,
 render_output: OutputBackend,
 output: Output,
 xdg_output: XdgOutput,
+single_pixel_buffer: SinglePixelBuffer,
 compositor: Compositor,
 subcompositor: Subcompositor,
 scene: Scene,
@@ -76,6 +78,7 @@ pub fn create(
         .render_output = undefined,
         .output = undefined,
         .xdg_output = undefined,
+        .single_pixel_buffer = undefined,
         .compositor = undefined,
         .subcompositor = undefined,
         .scene = undefined,
@@ -149,6 +152,8 @@ pub fn create(
     self.compositor.setOutput(&self.output);
     try self.xdg_output.init(display, &self.output);
     errdefer self.xdg_output.deinit();
+    try self.single_pixel_buffer.init(allocator, display);
+    errdefer self.single_pixel_buffer.deinit();
     try self.presentation_protocol.init(
         allocator,
         display,
@@ -251,6 +256,7 @@ pub fn destroy(self: *Self) void {
     self.fractional_scale.deinit();
     self.viewporter.deinit();
     self.presentation_protocol.deinit();
+    self.single_pixel_buffer.deinit();
     self.xdg_output.deinit();
     self.output.deinit();
     self.render_output.deinit();

@@ -10,6 +10,7 @@ const render_types = @import("../render/types.zig");
 const slot_map = @import("../slot_map.zig");
 const WaylandRegion = @import("region.zig");
 const LinuxDmabuf = @import("linux_dmabuf.zig");
+const SinglePixelBuffer = @import("single_pixel_buffer.zig");
 
 const wl = wayland.server.wl;
 const wp = wayland.server.wp;
@@ -846,6 +847,15 @@ fn snapshotPendingAttachment(self: *Self) BufferSnapshot.Error!?BufferSnapshot {
             surface_state.pending_viewport,
         );
     }
+    if (self.pending_attachment.single_pixel) |pixel| {
+        return try BufferSnapshot.copySinglePixel(
+            self.allocator,
+            pixel,
+            surface_state.pending_scale,
+            surface_state.pending_transform,
+            surface_state.pending_viewport,
+        );
+    }
     return null;
 }
 
@@ -1056,6 +1066,7 @@ const Attachment = struct {
     resource: ?*wl.Buffer = null,
     shm: ?*wl.shm.Buffer = null,
     dmabuf: ?*LinuxDmabuf.Buffer = null,
+    single_pixel: ?u32 = null,
     destroy_listener: wl.Listener(*wl.Resource) = undefined,
 
     const Error = error{UnsupportedBuffer};
@@ -1068,11 +1079,18 @@ const Attachment = struct {
             LinuxDmabuf.Buffer.fromResource(buffer)
         else
             null;
-        if (shm_buffer == null and dmabuf_buffer == null) return error.UnsupportedBuffer;
+        const single_pixel_buffer = if (shm_buffer == null and dmabuf_buffer == null)
+            SinglePixelBuffer.Buffer.fromResource(buffer)
+        else
+            null;
+        if (shm_buffer == null and dmabuf_buffer == null and single_pixel_buffer == null) {
+            return error.UnsupportedBuffer;
+        }
 
         self.resource = buffer;
         self.shm = if (shm_buffer) |shm| wl_shm_buffer_ref(shm) else null;
         self.dmabuf = dmabuf_buffer;
+        self.single_pixel = if (single_pixel_buffer) |single| single.pixel else null;
         self.destroy_listener = wl.Listener(*wl.Resource).init(handleResourceDestroy);
         @as(*wl.Resource, @ptrCast(buffer)).addDestroyListener(&self.destroy_listener);
     }
@@ -1083,10 +1101,11 @@ const Attachment = struct {
         self.resource = null;
         self.shm = null;
         self.dmabuf = null;
+        self.single_pixel = null;
     }
 
     fn hasBuffer(self: *const Attachment) bool {
-        return self.shm != null or self.dmabuf != null;
+        return self.shm != null or self.dmabuf != null or self.single_pixel != null;
     }
 
     fn handleResourceDestroy(
@@ -1193,6 +1212,28 @@ pub const BufferSnapshot = struct {
             error.ImportFailed => return error.ImportFailed,
         };
 
+        return .{
+            .allocator = allocator,
+            .buffer_size = buffer_size,
+            .logical_size = geometry.logical_size,
+            .scale = scale,
+            .transform = transform,
+            .source = geometry.source,
+            .pixels = pixels,
+        };
+    }
+
+    fn copySinglePixel(
+        allocator: std.mem.Allocator,
+        pixel: u32,
+        scale: i32,
+        transform: wl.Output.Transform,
+        viewport: ViewportState,
+    ) Error!BufferSnapshot {
+        const buffer_size: render_types.Size = .{ .width = 1, .height = 1 };
+        const geometry = try viewportGeometry(buffer_size, scale, transform, viewport);
+        const pixels = allocator.alloc(u32, 1) catch return error.OutOfMemory;
+        pixels[0] = pixel;
         return .{
             .allocator = allocator,
             .buffer_size = buffer_size,
@@ -1362,6 +1403,27 @@ test "viewport destination defines logical surface size" {
         geometry.logical_size,
     );
     try std.testing.expectEqual(@as(?render_types.SourceRect, null), geometry.source);
+}
+
+test "single pixel snapshots use viewporter destination without changing color" {
+    var snapshot = try BufferSnapshot.copySinglePixel(
+        std.testing.allocator,
+        0x8040_2000,
+        1,
+        .normal,
+        .{ .destination = .{ .width = 320, .height = 180 } },
+    );
+    defer snapshot.deinit();
+
+    try std.testing.expectEqual(
+        render_types.Size{ .width = 1, .height = 1 },
+        snapshot.buffer_size,
+    );
+    try std.testing.expectEqual(
+        render_types.Size{ .width = 320, .height = 180 },
+        snapshot.logical_size,
+    );
+    try std.testing.expectEqualSlices(u32, &.{0x8040_2000}, snapshot.pixels);
 }
 
 test "viewport source is validated and converted to buffer coordinates" {

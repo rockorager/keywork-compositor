@@ -564,16 +564,17 @@
       "interfaces": [
         {
           "name": "wp_single_pixel_buffer_manager_v1",
-          "current_version": null,
+          "current_version": 1,
           "target_version": 1
         }
       ],
-      "status": "not_started",
+      "status": "done",
       "privileged": false,
       "blocked_by": [
         "wl-compositor",
         "wl-shm"
-      ]
+      ],
+      "status_detail": "Version 1 creates immutable premultiplied RGBA buffers, snapshots them through the shared surface buffer path, and supports viewporter scaling."
     },
     {
       "id": "river-input-management",

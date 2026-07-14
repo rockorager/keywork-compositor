@@ -70,6 +70,7 @@ test {
     _ = @import("wayland/fractional_scale.zig");
     _ = @import("wayland/fixes.zig");
     _ = @import("wayland/linux_dmabuf.zig");
+    _ = @import("wayland/single_pixel_buffer.zig");
     _ = @import("wayland/xdg_activation.zig");
     _ = @import("wayland/xdg_output.zig");
     _ = @import("wayland/viewporter.zig");
