@@ -138,13 +138,14 @@
       "interfaces": [
         {
           "name": "wl_fixes",
-          "current_version": null,
+          "current_version": 1,
           "target_version": 1
         }
       ],
-      "status": "not_started",
+      "status": "done",
       "privileged": false,
-      "blocked_by": []
+      "blocked_by": [],
+      "status_detail": "The destroy_registry fix is implemented."
     },
     {
       "id": "xdg-shell",

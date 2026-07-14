@@ -20,6 +20,7 @@ pub fn build(b: *std.Build) void {
     scanner.generate("wl_compositor", 6);
     scanner.generate("wl_subcompositor", 1);
     scanner.generate("wl_shm", 1);
+    scanner.generate("wl_fixes", 1);
     scanner.generate("wl_output", 4);
     scanner.generate("wl_seat", 10);
     scanner.generate("wl_data_device_manager", 3);

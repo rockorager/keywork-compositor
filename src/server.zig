@@ -13,6 +13,7 @@ const DataDevice = @import("wayland/data_device.zig");
 const PrimarySelection = @import("wayland/primary_selection.zig");
 const PresentationProtocol = @import("wayland/presentation.zig");
 const FractionalScale = @import("wayland/fractional_scale.zig");
+const Fixes = @import("wayland/fixes.zig");
 const Output = @import("wayland/output.zig");
 const OutputBackend = @import("backend/output.zig");
 const renderer_types = @import("render/renderer.zig");
@@ -38,6 +39,7 @@ data_device: DataDevice,
 primary_selection: PrimarySelection,
 presentation_protocol: PresentationProtocol,
 fractional_scale: FractionalScale,
+fixes: Fixes,
 viewporter: Viewporter,
 window_manager: WindowManager,
 renderer: renderer_types.Renderer,
@@ -74,6 +76,7 @@ pub fn create(
         .primary_selection = undefined,
         .presentation_protocol = undefined,
         .fractional_scale = undefined,
+        .fixes = undefined,
         .viewporter = undefined,
         .window_manager = undefined,
         .renderer = try renderer_types.Renderer.init(allocator, renderer_kind),
@@ -148,6 +151,8 @@ pub fn create(
         self.render_output.renderScale(),
     );
     errdefer self.fractional_scale.deinit();
+    try self.fixes.init(display);
+    errdefer self.fixes.deinit();
     try self.subcompositor.init(allocator, display, self.compositor.surfaceStore());
     errdefer self.subcompositor.deinit();
     self.scene.init(allocator);
@@ -205,6 +210,7 @@ pub fn destroy(self: *Self) void {
     self.xdg_shell.deinit();
     self.scene.deinit();
     self.subcompositor.deinit();
+    self.fixes.deinit();
     self.fractional_scale.deinit();
     self.viewporter.deinit();
     self.presentation_protocol.deinit();

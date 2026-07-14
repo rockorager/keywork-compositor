@@ -68,6 +68,7 @@ test {
     _ = @import("wayland/primary_selection.zig");
     _ = @import("wayland/presentation.zig");
     _ = @import("wayland/fractional_scale.zig");
+    _ = @import("wayland/fixes.zig");
     _ = @import("wayland/viewporter.zig");
     _ = @import("wayland/xdg_shell.zig");
     _ = @import("river/window_manager.zig");
