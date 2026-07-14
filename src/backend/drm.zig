@@ -271,7 +271,8 @@ pub fn activate(self: *Self, fd: std.posix.fd_t, selection: Selection, device_pa
     const selected_mode = selection.modes[selection.mode_index];
     const selected_size = selected_mode.size();
     if (self.size.width != 0 and (!std.meta.eql(self.size, selected_size) or
-        self.connector_id != selection.connector_id))
+        self.connector_id != selection.connector_id or
+        !modeListsEqual(self.modes, selection.modes)))
     {
         return error.OutputChanged;
     }
@@ -458,7 +459,7 @@ pub fn setMode(self: *Self, fd: std.posix.fd_t, mode_index: usize) !void {
             return error.DisableFailed;
         }
         self.notifyDeactivated();
-        const old_buffers = self.buffers;
+        var old_buffers = self.buffers;
         self.buffers = buffers;
         for (&old_buffers) |*buffer| destroyBuffer(fd, buffer);
         self.displayed = null;
@@ -680,6 +681,14 @@ fn findModeIndex(modes: []const Mode, target: c.drmModeModeInfo) ?usize {
     return null;
 }
 
+fn modeListsEqual(a: []const Mode, b: []const Mode) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |a_mode, b_mode| {
+        if (!std.meta.eql(a_mode, b_mode)) return false;
+    }
+    return true;
+}
+
 fn refreshNanoseconds(mode: c.drmModeModeInfo) u32 {
     if (mode.vrefresh == 0) return presentation.nominal_refresh_nanoseconds;
     return @intCast(std.time.ns_per_s / mode.vrefresh);
@@ -779,6 +788,20 @@ test "preferred DRM mode wins over the first mode" {
     };
     modes[1].type = c.DRM_MODE_TYPE_PREFERRED;
     try std.testing.expectEqual(@as(usize, 1), preferredModeIndex(&modes));
+}
+
+test "DRM mode inventory equality includes timing and preference" {
+    var a = [_]Mode{.{
+        .value = std.mem.zeroes(c.drmModeModeInfo),
+        .preferred = true,
+    }};
+    var b = a;
+    try std.testing.expect(modeListsEqual(&a, &b));
+    b[0].value.vrefresh = 120;
+    try std.testing.expect(!modeListsEqual(&a, &b));
+    b = a;
+    b[0].preferred = false;
+    try std.testing.expect(!modeListsEqual(&a, &b));
 }
 
 test "DRM mode refresh converts to presentation period" {

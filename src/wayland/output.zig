@@ -16,6 +16,7 @@ position: Position,
 size: render.Size,
 mode_size: render.Size,
 physical_size: render.Size,
+mode_preferred: bool,
 scale: i32,
 preferred_scale: render.Scale,
 refresh_millihertz: i32,
@@ -38,6 +39,8 @@ pub const Config = struct {
     size: render.Size,
     mode_size: ?render.Size = null,
     physical_size: render.Size,
+    mode_preferred: bool = true,
+    refresh_millihertz: i32 = 60_000,
     scale: u32,
     preferred_scale: render.Scale = .{},
     name: []const u8,
@@ -94,9 +97,10 @@ pub fn init(
         .size = config.size,
         .mode_size = mode_size,
         .physical_size = config.physical_size,
+        .mode_preferred = config.mode_preferred,
         .scale = @intCast(config.scale),
         .preferred_scale = config.preferred_scale,
-        .refresh_millihertz = 60_000,
+        .refresh_millihertz = config.refresh_millihertz,
         .name_value = name_value,
         .description_value = description_value,
         .make = make,
@@ -182,6 +186,30 @@ pub fn preferredScale(self: *const Self) render.Scale {
 
 pub fn clientScale(self: *const Self) u32 {
     return @intCast(self.scale);
+}
+
+pub fn setMode(
+    self: *Self,
+    size: render.Size,
+    mode_size: render.Size,
+    refresh_millihertz: i32,
+    preferred: bool,
+) bool {
+    std.debug.assert(size.width > 0 and size.height > 0);
+    std.debug.assert(mode_size.width > 0 and mode_size.height > 0);
+    const mode_changed = !std.meta.eql(self.mode_size, mode_size) or
+        self.refresh_millihertz != refresh_millihertz or
+        self.mode_preferred != preferred;
+    self.size = size;
+    self.mode_size = mode_size;
+    self.refresh_millihertz = refresh_millihertz;
+    self.mode_preferred = preferred;
+    if (!mode_changed) return false;
+    for (self.resources.items) |resource| {
+        self.sendMode(resource);
+        if (resource.getVersion() >= wl.Output.done_since_version) resource.sendDone();
+    }
+    return true;
 }
 
 pub fn logicalRect(self: *const Self) render.Rect {
@@ -316,7 +344,7 @@ fn sendGeometry(self: *const Self, resource: *wl.Output) void {
 
 fn sendMode(self: *const Self, resource: *wl.Output) void {
     resource.sendMode(
-        .{ .current = true, .preferred = true },
+        .{ .current = true, .preferred = self.mode_preferred },
         @intCast(self.mode_size.width),
         @intCast(self.mode_size.height),
         self.refresh_millihertz,

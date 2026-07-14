@@ -114,6 +114,20 @@ pub fn modeSize(self: *const Self) render.Size {
     };
 }
 
+pub fn modePreferred(self: *const Self) bool {
+    return switch (self.backend) {
+        .drm => |output| output.availableModes()[output.currentModeIndex()].preferred,
+        .headless, .nested => true,
+    };
+}
+
+pub fn refreshMillihertz(self: *const Self) i32 {
+    return switch (self.backend) {
+        .drm => |output| output.refreshMillihertz(),
+        .headless, .nested => 60_000,
+    };
+}
+
 pub fn physicalSize(self: *const Self) render.Size {
     return switch (self.backend) {
         .drm => |output| output.physical_size,

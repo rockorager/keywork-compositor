@@ -27,9 +27,11 @@ pub const Change = struct {
     old_x: i32,
     old_y: i32,
     old_scale: render.Scale,
+    old_mode_index: usize,
     x: i32,
     y: i32,
     scale: render.Scale,
+    mode_index: usize,
 };
 
 pub const Listener = struct {
@@ -49,9 +51,9 @@ const Head = struct {
     x: i32,
     y: i32,
     scale: render.Scale,
-    size: struct { width: u32, height: u32 },
+    modes: []DrmOutput.Mode,
+    current_mode_index: usize,
     physical_size: struct { width: u32, height: u32 },
-    refresh_millihertz: i32,
 };
 
 const ManagerResource = struct {
@@ -63,12 +65,12 @@ const ManagerResource = struct {
 const HeadResource = struct {
     head: *Head,
     resource: ?*zwlr.OutputHeadV1,
-    mode: *ModeResource,
     finished: bool,
 };
 
 const ModeResource = struct {
-    head: *Head,
+    owner: *HeadResource,
+    mode_index: usize,
     resource: ?*zwlr.OutputModeV1,
     finished: bool,
 };
@@ -87,6 +89,7 @@ const ConfiguredHead = struct {
     enabled: bool,
     resource: ?*zwlr.OutputConfigurationHeadV1,
     mode_set: bool = false,
+    mode_index: ?usize = null,
     custom_mode_set: bool = false,
     position: ?struct { x: i32, y: i32 } = null,
     transform: ?wl.Output.Transform = null,
@@ -146,6 +149,7 @@ fn deinitStorage(self: *Self) void {
     for (self.managers.items) |manager| self.allocator.destroy(manager);
     self.managers.deinit(self.allocator);
     for (self.heads.items) |head| {
+        self.allocator.free(head.modes);
         self.allocator.free(head.serial);
         self.allocator.free(head.model);
         self.allocator.free(head.make);
@@ -180,6 +184,11 @@ fn addHeadStorage(self: *Self, output: *DrmOutput) !*Head {
     errdefer self.allocator.free(model);
     const serial = try self.allocator.dupeSentinel(u8, output.serial() orelse "", 0);
     errdefer self.allocator.free(serial);
+    const modes = try self.allocator.dupe(DrmOutput.Mode, output.availableModes());
+    errdefer self.allocator.free(modes);
+    std.debug.assert(modes.len > 0);
+    const current_mode_index = output.currentModeIndex();
+    std.debug.assert(current_mode_index < modes.len);
     const head = try self.allocator.create(Head);
     errdefer self.allocator.destroy(head);
     head.* = .{
@@ -194,12 +203,12 @@ fn addHeadStorage(self: *Self, output: *DrmOutput) !*Head {
         .x = output.logical_x,
         .y = output.logical_y,
         .scale = output.scale,
-        .size = .{ .width = output.size.width, .height = output.size.height },
+        .modes = modes,
+        .current_mode_index = current_mode_index,
         .physical_size = .{
             .width = output.physical_size.width,
             .height = output.physical_size.height,
         },
-        .refresh_millihertz = output.refreshMillihertz(),
     };
     try self.heads.append(self.allocator, head);
     return head;
@@ -210,7 +219,7 @@ pub fn removeHead(self: *Self, output: *DrmOutput) void {
     head.output = null;
     head.connected = false;
     for (self.mode_resources.items) |mode| {
-        if (mode.head != head or mode.resource == null or mode.finished) continue;
+        if (mode.owner.head != head or mode.resource == null or mode.finished) continue;
         mode.resource.?.sendFinished();
         mode.finished = true;
     }
@@ -227,20 +236,28 @@ pub fn syncHead(self: *Self, output: *DrmOutput) void {
     const enabled_changed = head.enabled != output.enabled;
     const position_changed = head.x != output.logical_x or head.y != output.logical_y;
     const scale_changed = head.scale.numerator != output.scale.numerator;
-    if (!enabled_changed and !position_changed and !scale_changed) return;
+    const mode_changed = head.current_mode_index != output.currentModeIndex();
+    if (!enabled_changed and !position_changed and !scale_changed and !mode_changed) return;
     head.enabled = output.enabled;
     head.x = output.logical_x;
     head.y = output.logical_y;
     head.scale = output.scale;
+    head.current_mode_index = output.currentModeIndex();
     for (self.head_resources.items) |advertised| {
         if (advertised.head != head or advertised.resource == null or advertised.finished) continue;
         const resource = advertised.resource.?;
         if (enabled_changed) {
             resource.sendEnabled(@intFromBool(head.enabled));
             if (head.enabled) {
-                if (advertised.mode.resource) |mode| resource.sendCurrentMode(mode);
+                if (self.modeResource(advertised, head.current_mode_index)) |mode| {
+                    resource.sendCurrentMode(mode);
+                }
                 resource.sendTransform(.normal);
                 resource.sendScale(scaleToFixed(head.scale));
+            }
+        } else if (head.enabled and mode_changed) {
+            if (self.modeResource(advertised, head.current_mode_index)) |mode| {
+                resource.sendCurrentMode(mode);
             }
         }
         if (head.enabled and (enabled_changed or position_changed)) {
@@ -321,39 +338,56 @@ fn managerDestroyed(_: *zwlr.OutputManagerV1, manager: *ManagerResource) void {
 
 fn createHeadResource(self: *Self, manager: *ManagerResource, head: *Head) !void {
     const manager_resource = manager.resource.?;
+    try self.head_resources.ensureUnusedCapacity(self.allocator, 1);
+    try self.mode_resources.ensureUnusedCapacity(self.allocator, head.modes.len);
     const head_resource = try zwlr.OutputHeadV1.create(
         manager_resource.getClient(),
         manager_resource.getVersion(),
         0,
     );
     errdefer head_resource.destroy();
-    const mode_resource = try zwlr.OutputModeV1.create(
-        manager_resource.getClient(),
-        @min(manager_resource.getVersion(), zwlr.OutputModeV1.generated_version),
-        0,
-    );
-    errdefer mode_resource.destroy();
-    const mode = try self.allocator.create(ModeResource);
-    errdefer self.allocator.destroy(mode);
-    mode.* = .{
-        .head = head,
-        .resource = mode_resource,
-        .finished = false,
-    };
-    try self.mode_resources.append(self.allocator, mode);
-    errdefer _ = self.mode_resources.pop();
     const managed = try self.allocator.create(HeadResource);
     errdefer self.allocator.destroy(managed);
     managed.* = .{
         .head = head,
         .resource = head_resource,
-        .mode = mode,
         .finished = false,
     };
-    try self.head_resources.append(self.allocator, managed);
+
+    const modes = try self.allocator.alloc(*ModeResource, head.modes.len);
+    defer self.allocator.free(modes);
+    var created_modes: usize = 0;
+    errdefer for (modes[0..created_modes]) |mode| {
+        mode.resource.?.destroy();
+        self.allocator.destroy(mode);
+    };
+    for (head.modes, 0..) |_, mode_index| {
+        const resource = try zwlr.OutputModeV1.create(
+            manager_resource.getClient(),
+            @min(manager_resource.getVersion(), zwlr.OutputModeV1.generated_version),
+            0,
+        );
+        const mode = self.allocator.create(ModeResource) catch |err| {
+            resource.destroy();
+            return err;
+        };
+        mode.* = .{
+            .owner = managed,
+            .mode_index = mode_index,
+            .resource = resource,
+            .finished = false,
+        };
+        modes[mode_index] = mode;
+        created_modes += 1;
+    }
+
+    self.head_resources.appendAssumeCapacity(managed);
+    for (modes) |mode| self.mode_resources.appendAssumeCapacity(mode);
 
     head_resource.setHandler(*HeadResource, headRequest, headDestroyed, managed);
-    mode_resource.setHandler(*ModeResource, modeRequest, modeDestroyed, mode);
+    for (modes) |mode| {
+        mode.resource.?.setHandler(*ModeResource, modeRequest, modeDestroyed, mode);
+    }
     manager_resource.sendHead(head_resource);
     head_resource.sendName(head.name);
     head_resource.sendDescription(head.description);
@@ -361,13 +395,18 @@ fn createHeadResource(self: *Self, manager: *ManagerResource, head: *Head) !void
         @intCast(head.physical_size.width),
         @intCast(head.physical_size.height),
     );
-    head_resource.sendMode(mode_resource);
-    mode_resource.sendSize(@intCast(head.size.width), @intCast(head.size.height));
-    if (head.refresh_millihertz > 0) mode_resource.sendRefresh(head.refresh_millihertz);
-    mode_resource.sendPreferred();
+    for (head.modes, modes) |mode, advertised| {
+        const resource = advertised.resource.?;
+        head_resource.sendMode(resource);
+        const size = mode.size();
+        resource.sendSize(@intCast(size.width), @intCast(size.height));
+        const refresh = mode.refreshMillihertz();
+        if (refresh > 0) resource.sendRefresh(refresh);
+        if (mode.preferred) resource.sendPreferred();
+    }
     head_resource.sendEnabled(@intFromBool(head.enabled));
     if (head.enabled) {
-        head_resource.sendCurrentMode(mode_resource);
+        head_resource.sendCurrentMode(modes[head.current_mode_index].resource.?);
         head_resource.sendPosition(head.x, head.y);
         head_resource.sendTransform(.normal);
         head_resource.sendScale(scaleToFixed(head.scale));
@@ -406,6 +445,18 @@ fn modeRequest(
 
 fn modeDestroyed(_: *zwlr.OutputModeV1, managed: *ModeResource) void {
     managed.resource = null;
+}
+
+fn modeResource(
+    self: *Self,
+    owner: *HeadResource,
+    mode_index: usize,
+) ?*zwlr.OutputModeV1 {
+    for (self.mode_resources.items) |mode| {
+        if (mode.owner != owner or mode.mode_index != mode_index or mode.finished) continue;
+        return mode.resource;
+    }
+    return null;
 }
 
 fn createConfiguration(
@@ -557,11 +608,12 @@ fn configuredHeadRequest(
                 resource.postError(.invalid_mode, "invalid output mode");
                 return;
             }));
-            if (mode.head != configured.head or mode.finished) {
+            if (mode.owner.head != configured.head or mode.finished) {
                 resource.postError(.invalid_mode, "mode does not belong to output head");
                 return;
             }
             configured.mode_set = true;
+            configured.mode_index = mode.mode_index;
         },
         .set_custom_mode => |set| {
             if (configured.mode_set or configured.custom_mode_set) {
@@ -596,15 +648,8 @@ fn configuredHeadRequest(
                 resource.postError(.already_set, "output scale has already been set");
                 return;
             }
-            const scale = scaleFromFixed(set.scale) catch {
+            _ = scaleFromFixed(set.scale) catch {
                 resource.postError(.invalid_scale, "output scale is not supported");
-                return;
-            };
-            _ = scale.logicalSize(.{
-                .width = configured.head.size.width,
-                .height = configured.head.size.height,
-            }) catch {
-                resource.postError(.invalid_scale, "output scale produces invalid dimensions");
                 return;
             };
             configured.scale = set.scale;
@@ -676,6 +721,15 @@ fn finish(configuration: *Configuration, apply: bool) void {
             configuration.resource.sendFailed();
             return;
         }
+        const mode_index = configured.mode_index orelse configured.head.current_mode_index;
+        const scale = if (configured.scale) |value|
+            scaleFromFixed(value) catch unreachable
+        else
+            configured.head.scale;
+        if (!modeScaleValid(configured.head.modes[mode_index], scale)) {
+            configuration.resource.sendFailed();
+            return;
+        }
     }
     if (enabled_count == 0) {
         configuration.resource.sendFailed();
@@ -689,6 +743,7 @@ fn finish(configuration: *Configuration, apply: bool) void {
         const x = if (configured.position) |position| position.x else head.x;
         const y = if (configured.position) |position| position.y else head.y;
         const scale = if (configured.scale) |value| scaleFromFixed(value) catch unreachable else head.scale;
+        const mode_index = configured.mode_index orelse head.current_mode_index;
         changes.append(manager.allocator, .{
             .output = head.output.?,
             .was_enabled = head.enabled,
@@ -696,9 +751,11 @@ fn finish(configuration: *Configuration, apply: bool) void {
             .old_x = head.x,
             .old_y = head.y,
             .old_scale = head.scale,
+            .old_mode_index = head.current_mode_index,
             .x = x,
             .y = y,
             .scale = scale,
+            .mode_index = mode_index,
         }) catch {
             configuration.resource.postNoMemory();
             return;
@@ -719,6 +776,7 @@ fn finish(configuration: *Configuration, apply: bool) void {
         const enabled_changed = head.enabled != change.enabled;
         const position_changed = head.x != change.x or head.y != change.y;
         const scale_changed = head.scale.numerator != change.scale.numerator;
+        const mode_changed = head.current_mode_index != change.mode_index;
         if (enabled_changed) {
             head.enabled = change.enabled;
             state_changed = true;
@@ -727,23 +785,33 @@ fn finish(configuration: *Configuration, apply: bool) void {
                 const resource = advertised.resource.?;
                 resource.sendEnabled(@intFromBool(head.enabled));
                 if (head.enabled) {
-                    if (advertised.mode.resource) |mode| resource.sendCurrentMode(mode);
+                    if (manager.modeResource(advertised, change.mode_index)) |mode| {
+                        resource.sendCurrentMode(mode);
+                    }
                     resource.sendPosition(change.x, change.y);
                     resource.sendTransform(.normal);
                     resource.sendScale(scaleToFixed(change.scale));
                 }
             }
-        } else if (head.enabled and (position_changed or scale_changed)) {
+        } else if (position_changed or scale_changed or mode_changed) {
             state_changed = true;
-            for (manager.head_resources.items) |advertised| {
-                if (advertised.head != head or advertised.resource == null or advertised.finished) continue;
-                if (position_changed) advertised.resource.?.sendPosition(change.x, change.y);
-                if (scale_changed) advertised.resource.?.sendScale(scaleToFixed(change.scale));
+            if (head.enabled) {
+                for (manager.head_resources.items) |advertised| {
+                    if (advertised.head != head or advertised.resource == null or advertised.finished) continue;
+                    if (position_changed) advertised.resource.?.sendPosition(change.x, change.y);
+                    if (scale_changed) advertised.resource.?.sendScale(scaleToFixed(change.scale));
+                    if (mode_changed) {
+                        if (manager.modeResource(advertised, change.mode_index)) |mode| {
+                            advertised.resource.?.sendCurrentMode(mode);
+                        }
+                    }
+                }
             }
         }
         head.x = change.x;
         head.y = change.y;
         head.scale = change.scale;
+        head.current_mode_index = change.mode_index;
     }
     if (state_changed) manager.changed();
     configuration.resource.sendSucceeded();
@@ -763,6 +831,11 @@ fn scaleToFixed(scale: render.Scale) wl.Fixed {
         render.Scale.denominator;
     std.debug.assert(raw <= std.math.maxInt(i32));
     return @enumFromInt(@as(i32, @intCast(raw)));
+}
+
+fn modeScaleValid(mode: DrmOutput.Mode, scale: render.Scale) bool {
+    _ = scale.logicalSize(mode.size()) catch return false;
+    return true;
 }
 
 fn testDeviceFd(_: *anyopaque) ?std.posix.fd_t {
@@ -792,6 +865,19 @@ test "output scales round-trip between fixed and v120 units" {
     try std.testing.expectError(error.InvalidScale, scaleFromFixed(wl.Fixed.fromInt(0)));
 }
 
+test "output scale validation uses the selected mode" {
+    var current = std.mem.zeroes(DrmOutput.Mode);
+    current.value.hdisplay = 3840;
+    current.value.vdisplay = 2160;
+    var selected = std.mem.zeroes(DrmOutput.Mode);
+    selected.value.hdisplay = 720;
+    selected.value.vdisplay = 480;
+    const scale: render.Scale = .{ .numerator = 120_000 };
+
+    try std.testing.expect(modeScaleValid(current, scale));
+    try std.testing.expect(!modeScaleValid(selected, scale));
+}
+
 test "connected head storage survives disable and reconnect lifetimes" {
     const display = try wl.Server.create();
     defer display.destroy();
@@ -811,6 +897,12 @@ test "connected head storage survives disable and reconnect lifetimes" {
     output.size = .{ .width = 1920, .height = 1080 };
     output.physical_size = .{ .width = 300, .height = 170 };
     output.mode.vrefresh = 60;
+    output.modes = try std.testing.allocator.alloc(DrmOutput.Mode, 2);
+    output.modes[0] = .{ .value = output.mode, .preferred = true };
+    output.modes[1] = .{ .value = output.mode, .preferred = false };
+    output.modes[1].value.hdisplay = 1280;
+    output.modes[1].value.vdisplay = 720;
+    output.mode_index = 0;
 
     var manager: Self = undefined;
     try manager.init(
@@ -823,6 +915,8 @@ test "connected head storage survives disable and reconnect lifetimes" {
 
     try std.testing.expectEqual(@as(usize, 1), manager.heads.items.len);
     try std.testing.expect(manager.heads.items[0].connected);
+    try std.testing.expectEqual(@as(usize, 2), manager.heads.items[0].modes.len);
+    try std.testing.expectEqual(@as(usize, 0), manager.heads.items[0].current_mode_index);
     manager.removeHead(&output);
     try std.testing.expect(!manager.heads.items[0].connected);
     try manager.addHead(&output);

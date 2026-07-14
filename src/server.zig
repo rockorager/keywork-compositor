@@ -457,6 +457,8 @@ fn addRenderOutput(
         .size = render_output.backend.size(),
         .mode_size = render_output.backend.modeSize(),
         .physical_size = render_output.backend.physicalSize(),
+        .mode_preferred = render_output.backend.modePreferred(),
+        .refresh_millihertz = render_output.backend.refreshMillihertz(),
         .scale = render_output.backend.clientScale(),
         .preferred_scale = render_output.backend.renderScale(),
         .name = render_output.backend.name(config.name),
@@ -587,12 +589,20 @@ fn setDrmOutputConfiguration(
     drm_output.scale = scale;
     const render_output = self.findDrmRenderOutput(drm_output) orelse return;
     const protocol_output = self.outputs.get(render_output.output.protocol_id).?;
+    const old_logical_size = protocol_output.logicalSize();
     protocol_output.setPosition(position);
+    const mode_changed = protocol_output.setMode(
+        render_output.output.backend.size(),
+        render_output.output.backend.modeSize(),
+        drm_output.refreshMillihertz(),
+        render_output.output.backend.modePreferred(),
+    );
     protocol_output.setScale(
         render_output.output.backend.size(),
         render_output.output.backend.clientScale(),
         render_output.output.backend.renderScale(),
     );
+    const dimensions_changed = !std.meta.eql(old_logical_size, protocol_output.logicalSize());
     const logical_size = render_output.output.backend.size();
     log.info(
         "configured {s} at {d},{d}: logical {d}x{d}, scale {d}/{d}",
@@ -610,9 +620,9 @@ fn setDrmOutputConfiguration(
     self.window_manager.outputStateChanged(
         render_output.output.protocol_id,
         position_changed,
-        scale_changed,
+        dimensions_changed,
     );
-    if (scale_changed and std.meta.eql(render_output.id, self.primary_render_output) and
+    if ((scale_changed or mode_changed) and std.meta.eql(render_output.id, self.primary_render_output) and
         self.native_input_initialized)
     {
         self.native_input.retarget(
@@ -620,7 +630,7 @@ fn setDrmOutputConfiguration(
             backendListener(render_output.output),
         );
     }
-    if (position_changed or scale_changed) self.layer_shell.refresh();
+    if (position_changed or dimensions_changed) self.layer_shell.refresh();
 }
 
 fn enableDrmOutput(self: *Self, drm_output: *DrmOutput, position: Output.Position) !void {
@@ -711,6 +721,13 @@ fn drmOutputRemoving(context: *anyopaque, drm_output: *DrmOutput) void {
 fn applyOutputConfiguration(context: *anyopaque, changes: []const OutputManagement.Change) bool {
     const self: *Self = @ptrCast(@alignCast(context));
     for (changes) |change| {
+        if (change.old_mode_index == change.mode_index) continue;
+        self.drm_device.setOutputMode(change.output, change.mode_index) catch {
+            rollbackOutputConfiguration(self, changes);
+            return false;
+        };
+    }
+    for (changes) |change| {
         if (change.was_enabled or !change.enabled) continue;
         change.output.scale = change.scale;
         self.enableDrmOutput(change.output, .{ .x = change.x, .y = change.y }) catch {
@@ -747,6 +764,11 @@ fn rollbackOutputConfiguration(self: *Self, changes: []const OutputManagement.Ch
             change.output,
             .{ .x = change.old_x, .y = change.old_y },
         ) catch return self.terminate();
+    }
+    for (changes) |change| {
+        if (change.output.currentModeIndex() == change.old_mode_index) continue;
+        self.drm_device.setOutputMode(change.output, change.old_mode_index) catch
+            return self.terminate();
     }
     for (changes) |change| {
         if (change.was_enabled) self.setDrmOutputConfiguration(
