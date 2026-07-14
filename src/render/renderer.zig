@@ -58,7 +58,7 @@ pub const Renderer = union(enum) {
             return self.renderDirect(frame, target);
         }
 
-        const physical_size = frame.scale.apply(frame.size) catch return error.InvalidTarget;
+        const physical_size = targetSize(target);
         for (frame.commands) |command| {
             const local_command = translateCommand(command, frame.origin);
             const commands = [_]render_types.Command{if (scaled)
@@ -86,6 +86,13 @@ pub const Renderer = union(enum) {
         };
     }
 };
+
+fn targetSize(target: Target) render_types.Size {
+    return switch (target) {
+        .cpu => |buffer| buffer.size,
+        .vulkan => |vulkan| vulkan.readback.size,
+    };
+}
 
 fn translateCommand(
     command: render_types.Command,
@@ -271,6 +278,27 @@ test "renderer scales logical commands into a physical target" {
     try std.testing.expectEqual(@as(u32, 0xff000000), output.pixel(1, 1));
     try std.testing.expectEqual(@as(u32, 0xffff0000), output.pixel(2, 1));
     try std.testing.expectEqual(@as(u32, 0xff000000), output.pixel(2, 2));
+}
+
+test "renderer fills a physical target when fractional logical size is truncated" {
+    var output = try headless.init(std.testing.allocator, .{ .width = 10, .height = 1 });
+    defer output.deinit();
+    const commands = [_]render_types.Command{
+        .{ .clear = render_types.Color.rgba(10, 20, 30, 255) },
+    };
+
+    var renderer = try Renderer.init(std.testing.allocator, .cpu);
+    defer renderer.deinit();
+    try renderer.render(
+        .{
+            .size = .{ .width = 7, .height = 1 },
+            .commands = &commands,
+            .scale = .{ .numerator = 156 },
+        },
+        .{ .cpu = output.target() },
+    );
+
+    try std.testing.expectEqual(@as(u32, 0xff0a141e), output.pixel(9, 0));
 }
 
 test "renderer translates global commands into an output-local target" {

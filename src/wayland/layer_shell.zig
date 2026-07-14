@@ -106,6 +106,10 @@ pub fn setDefaultOutput(self: *Self, output_id: OutputLayout.Id) void {
     self.arrange();
 }
 
+pub fn refresh(self: *Self) void {
+    self.arrange();
+}
+
 pub fn setPolicyListener(self: *Self, listener: PolicyListener) void {
     self.policy_listener = listener;
     self.notifyPolicy();

@@ -14,6 +14,7 @@ allocator: std.mem.Allocator,
 global: *wl.Global,
 position: Position,
 size: render.Size,
+mode_size: render.Size,
 physical_size: render.Size,
 scale: i32,
 preferred_scale: render.Scale,
@@ -35,6 +36,7 @@ pub const Position = struct {
 pub const Config = struct {
     position: Position = .{},
     size: render.Size,
+    mode_size: ?render.Size = null,
     physical_size: render.Size,
     scale: u32,
     preferred_scale: render.Scale = .{},
@@ -62,8 +64,11 @@ pub fn init(
     config: Config,
     surfaces: *Surface.Store,
 ) Error!void {
+    const mode_size = config.mode_size orelse config.size;
     if (config.size.width == 0 or config.size.height == 0 or
         config.size.width > std.math.maxInt(i32) or config.size.height > std.math.maxInt(i32) or
+        mode_size.width == 0 or mode_size.height == 0 or
+        mode_size.width > std.math.maxInt(i32) or mode_size.height > std.math.maxInt(i32) or
         config.scale == 0 or config.scale > std.math.maxInt(i32) or
         config.preferred_scale.numerator == 0 or
         config.physical_size.width == 0 or config.physical_size.height == 0 or
@@ -87,6 +92,7 @@ pub fn init(
         .global = try wl.Global.create(display, wl.Output, 4, *Self, self, bind),
         .position = config.position,
         .size = config.size,
+        .mode_size = mode_size,
         .physical_size = config.physical_size,
         .scale = @intCast(config.scale),
         .preferred_scale = config.preferred_scale,
@@ -146,6 +152,26 @@ pub fn setPosition(self: *Self, position: Position) void {
     self.position = position;
     for (self.resources.items) |resource| {
         self.sendGeometry(resource);
+        if (resource.getVersion() >= wl.Output.done_since_version) resource.sendDone();
+    }
+}
+
+pub fn setScale(
+    self: *Self,
+    size: render.Size,
+    scale: u32,
+    preferred_scale: render.Scale,
+) void {
+    std.debug.assert(size.width > 0 and size.height > 0);
+    std.debug.assert(scale > 0 and scale <= std.math.maxInt(i32));
+    std.debug.assert(preferred_scale.numerator > 0);
+    const client_scale_changed = self.scale != scale;
+    self.size = size;
+    self.scale = @intCast(scale);
+    self.preferred_scale = preferred_scale;
+    if (!client_scale_changed) return;
+    for (self.resources.items) |resource| {
+        if (resource.getVersion() >= wl.Output.scale_since_version) resource.sendScale(self.scale);
         if (resource.getVersion() >= wl.Output.done_since_version) resource.sendDone();
     }
 }
@@ -291,8 +317,8 @@ fn sendGeometry(self: *const Self, resource: *wl.Output) void {
 fn sendMode(self: *const Self, resource: *wl.Output) void {
     resource.sendMode(
         .{ .current = true, .preferred = true },
-        @intCast(self.size.width),
-        @intCast(self.size.height),
+        @intCast(self.mode_size.width),
+        @intCast(self.mode_size.height),
         self.refresh_millihertz,
     );
 }

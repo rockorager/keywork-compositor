@@ -86,9 +86,17 @@ pub fn deinit(self: *Self) void {
 
 pub fn size(self: *const Self) render.Size {
     return switch (self.backend) {
-        .drm => |output| output.size,
+        .drm => |output| output.logicalSize(),
         .headless => |output| output.size,
         .nested => |output| output.size,
+    };
+}
+
+pub fn modeSize(self: *const Self) render.Size {
+    return switch (self.backend) {
+        .drm => |output| output.size,
+        .headless => |output| output.size,
+        .nested => |output| output.buffer_size,
     };
 }
 
@@ -102,7 +110,7 @@ pub fn physicalSize(self: *const Self) render.Size {
 
 pub fn renderScale(self: *const Self) render.Scale {
     return switch (self.backend) {
-        .drm => .{},
+        .drm => |output| output.scale,
         .headless => .{},
         .nested => |output| output.render_scale,
     };
@@ -110,7 +118,7 @@ pub fn renderScale(self: *const Self) render.Scale {
 
 pub fn clientScale(self: *const Self) u32 {
     return switch (self.backend) {
-        .drm => 1,
+        .drm => |output| output.scale.ceil() catch unreachable,
         .headless => 1,
         .nested => |output| output.client_scale,
     };

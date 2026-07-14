@@ -372,6 +372,25 @@ pub fn setDefaultOutput(self: *Self, output_id: OutputLayout.Id) void {
     self.layer_area = self.layer_shell.usableArea();
 }
 
+pub fn outputStateChanged(
+    self: *Self,
+    output_id: OutputLayout.Id,
+    position_changed: bool,
+    dimensions_changed: bool,
+) void {
+    const resource = self.outputResource(output_id) orelse return;
+    const output = self.outputs.get(output_id) orelse return;
+    if (position_changed) {
+        const position = output.logicalPosition();
+        resource.sendPosition(position.x, position.y);
+    }
+    if (dimensions_changed) {
+        const size = output.logicalSize();
+        resource.sendDimensions(@intCast(size.width), @intCast(size.height));
+    }
+    if (position_changed or dimensions_changed) self.requestManage();
+}
+
 fn outputResource(self: *Self, output_id: OutputLayout.Id) ?*river.OutputV1 {
     for (self.output_resources.items) |output_resource| {
         if (output_resource.owner_generation != self.session_generation) continue;

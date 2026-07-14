@@ -23,6 +23,7 @@ buffers: [buffer_count]Buffer,
 mode: c.drmModeModeInfo,
 size: render.Size,
 physical_size: render.Size,
+scale: render.Scale,
 connector_id: u32,
 crtc_id: u32,
 connector_name: [32]u8,
@@ -87,6 +88,7 @@ pub fn init(
         .mode = std.mem.zeroes(c.drmModeModeInfo),
         .size = .{ .width = 0, .height = 0 },
         .physical_size = .{ .width = 0, .height = 0 },
+        .scale = .{},
         .connector_id = 0,
         .crtc_id = 0,
         .connector_name = undefined,
@@ -129,6 +131,10 @@ pub fn refreshMillihertz(self: *const Self) i32 {
         @as(u64, self.mode.vrefresh) * 1000,
         std.math.maxInt(i32),
     ));
+}
+
+pub fn logicalSize(self: *const Self) render.Size {
+    return self.scale.logicalSize(self.size) catch unreachable;
 }
 
 pub fn ready(self: *const Self) bool {
@@ -574,6 +580,18 @@ fn restoreCrtc(fd: std.posix.fd_t, connector_id: u32, old_crtc: *c.drmModeCrtc) 
     }
 }
 
+fn testDeviceFd(_: *anyopaque) ?std.posix.fd_t {
+    return null;
+}
+
+fn testDeviceActive(_: *anyopaque) bool {
+    return false;
+}
+
+fn testDeviceFail(_: *anyopaque, _: anyerror) void {
+    unreachable;
+}
+
 test "preferred DRM mode wins over the first mode" {
     var modes = [_]c.drmModeModeInfo{
         std.mem.zeroes(c.drmModeModeInfo),
@@ -589,6 +607,26 @@ test "DRM mode refresh converts to presentation period" {
     try std.testing.expectEqual(@as(u32, 20_000_000), refreshNanoseconds(mode));
     mode.vrefresh = 0;
     try std.testing.expectEqual(presentation.nominal_refresh_nanoseconds, refreshNanoseconds(mode));
+}
+
+test "DRM scale preserves mode pixels and derives logical size" {
+    var context: u8 = 0;
+    var output: Self = undefined;
+    output.init(std.testing.io, .{
+        .context = &context,
+        .fd = testDeviceFd,
+        .active = testDeviceActive,
+        .fail = testDeviceFail,
+    });
+    defer output.deinit();
+    output.size = .{ .width = 3840, .height = 2160 };
+    output.scale = .{ .numerator = 150 };
+
+    try std.testing.expectEqual(
+        render.Size{ .width = 3072, .height = 1728 },
+        output.logicalSize(),
+    );
+    try std.testing.expectEqual(render.Size{ .width = 3840, .height = 2160 }, output.size);
 }
 
 test "DRM discovery only accepts primary nodes" {

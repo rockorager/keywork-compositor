@@ -448,6 +448,7 @@ fn addRenderOutput(
     render_output.protocol_id = try self.outputs.add(.{
         .position = config.position,
         .size = render_output.backend.size(),
+        .mode_size = render_output.backend.modeSize(),
         .physical_size = render_output.backend.physicalSize(),
         .scale = render_output.backend.clientScale(),
         .preferred_scale = render_output.backend.renderScale(),
@@ -558,18 +559,58 @@ fn findDrmRenderOutput(self: *Self, drm_output: *DrmOutput) ?struct {
     return null;
 }
 
-fn setDrmOutputPosition(self: *Self, drm_output: *DrmOutput, position: Output.Position) void {
+fn setDrmOutputConfiguration(
+    self: *Self,
+    drm_output: *DrmOutput,
+    position: Output.Position,
+    scale: render.Scale,
+) void {
+    const position_changed = drm_output.logical_x != position.x or drm_output.logical_y != position.y;
+    const scale_changed = drm_output.scale.numerator != scale.numerator;
     drm_output.logical_x = position.x;
     drm_output.logical_y = position.y;
+    drm_output.scale = scale;
     const render_output = self.findDrmRenderOutput(drm_output) orelse return;
     const protocol_output = self.outputs.get(render_output.output.protocol_id).?;
     protocol_output.setPosition(position);
+    protocol_output.setScale(
+        render_output.output.backend.size(),
+        render_output.output.backend.clientScale(),
+        render_output.output.backend.renderScale(),
+    );
+    const logical_size = render_output.output.backend.size();
+    log.info(
+        "configured {s} at {d},{d}: logical {d}x{d}, scale {d}/{d}",
+        .{
+            drm_output.name(),
+            position.x,
+            position.y,
+            logical_size.width,
+            logical_size.height,
+            scale.numerator,
+            render.Scale.denominator,
+        },
+    );
     self.xdg_output.refresh(protocol_output);
+    self.window_manager.outputStateChanged(
+        render_output.output.protocol_id,
+        position_changed,
+        scale_changed,
+    );
+    if (scale_changed and std.meta.eql(render_output.id, self.primary_render_output) and
+        self.native_input_initialized)
+    {
+        self.native_input.retarget(
+            render_output.output.backend.size(),
+            backendListener(render_output.output),
+        );
+    }
+    if (position_changed or scale_changed) self.layer_shell.refresh();
 }
 
 fn enableDrmOutput(self: *Self, drm_output: *DrmOutput, position: Output.Position) !void {
     if (drm_output.enabled) {
-        self.setDrmOutputPosition(drm_output, position);
+        self.setDrmOutputConfiguration(drm_output, position, drm_output.scale);
         return;
     }
     try self.drm_device.setOutputEnabled(drm_output, true);
@@ -656,6 +697,7 @@ fn applyOutputConfiguration(context: *anyopaque, changes: []const OutputManageme
     const self: *Self = @ptrCast(@alignCast(context));
     for (changes) |change| {
         if (change.was_enabled or !change.enabled) continue;
+        change.output.scale = change.scale;
         self.enableDrmOutput(change.output, .{ .x = change.x, .y = change.y }) catch {
             rollbackOutputConfiguration(self, changes);
             return false;
@@ -663,9 +705,10 @@ fn applyOutputConfiguration(context: *anyopaque, changes: []const OutputManageme
     }
 
     for (changes) |change| {
-        if (change.enabled) self.setDrmOutputPosition(
+        if (change.enabled) self.setDrmOutputConfiguration(
             change.output,
             .{ .x = change.x, .y = change.y },
+            change.scale,
         );
     }
     for (changes) |change| {
@@ -675,6 +718,7 @@ fn applyOutputConfiguration(context: *anyopaque, changes: []const OutputManageme
             return false;
         };
     }
+    requestRepaint(self);
     return true;
 }
 
@@ -683,21 +727,27 @@ fn rollbackOutputConfiguration(self: *Self, changes: []const OutputManagement.Ch
     // head never violates the compositor's one-enabled-output invariant.
     for (changes) |change| {
         if (!change.was_enabled or change.output.enabled) continue;
+        change.output.scale = change.old_scale;
         self.enableDrmOutput(
             change.output,
             .{ .x = change.old_x, .y = change.old_y },
         ) catch return self.terminate();
     }
     for (changes) |change| {
-        if (change.was_enabled) self.setDrmOutputPosition(
+        if (change.was_enabled) self.setDrmOutputConfiguration(
             change.output,
             .{ .x = change.old_x, .y = change.old_y },
+            change.old_scale,
         );
     }
     for (changes) |change| {
         if (change.was_enabled or !change.output.enabled) continue;
         self.disableDrmOutput(change.output) catch return self.terminate();
     }
+    for (changes) |change| {
+        if (!change.output.enabled) change.output.scale = change.old_scale;
+    }
+    requestRepaint(self);
 }
 
 fn drmDeviceFailed(context: *anyopaque) void {

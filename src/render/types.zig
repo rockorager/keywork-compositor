@@ -35,12 +35,28 @@ pub const Scale = struct {
         };
     }
 
+    pub fn logicalSize(self: Scale, pixel_size: Size) error{ InvalidScale, InvalidDimensions, Overflow }!Size {
+        if (self.numerator == 0) return error.InvalidScale;
+        const width = try self.logicalDimension(pixel_size.width);
+        const height = try self.logicalDimension(pixel_size.height);
+        if (width == 0 or height == 0) return error.InvalidDimensions;
+        return .{ .width = width, .height = height };
+    }
+
     fn applyDimension(self: Scale, value: u32) error{Overflow}!u32 {
         const product = std.math.mul(u64, value, self.numerator) catch
             return error.Overflow;
         const rounded = std.math.add(u64, product, denominator / 2) catch
             return error.Overflow;
         const result = rounded / denominator;
+        if (result > std.math.maxInt(u32)) return error.Overflow;
+        return @intCast(result);
+    }
+
+    fn logicalDimension(self: Scale, value: u32) error{Overflow}!u32 {
+        const product = std.math.mul(u64, value, denominator) catch
+            return error.Overflow;
+        const result = product / self.numerator;
         if (result > std.math.maxInt(u32)) return error.Overflow;
         return @intCast(result);
     }
@@ -214,6 +230,18 @@ test "fractional scale rounds physical dimensions halfway up" {
     try std.testing.expectEqual(
         Size{ .width = 2, .height = 5 },
         try scale.apply(.{ .width = 1, .height = 3 }),
+    );
+}
+
+test "fractional scale floors logical output dimensions" {
+    const scale: Scale = .{ .numerator = 156 };
+    try std.testing.expectEqual(
+        Size{ .width = 1476, .height = 830 },
+        try scale.logicalSize(.{ .width = 1920, .height = 1080 }),
+    );
+    try std.testing.expectError(
+        error.InvalidDimensions,
+        (Scale{ .numerator = 240 }).logicalSize(.{ .width = 1, .height = 1 }),
     );
 }
 

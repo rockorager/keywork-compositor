@@ -5,6 +5,7 @@ const Self = @This();
 const std = @import("std");
 const wayland = @import("wayland");
 const DrmOutput = @import("../backend/drm.zig");
+const render = @import("../render/types.zig");
 
 const wl = wayland.server.wl;
 const zwlr = wayland.server.zwlr;
@@ -25,8 +26,10 @@ pub const Change = struct {
     enabled: bool,
     old_x: i32,
     old_y: i32,
+    old_scale: render.Scale,
     x: i32,
     y: i32,
+    scale: render.Scale,
 };
 
 pub const Listener = struct {
@@ -41,6 +44,7 @@ const Head = struct {
     enabled: bool,
     x: i32,
     y: i32,
+    scale: render.Scale,
     size: struct { width: u32, height: u32 },
     physical_size: struct { width: u32, height: u32 },
     refresh_millihertz: i32,
@@ -169,6 +173,7 @@ fn addHeadStorage(self: *Self, output: *DrmOutput) !*Head {
         .enabled = output.enabled,
         .x = output.logical_x,
         .y = output.logical_y,
+        .scale = output.scale,
         .size = .{ .width = output.size.width, .height = output.size.height },
         .physical_size = .{
             .width = output.physical_size.width,
@@ -201,10 +206,12 @@ pub fn syncHead(self: *Self, output: *DrmOutput) void {
     const head = self.findHead(output) orelse return;
     const enabled_changed = head.enabled != output.enabled;
     const position_changed = head.x != output.logical_x or head.y != output.logical_y;
-    if (!enabled_changed and !position_changed) return;
+    const scale_changed = head.scale.numerator != output.scale.numerator;
+    if (!enabled_changed and !position_changed and !scale_changed) return;
     head.enabled = output.enabled;
     head.x = output.logical_x;
     head.y = output.logical_y;
+    head.scale = output.scale;
     for (self.head_resources.items) |advertised| {
         if (advertised.head != head or advertised.resource == null or advertised.finished) continue;
         const resource = advertised.resource.?;
@@ -213,11 +220,14 @@ pub fn syncHead(self: *Self, output: *DrmOutput) void {
             if (head.enabled) {
                 if (advertised.mode.resource) |mode| resource.sendCurrentMode(mode);
                 resource.sendTransform(.normal);
-                resource.sendScale(wl.Fixed.fromDouble(1));
+                resource.sendScale(scaleToFixed(head.scale));
             }
         }
         if (head.enabled and (enabled_changed or position_changed)) {
             resource.sendPosition(head.x, head.y);
+        }
+        if (head.enabled and !enabled_changed and scale_changed) {
+            resource.sendScale(scaleToFixed(head.scale));
         }
     }
     self.changed();
@@ -340,7 +350,7 @@ fn createHeadResource(self: *Self, manager: *ManagerResource, head: *Head) !void
         head_resource.sendCurrentMode(mode_resource);
         head_resource.sendPosition(head.x, head.y);
         head_resource.sendTransform(.normal);
-        head_resource.sendScale(wl.Fixed.fromDouble(1));
+        head_resource.sendScale(scaleToFixed(head.scale));
     }
     if (head_resource.getVersion() >= 2) {
         head_resource.sendMake("keywork");
@@ -565,10 +575,17 @@ fn configuredHeadRequest(
                 resource.postError(.already_set, "output scale has already been set");
                 return;
             }
-            if (set.scale.toDouble() <= 0) {
-                resource.postError(.invalid_scale, "output scale must be positive");
+            const scale = scaleFromFixed(set.scale) catch {
+                resource.postError(.invalid_scale, "output scale is not supported");
                 return;
-            }
+            };
+            _ = scale.logicalSize(.{
+                .width = configured.head.size.width,
+                .height = configured.head.size.height,
+            }) catch {
+                resource.postError(.invalid_scale, "output scale produces invalid dimensions");
+                return;
+            };
             configured.scale = set.scale;
         },
         .set_adaptive_sync => |set| {
@@ -633,7 +650,6 @@ fn finish(configuration: *Configuration, apply: bool) void {
         enabled_count += 1;
         if (configured.custom_mode_set or
             (configured.transform != null and configured.transform.? != .normal) or
-            (configured.scale != null and configured.scale.?.toDouble() != 1) or
             (configured.adaptive_sync != null and configured.adaptive_sync.? != .disabled))
         {
             configuration.resource.sendFailed();
@@ -651,14 +667,17 @@ fn finish(configuration: *Configuration, apply: bool) void {
         const head = configured.head;
         const x = if (configured.position) |position| position.x else head.x;
         const y = if (configured.position) |position| position.y else head.y;
+        const scale = if (configured.scale) |value| scaleFromFixed(value) catch unreachable else head.scale;
         changes.append(manager.allocator, .{
             .output = head.output.?,
             .was_enabled = head.enabled,
             .enabled = configured.enabled,
             .old_x = head.x,
             .old_y = head.y,
+            .old_scale = head.scale,
             .x = x,
             .y = y,
+            .scale = scale,
         }) catch {
             configuration.resource.postNoMemory();
             return;
@@ -676,7 +695,10 @@ fn finish(configuration: *Configuration, apply: bool) void {
     var state_changed = false;
     for (changes.items) |change| {
         const head = manager.findHead(change.output) orelse continue;
-        if (head.enabled != change.enabled) {
+        const enabled_changed = head.enabled != change.enabled;
+        const position_changed = head.x != change.x or head.y != change.y;
+        const scale_changed = head.scale.numerator != change.scale.numerator;
+        if (enabled_changed) {
             head.enabled = change.enabled;
             state_changed = true;
             for (manager.head_resources.items) |advertised| {
@@ -687,22 +709,39 @@ fn finish(configuration: *Configuration, apply: bool) void {
                     if (advertised.mode.resource) |mode| resource.sendCurrentMode(mode);
                     resource.sendPosition(change.x, change.y);
                     resource.sendTransform(.normal);
-                    resource.sendScale(wl.Fixed.fromDouble(1));
+                    resource.sendScale(scaleToFixed(change.scale));
                 }
             }
-        } else if (head.enabled and (head.x != change.x or head.y != change.y)) {
+        } else if (head.enabled and (position_changed or scale_changed)) {
             state_changed = true;
             for (manager.head_resources.items) |advertised| {
-                if (advertised.head == head and advertised.resource != null and !advertised.finished) {
-                    advertised.resource.?.sendPosition(change.x, change.y);
-                }
+                if (advertised.head != head or advertised.resource == null or advertised.finished) continue;
+                if (position_changed) advertised.resource.?.sendPosition(change.x, change.y);
+                if (scale_changed) advertised.resource.?.sendScale(scaleToFixed(change.scale));
             }
         }
         head.x = change.x;
         head.y = change.y;
+        head.scale = change.scale;
     }
     if (state_changed) manager.changed();
     configuration.resource.sendSucceeded();
+}
+
+fn scaleFromFixed(value: wl.Fixed) error{InvalidScale}!render.Scale {
+    const raw = @intFromEnum(value);
+    if (raw <= 0) return error.InvalidScale;
+    const numerator = (@as(u64, @intCast(raw)) * render.Scale.denominator + 128) / 256;
+    if (numerator == 0 or numerator > std.math.maxInt(u32)) return error.InvalidScale;
+    return .{ .numerator = @intCast(numerator) };
+}
+
+fn scaleToFixed(scale: render.Scale) wl.Fixed {
+    std.debug.assert(scale.numerator > 0);
+    const raw = (@as(u64, scale.numerator) * 256 + render.Scale.denominator / 2) /
+        render.Scale.denominator;
+    std.debug.assert(raw <= std.math.maxInt(i32));
+    return @enumFromInt(@as(i32, @intCast(raw)));
 }
 
 fn testDeviceFd(_: *anyopaque) ?std.posix.fd_t {
@@ -719,6 +758,17 @@ fn testDeviceFail(_: *anyopaque, _: anyerror) void {
 
 fn testApply(_: *anyopaque, _: []const Change) bool {
     return true;
+}
+
+test "output scales round-trip between fixed and v120 units" {
+    const scale = try scaleFromFixed(wl.Fixed.fromDouble(1.25));
+    try std.testing.expectEqual(@as(u32, 150), scale.numerator);
+    try std.testing.expectApproxEqAbs(
+        @as(f64, 1.25),
+        scaleToFixed(scale).toDouble(),
+        1.0 / 256.0,
+    );
+    try std.testing.expectError(error.InvalidScale, scaleFromFixed(wl.Fixed.fromInt(0)));
 }
 
 test "connected head storage survives disable and reconnect lifetimes" {

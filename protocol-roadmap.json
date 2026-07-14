@@ -208,7 +208,7 @@
         "wl-output",
         "viewporter"
       ],
-      "status_detail": "The current fixed preferred scale is implemented; future multi-output work must update it dynamically."
+      "status_detail": "Preferred fractional scale tracks each output's configured native scale and updates dynamically from surface/output membership after layout changes."
     },
     {
       "id": "xdg-decoration",
@@ -512,7 +512,7 @@
       "blocked_by": [
         "wl-output"
       ],
-      "status_detail": "Version 3 reports each output's logical position, logical size, stable name, and description, refreshes position changes, tears resources down on hotplug, and emits version-correct done events."
+      "status_detail": "Version 3 reports each output's logical position, scaled logical size, stable name, and description, refreshes configuration changes, makes bound resources inert on hotplug, and emits version-correct done events."
     },
     {
       "id": "xdg-foreign-v2",
@@ -909,7 +909,7 @@
         "security-context",
         "wl-output"
       ],
-      "status_detail": "Version 4 head discovery, current-mode advertisement, hotplug lifecycles, stale-serial cancellation, complete test/apply transactions, positions, and native DRM enable/disable are implemented for Kanshi. The current hardware mode, unit scale, normal transform, and disabled adaptive sync are supported; unsupported custom modes, transforms, fractional scales, and adaptive sync are rejected. The global is temporarily visible to all clients until security-context authorization is implemented."
+      "status_detail": "Version 4 head discovery, current-mode advertisement, hotplug lifecycles, stale-serial cancellation, complete test/apply transactions, positions, fractional scales, and native DRM enable/disable are implemented for Kanshi. Scaling preserves native mode pixels while updating logical geometry, rendering, input bounds, wl_output, xdg-output, fractional-scale, layer-shell, and River output state. Unsupported custom modes, transforms, and adaptive sync are rejected. The global is temporarily visible to all clients until security-context authorization is implemented."
     },
     {
       "id": "wlr-output-power-management",
