@@ -4,6 +4,7 @@ const Self = @This();
 
 const std = @import("std");
 const wayland = @import("wayland");
+const slot_map = @import("slot_map.zig");
 const presentation = @import("presentation.zig");
 const Compositor = @import("wayland/compositor.zig");
 const Subcompositor = @import("wayland/subcompositor.zig");
@@ -35,7 +36,8 @@ const log = std.log.scoped(.server);
 
 allocator: std.mem.Allocator,
 display: *wl.Server,
-render_output: RenderOutput,
+render_outputs: RenderOutputStore,
+primary_render_output: RenderOutputId,
 outputs: OutputLayout,
 xdg_output: XdgOutput,
 single_pixel_buffer: SinglePixelBuffer,
@@ -79,6 +81,9 @@ const RenderOutput = struct {
     }
 };
 
+const RenderOutputStore = slot_map.SlotMap(*RenderOutput, enum { render_output });
+const RenderOutputId = RenderOutputStore.Id;
+
 pub fn create(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -95,14 +100,8 @@ pub fn create(
     self.* = .{
         .allocator = allocator,
         .display = display,
-        .render_output = .{
-            .server = self,
-            .backend = undefined,
-            .protocol_id = undefined,
-            .timer = undefined,
-            .repaint_needed = false,
-            .render_scheduled = false,
-        },
+        .render_outputs = .{},
+        .primary_render_output = undefined,
         .outputs = undefined,
         .xdg_output = undefined,
         .single_pixel_buffer = undefined,
@@ -127,6 +126,7 @@ pub fn create(
         .socket_buffer = undefined,
         .listening = false,
     };
+    errdefer self.render_outputs.deinit(allocator);
     errdefer self.renderer.deinit();
     try self.compositor.init(allocator, display);
     errdefer self.compositor.deinit();
@@ -134,14 +134,24 @@ pub fn create(
     errdefer self.outputs.deinit();
     try self.seat.init(allocator, io, display, self.compositor.surfaceStore());
     errdefer self.seat.deinit();
-    try self.render_output.backend.init(
+    const render_output = try allocator.create(RenderOutput);
+    errdefer allocator.destroy(render_output);
+    render_output.* = .{
+        .server = self,
+        .backend = undefined,
+        .protocol_id = undefined,
+        .timer = undefined,
+        .repaint_needed = false,
+        .render_scheduled = false,
+    };
+    try render_output.backend.init(
         allocator,
         io,
         display,
         .{ .width = 1280, .height = 720 },
         output_kind,
         .{
-            .context = &self.render_output,
+            .context = render_output,
             .ready = outputReady,
             .presented = outputPresented,
             .discarded = outputDiscarded,
@@ -175,11 +185,11 @@ pub fn create(
             .touch_orientation = touchOrientation,
         },
     );
-    errdefer self.render_output.backend.deinit();
-    self.render_output.protocol_id = try self.outputs.add(.{
-        .size = self.render_output.backend.size(),
-        .physical_size = self.render_output.backend.physicalSize(),
-        .scale = self.render_output.backend.clientScale(),
+    errdefer render_output.backend.deinit();
+    render_output.protocol_id = try self.outputs.add(.{
+        .size = render_output.backend.size(),
+        .physical_size = render_output.backend.physicalSize(),
+        .scale = render_output.backend.clientScale(),
         .name = switch (output_kind) {
             .headless => "HEADLESS-1",
             .nested => "NESTED-1",
@@ -193,7 +203,10 @@ pub fn create(
             .nested => "nested-wayland",
         },
     });
-    errdefer std.debug.assert(self.outputs.remove(self.render_output.protocol_id));
+    errdefer std.debug.assert(self.outputs.remove(render_output.protocol_id));
+    const render_output_id = try self.render_outputs.insert(allocator, render_output);
+    errdefer std.debug.assert(self.render_outputs.remove(render_output_id) == render_output);
+    self.primary_render_output = render_output_id;
     try self.xdg_output.init(display, &self.outputs);
     errdefer self.xdg_output.deinit();
     try self.single_pixel_buffer.init(allocator, display);
@@ -203,8 +216,8 @@ pub fn create(
         display,
         self.compositor.surfaceStore(),
         &self.outputs,
-        self.render_output.protocol_id,
-        self.render_output.backend.presentationClockId(),
+        render_output.protocol_id,
+        render_output.backend.presentationClockId(),
     );
     errdefer self.presentation_protocol.deinit();
     try self.viewporter.init(allocator, display);
@@ -212,7 +225,7 @@ pub fn create(
     try self.fractional_scale.init(
         allocator,
         display,
-        self.render_output.backend.renderScale(),
+        render_output.backend.renderScale(),
     );
     errdefer self.fractional_scale.deinit();
     try self.fixes.init(display);
@@ -229,14 +242,14 @@ pub fn create(
         self.compositor.surfaceStore(),
         &self.scene,
         &self.seat,
-        self.render_output.backend.size(),
+        render_output.backend.size(),
     );
     errdefer self.xdg_shell.deinit();
     try self.layer_shell.init(
         allocator,
         display,
         &self.outputs,
-        self.render_output.protocol_id,
+        render_output.protocol_id,
         &self.scene,
         &self.seat,
         &self.xdg_shell,
@@ -285,7 +298,7 @@ pub fn create(
         allocator,
         display,
         &self.outputs,
-        self.render_output.protocol_id,
+        render_output.protocol_id,
         &self.seat,
         &self.scene,
         &self.xdg_shell,
@@ -293,10 +306,10 @@ pub fn create(
         .{ .context = self, .route = routePointer },
     );
     errdefer self.window_manager.deinit();
-    self.render_output.timer = try display.getEventLoop().addTimer(
+    render_output.timer = try display.getEventLoop().addTimer(
         *RenderOutput,
         handleRenderTimer,
-        &self.render_output,
+        render_output,
     );
     self.subcompositor.setRepaintListener(.{
         .context = self,
@@ -326,7 +339,8 @@ pub fn destroy(self: *Self) void {
     self.seat.clearRepaintListener();
     self.scene.clearRepaintListener();
     self.subcompositor.clearRepaintListener();
-    self.render_output.timer.remove();
+    var render_outputs = self.render_outputs.iterator();
+    while (render_outputs.next()) |entry| entry.value.*.timer.remove();
     self.display.destroyClients();
     self.window_manager.deinit();
     self.input_method.deinit();
@@ -345,9 +359,16 @@ pub fn destroy(self: *Self) void {
     self.presentation_protocol.deinit();
     self.single_pixel_buffer.deinit();
     self.xdg_output.deinit();
-    std.debug.assert(self.outputs.remove(self.render_output.protocol_id));
+    render_outputs = self.render_outputs.iterator();
+    while (render_outputs.next()) |entry| {
+        const render_output = entry.value.*;
+        std.debug.assert(self.outputs.remove(render_output.protocol_id));
+        render_output.backend.deinit();
+        std.debug.assert(self.render_outputs.remove(entry.id) == render_output);
+        allocator.destroy(render_output);
+    }
     self.outputs.deinit();
-    self.render_output.backend.deinit();
+    self.render_outputs.deinit(allocator);
     self.seat.deinit();
     self.compositor.deinit();
     self.renderer.deinit();
@@ -377,8 +398,12 @@ pub fn terminate(self: *Self) void {
 
 fn requestRepaint(context: *anyopaque) void {
     const self: *Self = @ptrCast(@alignCast(context));
-    self.render_output.repaint_needed = true;
-    self.scheduleRepaint();
+    var render_outputs = self.render_outputs.iterator();
+    while (render_outputs.next()) |entry| {
+        const render_output = entry.value.*;
+        render_output.repaint_needed = true;
+        self.scheduleRepaint(render_output);
+    }
 }
 
 fn inputMethodSurfacePosition(context: *anyopaque, surface_id: Surface.Id) ?InputMethod.Position {
@@ -389,11 +414,14 @@ fn inputMethodSurfacePosition(context: *anyopaque, surface_id: Surface.Id) ?Inpu
 
 fn inputMethodOutputSize(context: *anyopaque) render.Size {
     const self: *Self = @ptrCast(@alignCast(context));
-    return self.render_output.backend.size();
+    return self.primaryRenderOutput().backend.size();
 }
 
-fn scheduleRepaint(self: *Self) void {
-    const output = &self.render_output;
+fn primaryRenderOutput(self: *Self) *RenderOutput {
+    return self.render_outputs.get(self.primary_render_output).?.*;
+}
+
+fn scheduleRepaint(self: *Self, output: *RenderOutput) void {
     if (!output.repaint_needed or output.render_scheduled or !output.backend.ready()) return;
     output.timer.timerUpdate(output.backend.repaintDelayMilliseconds()) catch |err| {
         log.err("failed to schedule repaint: {t}", .{err});
@@ -405,7 +433,7 @@ fn scheduleRepaint(self: *Self) void {
 
 fn outputReady(context: *anyopaque) void {
     const output: *RenderOutput = @ptrCast(@alignCast(context));
-    output.server.scheduleRepaint();
+    output.server.scheduleRepaint(output);
 }
 
 fn outputPresented(context: *anyopaque, info: presentation.Info) void {
@@ -1000,16 +1028,15 @@ fn handleRenderTimer(output_context: *RenderOutput) c_int {
     output_context.render_scheduled = false;
     if (!output_context.repaint_needed or !output_context.backend.ready()) return 0;
     output_context.repaint_needed = false;
-    self.renderFrame() catch |err| {
+    self.renderFrame(output_context) catch |err| {
         log.err("output frame failed: {t}", .{err});
         self.terminate();
     };
-    self.scheduleRepaint();
+    self.scheduleRepaint(output_context);
     return 0;
 }
 
-fn renderFrame(self: *Self) renderer_types.Renderer.Error!void {
-    const render_output = &self.render_output;
+fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Renderer.Error!void {
     const pixel_target = render_output.backend.acquire() orelse {
         render_output.repaint_needed = true;
         return;
@@ -1224,7 +1251,7 @@ fn renderCommands(
     try self.renderer.render(.{
         .size = output_size,
         .commands = commands,
-        .scale = self.render_output.backend.renderScale(),
+        .scale = self.primaryRenderOutput().backend.renderScale(),
     }, target);
 }
 
@@ -1359,7 +1386,7 @@ fn renderSurfaceTree(
                 .width = buffer.logical_size.width,
                 .height = buffer.logical_size.height,
             };
-            const output = self.outputs.get(self.render_output.protocol_id).?;
+            const output = self.outputs.get(self.primaryRenderOutput().protocol_id).?;
             const visible_rect = surface_rect.intersection(output.logicalRect()) orelse continue;
             if (clip) |clip_rect| {
                 if (visible_rect.intersection(clip_rect) == null) continue;
@@ -1377,7 +1404,7 @@ fn renderSurfaceTree(
                     .clip = clip,
                 } },
             };
-            try self.renderCommands(self.render_output.backend.size(), &image_command, target);
+            try self.renderCommands(self.primaryRenderOutput().backend.size(), &image_command, target);
         },
         .child => |child| try self.renderSurfaceTree(
             child.surface_id,
@@ -1405,7 +1432,7 @@ fn renderWindowBorders(
         clip,
         &commands,
     );
-    try self.renderCommands(self.render_output.backend.size(), border_commands, target);
+    try self.renderCommands(self.primaryRenderOutput().backend.size(), border_commands, target);
 }
 
 fn renderWindowDecorations(
@@ -1527,7 +1554,7 @@ fn submitSurfaceTree(self: *Self, surface_id: Surface.Id) void {
 
     var stack = self.subcompositor.stackIterator(surface_id);
     while (stack.next()) |entry| switch (entry) {
-        .parent => if (self.outputs.get(self.render_output.protocol_id).?.containsSurface(surface_id)) {
+        .parent => if (self.outputs.get(self.primaryRenderOutput().protocol_id).?.containsSurface(surface_id)) {
             Surface.submitPresentationFor(self.compositor.surfaceStore(), surface_id);
         },
         .child => |child| self.submitSurfaceTree(child.surface_id),
