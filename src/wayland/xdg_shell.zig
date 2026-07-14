@@ -190,6 +190,14 @@ pub const TiledEdges = packed struct(u8) {
     _padding: u4 = 0,
 };
 
+pub const ConstrainedEdges = packed struct(u8) {
+    top: bool = false,
+    bottom: bool = false,
+    left: bool = false,
+    right: bool = false,
+    _padding: u4 = 0,
+};
+
 pub const WindowCapabilities = packed struct(u8) {
     window_menu: bool = true,
     maximize: bool = true,
@@ -207,6 +215,8 @@ pub const ToplevelConfigure = struct {
     capabilities: WindowCapabilities = .{},
     decoration_mode: DecorationMode = .client_side,
     bounds: Dimensions = .{ .width = 0, .height = 0 },
+    suspended: bool = false,
+    constrained: ConstrainedEdges = .{},
 };
 
 pub const DecorationMode = enum {
@@ -305,7 +315,7 @@ pub fn init(
     errdefer self.xdg_surfaces.deinit(allocator);
     errdefer self.windows.deinit(allocator);
     errdefer self.popups.deinit(allocator);
-    self.global = try wl.Global.create(display, xdg.WmBase, 5, *Self, self, bind);
+    self.global = try wl.Global.create(display, xdg.WmBase, 7, *Self, self, bind);
     errdefer self.global.destroy();
     self.decoration_global = try wl.Global.create(
         display,
@@ -440,6 +450,34 @@ fn appendEnum(values: anytype, count: *usize, value: anytype) void {
     count.* += 1;
 }
 
+fn toplevelStates(
+    configuration: ToplevelConfigure,
+    version: u32,
+    values: *[13]u32,
+) []u32 {
+    var count: usize = 0;
+    if (configuration.maximized) appendEnum(values, &count, xdg.Toplevel.State.maximized);
+    if (configuration.fullscreen) appendEnum(values, &count, xdg.Toplevel.State.fullscreen);
+    if (configuration.resizing) appendEnum(values, &count, xdg.Toplevel.State.resizing);
+    if (configuration.activated) appendEnum(values, &count, xdg.Toplevel.State.activated);
+    if (version >= 2) {
+        if (configuration.tiled.left) appendEnum(values, &count, xdg.Toplevel.State.tiled_left);
+        if (configuration.tiled.right) appendEnum(values, &count, xdg.Toplevel.State.tiled_right);
+        if (configuration.tiled.top) appendEnum(values, &count, xdg.Toplevel.State.tiled_top);
+        if (configuration.tiled.bottom) appendEnum(values, &count, xdg.Toplevel.State.tiled_bottom);
+    }
+    if (version >= 6 and configuration.suspended) {
+        appendEnum(values, &count, xdg.Toplevel.State.suspended);
+    }
+    if (version >= 7) {
+        if (configuration.constrained.left) appendEnum(values, &count, xdg.Toplevel.State.constrained_left);
+        if (configuration.constrained.right) appendEnum(values, &count, xdg.Toplevel.State.constrained_right);
+        if (configuration.constrained.top) appendEnum(values, &count, xdg.Toplevel.State.constrained_top);
+        if (configuration.constrained.bottom) appendEnum(values, &count, xdg.Toplevel.State.constrained_bottom);
+    }
+    return values[0..count];
+}
+
 pub fn configureWindow(
     self: *Self,
     id: WindowId,
@@ -466,54 +504,12 @@ pub fn configureWindowState(
     const serial = self.display.nextSerial();
     state.configure_serials.append(self.allocator, serial) catch return error.OutOfMemory;
 
-    var state_values: [8]u32 = undefined;
-    var state_count: usize = 0;
-    if (configuration.maximized) appendEnum(
-        &state_values,
-        &state_count,
-        xdg.Toplevel.State.maximized,
-    );
-    if (configuration.fullscreen) appendEnum(
-        &state_values,
-        &state_count,
-        xdg.Toplevel.State.fullscreen,
-    );
-    if (configuration.resizing) appendEnum(
-        &state_values,
-        &state_count,
-        xdg.Toplevel.State.resizing,
-    );
-    if (configuration.activated) appendEnum(
-        &state_values,
-        &state_count,
-        xdg.Toplevel.State.activated,
-    );
-    if (toplevel.getVersion() >= 2) {
-        if (configuration.tiled.left) appendEnum(
-            &state_values,
-            &state_count,
-            xdg.Toplevel.State.tiled_left,
-        );
-        if (configuration.tiled.right) appendEnum(
-            &state_values,
-            &state_count,
-            xdg.Toplevel.State.tiled_right,
-        );
-        if (configuration.tiled.top) appendEnum(
-            &state_values,
-            &state_count,
-            xdg.Toplevel.State.tiled_top,
-        );
-        if (configuration.tiled.bottom) appendEnum(
-            &state_values,
-            &state_count,
-            xdg.Toplevel.State.tiled_bottom,
-        );
-    }
+    var state_values: [13]u32 = undefined;
+    const states = toplevelStates(configuration, toplevel.getVersion(), &state_values);
     var states_array: wl.Array = .{
-        .size = state_count * @sizeOf(u32),
-        .alloc = state_count * @sizeOf(u32),
-        .data = if (state_count == 0) null else @ptrCast(&state_values),
+        .size = states.len * @sizeOf(u32),
+        .alloc = states.len * @sizeOf(u32),
+        .data = if (states.len == 0) null else @ptrCast(states.ptr),
     };
     if (toplevel.getVersion() >= 5 and
         (state.sent_capabilities == null or
@@ -1476,6 +1472,7 @@ const XdgSurfaceResource = struct {
             state.configured = false;
             state.initial_configure_sent = false;
             state.sent_capabilities = null;
+            state.sent_bounds = null;
             state.last_acked_serial = null;
             state.configure_serials.clearRetainingCapacity();
             if (state.toplevel_resource) |resource| {
@@ -2132,6 +2129,7 @@ const ToplevelResource = struct {
             xdg_surface.configured = false;
             xdg_surface.initial_configure_sent = false;
             xdg_surface.sent_capabilities = null;
+            xdg_surface.sent_bounds = null;
             xdg_surface.last_acked_serial = null;
             xdg_surface.configure_serials.clearRetainingCapacity();
             xdg_surface.toplevel_resource = null;
@@ -2415,6 +2413,31 @@ fn clampI32(value: i64) i32 {
         @as(i64, std.math.minInt(i32)),
         @as(i64, std.math.maxInt(i32)),
     ));
+}
+
+test "xdg toplevel states are gated by protocol version" {
+    const configuration: ToplevelConfigure = .{
+        .suspended = true,
+        .constrained = .{
+            .top = true,
+            .bottom = true,
+            .left = true,
+            .right = true,
+        },
+    };
+    var values: [13]u32 = undefined;
+
+    try std.testing.expectEqualSlices(u32, &.{}, toplevelStates(configuration, 5, &values));
+    try std.testing.expectEqualSlices(u32, &.{
+        @intFromEnum(xdg.Toplevel.State.suspended),
+    }, toplevelStates(configuration, 6, &values));
+    try std.testing.expectEqualSlices(u32, &.{
+        @intFromEnum(xdg.Toplevel.State.suspended),
+        @intFromEnum(xdg.Toplevel.State.constrained_left),
+        @intFromEnum(xdg.Toplevel.State.constrained_right),
+        @intFromEnum(xdg.Toplevel.State.constrained_top),
+        @intFromEnum(xdg.Toplevel.State.constrained_bottom),
+    }, toplevelStates(configuration, 7, &values));
 }
 
 test "xdg size hints reject contradictory bounds" {

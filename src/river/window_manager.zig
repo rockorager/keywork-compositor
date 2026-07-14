@@ -1343,6 +1343,7 @@ fn releaseWindows(self: *Self) void {
             entry.value.xdg_id,
             entry.value.sent_configuration.activated or
                 entry.value.sent_configuration.decoration_mode == .server_side or
+                entry.value.sent_configuration.suspended or
                 entry.value.sent_configuration.bounds.width != 0 or
                 entry.value.sent_configuration.bounds.height != 0,
             entry.value.requested_dimensions,
@@ -1561,10 +1562,14 @@ const WindowResource = struct {
             .hide => {
                 if (!self.requireRendering(manager_resource)) return;
                 window.requested_visible = false;
+                window.requested_configuration.suspended = true;
+                self.manager.requestManage();
             },
             .show => {
                 if (!self.requireRendering(manager_resource)) return;
                 window.requested_visible = true;
+                window.requested_configuration.suspended = false;
+                self.manager.requestManage();
             },
             .use_csd => {
                 if (!self.requireManage(manager_resource)) return;

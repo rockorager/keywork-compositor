@@ -156,18 +156,18 @@
       "interfaces": [
         {
           "name": "xdg_wm_base",
-          "current_version": 5,
+          "current_version": 7,
           "target_version": 7
         }
       ],
-      "status": "in_progress",
+      "status": "done",
       "privileged": false,
       "blocked_by": [
         "wl-compositor",
         "wl-output",
         "wl-seat"
       ],
-      "status_detail": "Toplevels, popups, positioners, configure and ack, grabs, and repositioning are implemented through v5."
+      "status_detail": "Version 7 is implemented, including toplevels, popups, positioners, configure and ack, grabs, repositioning, configure bounds, capabilities, suspended state, and version-gated constrained-edge state."
     },
     {
       "id": "viewporter",
