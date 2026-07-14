@@ -460,8 +460,8 @@ fn addRenderOutput(
         .scale = render_output.backend.clientScale(),
         .preferred_scale = render_output.backend.renderScale(),
         .name = render_output.backend.name(config.name),
-        .description = config.description,
-        .make = config.make,
+        .description = render_output.backend.description(config.description),
+        .make = render_output.backend.make(config.make),
         .model = render_output.backend.model(config.model),
     });
     errdefer std.debug.assert(self.outputs.remove(render_output.protocol_id));

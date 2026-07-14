@@ -64,6 +64,7 @@ pub fn build(b: *std.Build) void {
     });
     root_module.addImport("wayland", wayland);
     root_module.addImport("vulkan", vulkan);
+    root_module.linkSystemLibrary("libdisplay-info", .{});
     root_module.linkSystemLibrary("libdrm", .{});
     root_module.linkSystemLibrary("libinput", .{});
     root_module.linkSystemLibrary("pixman-1", .{});

@@ -8,12 +8,15 @@ const presentation = @import("../presentation.zig");
 const render = @import("../render/types.zig");
 
 const c = @cImport({
+    @cInclude("stdlib.h");
+    @cInclude("libdisplay-info/info.h");
     @cInclude("libudev.h");
     @cInclude("xf86drm.h");
     @cInclude("xf86drmMode.h");
 });
 const log = std.log.scoped(.drm);
 const buffer_count = 2;
+const description_capacity = 512;
 
 io: std.Io,
 device_access: DeviceAccess,
@@ -28,6 +31,11 @@ connector_id: u32,
 crtc_id: u32,
 connector_name: [32]u8,
 connector_name_length: usize,
+make_value: [*c]u8,
+model_value: [*c]u8,
+serial_value: [*c]u8,
+description_value: [description_capacity]u8,
+description_length: usize,
 logical_x: i32,
 logical_y: i32,
 refresh_nanoseconds: u32,
@@ -93,6 +101,11 @@ pub fn init(
         .crtc_id = 0,
         .connector_name = undefined,
         .connector_name_length = 0,
+        .make_value = null,
+        .model_value = null,
+        .serial_value = null,
+        .description_value = undefined,
+        .description_length = 0,
         .logical_x = 0,
         .logical_y = 0,
         .refresh_nanoseconds = presentation.nominal_refresh_nanoseconds,
@@ -109,6 +122,7 @@ pub fn init(
 pub fn deinit(self: *Self) void {
     std.debug.assert(self.listener == null);
     std.debug.assert(self.old_crtc == null);
+    self.clearIdentity();
     self.* = undefined;
 }
 
@@ -124,6 +138,22 @@ pub fn detach(self: *Self) void {
 
 pub fn name(self: *const Self) []const u8 {
     return self.connector_name[0..self.connector_name_length];
+}
+
+pub fn make(self: *const Self) ?[]const u8 {
+    return if (self.make_value == null) null else std.mem.span(self.make_value);
+}
+
+pub fn model(self: *const Self) ?[]const u8 {
+    return if (self.model_value == null) null else std.mem.span(self.model_value);
+}
+
+pub fn serial(self: *const Self) ?[]const u8 {
+    return if (self.serial_value == null) null else std.mem.span(self.serial_value);
+}
+
+pub fn description(self: *const Self) []const u8 {
+    return self.description_value[0..self.description_length];
 }
 
 pub fn refreshMillihertz(self: *const Self) i32 {
@@ -222,6 +252,22 @@ pub fn activate(self: *Self, fd: std.posix.fd_t, selection: Selection, device_pa
         .{ type_name, selection.connector_type_id },
     );
     self.connector_name_length = name_value.len;
+    self.readIdentity(fd);
+    const make_value = self.make() orelse "Unknown";
+    const model_value = self.model() orelse "display";
+    const description_value = if (self.serial()) |serial_text|
+        try std.fmt.bufPrint(
+            &self.description_value,
+            "{s} {s} {s} ({s})",
+            .{ make_value, model_value, serial_text, self.name() },
+        )
+    else
+        try std.fmt.bufPrint(
+            &self.description_value,
+            "{s} {s} ({s})",
+            .{ make_value, model_value, self.name() },
+        );
+    self.description_length = description_value.len;
     self.refresh_nanoseconds = refreshNanoseconds(self.mode);
 
     var monotonic: u64 = 0;
@@ -251,9 +297,47 @@ pub fn activate(self: *Self, fd: std.posix.fd_t, selection: Selection, device_pa
         }
     }
     log.info(
-        "activated connector {s} ({d}) on {s} at {d}x{d}, CRTC {d}, enabled={}",
-        .{ self.name(), self.connector_id, device_path, self.size.width, self.size.height, self.crtc_id, self.enabled },
+        "activated connector {s} ({d}) on {s} at {d}x{d}, CRTC {d}, enabled={}: {s}",
+        .{ self.name(), self.connector_id, device_path, self.size.width, self.size.height, self.crtc_id, self.enabled, self.description() },
     );
+}
+
+fn readIdentity(self: *Self, fd: std.posix.fd_t) void {
+    self.clearIdentity();
+    const properties = c.drmModeObjectGetProperties(
+        fd,
+        self.connector_id,
+        c.DRM_MODE_OBJECT_CONNECTOR,
+    ) orelse return;
+    defer c.drmModeFreeObjectProperties(properties);
+
+    const property_count: usize = @intCast(properties.*.count_props);
+    for (0..property_count) |index| {
+        const property = c.drmModeGetProperty(fd, properties.*.props[index]) orelse continue;
+        defer c.drmModeFreeProperty(property);
+        const name_value = std.mem.sliceTo(property.*.name[0..], 0);
+        if (!std.mem.eql(u8, name_value, "EDID")) continue;
+        const blob_id = properties.*.prop_values[index];
+        if (blob_id == 0 or blob_id > std.math.maxInt(u32)) return;
+        const blob = c.drmModeGetPropertyBlob(fd, @intCast(blob_id)) orelse return;
+        defer c.drmModeFreePropertyBlob(blob);
+        if (blob.*.data == null or blob.*.length == 0) return;
+        const info = c.di_info_parse_edid(blob.*.data, blob.*.length) orelse return;
+        defer c.di_info_destroy(info);
+        self.make_value = c.di_info_get_make(info);
+        self.model_value = c.di_info_get_model(info);
+        self.serial_value = c.di_info_get_serial(info);
+        return;
+    }
+}
+
+fn clearIdentity(self: *Self) void {
+    if (self.make_value != null) c.free(self.make_value);
+    if (self.model_value != null) c.free(self.model_value);
+    if (self.serial_value != null) c.free(self.serial_value);
+    self.make_value = null;
+    self.model_value = null;
+    self.serial_value = null;
 }
 
 pub fn isPrimaryNode(path: []const u8) bool {

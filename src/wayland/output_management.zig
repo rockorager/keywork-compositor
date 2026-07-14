@@ -41,6 +41,10 @@ const Head = struct {
     output: ?*DrmOutput,
     connected: bool,
     name: [:0]u8,
+    description: [:0]u8,
+    make: [:0]u8,
+    model: [:0]u8,
+    serial: [:0]u8,
     enabled: bool,
     x: i32,
     y: i32,
@@ -142,6 +146,10 @@ fn deinitStorage(self: *Self) void {
     for (self.managers.items) |manager| self.allocator.destroy(manager);
     self.managers.deinit(self.allocator);
     for (self.heads.items) |head| {
+        self.allocator.free(head.serial);
+        self.allocator.free(head.model);
+        self.allocator.free(head.make);
+        self.allocator.free(head.description);
         self.allocator.free(head.name);
         self.allocator.destroy(head);
     }
@@ -164,12 +172,24 @@ pub fn addHead(self: *Self, output: *DrmOutput) !void {
 fn addHeadStorage(self: *Self, output: *DrmOutput) !*Head {
     const name = try self.allocator.dupeSentinel(u8, output.name(), 0);
     errdefer self.allocator.free(name);
+    const description = try self.allocator.dupeSentinel(u8, output.description(), 0);
+    errdefer self.allocator.free(description);
+    const make = try self.allocator.dupeSentinel(u8, output.make() orelse "Unknown", 0);
+    errdefer self.allocator.free(make);
+    const model = try self.allocator.dupeSentinel(u8, output.model() orelse output.name(), 0);
+    errdefer self.allocator.free(model);
+    const serial = try self.allocator.dupeSentinel(u8, output.serial() orelse "", 0);
+    errdefer self.allocator.free(serial);
     const head = try self.allocator.create(Head);
     errdefer self.allocator.destroy(head);
     head.* = .{
         .output = output,
         .connected = true,
         .name = name,
+        .description = description,
+        .make = make,
+        .model = model,
+        .serial = serial,
         .enabled = output.enabled,
         .x = output.logical_x,
         .y = output.logical_y,
@@ -336,7 +356,7 @@ fn createHeadResource(self: *Self, manager: *ManagerResource, head: *Head) !void
     mode_resource.setHandler(*ModeResource, modeRequest, modeDestroyed, mode);
     manager_resource.sendHead(head_resource);
     head_resource.sendName(head.name);
-    head_resource.sendDescription("Keywork DRM output");
+    head_resource.sendDescription(head.description);
     head_resource.sendPhysicalSize(
         @intCast(head.physical_size.width),
         @intCast(head.physical_size.height),
@@ -353,8 +373,9 @@ fn createHeadResource(self: *Self, manager: *ManagerResource, head: *Head) !void
         head_resource.sendScale(scaleToFixed(head.scale));
     }
     if (head_resource.getVersion() >= 2) {
-        head_resource.sendMake("keywork");
-        head_resource.sendModel(head.name);
+        head_resource.sendMake(head.make);
+        head_resource.sendModel(head.model);
+        if (head.serial.len > 0) head_resource.sendSerialNumber(head.serial);
     }
     if (head_resource.getVersion() >= 4) head_resource.sendAdaptiveSync(.disabled);
 }

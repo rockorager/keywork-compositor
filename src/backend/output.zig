@@ -68,9 +68,23 @@ pub fn name(self: *const Self, fallback: []const u8) []const u8 {
     };
 }
 
+pub fn description(self: *const Self, fallback: []const u8) []const u8 {
+    return switch (self.backend) {
+        .drm => |output| output.description(),
+        .headless, .nested => fallback,
+    };
+}
+
+pub fn make(self: *const Self, fallback: []const u8) []const u8 {
+    return switch (self.backend) {
+        .drm => |output| output.make() orelse fallback,
+        .headless, .nested => fallback,
+    };
+}
+
 pub fn model(self: *const Self, fallback: []const u8) []const u8 {
     return switch (self.backend) {
-        .drm => |output| output.name(),
+        .drm => |output| output.model() orelse fallback,
         .headless, .nested => fallback,
     };
 }
