@@ -49,7 +49,7 @@ pub fn init(
         .global = try wl.Global.create(
             display,
             zwp.LinuxDmabufV1,
-            if (feedback_state == null) 3 else 5,
+            if (feedback_state == null) 3 else 6,
             *Self,
             self,
             bind,
@@ -193,9 +193,12 @@ const Feedback = struct {
             .data = @ptrCast(&indices),
         };
         resource.sendFormatTable(state.file.handle, 2 * @sizeOf(FormatTableEntry));
-        resource.sendMainDevice(&device_array);
+        if (resource.getVersion() < 6) resource.sendMainDevice(&device_array);
         resource.sendTrancheTargetDevice(&device_array);
-        resource.sendTrancheFlags(@bitCast(@as(u32, 0)));
+        resource.sendTrancheFlags(if (resource.getVersion() >= 6)
+            .{ .sampling = true }
+        else
+            .{});
         resource.sendTrancheFormats(&indices_array);
         resource.sendTrancheDone();
         resource.sendDone();
@@ -232,6 +235,7 @@ const Params = struct {
     manager: *Self,
     resource: *zwp.LinuxBufferParamsV1,
     planes: [max_planes]?Plane,
+    sampling_device: ?linux.dev_t,
     used: bool,
 
     fn create(
@@ -247,6 +251,7 @@ const Params = struct {
             .manager = manager,
             .resource = resource,
             .planes = @splat(null),
+            .sampling_device = null,
             .used = false,
         };
         manager.params_count += 1;
@@ -280,7 +285,23 @@ const Params = struct {
                 create_request.flags,
                 create_request.buffer_id,
             ),
+            .set_sampling_device => |set| self.setSamplingDevice(resource, set.device),
         }
+    }
+
+    fn setSamplingDevice(
+        self: *Params,
+        resource: *zwp.LinuxBufferParamsV1,
+        array: *wl.Array,
+    ) void {
+        if (self.used) {
+            resource.postError(.already_used, "buffer parameters were already used");
+            return;
+        }
+        self.sampling_device = deviceFromArray(array) catch {
+            resource.postError(.invalid_dev_t_size, "sampling device has invalid size");
+            return;
+        };
     }
 
     fn addPlane(
@@ -346,13 +367,16 @@ const Params = struct {
                     .out_of_bounds,
                     "DMA-BUF plane does not contain the requested image",
                 ),
-                error.ImportFailed => if (immediate_id == null)
-                    self.resource.sendFailed()
-                else
-                    self.resource.postError(.invalid_wl_buffer, "DMA-BUF import failed"),
+                error.ImportFailed => self.importFailed(immediate_id),
             }
             return;
         };
+        if (self.sampling_device) |device| {
+            if (device != self.manager.feedback_state.?.device) {
+                self.importFailed(immediate_id);
+                return;
+            }
+        }
         if (descriptor.plane.modifier == invalid_modifier) {
             log.warn("assuming a legacy implicit DMA-BUF has linear layout", .{});
         }
@@ -370,12 +394,29 @@ const Params = struct {
         if (immediate_id == null) self.resource.sendCreated(buffer.resource);
     }
 
+    fn importFailed(self: *Params, immediate_id: ?u32) void {
+        if (immediate_id == null) {
+            self.resource.sendFailed();
+        } else {
+            self.resource.postError(.invalid_wl_buffer, "DMA-BUF import failed");
+        }
+    }
+
     fn handleDestroy(_: *zwp.LinuxBufferParamsV1, self: *Params) void {
         for (self.planes) |plane| if (plane) |value| value.close();
         self.manager.params_count -= 1;
         self.manager.allocator.destroy(self);
     }
 };
+
+fn deviceFromArray(array: *const wl.Array) error{InvalidSize}!linux.dev_t {
+    if (array.size != @sizeOf(linux.dev_t)) return error.InvalidSize;
+    const data = array.data orelse return error.InvalidSize;
+    const bytes: [*]const u8 = @ptrCast(data);
+    var device: linux.dev_t = undefined;
+    @memcpy(std.mem.asBytes(&device), bytes[0..@sizeOf(linux.dev_t)]);
+    return device;
+}
 
 const Descriptor = struct {
     plane: Plane,
@@ -626,4 +667,17 @@ test "DMA-BUF descriptor rejects malformed and unsupported layouts before import
         error.ImportFailed,
         validateDescriptor(planes, 2, 2, argb8888, interlaced, false),
     );
+}
+
+test "DMA-BUF sampling device arrays use native dev_t representation" {
+    var device: linux.dev_t = 0x1234;
+    var array: wl.Array = .{
+        .size = @sizeOf(linux.dev_t),
+        .alloc = @sizeOf(linux.dev_t),
+        .data = @ptrCast(&device),
+    };
+    try std.testing.expectEqual(device, try deviceFromArray(&array));
+
+    array.size -= 1;
+    try std.testing.expectError(error.InvalidSize, deviceFromArray(&array));
 }
