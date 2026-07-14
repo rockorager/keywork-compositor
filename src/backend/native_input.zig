@@ -164,11 +164,21 @@ fn installKeymap(self: *Self) !void {
     const size = std.math.add(usize, text.len, 1) catch return error.KeymapTooLarge;
     if (size > std.math.maxInt(u32)) return error.KeymapTooLarge;
 
-    const fd = try std.posix.memfd_create("keywork-keymap", 0);
+    const fd = try std.posix.memfd_create(
+        "keywork-keymap",
+        std.os.linux.MFD.CLOEXEC | std.os.linux.MFD.ALLOW_SEALING,
+    );
     const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
     errdefer file.close(self.io);
     try file.setLength(self.io, size);
     try file.writeStreamingAll(self.io, text.ptr[0..size]);
+    const seals = std.os.linux.F.SEAL_SHRINK |
+        std.os.linux.F.SEAL_GROW |
+        std.os.linux.F.SEAL_WRITE |
+        std.os.linux.F.SEAL_SEAL;
+    if (std.c.fcntl(fd, std.os.linux.F.ADD_SEALS, @as(c_int, seals)) < 0) {
+        return error.SealKeymapFailed;
+    }
     self.listener.keyboard_keymap(
         self.listener.context,
         .xkb_v1,
