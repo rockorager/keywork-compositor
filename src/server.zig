@@ -222,8 +222,6 @@ pub fn create(
         allocator,
         display,
         self.compositor.surfaceStore(),
-        &self.outputs,
-        render_output.protocol_id,
         render_output.backend.presentationClockId(),
     );
     errdefer self.presentation_protocol.deinit();
@@ -446,14 +444,18 @@ fn outputReady(context: *anyopaque) void {
 fn outputPresented(context: *anyopaque, info: presentation.Info) void {
     const output: *RenderOutput = @ptrCast(@alignCast(context));
     const self = output.server;
-    self.outputs.get(output.protocol_id).?.setRefresh(info);
-    Surface.finishPresentation(self.compositor.surfaceStore(), info);
+    const protocol_output = self.outputs.get(output.protocol_id).?;
+    protocol_output.setRefresh(info);
+    Surface.finishPresentation(self.compositor.surfaceStore(), protocol_output, info);
 }
 
 fn outputDiscarded(context: *anyopaque) void {
     const output: *RenderOutput = @ptrCast(@alignCast(context));
     const self = output.server;
-    Surface.discardPresentation(self.compositor.surfaceStore());
+    Surface.discardPresentation(
+        self.compositor.surfaceStore(),
+        self.outputs.get(output.protocol_id).?,
+    );
     requestRepaint(self);
 }
 
@@ -1162,7 +1164,7 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
     while (input_popups.next()) |popup| self.submitSurfaceTree(output, popup.surface_id);
     if (drag_icon) |info| self.submitSurfaceTree(output, info.surface_id);
     if (cursor) |info| self.submitSurfaceTree(output, info.surface_id);
-    Surface.discardUnsubmittedFeedback(self.compositor.surfaceStore());
+    self.discardUnsubmittedFeedbackIfIdle();
     if (presented) |info| outputPresented(render_output, info);
     const keyboard_focus = self.layer_shell.keyboardFocus(
         self.xdg_shell.popupKeyboardFocus(),
@@ -1172,6 +1174,15 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
     else
         null;
     self.seat.setKeyboardFocus(keyboard_focus);
+}
+
+fn discardUnsubmittedFeedbackIfIdle(self: *Self) void {
+    var render_outputs = self.render_outputs.iterator();
+    while (render_outputs.next()) |entry| {
+        const render_output = entry.value.*;
+        if (render_output.repaint_needed or render_output.render_scheduled) return;
+    }
+    Surface.discardUnsubmittedFeedback(self.compositor.surfaceStore());
 }
 
 fn renderLayerSurfaces(
@@ -1564,7 +1575,7 @@ fn submitSurfaceTree(self: *Self, output: *Output, surface_id: Surface.Id) void 
     var stack = self.subcompositor.stackIterator(surface_id);
     while (stack.next()) |entry| switch (entry) {
         .parent => if (output.containsSurface(surface_id)) {
-            Surface.submitPresentationFor(self.compositor.surfaceStore(), surface_id);
+            Surface.submitPresentationFor(self.compositor.surfaceStore(), surface_id, output);
         },
         .child => |child| self.submitSurfaceTree(output, child.surface_id),
     };

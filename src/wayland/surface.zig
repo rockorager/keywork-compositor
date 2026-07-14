@@ -50,7 +50,7 @@ pub const State = struct {
     callbacks: std.ArrayList(*FrameCallback),
     release_callbacks: std.ArrayList(*BufferReleaseCallback),
     commit_feedbacks: std.ArrayList(*CommitFeedback),
-    presentation_submitted: bool,
+    presentation_output: ?*anyopaque,
     commit_after_submission: bool,
     current_buffer: ?BufferSnapshot,
     cached_buffer: ?BufferSnapshot,
@@ -90,7 +90,7 @@ pub const State = struct {
             .callbacks = .empty,
             .release_callbacks = .empty,
             .commit_feedbacks = .empty,
-            .presentation_submitted = false,
+            .presentation_output = null,
             .commit_after_submission = false,
             .current_buffer = null,
             .cached_buffer = null,
@@ -285,6 +285,7 @@ pub const CommitListener = struct {
 
 pub const CommitFeedback = struct {
     context: *anyopaque,
+    sampled: *const fn (*anyopaque, *anyopaque) void,
     presented: *const fn (*anyopaque, presentation.Info) void,
     discarded: *const fn (*anyopaque) void,
     state: Status = .pending,
@@ -429,34 +430,41 @@ pub fn sendFrameDoneFor(store: *Store, id: Id, time_milliseconds: u32) void {
     }
 }
 
-pub fn submitPresentationFor(store: *Store, id: Id) void {
+pub fn submitPresentationFor(store: *Store, id: Id, output_context: *anyopaque) void {
     const surface_state = store.get(id) orelse return;
-    if (surface_state.presentation_submitted) return;
-    surface_state.presentation_submitted = true;
+    if (surface_state.presentation_output != null) return;
+    surface_state.presentation_output = output_context;
     surface_state.commit_after_submission = false;
     for (surface_state.callbacks.items) |callback| {
         if (callback.state == .active) callback.state = .submitted;
     }
     for (surface_state.commit_feedbacks.items) |feedback| {
-        if (feedback.state == .active) feedback.state = .submitted;
+        if (feedback.state == .active) {
+            feedback.sampled(feedback.context, output_context);
+            feedback.state = .submitted;
+        }
     }
 }
 
 pub fn discardUnsubmittedFeedback(store: *Store) void {
     var surfaces = store.iterator();
     while (surfaces.next()) |entry| {
-        if (!entry.value.presentation_submitted) {
+        if (entry.value.presentation_output == null) {
             discardCommitFeedbacks(entry.value, .active);
         }
     }
 }
 
-pub fn finishPresentation(store: *Store, info: presentation.Info) void {
+pub fn finishPresentation(
+    store: *Store,
+    output_context: *anyopaque,
+    info: presentation.Info,
+) void {
     var surfaces = store.iterator();
     while (surfaces.next()) |entry| {
         const surface_state = entry.value;
-        if (!surface_state.presentation_submitted) continue;
-        surface_state.presentation_submitted = false;
+        if (surface_state.presentation_output != output_context) continue;
+        surface_state.presentation_output = null;
         surface_state.commit_after_submission = false;
         sendFrameDoneFor(store, entry.id, info.timestamp.milliseconds());
         while (commitFeedbackWithState(surface_state, .submitted)) |feedback| {
@@ -465,12 +473,12 @@ pub fn finishPresentation(store: *Store, info: presentation.Info) void {
     }
 }
 
-pub fn discardPresentation(store: *Store) void {
+pub fn discardPresentation(store: *Store, output_context: *anyopaque) void {
     var surfaces = store.iterator();
     while (surfaces.next()) |entry| {
         const surface_state = entry.value;
-        if (!surface_state.presentation_submitted) continue;
-        surface_state.presentation_submitted = false;
+        if (surface_state.presentation_output != output_context) continue;
+        surface_state.presentation_output = null;
         for (surface_state.callbacks.items) |callback| {
             if (callback.state == .submitted) callback.state = .active;
         }
@@ -660,7 +668,7 @@ fn applyPending(self: *Self, commit_info: CommitInfo) void {
     surface_state.pending_surface_damage.clear();
     surface_state.pending_buffer_damage.clear();
     surface_state.has_committed = true;
-    if (surface_state.presentation_submitted) surface_state.commit_after_submission = true;
+    if (surface_state.presentation_output != null) surface_state.commit_after_submission = true;
     discardCommitFeedbacks(surface_state, .active);
     for (surface_state.callbacks.items) |callback| {
         if (callback.state == .pending) callback.state = .active;
@@ -802,7 +810,7 @@ fn applyCached(self: *Self) void {
     surface_state.cached_surface_damage.clear();
     surface_state.cached_buffer_damage.clear();
     surface_state.has_cached_state = false;
-    if (surface_state.presentation_submitted) surface_state.commit_after_submission = true;
+    if (surface_state.presentation_output != null) surface_state.commit_after_submission = true;
     discardCommitFeedbacks(surface_state, .active);
     for (surface_state.callbacks.items) |callback| {
         if (callback.state == .cached) callback.state = .active;

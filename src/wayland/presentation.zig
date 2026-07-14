@@ -5,7 +5,7 @@ const Self = @This();
 const std = @import("std");
 const wayland = @import("wayland");
 const presentation = @import("../presentation.zig");
-const OutputLayout = @import("output_layout.zig");
+const Output = @import("output.zig");
 const Surface = @import("surface.zig");
 
 const wl = wayland.server.wl;
@@ -14,8 +14,6 @@ const wp = wayland.server.wp;
 allocator: std.mem.Allocator,
 global: *wl.Global,
 surfaces: *Surface.Store,
-outputs: *OutputLayout,
-output_id: OutputLayout.Id,
 clock_id: u32,
 
 pub fn init(
@@ -23,16 +21,12 @@ pub fn init(
     allocator: std.mem.Allocator,
     display: *wl.Server,
     surfaces: *Surface.Store,
-    outputs: *OutputLayout,
-    output_id: OutputLayout.Id,
     clock_id: u32,
 ) !void {
     self.* = .{
         .allocator = allocator,
         .global = try wl.Global.create(display, wp.Presentation, 2, *Self, self, bind),
         .surfaces = surfaces,
-        .outputs = outputs,
-        .output_id = output_id,
         .clock_id = clock_id,
     };
 }
@@ -72,8 +66,7 @@ const Feedback = struct {
     allocator: std.mem.Allocator,
     store: *Surface.Store,
     surface_id: Surface.Id,
-    outputs: *OutputLayout,
-    output_id: OutputLayout.Id,
+    output: ?*Output,
     resource: *wp.PresentationFeedback,
     commit_feedback: Surface.CommitFeedback,
 
@@ -96,11 +89,11 @@ const Feedback = struct {
             .allocator = manager.allocator,
             .store = manager.surfaces,
             .surface_id = surface.handle(),
-            .outputs = manager.outputs,
-            .output_id = manager.output_id,
+            .output = null,
             .resource = resource,
             .commit_feedback = .{
                 .context = self,
+                .sampled = sampled,
                 .presented = presented,
                 .discarded = discarded,
             },
@@ -115,9 +108,15 @@ const Feedback = struct {
         return self;
     }
 
+    fn sampled(context: *anyopaque, output_context: *anyopaque) void {
+        const self: *Feedback = @ptrCast(@alignCast(context));
+        const output: *Output = @ptrCast(@alignCast(output_context));
+        self.output = output;
+    }
+
     fn presented(context: *anyopaque, info: presentation.Info) void {
         const self: *Feedback = @ptrCast(@alignCast(context));
-        if (self.outputs.get(self.output_id)) |output| {
+        if (self.output) |output| {
             for (output.boundResources()) |output_resource| {
                 if (output_resource.getClient() == self.resource.getClient()) {
                     self.resource.sendSyncOutput(output_resource);
