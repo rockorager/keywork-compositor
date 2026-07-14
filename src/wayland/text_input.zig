@@ -34,7 +34,7 @@ pub const Listener = struct {
 };
 
 pub const SurroundingText = struct {
-    text: []const u8,
+    text: [:0]const u8,
     cursor: u32,
     anchor: u32,
 };

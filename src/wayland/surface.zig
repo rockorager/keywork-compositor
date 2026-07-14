@@ -250,6 +250,7 @@ pub const Role = enum {
     subsurface,
     cursor,
     drag_icon,
+    input_popup,
     river_decoration,
     river_shell_surface,
 };

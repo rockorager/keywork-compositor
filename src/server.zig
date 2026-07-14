@@ -15,6 +15,7 @@ const Seat = @import("wayland/seat.zig");
 const DataDevice = @import("wayland/data_device.zig");
 const PrimarySelection = @import("wayland/primary_selection.zig");
 const TextInput = @import("wayland/text_input.zig");
+const InputMethod = @import("wayland/input_method.zig");
 const PresentationProtocol = @import("wayland/presentation.zig");
 const FractionalScale = @import("wayland/fractional_scale.zig");
 const Fixes = @import("wayland/fixes.zig");
@@ -47,6 +48,7 @@ seat: Seat,
 data_device: DataDevice,
 primary_selection: PrimarySelection,
 text_input: TextInput,
+input_method: InputMethod,
 presentation_protocol: PresentationProtocol,
 fractional_scale: FractionalScale,
 fixes: Fixes,
@@ -90,6 +92,7 @@ pub fn create(
         .data_device = undefined,
         .primary_selection = undefined,
         .text_input = undefined,
+        .input_method = undefined,
         .presentation_protocol = undefined,
         .fractional_scale = undefined,
         .fixes = undefined,
@@ -232,6 +235,20 @@ pub fn create(
         self.compositor.surfaceStore(),
     );
     errdefer self.text_input.deinit();
+    try self.input_method.init(
+        allocator,
+        display,
+        &self.seat,
+        self.compositor.surfaceStore(),
+        &self.text_input,
+        .{
+            .context = self,
+            .surface_position = inputMethodSurfacePosition,
+            .output_size = inputMethodOutputSize,
+            .repaint = requestRepaint,
+        },
+    );
+    errdefer self.input_method.deinit();
     try self.window_manager.init(
         allocator,
         display,
@@ -275,6 +292,7 @@ pub fn destroy(self: *Self) void {
     self.render_timer.remove();
     self.display.destroyClients();
     self.window_manager.deinit();
+    self.input_method.deinit();
     self.text_input.deinit();
     self.primary_selection.deinit();
     self.data_device.deinit();
@@ -323,6 +341,17 @@ fn requestRepaint(context: *anyopaque) void {
     const self: *Self = @ptrCast(@alignCast(context));
     self.repaint_needed = true;
     self.scheduleRepaint();
+}
+
+fn inputMethodSurfacePosition(context: *anyopaque, surface_id: Surface.Id) ?InputMethod.Position {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const position = self.scene.surfacePosition(surface_id) orelse return null;
+    return .{ .x = position.x, .y = position.y };
+}
+
+fn inputMethodOutputSize(context: *anyopaque) render.Size {
+    const self: *Self = @ptrCast(@alignCast(context));
+    return self.render_output.size();
 }
 
 fn scheduleRepaint(self: *Self) void {
@@ -673,6 +702,15 @@ fn borderRoot(self: *Self, x: f64, y: f64) ?Surface.Id {
 }
 
 fn scenePointerFocus(self: *Self, x: f64, y: f64) ?Seat.PointerFocus {
+    var input_popups = self.input_method.reversePopupIterator();
+    while (input_popups.next()) |popup| {
+        if (self.hitTestSurface(
+            popup.surface_id,
+            .{ .x = popup.position.x, .y = popup.position.y },
+            x,
+            y,
+        )) |focus| return focus;
+    }
     if (self.hitTestLayerPopups(x, y)) |focus| return focus;
     if (self.hitTestLayer(.overlay, x, y)) |focus| return focus;
     const fullscreen = self.scene.topFullscreen();
@@ -950,6 +988,19 @@ fn renderFrame(self: *Self) renderer_types.Renderer.Error!void {
     try self.renderLayerSurfaces(.overlay, target);
     try self.renderLayerPopups(target);
 
+    self.input_method.refreshPopups();
+    var input_popups = self.input_method.popupIterator();
+    while (input_popups.next()) |popup| {
+        try self.renderSurfaceTree(
+            popup.surface_id,
+            popup.position.x,
+            popup.position.y,
+            null,
+            null,
+            target,
+        );
+    }
+
     const drag_icon = self.data_device.iconInfo();
     if (drag_icon) |info| {
         try self.renderSurfaceTree(
@@ -1001,6 +1052,8 @@ fn renderFrame(self: *Self) renderer_types.Renderer.Error!void {
     if (top_fullscreen == null) self.submitLayerSurfaces(.top);
     self.submitLayerSurfaces(.overlay);
     self.submitLayerPopups();
+    input_popups = self.input_method.popupIterator();
+    while (input_popups.next()) |popup| self.submitSurfaceTree(popup.surface_id);
     if (drag_icon) |info| self.submitSurfaceTree(info.surface_id);
     if (cursor) |info| self.submitSurfaceTree(info.surface_id);
     if (presented) |info| outputPresented(self, info);

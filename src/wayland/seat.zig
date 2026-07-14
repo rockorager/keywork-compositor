@@ -30,6 +30,7 @@ pointer_available: bool,
 touch_available: bool,
 keymap: ?Keymap,
 repeat_info: RepeatInfo,
+keyboard_grab: ?KeyboardGrab,
 repaint_listener: ?RepaintListener,
 keyboard_focus_listeners: std.ArrayList(KeyboardFocusListener),
 parent_focused: bool,
@@ -45,6 +46,7 @@ drag_cursor_client: ?*wl.Client,
 cursor_surface_count: usize,
 pressed_pointer_buttons: std.ArrayList(PressedPointerButton),
 pressed_keys: std.ArrayList(u32),
+grabbed_keys: std.ArrayList(GrabbedKey),
 modifiers: Modifiers,
 last_user_action: ?UserAction,
 recent_user_actions: [user_action_history_capacity]UserAction,
@@ -69,6 +71,11 @@ const Modifiers = struct {
     latched: u32 = 0,
     locked: u32 = 0,
     group: u32 = 0,
+};
+
+const GrabbedKey = struct {
+    key: u32,
+    token: u64,
 };
 
 const UserAction = struct {
@@ -150,6 +157,15 @@ pub const KeyboardFocusListener = struct {
     changed: *const fn (*anyopaque, ?*wl.Client) void,
 };
 
+pub const KeyboardGrab = struct {
+    context: *anyopaque,
+    token: u64,
+    keymap: *const fn (*anyopaque, wl.Keyboard.KeymapFormat, std.posix.fd_t, u32) void,
+    key: *const fn (*anyopaque, u32, u32, u32, wl.Keyboard.KeyState) void,
+    modifiers: *const fn (*anyopaque, u32, u32, u32, u32) void,
+    repeat_info: *const fn (*anyopaque, i32, i32) void,
+};
+
 pub fn init(
     self: *Self,
     allocator: std.mem.Allocator,
@@ -179,6 +195,7 @@ pub fn init(
         .touch_available = false,
         .keymap = null,
         .repeat_info = .{},
+        .keyboard_grab = null,
         .repaint_listener = null,
         .keyboard_focus_listeners = .empty,
         .parent_focused = false,
@@ -194,6 +211,7 @@ pub fn init(
         .cursor_surface_count = 0,
         .pressed_pointer_buttons = .empty,
         .pressed_keys = .empty,
+        .grabbed_keys = .empty,
         .modifiers = .{},
         .last_user_action = null,
         .recent_user_actions = undefined,
@@ -208,6 +226,7 @@ pub fn init(
     errdefer self.touch_frame_resources.deinit(allocator);
     errdefer self.pressed_pointer_buttons.deinit(allocator);
     errdefer self.pressed_keys.deinit(allocator);
+    errdefer self.grabbed_keys.deinit(allocator);
     errdefer self.keyboard_focus_listeners.deinit(allocator);
     self.global = try wl.Global.create(display, wl.Seat, 10, *Self, self, bind);
 }
@@ -218,11 +237,13 @@ pub fn deinit(self: *Self) void {
     std.debug.assert(self.pointer_resources.items.len == 0);
     std.debug.assert(self.touch_resources.items.len == 0);
     std.debug.assert(self.cursor_surface_count == 0);
+    std.debug.assert(self.keyboard_grab == null);
     std.debug.assert(self.repaint_listener == null);
     std.debug.assert(self.keyboard_focus_listeners.items.len == 0);
     self.global.destroy();
     if (self.keymap) |keymap| keymap.file.close(self.io);
     self.keyboard_focus_listeners.deinit(self.allocator);
+    self.grabbed_keys.deinit(self.allocator);
     self.pressed_keys.deinit(self.allocator);
     self.pressed_pointer_buttons.deinit(self.allocator);
     self.touch_frame_resources.deinit(self.allocator);
@@ -269,6 +290,38 @@ pub fn removeKeyboardFocusListener(self: *Self, context: *anyopaque) void {
         return;
     }
     unreachable;
+}
+
+pub fn setKeyboardGrab(self: *Self, grab: KeyboardGrab) void {
+    std.debug.assert(self.keyboard_grab == null);
+    self.keyboard_grab = grab;
+    if (self.keymap) |keymap| {
+        grab.keymap(grab.context, keymap.format, keymap.file.handle, keymap.size);
+    }
+    grab.repeat_info(grab.context, self.repeat_info.rate, self.repeat_info.delay);
+    grab.modifiers(
+        grab.context,
+        self.modifiers.depressed,
+        self.modifiers.latched,
+        self.modifiers.locked,
+        self.modifiers.group,
+    );
+}
+
+pub fn clearKeyboardGrab(self: *Self, context: *anyopaque, restore_focus: bool) void {
+    const grab = self.keyboard_grab orelse unreachable;
+    std.debug.assert(grab.context == context);
+    self.keyboard_grab = null;
+    if (!restore_focus) return;
+    const surface = self.focusedSurface() orelse return;
+    if (!self.parent_focused or self.keymap == null) return;
+    const serial = self.display.nextSerial();
+    for (self.keyboard_resources.items) |entry| {
+        if (!self.keyboardResourceActive(entry)) continue;
+        if (entry.resource.getClient() == surface.getClient()) {
+            self.sendModifiers(entry.resource, serial);
+        }
+    }
 }
 
 pub fn acceptsUserActionSerial(
@@ -472,6 +525,9 @@ pub fn setKeymap(
         self.sendKeymap(entry.resource);
         self.sendRepeatInfo(entry.resource);
     }
+    if (self.keyboard_grab) |grab| {
+        grab.keymap(grab.context, format, fd, size);
+    }
     if (old_focus == null and self.keyboardFocusedClient() != null) {
         self.notifyKeyboardFocus();
         self.sendEnter();
@@ -484,6 +540,7 @@ pub fn setRepeatInfo(self: *Self, rate: i32, delay: i32) void {
     for (self.keyboard_resources.items) |entry| {
         if (self.keyboardResourceActive(entry)) self.sendRepeatInfo(entry.resource);
     }
+    if (self.keyboard_grab) |grab| grab.repeat_info(grab.context, rate, delay);
 }
 
 pub fn setKeyboardFocus(self: *Self, focus: ?Surface.Id) void {
@@ -498,6 +555,7 @@ pub fn setKeyboardFocus(self: *Self, focus: ?Surface.Id) void {
 
 pub fn parentKeyboardEnter(self: *Self, pressed_keys: []const u32) error{OutOfMemory}!void {
     self.pressed_keys.clearRetainingCapacity();
+    self.grabbed_keys.clearRetainingCapacity();
     try self.pressed_keys.appendSlice(self.allocator, pressed_keys);
     if (self.parent_focused) return;
     self.parent_focused = true;
@@ -510,6 +568,7 @@ pub fn parentKeyboardLeave(self: *Self) void {
     self.parent_focused = false;
     self.notifyKeyboardFocus();
     self.pressed_keys.clearRetainingCapacity();
+    self.grabbed_keys.clearRetainingCapacity();
 }
 
 pub fn key(
@@ -518,12 +577,21 @@ pub fn key(
     key_code: u32,
     state: wl.Keyboard.KeyState,
 ) error{OutOfMemory}!void {
+    var route_to_grab: ?u64 = null;
     switch (state) {
         .pressed => {
             for (self.pressed_keys.items) |pressed| {
                 if (pressed == key_code) return;
             }
             try self.pressed_keys.append(self.allocator, key_code);
+            errdefer _ = self.pressed_keys.pop();
+            if (self.keyboard_grab) |grab| {
+                try self.grabbed_keys.append(self.allocator, .{
+                    .key = key_code,
+                    .token = grab.token,
+                });
+                route_to_grab = grab.token;
+            }
         },
         .released => {
             for (self.pressed_keys.items, 0..) |pressed, index| {
@@ -531,13 +599,30 @@ pub fn key(
                 _ = self.pressed_keys.orderedRemove(index);
                 break;
             } else return;
+            for (self.grabbed_keys.items, 0..) |grabbed, index| {
+                if (grabbed.key != key_code) continue;
+                route_to_grab = grabbed.token;
+                _ = self.grabbed_keys.orderedRemove(index);
+                break;
+            }
         },
-        .repeated => {},
+        .repeated => for (self.grabbed_keys.items) |grabbed| {
+            if (grabbed.key == key_code) {
+                route_to_grab = grabbed.token;
+                break;
+            }
+        },
         else => return,
     }
 
-    const surface = self.focusedSurface() orelse return;
     if (!self.parent_focused or self.keymap == null) return;
+    if (route_to_grab) |token| {
+        const grab = self.keyboard_grab orelse return;
+        if (grab.token != token or state == .repeated) return;
+        grab.key(grab.context, self.display.nextSerial(), time, key_code, state);
+        return;
+    }
+    const surface = self.focusedSurface() orelse return;
     const serial = self.display.nextSerial();
     if (state == .pressed) self.recordUserAction(surface.getClient(), serial);
     for (self.keyboard_resources.items) |entry| {
@@ -562,6 +647,10 @@ pub fn setModifiers(
         .locked = locked,
         .group = group,
     };
+    if (self.keyboard_grab) |grab| {
+        grab.modifiers(grab.context, depressed, latched, locked, group);
+        return;
+    }
     const surface = self.focusedSurface() orelse return;
     if (!self.parent_focused or self.keymap == null) return;
     const serial = self.display.nextSerial();

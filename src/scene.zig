@@ -849,6 +849,37 @@ pub fn popupPosition(self: *Self, id: PopupId) ?Position {
     return self.popupGlobalPosition(id);
 }
 
+pub fn surfacePosition(self: *Self, surface_id: Surface.Id) ?Position {
+    var windows = self.windows.iterator();
+    while (windows.next()) |entry| {
+        if (!std.meta.eql(entry.value.surface_id, surface_id)) continue;
+        const offset = if (entry.value.content_geometry) |geometry| geometry.offset else Position{};
+        return .{
+            .x = entry.value.position.x -| offset.x,
+            .y = entry.value.position.y -| offset.y,
+        };
+    }
+    var shell_surfaces = self.shell_surfaces.iterator();
+    while (shell_surfaces.next()) |entry| {
+        if (std.meta.eql(entry.value.surface_id, surface_id)) return entry.value.position;
+    }
+    var layer_surfaces = self.layer_surfaces.iterator();
+    while (layer_surfaces.next()) |entry| {
+        if (std.meta.eql(entry.value.surface_id, surface_id)) return entry.value.position;
+    }
+    var popups = self.popups.iterator();
+    while (popups.next()) |entry| {
+        if (!std.meta.eql(entry.value.surface_id, surface_id)) continue;
+        var position = self.popupGlobalPosition(entry.id) orelse return null;
+        if (entry.value.content_geometry) |geometry| {
+            position.x -|= geometry.offset.x;
+            position.y -|= geometry.offset.y;
+        }
+        return position;
+    }
+    return null;
+}
+
 pub fn topFullscreen(self: *Self) ?Id {
     var index = self.stack.items.len;
     while (index > 0) {

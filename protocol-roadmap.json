@@ -365,16 +365,17 @@
       "interfaces": [
         {
           "name": "zwp_input_method_manager_v2",
-          "current_version": null,
+          "current_version": 1,
           "target_version": 1
         }
       ],
-      "status": "not_started",
+      "status": "done",
       "privileged": true,
       "blocked_by": [
         "text-input-v3",
         "wl-seat"
-      ]
+      ],
+      "status_detail": "Version 1 implements one input method per seat with unavailable competitors, text-input-v3 activation/state/edit brokerage and serial validation, physical keyboard grabs with stable press/release routing, and cursor-relative popup roles, placement, rendering, input, and lifecycle handling. The vendored external protocol remains privileged; security-context-v1 will provide sandbox-aware registry filtering."
     },
     {
       "id": "virtual-keyboard",
