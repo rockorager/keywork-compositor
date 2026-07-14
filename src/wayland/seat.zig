@@ -384,6 +384,13 @@ pub fn keyboardFocusedClient(self: *Self) ?*wl.Client {
     return surface.getClient();
 }
 
+pub fn keyboardFocusedSurface(self: *const Self) ?Surface.Id {
+    if (!self.parent_focused or self.keymap == null) return null;
+    const focus = self.focus orelse return null;
+    if (Surface.resourceFor(self.surface_store, focus) == null) return null;
+    return focus;
+}
+
 pub fn cursorInfo(self: *const Self) ?CursorInfo {
     const cursor = self.active_cursor orelse return null;
     const position = self.pointer_position orelse return null;

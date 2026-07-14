@@ -14,6 +14,7 @@ const SinglePixelBuffer = @import("wayland/single_pixel_buffer.zig");
 const Seat = @import("wayland/seat.zig");
 const DataDevice = @import("wayland/data_device.zig");
 const PrimarySelection = @import("wayland/primary_selection.zig");
+const TextInput = @import("wayland/text_input.zig");
 const PresentationProtocol = @import("wayland/presentation.zig");
 const FractionalScale = @import("wayland/fractional_scale.zig");
 const Fixes = @import("wayland/fixes.zig");
@@ -45,6 +46,7 @@ layer_shell: LayerShell,
 seat: Seat,
 data_device: DataDevice,
 primary_selection: PrimarySelection,
+text_input: TextInput,
 presentation_protocol: PresentationProtocol,
 fractional_scale: FractionalScale,
 fixes: Fixes,
@@ -87,6 +89,7 @@ pub fn create(
         .seat = undefined,
         .data_device = undefined,
         .primary_selection = undefined,
+        .text_input = undefined,
         .presentation_protocol = undefined,
         .fractional_scale = undefined,
         .fixes = undefined,
@@ -222,6 +225,13 @@ pub fn create(
     errdefer self.data_device.deinit();
     try self.primary_selection.init(allocator, display, &self.seat);
     errdefer self.primary_selection.deinit();
+    try self.text_input.init(
+        allocator,
+        display,
+        &self.seat,
+        self.compositor.surfaceStore(),
+    );
+    errdefer self.text_input.deinit();
     try self.window_manager.init(
         allocator,
         display,
@@ -265,6 +275,7 @@ pub fn destroy(self: *Self) void {
     self.render_timer.remove();
     self.display.destroyClients();
     self.window_manager.deinit();
+    self.text_input.deinit();
     self.primary_selection.deinit();
     self.data_device.deinit();
     self.xdg_activation.deinit();

@@ -13,6 +13,7 @@ pub fn build(b: *std.Build) void {
     scanner.addSystemProtocol("stable/xdg-shell/xdg-shell.xml");
     scanner.addSystemProtocol("unstable/xdg-decoration/xdg-decoration-unstable-v1.xml");
     scanner.addSystemProtocol("unstable/primary-selection/primary-selection-unstable-v1.xml");
+    scanner.addSystemProtocol("unstable/text-input/text-input-unstable-v3.xml");
     scanner.addSystemProtocol("stable/viewporter/viewporter.xml");
     scanner.addSystemProtocol("staging/fractional-scale/fractional-scale-v1.xml");
     scanner.addSystemProtocol("stable/presentation-time/presentation-time.xml");
@@ -33,6 +34,7 @@ pub fn build(b: *std.Build) void {
     scanner.generate("xdg_wm_base", 7);
     scanner.generate("zxdg_decoration_manager_v1", 2);
     scanner.generate("zwp_primary_selection_device_manager_v1", 1);
+    scanner.generate("zwp_text_input_manager_v3", 2);
     scanner.generate("wp_viewporter", 1);
     scanner.generate("wp_fractional_scale_manager_v1", 1);
     scanner.generate("wp_presentation", 2);

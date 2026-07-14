@@ -345,15 +345,16 @@
       "interfaces": [
         {
           "name": "zwp_text_input_manager_v3",
-          "current_version": null,
+          "current_version": 2,
           "target_version": 2
         }
       ],
-      "status": "not_started",
+      "status": "done",
       "privileged": false,
       "blocked_by": [
         "wl-seat"
-      ]
+      ],
+      "status_detail": "Version 2 follows exact keyboard-surface focus, implements multi-object enter/leave and single-active-input arbitration, double-buffers editor state, stages cursor rectangles through wl_surface commits, validates available actions, handles input-panel hints, and exposes input-method edit and state hooks."
     },
     {
       "id": "input-method-v2",

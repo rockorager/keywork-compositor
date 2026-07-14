@@ -66,6 +66,7 @@ test {
     _ = @import("wayland/output.zig");
     _ = @import("wayland/data_device.zig");
     _ = @import("wayland/primary_selection.zig");
+    _ = @import("wayland/text_input.zig");
     _ = @import("wayland/presentation.zig");
     _ = @import("wayland/fractional_scale.zig");
     _ = @import("wayland/fixes.zig");
