@@ -103,6 +103,7 @@ test {
     _ = @import("wayland/cursor_shape.zig");
     _ = @import("wayland/relative_pointer.zig");
     _ = @import("wayland/pointer_constraints.zig");
+    _ = @import("wayland/idle_inhibit.zig");
     _ = @import("wayland/xdg_activation.zig");
     _ = @import("wayland/xdg_output.zig");
     _ = @import("wayland/viewporter.zig");

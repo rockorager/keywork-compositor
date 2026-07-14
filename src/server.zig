@@ -15,6 +15,7 @@ const SinglePixelBuffer = @import("wayland/single_pixel_buffer.zig");
 const CursorShape = @import("wayland/cursor_shape.zig");
 const RelativePointer = @import("wayland/relative_pointer.zig");
 const PointerConstraints = @import("wayland/pointer_constraints.zig");
+const IdleInhibit = @import("wayland/idle_inhibit.zig");
 const Seat = @import("wayland/seat.zig");
 const DataDevice = @import("wayland/data_device.zig");
 const PrimarySelection = @import("wayland/primary_selection.zig");
@@ -63,6 +64,7 @@ single_pixel_buffer: SinglePixelBuffer,
 cursor_shape: CursorShape,
 relative_pointer: RelativePointer,
 pointer_constraints: PointerConstraints,
+idle_inhibit: IdleInhibit,
 compositor: Compositor,
 subcompositor: Subcompositor,
 scene: Scene,
@@ -159,6 +161,7 @@ pub fn create(
         .cursor_shape = undefined,
         .relative_pointer = undefined,
         .pointer_constraints = undefined,
+        .idle_inhibit = undefined,
         .compositor = undefined,
         .subcompositor = undefined,
         .scene = undefined,
@@ -262,6 +265,8 @@ pub fn create(
         self.compositor.surfaceStore(),
     );
     errdefer self.pointer_constraints.deinit();
+    try self.idle_inhibit.init(allocator, display);
+    errdefer self.idle_inhibit.deinit();
     try self.presentation_protocol.init(
         allocator,
         display,
@@ -435,6 +440,7 @@ pub fn destroy(self: *Self) void {
     self.fractional_scale.deinit();
     self.viewporter.deinit();
     self.presentation_protocol.deinit();
+    self.idle_inhibit.deinit();
     self.pointer_constraints.deinit();
     self.relative_pointer.deinit();
     self.cursor_shape.deinit();

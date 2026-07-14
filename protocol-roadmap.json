@@ -488,15 +488,16 @@
       "interfaces": [
         {
           "name": "zwp_idle_inhibit_manager_v1",
-          "current_version": null,
+          "current_version": 1,
           "target_version": 1
         }
       ],
-      "status": "not_started",
+      "status": "done",
       "privileged": false,
       "blocked_by": [
         "wl-compositor"
-      ]
+      ],
+      "status_detail": "Version 1 supports any number of surface-scoped inhibitors, removes their policy effect immediately when either the inhibitor or wl_surface is destroyed, and exposes live inhibitor state for visibility-aware idle, locking, screensaver, and display-power policy. Keywork does not yet initiate automatic idle actions, so there is currently nothing further to suppress."
     },
     {
       "id": "xdg-output",
