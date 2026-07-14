@@ -94,6 +94,7 @@ const RenderOutputId = RenderOutputStore.Id;
 const RenderOutputConfig = struct {
     kind: OutputBackend.Kind,
     size: render.Size,
+    drm_device_path: ?[]const u8 = null,
     position: Output.Position = .{},
     name: []const u8,
     description: []const u8,
@@ -112,6 +113,7 @@ pub fn create(
     io: std.Io,
     renderer_kind: renderer_types.Renderer.Kind,
     output_kind: OutputBackend.Kind,
+    drm_device_path: ?[]const u8,
 ) !*Self {
     const self = try allocator.create(Self);
     errdefer allocator.destroy(self);
@@ -169,6 +171,7 @@ pub fn create(
     const render_output_id = try self.addRenderOutput(io, .{
         .kind = output_kind,
         .size = .{ .width = 1280, .height = 720 },
+        .drm_device_path = drm_device_path,
         .name = switch (output_kind) {
             .drm => "DRM-1",
             .headless => "HEADLESS-1",
@@ -383,6 +386,7 @@ fn addRenderOutput(
         config.size,
         config.kind,
         if (self.session_initialized) &self.session else null,
+        config.drm_device_path,
         backendListener(render_output),
     );
     errdefer render_output.backend.deinit();
@@ -392,10 +396,10 @@ fn addRenderOutput(
         .physical_size = render_output.backend.physicalSize(),
         .scale = render_output.backend.clientScale(),
         .preferred_scale = render_output.backend.renderScale(),
-        .name = config.name,
+        .name = render_output.backend.name(config.name),
         .description = config.description,
         .make = config.make,
-        .model = config.model,
+        .model = render_output.backend.model(config.model),
     });
     errdefer std.debug.assert(self.outputs.remove(render_output.protocol_id));
     render_output.timer = try self.display.getEventLoop().addTimer(
@@ -1735,12 +1739,12 @@ fn submitWindowPopups(self: *Self, output: *Output, window_id: Scene.Id) void {
 }
 
 test "server creates and destroys protocol globals" {
-    const server = try Self.create(std.testing.allocator, std.testing.io, .cpu, .headless);
+    const server = try Self.create(std.testing.allocator, std.testing.io, .cpu, .headless, null);
     server.destroy();
 }
 
 test "server adds and removes independent render outputs" {
-    const server = try Self.create(std.testing.allocator, std.testing.io, .cpu, .headless);
+    const server = try Self.create(std.testing.allocator, std.testing.io, .cpu, .headless, null);
     defer server.destroy();
 
     const second_id = try server.addRenderOutput(std.testing.io, .{
@@ -1762,7 +1766,7 @@ test "server adds and removes independent render outputs" {
 }
 
 test "fullscreen selection is isolated to each output" {
-    const server = try Self.create(std.testing.allocator, std.testing.io, .cpu, .headless);
+    const server = try Self.create(std.testing.allocator, std.testing.io, .cpu, .headless, null);
     defer server.destroy();
 
     const first = try server.scene.addWindow(.{ .index = 100, .generation = 1 });

@@ -19,12 +19,14 @@ const log = std.log.scoped(.drm);
 const buffer_count = 2;
 const default_device_path = "/dev/dri/card0";
 
+allocator: std.mem.Allocator,
 io: std.Io,
 session: *Session,
 session_listener: Session.Listener,
 event_loop: *wl.EventLoop,
 event_source: ?*wl.EventSource,
 listener: Listener,
+device_path: [:0]u8,
 device: ?Session.Device,
 old_crtc: ?*c.drmModeCrtc,
 buffers: [buffer_count]Buffer,
@@ -33,6 +35,8 @@ size: render.Size,
 physical_size: render.Size,
 connector_id: u32,
 crtc_id: u32,
+connector_name: [32]u8,
+connector_name_length: usize,
 refresh_nanoseconds: u32,
 presentation_clock_id: u32,
 acquired: ?usize,
@@ -57,6 +61,8 @@ const Selection = struct {
     size: render.Size,
     physical_size: render.Size,
     connector_id: u32,
+    connector_type: u32,
+    connector_type_id: u32,
     crtc_id: u32,
 };
 
@@ -70,12 +76,21 @@ const event_context: c.drmEventContext = .{
 
 pub fn init(
     self: *Self,
+    allocator: std.mem.Allocator,
     io: std.Io,
     event_loop: *wl.EventLoop,
     session: *Session,
+    device_path: ?[]const u8,
     listener: Listener,
 ) !void {
+    const path = try allocator.dupeSentinel(
+        u8,
+        device_path orelse default_device_path,
+        0,
+    );
+    errdefer allocator.free(path);
     self.* = .{
+        .allocator = allocator,
         .io = io,
         .session = session,
         .session_listener = .{
@@ -87,6 +102,7 @@ pub fn init(
         .event_loop = event_loop,
         .event_source = null,
         .listener = listener,
+        .device_path = path,
         .device = null,
         .old_crtc = null,
         .buffers = .{ .{}, .{} },
@@ -95,6 +111,8 @@ pub fn init(
         .physical_size = .{ .width = 0, .height = 0 },
         .connector_id = 0,
         .crtc_id = 0,
+        .connector_name = undefined,
+        .connector_name_length = 0,
         .refresh_nanoseconds = presentation.nominal_refresh_nanoseconds,
         .presentation_clock_id = presentation.monotonic_clock_id,
         .acquired = null,
@@ -115,7 +133,12 @@ pub fn deinit(self: *Self) void {
     self.initialized = false;
     self.session.removeListener(&self.session_listener);
     self.deactivate();
+    self.allocator.free(self.device_path);
     self.* = undefined;
+}
+
+pub fn name(self: *const Self) []const u8 {
+    return self.connector_name[0..self.connector_name_length];
 }
 
 pub fn ready(self: *const Self) bool {
@@ -185,7 +208,7 @@ pub fn present(self: *Self) !?presentation.Info {
 
 fn activate(self: *Self) !void {
     std.debug.assert(self.device == null);
-    const device = try self.session.openDevice(default_device_path);
+    const device = try self.session.openDevice(self.device_path);
     self.device = device;
     errdefer {
         self.session.closeDevice(device) catch {};
@@ -204,6 +227,14 @@ fn activate(self: *Self) !void {
     self.physical_size = selection.physical_size;
     self.connector_id = selection.connector_id;
     self.crtc_id = selection.crtc_id;
+    const connector_type = c.drmModeGetConnectorTypeName(selection.connector_type);
+    const type_name = if (connector_type == null) "Unknown" else std.mem.span(connector_type);
+    const name_value = try std.fmt.bufPrint(
+        &self.connector_name,
+        "{s}-{d}",
+        .{ type_name, selection.connector_type_id },
+    );
+    self.connector_name_length = name_value.len;
     self.refresh_nanoseconds = refreshNanoseconds(self.mode);
 
     var monotonic: u64 = 0;
@@ -372,6 +403,8 @@ fn selectOutput(fd: std.posix.fd_t) !Selection {
                     .height = @max(connector.*.mmHeight, 1),
                 },
                 .connector_id = connector.*.connector_id,
+                .connector_type = connector.*.connector_type,
+                .connector_type_id = connector.*.connector_type_id,
                 .crtc_id = resources.*.crtcs[crtc_index],
             };
         }

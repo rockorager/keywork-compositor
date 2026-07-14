@@ -14,7 +14,13 @@ pub fn main(init: std.process.Init) !void {
         std.meta.stringToEnum(OutputBackend.Kind, value) orelse return error.InvalidOutputBackend
     else
         .headless;
-    const server = try Server.create(init.gpa, init.io, renderer_kind, output_kind);
+    const server = try Server.create(
+        init.gpa,
+        init.io,
+        renderer_kind,
+        output_kind,
+        init.environ_map.get("KEYWORK_DRM_DEVICE"),
+    );
     defer server.destroy();
 
     const interrupt = try server.eventLoop().addSignal(

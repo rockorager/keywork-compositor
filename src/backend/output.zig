@@ -38,6 +38,7 @@ pub fn init(
     output_size: render.Size,
     kind: Kind,
     session: ?*Session,
+    drm_device_path: ?[]const u8,
     listener: Listener,
 ) !void {
     self.io = io;
@@ -45,9 +46,11 @@ pub fn init(
         .drm => {
             self.backend = .{ .drm = undefined };
             try self.backend.drm.init(
+                allocator,
                 io,
                 display.getEventLoop(),
                 session orelse return error.MissingSession,
+                drm_device_path,
                 listener,
             );
         },
@@ -57,6 +60,20 @@ pub fn init(
             try self.backend.nested.init(io, display, output_size, listener);
         },
     }
+}
+
+pub fn name(self: *const Self, fallback: []const u8) []const u8 {
+    return switch (self.backend) {
+        .drm => |output| output.name(),
+        .headless, .nested => fallback,
+    };
+}
+
+pub fn model(self: *const Self, fallback: []const u8) []const u8 {
+    return switch (self.backend) {
+        .drm => |output| output.name(),
+        .headless, .nested => fallback,
+    };
 }
 
 pub fn deinit(self: *Self) void {
