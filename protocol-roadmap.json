@@ -98,16 +98,16 @@
       "interfaces": [
         {
           "name": "wl_data_device_manager",
-          "current_version": 3,
+          "current_version": 4,
           "target_version": 4
         }
       ],
-      "status": "in_progress",
+      "status": "done",
       "privileged": false,
       "blocked_by": [
         "wl-seat"
       ],
-      "status_detail": "Clipboard selection, MIME offers and transfers, focus delivery, and source cancellation are implemented through v3; drag-and-drop and v4 remain."
+      "status_detail": "Clipboard and drag-and-drop are implemented through v4, including implicit-grab validation, drag icons, MIME negotiation and transfers, target routing, legacy interoperability, action negotiation, drop completion, and source/offer cancellation lifecycles."
     },
     {
       "id": "wl-subcompositor",

@@ -207,7 +207,18 @@ pub fn create(
     errdefer self.layer_shell.deinit();
     try self.xdg_activation.init(allocator, io, display, &self.seat);
     errdefer self.xdg_activation.deinit();
-    try self.data_device.init(allocator, display, &self.seat);
+    try self.data_device.init(
+        allocator,
+        display,
+        &self.seat,
+        self.compositor.surfaceStore(),
+        .{
+            .context = self,
+            .started = dragStarted,
+            .ended = dragEnded,
+            .repaint = requestRepaint,
+        },
+    );
     errdefer self.data_device.deinit();
     try self.primary_selection.init(allocator, display, &self.seat);
     errdefer self.primary_selection.deinit();
@@ -246,6 +257,7 @@ pub fn create(
 
 pub fn destroy(self: *Self) void {
     const allocator = self.allocator;
+    self.data_device.cancel();
     self.layer_shell.clearRepaintListener();
     self.seat.clearRepaintListener();
     self.scene.clearRepaintListener();
@@ -393,18 +405,26 @@ fn keyboardRepeatInfo(context: *anyopaque, rate: i32, delay: i32) void {
 
 fn pointerAvailable(context: *anyopaque, available: bool) void {
     const self: *Self = @ptrCast(@alignCast(context));
+    if (!available) self.data_device.cancel();
     self.seat.setPointerAvailable(available);
 }
 
 fn pointerEnter(context: *anyopaque, x: f64, y: f64) void {
     const self: *Self = @ptrCast(@alignCast(context));
     const route = self.pointerRoute(x, y);
+    if (self.data_device.isDragging()) {
+        self.seat.pointerEnter(x, y, null);
+        self.data_device.pointerEntered(route.focus);
+        self.window_manager.pointerMoved(null);
+        return;
+    }
     self.seat.pointerEnter(x, y, if (self.window_manager.pointerGrabbed()) null else route.focus);
     self.window_manager.pointerMoved(if (self.window_manager.pointerGrabbed()) null else route.root);
 }
 
 fn pointerLeave(context: *anyopaque) void {
     const self: *Self = @ptrCast(@alignCast(context));
+    self.data_device.pointerLeft();
     self.seat.pointerLeave();
     self.window_manager.pointerMoved(null);
 }
@@ -412,6 +432,12 @@ fn pointerLeave(context: *anyopaque) void {
 fn pointerMotion(context: *anyopaque, time: u32, x: f64, y: f64) void {
     const self: *Self = @ptrCast(@alignCast(context));
     const route = self.pointerRoute(x, y);
+    if (self.data_device.isDragging()) {
+        self.seat.pointerMotion(time, x, y, null);
+        self.data_device.pointerMotion(time, route.focus);
+        self.window_manager.pointerMoved(null);
+        return;
+    }
     self.seat.pointerMotion(time, x, y, if (self.window_manager.pointerGrabbed()) null else route.focus);
     self.window_manager.pointerMoved(if (self.window_manager.pointerGrabbed()) null else route.root);
 }
@@ -423,6 +449,15 @@ fn pointerButton(
     state: wl.Pointer.ButtonState,
 ) void {
     const self: *Self = @ptrCast(@alignCast(context));
+    if (self.data_device.isDragging()) {
+        const grab_ended = self.seat.pointerButton(time, button, state) catch {
+            log.err("failed to store pointer button state", .{});
+            self.terminate();
+            return;
+        };
+        if (state == .released and grab_ended) self.data_device.drop();
+        return;
+    }
     const root = if (self.seat.pointerPosition()) |position|
         self.pointerRoute(position.x, position.y).root
     else
@@ -445,7 +480,31 @@ fn pointerButton(
         self.xdg_shell.dismissPopupGrab();
         return;
     }
-    self.seat.pointerButton(time, button, state);
+    _ = self.seat.pointerButton(time, button, state) catch {
+        log.err("failed to store pointer button state", .{});
+        self.terminate();
+    };
+}
+
+fn dragStarted(context: *anyopaque) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const position = self.seat.pointerPosition() orelse return;
+    const route = self.pointerRoute(position.x, position.y);
+    self.seat.suppressPointerFocus(true);
+    self.window_manager.pointerMoved(null);
+    self.data_device.pointerEntered(route.focus);
+}
+
+fn dragEnded(context: *anyopaque) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const position = self.seat.pointerPosition() orelse return;
+    const route = self.pointerRoute(position.x, position.y);
+    self.seat.pointerEnter(
+        position.x,
+        position.y,
+        if (self.window_manager.pointerGrabbed()) null else route.focus,
+    );
+    self.window_manager.pointerMoved(if (self.window_manager.pointerGrabbed()) null else route.root);
 }
 
 fn pointerAxis(context: *anyopaque, time: u32, axis: wl.Pointer.Axis, value: wl.Fixed) void {
@@ -880,6 +939,18 @@ fn renderFrame(self: *Self) renderer_types.Renderer.Error!void {
     try self.renderLayerSurfaces(.overlay, target);
     try self.renderLayerPopups(target);
 
+    const drag_icon = self.data_device.iconInfo();
+    if (drag_icon) |info| {
+        try self.renderSurfaceTree(
+            info.surface_id,
+            info.x,
+            info.y,
+            null,
+            null,
+            target,
+        );
+    }
+
     const cursor = self.seat.cursorInfo();
     if (cursor) |info| {
         try self.renderSurfaceTree(
@@ -919,6 +990,7 @@ fn renderFrame(self: *Self) renderer_types.Renderer.Error!void {
     if (top_fullscreen == null) self.submitLayerSurfaces(.top);
     self.submitLayerSurfaces(.overlay);
     self.submitLayerPopups();
+    if (drag_icon) |info| self.submitSurfaceTree(info.surface_id);
     if (cursor) |info| self.submitSurfaceTree(info.surface_id);
     if (presented) |info| outputPresented(self, info);
     const keyboard_focus = self.layer_shell.keyboardFocus(

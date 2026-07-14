@@ -5,13 +5,17 @@ const Self = @This();
 const std = @import("std");
 const wayland = @import("wayland");
 const Seat = @import("seat.zig");
+const Surface = @import("surface.zig");
 const slot_map = @import("../slot_map.zig");
 
 const wl = wayland.server.wl;
 
 allocator: std.mem.Allocator,
 global: *wl.Global,
+display: *wl.Server,
 seat: *Seat,
+surface_store: *Surface.Store,
+listener: Listener,
 sources: SourceStore,
 source_adapters: std.AutoHashMapUnmanaged(SourceId, *SourceResource),
 devices: DeviceStore,
@@ -21,6 +25,22 @@ offer_adapters: std.AutoHashMapUnmanaged(OfferId, *OfferResource),
 selection: ?SourceId,
 selection_serial: u32,
 focused_client: ?*wl.Client,
+drag: ?DragState,
+next_drag_generation: u64,
+drag_icon: ?*DragIcon,
+
+pub const Listener = struct {
+    context: *anyopaque,
+    started: *const fn (*anyopaque) void,
+    ended: *const fn (*anyopaque) void,
+    repaint: *const fn (*anyopaque) void,
+};
+
+pub const IconInfo = struct {
+    surface_id: Surface.Id,
+    x: i32,
+    y: i32,
+};
 
 const SourceStore = slot_map.SlotMap(SourceState, enum { data_source });
 const SourceId = SourceStore.Id;
@@ -50,6 +70,89 @@ const OfferState = struct {
     resource: *wl.DataOffer,
     device: DeviceId,
     source: ?SourceId,
+    kind: Kind,
+    drag_generation: u64 = 0,
+    enter_serial: u32 = 0,
+    active: bool = false,
+    accepted: bool = false,
+    destination_actions: wl.DataDeviceManager.DndAction = .{},
+    preferred_action: wl.DataDeviceManager.DndAction = .{},
+    selected_action: wl.DataDeviceManager.DndAction = .{},
+    dropped: bool = false,
+    finished: bool = false,
+
+    const Kind = enum {
+        selection,
+        drag,
+    };
+};
+
+const DragState = struct {
+    generation: u64,
+    source: ?SourceId,
+    source_client: *wl.Client,
+    origin: Surface.Id,
+    target: ?Target = null,
+
+    const Target = struct {
+        surface_id: Surface.Id,
+        client: *wl.Client,
+        enter_serial: u32,
+        x: f64,
+        y: f64,
+    };
+};
+
+const DragIcon = struct {
+    manager: *Self,
+    surface: *Surface,
+    surface_id: Surface.Id,
+    offset_x: i32 = 0,
+    offset_y: i32 = 0,
+
+    fn create(manager: *Self, surface: *Surface) error{ OutOfMemory, InvalidRole }!*DragIcon {
+        const self = manager.allocator.create(DragIcon) catch return error.OutOfMemory;
+        errdefer manager.allocator.destroy(self);
+        self.* = .{
+            .manager = manager,
+            .surface = surface,
+            .surface_id = surface.handle(),
+        };
+        surface.reserveRole(.drag_icon, .{
+            .context = self,
+            .before_commit = beforeCommit,
+            .after_commit = afterCommit,
+            .surface_destroyed = surfaceDestroyed,
+        }) catch return error.InvalidRole;
+        errdefer surface.releaseRole(self);
+        surface.assignReservedRole(.drag_icon, self) catch unreachable;
+        return self;
+    }
+
+    fn destroy(self: *DragIcon) void {
+        self.surface.releaseRole(self);
+        self.manager.allocator.destroy(self);
+    }
+
+    fn beforeCommit(_: *anyopaque, _: Surface.CommitInfo) Surface.CommitAction {
+        return .apply;
+    }
+
+    fn afterCommit(context: *anyopaque, info: Surface.CommitInfo) void {
+        const self: *DragIcon = @ptrCast(@alignCast(context));
+        self.offset_x +|= info.offset_x;
+        self.offset_y +|= info.offset_y;
+        self.manager.listener.repaint(self.manager.listener.context);
+    }
+
+    fn surfaceDestroyed(context: *anyopaque) void {
+        const self: *DragIcon = @ptrCast(@alignCast(context));
+        const manager = self.manager;
+        std.debug.assert(manager.drag_icon == self);
+        manager.drag_icon = null;
+        manager.allocator.destroy(self);
+        manager.listener.repaint(manager.listener.context);
+    }
 };
 
 pub fn init(
@@ -57,11 +160,16 @@ pub fn init(
     allocator: std.mem.Allocator,
     display: *wl.Server,
     seat: *Seat,
+    surface_store: *Surface.Store,
+    listener: Listener,
 ) !void {
     self.* = .{
         .allocator = allocator,
         .global = undefined,
+        .display = display,
         .seat = seat,
+        .surface_store = surface_store,
+        .listener = listener,
         .sources = .{},
         .source_adapters = .empty,
         .devices = .{},
@@ -71,6 +179,9 @@ pub fn init(
         .selection = null,
         .selection_serial = 0,
         .focused_client = null,
+        .drag = null,
+        .next_drag_generation = 0,
+        .drag_icon = null,
     };
     errdefer self.sources.deinit(allocator);
     errdefer self.source_adapters.deinit(allocator);
@@ -78,7 +189,7 @@ pub fn init(
     errdefer self.device_adapters.deinit(allocator);
     errdefer self.offers.deinit(allocator);
     errdefer self.offer_adapters.deinit(allocator);
-    self.global = try wl.Global.create(display, wl.DataDeviceManager, 3, *Self, self, bind);
+    self.global = try wl.Global.create(display, wl.DataDeviceManager, 4, *Self, self, bind);
     errdefer self.global.destroy();
     try seat.addKeyboardFocusListener(.{
         .context = self,
@@ -87,6 +198,7 @@ pub fn init(
 }
 
 pub fn deinit(self: *Self) void {
+    self.cancelDrag(false);
     self.seat.removeKeyboardFocusListener(self);
     self.global.destroy();
     std.debug.assert(self.sources.len() == 0);
@@ -118,6 +230,7 @@ fn handleRequest(
     self: *Self,
 ) void {
     switch (request) {
+        .release => resource.destroy(),
         .create_data_source => |create| SourceResource.create(
             self,
             resource.getClient(),
@@ -216,7 +329,14 @@ const SourceResource = struct {
         state.mime_types.append(self.allocator, copy) catch {
             self.allocator.free(copy);
             resource.postNoMemory();
+            return;
         };
+        var offers = self.manager.offers.iterator();
+        while (offers.next()) |entry| {
+            if (entry.value.source) |source_id| {
+                if (std.meta.eql(source_id, self.id)) entry.value.resource.sendOffer(copy.ptr);
+            }
+        }
     }
 
     fn handleDestroy(_: *wl.DataSource, self: *SourceResource) void {
@@ -267,6 +387,10 @@ const DeviceResource = struct {
         if (manager.focused_client == client) {
             manager.sendSelectionToDevice(id) catch resource.postNoMemory();
         }
+        _ = manager.sendCurrentDragToDevice(id) catch {
+            resource.postNoMemory();
+            return;
+        };
     }
 
     fn handleRequest(
@@ -276,28 +400,16 @@ const DeviceResource = struct {
     ) void {
         switch (request) {
             .release => resource.destroy(),
-            .start_drag => |start| self.rejectDrag(resource, start.source, start.serial),
+            .start_drag => |start| self.manager.startDrag(
+                self.id,
+                resource,
+                start.source,
+                start.origin,
+                start.icon,
+                start.serial,
+            ),
             .set_selection => |set| self.setSelection(resource, set.source, set.serial),
         }
-    }
-
-    fn rejectDrag(
-        self: *DeviceResource,
-        resource: *wl.DataDevice,
-        source_resource: ?*wl.DataSource,
-        _: u32,
-    ) void {
-        const source = source_resource orelse return;
-        const data = source.getUserData() orelse return;
-        const adapter: *SourceResource = @ptrCast(@alignCast(data));
-        if (adapter.manager != self.manager or source.getClient() != resource.getClient()) return;
-        const state = self.manager.sources.get(adapter.id) orelse return;
-        if (state.used) {
-            resource.postError(.used_source, "data source was already used");
-            return;
-        }
-        state.used = true;
-        if (source.getVersion() >= 3) source.sendCancelled();
     }
 
     fn setSelection(
@@ -306,6 +418,7 @@ const DeviceResource = struct {
         source_resource: ?*wl.DataSource,
         serial: u32,
     ) void {
+        if (!self.manager.seat.acceptsSelectionSerial(resource.getClient(), serial)) return;
         const source_id = if (source_resource) |source| source: {
             const data = source.getUserData() orelse return;
             const adapter: *SourceResource = @ptrCast(@alignCast(data));
@@ -323,7 +436,6 @@ const DeviceResource = struct {
             break :source adapter.id;
         } else null;
 
-        if (!self.manager.seat.acceptsSelectionSerial(resource.getClient(), serial)) return;
         self.manager.setSelection(source_id, serial);
     }
 
@@ -334,6 +446,306 @@ const DeviceResource = struct {
         self.allocator.destroy(self);
     }
 };
+
+fn startDrag(
+    self: *Self,
+    device_id: DeviceId,
+    device_resource: *wl.DataDevice,
+    source_resource: ?*wl.DataSource,
+    origin_resource: *wl.Surface,
+    icon_resource: ?*wl.Surface,
+    serial: u32,
+) void {
+    if (self.drag != null) return;
+    const client = device_resource.getClient();
+    const device = self.devices.get(device_id) orelse return;
+    if (device.resource != device_resource or origin_resource.getClient() != client) return;
+
+    const origin = Surface.fromResource(origin_resource);
+    if (!self.seat.acceptsPointerGrabSerial(client, origin.handle(), serial)) return;
+
+    const source_id: ?SourceId = if (source_resource) |resource| source: {
+        if (resource.getClient() != client) return;
+        const data = resource.getUserData() orelse return;
+        const adapter: *SourceResource = @ptrCast(@alignCast(data));
+        if (adapter.manager != self) return;
+        const source = self.sources.get(adapter.id) orelse return;
+        if (source.used) {
+            device_resource.postError(.used_source, "data source was already used");
+            return;
+        }
+        break :source adapter.id;
+    } else null;
+
+    const icon = if (icon_resource) |resource| icon: {
+        if (resource.getClient() != client) return;
+        break :icon DragIcon.create(self, Surface.fromResource(resource)) catch |err| {
+            switch (err) {
+                error.OutOfMemory => device_resource.postNoMemory(),
+                error.InvalidRole => device_resource.postError(
+                    .role,
+                    "drag icon surface already has another role",
+                ),
+            }
+            return;
+        };
+    } else null;
+
+    self.next_drag_generation = std.math.add(u64, self.next_drag_generation, 1) catch 1;
+    if (source_id) |id| self.sources.get(id).?.used = true;
+    self.drag_icon = icon;
+    self.drag = .{
+        .generation = self.next_drag_generation,
+        .source = source_id,
+        .source_client = client,
+        .origin = origin.handle(),
+    };
+    self.seat.setDragCursorController(client);
+    self.listener.started(self.listener.context);
+    self.listener.repaint(self.listener.context);
+}
+
+pub fn isDragging(self: *const Self) bool {
+    return self.drag != null;
+}
+
+pub fn pointerEntered(self: *Self, focus: ?Seat.PointerFocus) void {
+    self.updateDragTarget(focus);
+}
+
+pub fn pointerMotion(self: *Self, time: u32, focus: ?Seat.PointerFocus) void {
+    self.updateDragTarget(focus);
+    const drag = self.drag orelse return;
+    const target = drag.target orelse return;
+    const position = focus orelse return;
+    if (!std.meta.eql(position.surface_id, target.surface_id)) return;
+
+    var iterator = self.devices.iterator();
+    while (iterator.next()) |entry| {
+        if (entry.value.resource.getClient() == target.client) {
+            entry.value.resource.sendMotion(time, fixed(position.x), fixed(position.y));
+        }
+    }
+    self.listener.repaint(self.listener.context);
+}
+
+pub fn pointerLeft(self: *Self) void {
+    self.updateDragTarget(null);
+}
+
+pub fn drop(self: *Self) void {
+    const drag = self.drag orelse return;
+    const target = drag.target orelse {
+        self.cancelDrag(true);
+        return;
+    };
+    const source_id = drag.source orelse {
+        self.sendDrop(target.client);
+        self.sendLeave(target.client);
+        self.finishPhysicalDrag();
+        return;
+    };
+    const source = self.sources.get(source_id) orelse {
+        self.finishPhysicalDrag();
+        return;
+    };
+
+    if (source.resource.getVersion() >= 3) source.resource.sendDndDropPerformed();
+    const accepted = self.generationAcceptsDrop(drag.generation);
+    var needs_finish = false;
+    var iterator = self.offers.iterator();
+    while (iterator.next()) |entry| {
+        const offer = entry.value;
+        if (offer.kind != .drag or offer.drag_generation != drag.generation or !offer.active) continue;
+        offer.active = false;
+        offer.dropped = accepted;
+        if (accepted and offer.accepted and (offer.resource.getVersion() < 3 or
+            actionBits(offer.selected_action) != 0)) needs_finish = true;
+    }
+
+    if (!accepted) {
+        self.sendLeave(target.client);
+        self.cancelDndSource(source_id);
+        self.invalidateDragGeneration(drag.generation);
+    } else {
+        self.sendDrop(target.client);
+        self.sendLeave(target.client);
+        if (!needs_finish) {
+            if (source.resource.getVersion() >= 3) source.resource.sendDndFinished();
+            self.invalidateDragGeneration(drag.generation);
+        }
+    }
+    self.finishPhysicalDrag();
+}
+
+pub fn cancel(self: *Self) void {
+    self.cancelDrag(true);
+}
+
+pub fn iconInfo(self: *const Self) ?IconInfo {
+    const icon = self.drag_icon orelse return null;
+    const position = self.seat.pointerPosition() orelse return null;
+    return .{
+        .surface_id = icon.surface_id,
+        .x = dragIconCoordinate(position.x, icon.offset_x),
+        .y = dragIconCoordinate(position.y, icon.offset_y),
+    };
+}
+
+fn updateDragTarget(self: *Self, focus: ?Seat.PointerFocus) void {
+    const drag = self.drag orelse return;
+    if (Surface.resourceFor(self.surface_store, drag.origin) == null) {
+        self.cancelDrag(true);
+        return;
+    }
+
+    if (drag.target) |target| {
+        const unchanged = if (focus) |next|
+            std.meta.eql(target.surface_id, next.surface_id)
+        else
+            false;
+        if (unchanged) {
+            self.drag.?.target.?.x = focus.?.x;
+            self.drag.?.target.?.y = focus.?.y;
+            return;
+        }
+        self.leaveDragTarget(true);
+    }
+    const next = focus orelse return;
+    const surface = Surface.resourceFor(self.surface_store, next.surface_id) orelse return;
+    const client = surface.getClient();
+    if (drag.source == null and client != drag.source_client) return;
+
+    const serial = self.display.nextSerial();
+    self.drag.?.target = .{
+        .surface_id = next.surface_id,
+        .client = client,
+        .enter_serial = serial,
+        .x = next.x,
+        .y = next.y,
+    };
+    var sent = false;
+    var iterator = self.devices.iterator();
+    while (iterator.next()) |entry| {
+        if (entry.value.resource.getClient() != client) continue;
+        sent = self.sendCurrentDragToDevice(entry.id) catch {
+            entry.value.resource.postNoMemory();
+            continue;
+        } or sent;
+    }
+    if (!sent) {
+        self.drag.?.target = null;
+        return;
+    }
+    if (drag.source) |source_id| self.notifySourceTarget(
+        source_id,
+        null,
+        self.currentDragAction(drag.generation),
+    );
+}
+
+fn sendCurrentDragToDevice(
+    self: *Self,
+    device_id: DeviceId,
+) error{ OutOfMemory, ResourceCreateFailed }!bool {
+    const drag = self.drag orelse return false;
+    const target = drag.target orelse return false;
+    const device = self.devices.get(device_id) orelse return false;
+    if (device.resource.getClient() != target.client) return false;
+    const surface = Surface.resourceFor(self.surface_store, target.surface_id) orelse return false;
+
+    const offer_resource: ?*wl.DataOffer = if (drag.source) |source_id| offer: {
+        const source = self.sources.get(source_id) orelse return false;
+        const resource = try OfferResource.create(
+            self,
+            target.client,
+            device.resource.getVersion(),
+            device_id,
+            source_id,
+            .drag,
+            drag.generation,
+            target.enter_serial,
+        );
+        const adapter: *OfferResource = @ptrCast(@alignCast(resource.getUserData().?));
+        const state = self.offers.get(adapter.id).?;
+        state.active = true;
+        state.selected_action = selectedAction(
+            sourceActions(source),
+            destinationActions(state),
+            state.preferred_action,
+        );
+        device.resource.sendDataOffer(resource);
+        for (source.mime_types.items) |mime_type| resource.sendOffer(mime_type.ptr);
+        if (resource.getVersion() >= 3) {
+            resource.sendSourceActions(sourceActions(source));
+            resource.sendAction(state.selected_action);
+        }
+        break :offer resource;
+    } else null;
+    device.resource.sendEnter(
+        target.enter_serial,
+        surface,
+        fixed(target.x),
+        fixed(target.y),
+        offer_resource,
+    );
+    return true;
+}
+
+fn leaveDragTarget(self: *Self, notify_source: bool) void {
+    const drag = self.drag orelse return;
+    const target = drag.target orelse return;
+    var devices = self.devices.iterator();
+    while (devices.next()) |entry| {
+        if (entry.value.resource.getClient() == target.client) entry.value.resource.sendLeave();
+    }
+    var offers = self.offers.iterator();
+    while (offers.next()) |entry| {
+        const offer = entry.value;
+        if (offer.kind != .drag or offer.drag_generation != drag.generation or !offer.active) continue;
+        offer.active = false;
+        offer.source = null;
+    }
+    if (notify_source) if (drag.source) |source_id| self.notifySourceTarget(source_id, null, .{});
+    self.drag.?.target = null;
+}
+
+fn sendDrop(self: *Self, client: *wl.Client) void {
+    var iterator = self.devices.iterator();
+    while (iterator.next()) |entry| {
+        if (entry.value.resource.getClient() == client) entry.value.resource.sendDrop();
+    }
+}
+
+fn sendLeave(self: *Self, client: *wl.Client) void {
+    var iterator = self.devices.iterator();
+    while (iterator.next()) |entry| {
+        if (entry.value.resource.getClient() == client) entry.value.resource.sendLeave();
+    }
+}
+
+fn finishPhysicalDrag(self: *Self) void {
+    std.debug.assert(self.drag != null);
+    self.drag = null;
+    self.clearDragIcon();
+    self.seat.setDragCursorController(null);
+    self.listener.ended(self.listener.context);
+    self.listener.repaint(self.listener.context);
+}
+
+fn cancelDrag(self: *Self, notify_source: bool) void {
+    const drag = self.drag orelse return;
+    if (drag.target != null) self.leaveDragTarget(notify_source);
+    if (notify_source) if (drag.source) |source_id| self.cancelDndSource(source_id);
+    self.invalidateDragGeneration(drag.generation);
+    self.finishPhysicalDrag();
+}
+
+fn clearDragIcon(self: *Self) void {
+    const icon = self.drag_icon orelse return;
+    self.drag_icon = null;
+    icon.destroy();
+}
 
 const OfferResource = struct {
     allocator: std.mem.Allocator,
@@ -346,6 +758,9 @@ const OfferResource = struct {
         version: u32,
         device_id: DeviceId,
         source_id: SourceId,
+        kind: OfferState.Kind,
+        drag_generation: u64,
+        enter_serial: u32,
     ) error{ OutOfMemory, ResourceCreateFailed }!*wl.DataOffer {
         const resource = try wl.DataOffer.create(client, version, 0);
         errdefer resource.destroy();
@@ -355,6 +770,9 @@ const OfferResource = struct {
             .resource = resource,
             .device = device_id,
             .source = source_id,
+            .kind = kind,
+            .drag_generation = drag_generation,
+            .enter_serial = enter_serial,
         }) catch return error.OutOfMemory;
         errdefer _ = manager.offers.remove(id);
 
@@ -379,8 +797,16 @@ const OfferResource = struct {
         request: wl.DataOffer.Request,
         self: *OfferResource,
     ) void {
+        const state = self.manager.offers.get(self.id) orelse return;
+        if (state.finished) {
+            switch (request) {
+                .destroy => resource.destroy(),
+                else => resource.postError(.invalid_finish, "drag-and-drop offer was already finished"),
+            }
+            return;
+        }
         switch (request) {
-            .accept => {},
+            .accept => |accept| self.manager.acceptOffer(self.id, accept.serial, accept.mime_type),
             .receive => |receive| {
                 defer (std.Io.File{
                     .handle = receive.fd,
@@ -389,23 +815,176 @@ const OfferResource = struct {
                 const offer = self.manager.offers.get(self.id) orelse return;
                 const source_id = offer.source orelse return;
                 const source = self.manager.sources.get(source_id) orelse return;
+                if (!sourceHasMime(source, receive.mime_type)) return;
                 source.resource.sendSend(receive.mime_type, receive.fd);
             },
             .destroy => resource.destroy(),
-            .finish => resource.postError(.invalid_finish, "selection offer cannot be finished"),
-            .set_actions => resource.postError(
-                .invalid_offer,
-                "drag-and-drop actions are invalid for a selection offer",
+            .finish => self.manager.finishOffer(self.id),
+            .set_actions => |set| self.manager.setOfferActions(
+                self.id,
+                set.dnd_actions,
+                set.preferred_action,
             ),
         }
     }
 
     fn handleDestroy(_: *wl.DataOffer, self: *OfferResource) void {
+        self.manager.offerDestroyed(self.id);
         _ = self.manager.offer_adapters.remove(self.id);
         _ = self.manager.offers.remove(self.id);
         self.allocator.destroy(self);
     }
 };
+
+fn acceptOffer(
+    self: *Self,
+    offer_id: OfferId,
+    serial: u32,
+    mime_type: ?[*:0]const u8,
+) void {
+    const offer = self.offers.get(offer_id) orelse return;
+    if (offer.kind != .drag or (!offer.active and !offer.dropped)) return;
+    if (offer.active and serial != offer.enter_serial) return;
+    const source_id = offer.source orelse return;
+    const source = self.sources.get(source_id) orelse return;
+    const accepted = if (mime_type) |value| sourceHasMime(source, value) else false;
+    offer.accepted = accepted;
+    source.resource.sendTarget(if (accepted) mime_type else null);
+}
+
+fn setOfferActions(
+    self: *Self,
+    offer_id: OfferId,
+    actions: wl.DataDeviceManager.DndAction,
+    preferred: wl.DataDeviceManager.DndAction,
+) void {
+    const offer = self.offers.get(offer_id) orelse return;
+    if (offer.kind != .drag) {
+        offer.resource.postError(
+            .invalid_offer,
+            "drag-and-drop actions are invalid for a selection offer",
+        );
+        return;
+    }
+    const action_bits = actionBits(actions);
+    if (action_bits & ~@as(u32, 7) != 0) {
+        offer.resource.postError(.invalid_action_mask, "invalid drag-and-drop action mask");
+        return;
+    }
+    const preferred_bits = actionBits(preferred);
+    if ((preferred_bits != 0 and preferred_bits & (preferred_bits - 1) != 0) or
+        preferred_bits & ~action_bits != 0)
+    {
+        offer.resource.postError(.invalid_action, "invalid preferred drag-and-drop action");
+        return;
+    }
+    const source_id = offer.source orelse return;
+    const source = self.sources.get(source_id) orelse return;
+    if (offer.dropped and actionBits(offer.selected_action) != actionBits(action(.ask))) return;
+    if (offer.dropped and preferred_bits != 0 and
+        preferred_bits & actionBits(sourceActions(source)) == 0)
+    {
+        offer.resource.postError(.invalid_action, "preferred action was not offered by the source");
+        return;
+    }
+
+    offer.destination_actions = actions;
+    offer.preferred_action = preferred;
+    const selected = selectedAction(sourceActions(source), actions, preferred);
+    if (actionBits(selected) == actionBits(offer.selected_action)) return;
+    offer.selected_action = selected;
+    offer.resource.sendAction(selected);
+    if (source.resource.getVersion() >= 3) source.resource.sendAction(selected);
+}
+
+fn finishOffer(self: *Self, offer_id: OfferId) void {
+    const offer = self.offers.get(offer_id) orelse return;
+    if (offer.kind != .drag or !offer.dropped or !offer.accepted or
+        actionBits(offer.selected_action) == 0 or
+        actionBits(offer.selected_action) == actionBits(action(.ask)))
+    {
+        offer.resource.postError(.invalid_finish, "drag-and-drop offer cannot be finished");
+        return;
+    }
+    const source_id = offer.source orelse {
+        offer.resource.postError(.invalid_finish, "drag-and-drop source is no longer available");
+        return;
+    };
+    const source = self.sources.get(source_id) orelse {
+        offer.resource.postError(.invalid_finish, "drag-and-drop source is no longer available");
+        return;
+    };
+    offer.finished = true;
+    if (source.resource.getVersion() >= 3) source.resource.sendDndFinished();
+    self.invalidateDragGeneration(offer.drag_generation);
+}
+
+fn offerDestroyed(self: *Self, offer_id: OfferId) void {
+    const offer = self.offers.get(offer_id) orelse return;
+    if (offer.kind != .drag or !offer.dropped or offer.finished or offer.source == null) return;
+    var iterator = self.offers.iterator();
+    while (iterator.next()) |entry| {
+        if (std.meta.eql(entry.id, offer_id)) continue;
+        const candidate = entry.value;
+        if (candidate.kind == .drag and candidate.drag_generation == offer.drag_generation and
+            candidate.dropped and !candidate.finished and candidate.source != null) return;
+    }
+    const source_id = offer.source.?;
+    const source = self.sources.get(source_id) orelse return;
+    if (offer.resource.getVersion() < 3) {
+        if (source.resource.getVersion() >= 3) source.resource.sendDndFinished();
+    } else {
+        self.cancelDndSource(source_id);
+    }
+    self.invalidateDragGeneration(offer.drag_generation);
+}
+
+fn generationAcceptsDrop(self: *Self, generation: u64) bool {
+    var iterator = self.offers.iterator();
+    while (iterator.next()) |entry| {
+        const offer = entry.value;
+        if (offer.kind != .drag or offer.drag_generation != generation or !offer.active) continue;
+        if (offer.accepted and actionBits(offer.selected_action) != 0) return true;
+    }
+    return false;
+}
+
+fn currentDragAction(self: *Self, generation: u64) wl.DataDeviceManager.DndAction {
+    var iterator = self.offers.iterator();
+    while (iterator.next()) |entry| {
+        const offer = entry.value;
+        if (offer.kind == .drag and offer.drag_generation == generation and offer.active and
+            actionBits(offer.selected_action) != 0) return offer.selected_action;
+    }
+    return .{};
+}
+
+fn invalidateDragGeneration(self: *Self, generation: u64) void {
+    var iterator = self.offers.iterator();
+    while (iterator.next()) |entry| {
+        const offer = entry.value;
+        if (offer.kind != .drag or offer.drag_generation != generation) continue;
+        offer.source = null;
+        offer.active = false;
+        offer.dropped = false;
+    }
+}
+
+fn cancelDndSource(self: *Self, source_id: SourceId) void {
+    const source = self.sources.get(source_id) orelse return;
+    if (source.resource.getVersion() >= 3) source.resource.sendCancelled();
+}
+
+fn notifySourceTarget(
+    self: *Self,
+    source_id: SourceId,
+    mime_type: ?[*:0]const u8,
+    selected: wl.DataDeviceManager.DndAction,
+) void {
+    const source = self.sources.get(source_id) orelse return;
+    source.resource.sendTarget(mime_type);
+    if (source.resource.getVersion() >= 3) source.resource.sendAction(selected);
+}
 
 fn keyboardFocusChanged(context: *anyopaque, client: ?*wl.Client) void {
     const self: *Self = @ptrCast(@alignCast(context));
@@ -432,6 +1011,11 @@ fn setSelection(self: *Self, source_id: ?SourceId, serial: u32) void {
 }
 
 fn sourceDestroyed(self: *Self, id: SourceId) void {
+    if (self.drag) |drag| {
+        if (drag.source) |source_id| {
+            if (std.meta.eql(source_id, id)) self.cancelDrag(false);
+        }
+    }
     var iterator = self.offers.iterator();
     while (iterator.next()) |entry| {
         if (entry.value.source) |source_id| {
@@ -446,15 +1030,15 @@ fn sourceDestroyed(self: *Self, id: SourceId) void {
 }
 
 fn deviceDestroyed(self: *Self, id: DeviceId) void {
-    var iterator = self.offers.iterator();
-    while (iterator.next()) |entry| {
-        if (std.meta.eql(entry.value.device, id)) entry.value.source = null;
-    }
+    _ = self;
+    _ = id;
 }
 
 fn invalidateOffers(self: *Self) void {
     var iterator = self.offers.iterator();
-    while (iterator.next()) |entry| entry.value.source = null;
+    while (iterator.next()) |entry| {
+        if (entry.value.kind == .selection) entry.value.source = null;
+    }
 }
 
 fn sendSelectionToClient(self: *Self, client: *wl.Client) void {
@@ -485,8 +1069,98 @@ fn sendSelectionToDevice(
         device.resource.getVersion(),
         device_id,
         source_id,
+        .selection,
+        0,
+        0,
     );
     device.resource.sendDataOffer(offer);
     for (source.mime_types.items) |mime_type| offer.sendOffer(mime_type.ptr);
     device.resource.sendSelection(offer);
+}
+
+const DndActionKind = enum {
+    copy,
+    move,
+    ask,
+};
+
+fn action(kind: DndActionKind) wl.DataDeviceManager.DndAction {
+    var result: wl.DataDeviceManager.DndAction = .{};
+    switch (kind) {
+        .copy => result.copy = true,
+        .move => result.move = true,
+        .ask => result.ask = true,
+    }
+    return result;
+}
+
+fn actionBits(value: wl.DataDeviceManager.DndAction) u32 {
+    return @bitCast(value);
+}
+
+fn sourceActions(source: *const SourceState) wl.DataDeviceManager.DndAction {
+    return if (source.resource.getVersion() < 3) action(.copy) else source.dnd_actions;
+}
+
+fn destinationActions(offer: *const OfferState) wl.DataDeviceManager.DndAction {
+    return if (offer.resource.getVersion() < 3) action(.copy) else offer.destination_actions;
+}
+
+fn selectedAction(
+    source: wl.DataDeviceManager.DndAction,
+    destination: wl.DataDeviceManager.DndAction,
+    preferred: wl.DataDeviceManager.DndAction,
+) wl.DataDeviceManager.DndAction {
+    const available = actionBits(source) & actionBits(destination);
+    const preferred_bits = actionBits(preferred);
+    if (preferred_bits != 0 and available & preferred_bits != 0) return preferred;
+    inline for (.{ DndActionKind.copy, DndActionKind.move, DndActionKind.ask }) |kind| {
+        const candidate = action(kind);
+        if (available & actionBits(candidate) != 0) return candidate;
+    }
+    return .{};
+}
+
+fn sourceHasMime(source: *const SourceState, mime_type: [*:0]const u8) bool {
+    const requested = std.mem.span(mime_type);
+    for (source.mime_types.items) |offered| {
+        if (std.mem.eql(u8, offered, requested)) return true;
+    }
+    return false;
+}
+
+fn dragIconCoordinate(position: f64, offset: i32) i32 {
+    const minimum = @as(f64, @floatFromInt(std.math.minInt(i32))) -
+        @as(f64, @floatFromInt(offset));
+    const maximum = @as(f64, @floatFromInt(std.math.maxInt(i32))) -
+        @as(f64, @floatFromInt(offset));
+    const integral: i64 = @intFromFloat(@floor(std.math.clamp(position, minimum, maximum)));
+    return @intCast(std.math.clamp(
+        integral + @as(i64, offset),
+        std.math.minInt(i32),
+        std.math.maxInt(i32),
+    ));
+}
+
+fn fixed(value: f64) wl.Fixed {
+    const minimum = @as(f64, @floatFromInt(std.math.minInt(i32))) / 256.0;
+    const maximum = @as(f64, @floatFromInt(std.math.maxInt(i32))) / 256.0;
+    return wl.Fixed.fromDouble(std.math.clamp(value, minimum, maximum));
+}
+
+test "drag action negotiation honors a common preference then bit order" {
+    const source: wl.DataDeviceManager.DndAction = .{ .copy = true, .move = true };
+    const destination: wl.DataDeviceManager.DndAction = .{ .copy = true, .move = true };
+
+    try std.testing.expectEqual(action(.move), selectedAction(source, destination, action(.move)));
+    try std.testing.expectEqual(action(.copy), selectedAction(source, destination, .{}));
+    try std.testing.expectEqual(
+        @as(u32, 0),
+        actionBits(selectedAction(source, action(.ask), action(.ask))),
+    );
+}
+
+test "drag icon position applies committed surface offsets" {
+    try std.testing.expectEqual(@as(i32, 15), dragIconCoordinate(12.75, 3));
+    try std.testing.expectEqual(std.math.maxInt(i32), dragIconCoordinate(1.0e20, 4));
 }

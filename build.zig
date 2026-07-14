@@ -29,7 +29,7 @@ pub fn build(b: *std.Build) void {
     scanner.generate("wl_fixes", 1);
     scanner.generate("wl_output", 4);
     scanner.generate("wl_seat", 10);
-    scanner.generate("wl_data_device_manager", 3);
+    scanner.generate("wl_data_device_manager", 4);
     scanner.generate("xdg_wm_base", 7);
     scanner.generate("zxdg_decoration_manager_v1", 2);
     scanner.generate("zwp_primary_selection_device_manager_v1", 1);

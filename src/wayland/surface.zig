@@ -249,6 +249,7 @@ pub const Role = enum {
     layer_surface,
     subsurface,
     cursor,
+    drag_icon,
     river_decoration,
     river_shell_surface,
 };
