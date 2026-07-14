@@ -101,6 +101,7 @@ const XdgSurfaceState = struct {
     initial_configure_sent: bool = false,
     configured: bool = false,
     sent_capabilities: ?WindowCapabilities = null,
+    sent_bounds: ?Dimensions = null,
     mapped: bool = false,
     surface_alive: bool = true,
     toplevel_resource: ?*xdg.Toplevel = null,
@@ -205,6 +206,7 @@ pub const ToplevelConfigure = struct {
     tiled: TiledEdges = .{},
     capabilities: WindowCapabilities = .{},
     decoration_mode: DecorationMode = .client_side,
+    bounds: Dimensions = .{ .width = 0, .height = 0 },
 };
 
 pub const DecorationMode = enum {
@@ -452,7 +454,11 @@ pub fn configureWindowState(
     dimensions: Dimensions,
     configuration: ToplevelConfigure,
 ) error{ InvalidWindow, OutOfMemory }!u32 {
-    if (dimensions.width < 0 or dimensions.height < 0) return error.InvalidWindow;
+    if (dimensions.width < 0 or dimensions.height < 0 or
+        configuration.bounds.width < 0 or configuration.bounds.height < 0)
+    {
+        return error.InvalidWindow;
+    }
     const window = self.windows.get(id) orelse return error.InvalidWindow;
     const state = self.xdg_surfaces.get(window.xdg_surface_id) orelse
         return error.InvalidWindow;
@@ -542,6 +548,16 @@ pub fn configureWindowState(
         };
         toplevel.sendWmCapabilities(&capabilities_array);
         state.sent_capabilities = configuration.capabilities;
+    }
+    if (toplevel.getVersion() >= 4 and
+        (state.sent_bounds == null or
+            !std.meta.eql(state.sent_bounds.?, configuration.bounds)))
+    {
+        toplevel.sendConfigureBounds(
+            configuration.bounds.width,
+            configuration.bounds.height,
+        );
+        state.sent_bounds = configuration.bounds;
     }
     const adapter: *ToplevelResource = @ptrCast(@alignCast(toplevel.getUserData().?));
     if (adapter.decoration) |decoration| {

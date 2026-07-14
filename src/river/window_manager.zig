@@ -18,6 +18,7 @@ const river = wayland.server.river;
 const protocol_version = 3;
 
 allocator: std.mem.Allocator,
+display: *wl.Server,
 global: *wl.Global,
 layer_global: *wl.Global,
 output: *Output,
@@ -42,6 +43,9 @@ layer_bindings: std.ArrayList(*LayerBinding),
 layer_area: LayerShell.Rect,
 layer_focus: LayerShell.FocusClass,
 layer_focus_sent: LayerShell.FocusClass,
+next_window_identifier: u64,
+presentation_mode: river.OutputV1.PresentationMode,
+pending_presentation_mode: ?river.OutputV1.PresentationMode,
 
 const WindowStore = slot_map.SlotMap(ManagedWindow, enum { managed_window });
 const WindowId = WindowStore.Id;
@@ -57,10 +61,12 @@ const ManagedNodeId = union(enum) {
 
 const ManagedWindow = struct {
     xdg_id: XdgShell.WindowId,
+    identifier: u64,
     resource: ?*river.WindowV1 = null,
     node_resource: ?*river.NodeV1 = null,
     node_created: bool = false,
     metadata_dirty: bool = true,
+    sent_presentation_hint: bool = false,
     proposed_dimensions: ?XdgShell.Dimensions = null,
     requested_dimensions: XdgShell.Dimensions = .{ .width = 0, .height = 0 },
     requested_configuration: XdgShell.ToplevelConfigure = .{},
@@ -228,6 +234,7 @@ pub fn init(
 ) !void {
     self.* = .{
         .allocator = allocator,
+        .display = display,
         .global = undefined,
         .layer_global = undefined,
         .output = output,
@@ -252,6 +259,9 @@ pub fn init(
         .layer_area = layer_shell.usableArea(),
         .layer_focus = .none,
         .layer_focus_sent = .none,
+        .next_window_identifier = 1,
+        .presentation_mode = .vsync,
+        .pending_presentation_mode = null,
     };
     errdefer self.windows.deinit(allocator);
     errdefer self.decorations.deinit(allocator);
@@ -371,7 +381,7 @@ fn handleRequest(
             Surface.fromResource(get.surface),
             get.id,
         ) catch resource.postNoMemory(),
-        .exit_session => unreachable,
+        .exit_session => self.display.terminate(),
     }
 }
 
@@ -381,7 +391,12 @@ fn handleDestroy(resource: *river.WindowManagerV1, self: *Self) void {
 
 fn ensureWindow(self: *Self, xdg_id: XdgShell.WindowId) error{OutOfMemory}!WindowId {
     if (self.findWindow(xdg_id)) |id| return id;
-    return self.windows.insert(self.allocator, .{ .xdg_id = xdg_id });
+    const identifier = self.next_window_identifier;
+    self.next_window_identifier = std.math.add(u64, identifier, 1) catch unreachable;
+    return self.windows.insert(self.allocator, .{
+        .xdg_id = xdg_id,
+        .identifier = identifier,
+    });
 }
 
 fn findWindow(self: *Self, xdg_id: XdgShell.WindowId) ?WindowId {
@@ -507,6 +522,19 @@ fn createWindowResource(
         const info = self.xdg_shell.windowInfo(window.xdg_id) orelse unreachable;
         resource.sendUnreliablePid(info.unreliable_pid);
     }
+    if (resource.getVersion() >= river.WindowV1.identifier_since_version) {
+        var identifier_buffer: [20]u8 = undefined;
+        const identifier = std.fmt.bufPrintSentinel(
+            &identifier_buffer,
+            "kw-{x:0>16}",
+            .{window.identifier},
+            0,
+        ) catch unreachable;
+        resource.sendIdentifier(identifier.ptr);
+    }
+    if (resource.getVersion() >= river.WindowV1.capture_sessions_since_version) {
+        resource.sendCaptureSessions(0);
+    }
 }
 
 fn finishManage(self: *Self, manager: *river.WindowManagerV1) void {
@@ -586,6 +614,14 @@ fn startRender(self: *Self, manager: *river.WindowManagerV1) void {
     std.debug.assert(self.sequence.state == .render);
     var iterator = self.windows.iterator();
     while (iterator.next()) |entry| {
+        if (!entry.value.sent_presentation_hint) {
+            if (entry.value.resource) |resource| {
+                if (resource.getVersion() >= river.WindowV1.presentation_hint_since_version) {
+                    resource.sendPresentationHint(.vsync);
+                }
+                entry.value.sent_presentation_hint = true;
+            }
+        }
         if (!entry.value.dimensions_pending) continue;
         const dimensions = (self.xdg_shell.windowInfo(entry.value.xdg_id) orelse continue).dimensions orelse
             continue;
@@ -608,6 +644,10 @@ fn finishRender(self: *Self, manager: *river.WindowManagerV1) void {
     if (!self.validateSynchronizedCommits()) return;
     self.applyDecorationState();
     self.applyShellSurfaceState();
+    if (self.pending_presentation_mode) |mode| {
+        self.presentation_mode = mode;
+        self.pending_presentation_mode = null;
+    }
 
     var iterator = self.windows.iterator();
     while (iterator.next()) |entry| {
@@ -994,6 +1034,8 @@ fn releaseManager(self: *Self) void {
     self.stack_operations.clearRetainingCapacity();
     self.focused = null;
     self.pending_focus = .unchanged;
+    self.presentation_mode = .vsync;
+    self.pending_presentation_mode = null;
     self.releaseWindows();
     self.releaseShellSurfaces();
 }
@@ -1010,7 +1052,9 @@ fn releaseWindows(self: *Self) void {
         self.xdg_shell.restoreStandaloneWindow(
             entry.value.xdg_id,
             entry.value.sent_configuration.activated or
-                entry.value.sent_configuration.decoration_mode == .server_side,
+                entry.value.sent_configuration.decoration_mode == .server_side or
+                entry.value.sent_configuration.bounds.width != 0 or
+                entry.value.sent_configuration.bounds.height != 0,
             entry.value.requested_dimensions,
         );
         _ = self.windows.remove(entry.id);
@@ -1368,7 +1412,20 @@ const WindowResource = struct {
                 .below,
                 get.id,
             ) catch resource.postNoMemory(),
-            .set_dimension_bounds => unreachable,
+            .set_dimension_bounds => |bounds| {
+                if (!self.requireManage(manager_resource)) return;
+                if (bounds.max_width < 0 or bounds.max_height < 0) {
+                    resource.postError(
+                        .invalid_dimensions,
+                        "dimension bounds must not be negative",
+                    );
+                    return;
+                }
+                window.requested_configuration.bounds = .{
+                    .width = bounds.max_width,
+                    .height = bounds.max_height,
+                };
+            },
         }
     }
 
@@ -1971,6 +2028,9 @@ fn createOutput(self: *Self, manager: *river.WindowManagerV1) !void {
     resource.sendPosition(0, 0);
     const size = self.output.logicalSize();
     resource.sendDimensions(@intCast(size.width), @intCast(size.height));
+    if (resource.getVersion() >= river.OutputV1.capture_sessions_since_version) {
+        resource.sendCaptureSessions(0);
+    }
 }
 
 fn createSeat(self: *Self, manager: *river.WindowManagerV1) !void {
@@ -2007,12 +2067,34 @@ const OutputResource = struct {
     ) void {
         switch (request) {
             .destroy => resource.destroy(),
-            .set_presentation_mode => if (self.manager.active != null and
-                self.manager.session_generation == self.owner_generation)
-            {
-                resource.getClient().postImplementationError(
-                    "river output presentation modes are not implemented",
-                );
+            .set_presentation_mode => |set| {
+                const manager_resource = self.activeManager() orelse return;
+                if (!self.requireRendering(manager_resource)) return;
+                switch (set.mode) {
+                    .vsync, .async => self.manager.pending_presentation_mode = set.mode,
+                    else => resource.postError(
+                        .invalid_presentation_mode,
+                        "unknown output presentation mode",
+                    ),
+                }
+            },
+        }
+    }
+
+    fn activeManager(self: *OutputResource) ?*river.WindowManagerV1 {
+        if (self.manager.session_generation != self.owner_generation) return null;
+        return self.manager.active;
+    }
+
+    fn requireRendering(
+        self: *OutputResource,
+        manager: *river.WindowManagerV1,
+    ) bool {
+        switch (self.manager.sequence.state) {
+            .manage, .inflight_configures, .render => return true,
+            .idle => {
+                manager.postError(.sequence_order, "output request outside a render sequence");
+                return false;
             },
         }
     }
