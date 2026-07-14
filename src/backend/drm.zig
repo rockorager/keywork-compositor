@@ -32,6 +32,7 @@ presentation_clock_id: u32,
 acquired: ?usize,
 pending: ?usize,
 displayed: ?usize,
+enabled: bool,
 mode_set: bool,
 retired: bool,
 
@@ -93,6 +94,7 @@ pub fn init(
         .acquired = null,
         .pending = null,
         .displayed = null,
+        .enabled = true,
         .mode_set = false,
         .retired = false,
     };
@@ -119,7 +121,7 @@ pub fn name(self: *const Self) []const u8 {
 }
 
 pub fn ready(self: *const Self) bool {
-    if (!self.device_access.active(self.device_access.context) or
+    if (!self.enabled or !self.device_access.active(self.device_access.context) or
         self.acquired != null or self.pending != null) return false;
     return self.availableBuffer() != null;
 }
@@ -221,13 +223,15 @@ pub fn activate(self: *Self, fd: std.posix.fd_t, selection: Selection, device_pa
         self.old_crtc = null;
     }
 
-    errdefer for (&self.buffers) |*buffer| destroyBuffer(fd, buffer);
-    for (&self.buffers) |*buffer| {
-        try createBuffer(fd, self.size, buffer);
+    if (self.enabled) {
+        errdefer for (&self.buffers) |*buffer| destroyBuffer(fd, buffer);
+        for (&self.buffers) |*buffer| {
+            try createBuffer(fd, self.size, buffer);
+        }
     }
     log.info(
-        "activated connector {s} ({d}) on {s} at {d}x{d}, CRTC {d}",
-        .{ self.name(), self.connector_id, device_path, self.size.width, self.size.height, self.crtc_id },
+        "activated connector {s} ({d}) on {s} at {d}x{d}, CRTC {d}, enabled={}",
+        .{ self.name(), self.connector_id, device_path, self.size.width, self.size.height, self.crtc_id, self.enabled },
     );
 }
 
@@ -241,7 +245,7 @@ pub fn isPrimaryNode(path: []const u8) bool {
 }
 
 pub fn deactivate(self: *Self, fd: std.posix.fd_t) void {
-    if (self.mode_set) restoreCrtc(fd, self.connector_id, self.old_crtc.?);
+    if (self.old_crtc) |old_crtc| restoreCrtc(fd, self.connector_id, old_crtc);
     self.mode_set = false;
     self.acquired = null;
     self.pending = null;
@@ -251,6 +255,32 @@ pub fn deactivate(self: *Self, fd: std.posix.fd_t) void {
         c.drmModeFreeCrtc(old_crtc);
         self.old_crtc = null;
     }
+}
+
+pub fn setEnabled(self: *Self, fd: std.posix.fd_t, enabled: bool) !void {
+    if (self.enabled == enabled) return;
+    std.debug.assert(self.old_crtc != null);
+    if (enabled) {
+        errdefer for (&self.buffers) |*buffer| destroyBuffer(fd, buffer);
+        for (&self.buffers) |*buffer| try createBuffer(fd, self.size, buffer);
+        self.enabled = true;
+        self.mode_set = false;
+        return;
+    }
+
+    // Destroying a framebuffer queued for a page flip is not safe. Output
+    // configuration is infrequent, so reject a busy head and let the client
+    // retry rather than complicating the page-flip lifetime.
+    if (self.pending != null) return error.OutputBusy;
+    self.acquired = null;
+    if (c.drmModeSetCrtc(fd, self.crtc_id, 0, 0, 0, null, 0, null) != 0) {
+        return error.DisableFailed;
+    }
+    self.notifyDeactivated();
+    self.enabled = false;
+    self.mode_set = false;
+    self.displayed = null;
+    for (&self.buffers) |*buffer| destroyBuffer(fd, buffer);
 }
 
 fn availableBuffer(self: *const Self) ?usize {

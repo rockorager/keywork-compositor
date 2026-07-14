@@ -92,6 +92,14 @@ pub fn outputs(self: *Self) []const *DrmOutput {
     return self.active_outputs.items;
 }
 
+pub fn setOutputEnabled(self: *Self, output: *DrmOutput, enabled: bool) !void {
+    if (self.failed or self.device == null or !self.session.isActive()) {
+        return error.SessionInactive;
+    }
+    if (self.findOutput(output.connector_id) != output) return error.UnknownOutput;
+    try output.setEnabled(self.device.?.fd, enabled);
+}
+
 pub fn setListener(self: *Self, listener: Listener) void {
     std.debug.assert(self.listener == null);
     self.listener = listener;

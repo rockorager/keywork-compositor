@@ -193,6 +193,7 @@ pub fn create(
         if (drm_outputs.len == 0) return error.NoConnectedOutput;
         var x: i32 = 0;
         for (drm_outputs, 0..) |drm_output, index| {
+            std.debug.assert(drm_output.enabled);
             const id = try self.addRenderOutput(io, .{ .kind = .drm, .size = drm_output.size, .position = .{ .x = x }, .name = "DRM", .description = "Keywork DRM output", .model = "drm-kms", .drm_output = drm_output });
             if (index == 0) render_output_id = id;
             x += @intCast(drm_output.size.width);
@@ -487,6 +488,7 @@ fn removeRenderOutput(self: *Self, id: RenderOutputId) bool {
 
 fn drmOutputAdded(context: *anyopaque, drm_output: *DrmOutput) void {
     const self: *Self = @ptrCast(@alignCast(context));
+    if (!drm_output.enabled) return;
     var right: i32 = 0;
     var iterator = self.render_outputs.iterator();
     while (iterator.next()) |entry| {
