@@ -69,7 +69,7 @@
       "status": "done",
       "privileged": false,
       "blocked_by": [],
-      "status_detail": "The protocol is implemented for the current single static output; multi-output and hotplug are backend work."
+      "status_detail": "The protocol is implemented for the current single output, including parent-derived nested refresh updates; multi-output and hotplug are backend work."
     },
     {
       "id": "wl-seat",
@@ -87,7 +87,7 @@
       "status": "in_progress",
       "privileged": false,
       "blocked_by": [],
-      "status_detail": "Keyboard and pointer events are implemented; client cursor surfaces and touch support remain."
+      "status_detail": "Keyboard and pointer events, focus, and client cursor surfaces are implemented; touch support remains."
     },
     {
       "id": "wl-data-device-manager",
@@ -107,7 +107,7 @@
       "blocked_by": [
         "wl-seat"
       ],
-      "status_detail": "Resource creation and action validation exist, but clipboard transfers, selections, offers, and drag-and-drop are not functional."
+      "status_detail": "Clipboard selection, MIME offers and transfers, focus delivery, and source cancellation are implemented through v3; drag-and-drop and v4 remain."
     },
     {
       "id": "wl-subcompositor",
@@ -222,12 +222,12 @@
           "target_version": 2
         }
       ],
-      "status": "in_progress",
+      "status": "done",
       "privileged": false,
       "blocked_by": [
         "xdg-shell"
       ],
-      "status_detail": "Implementation is present in the current uncommitted working tree and still needs final verification."
+      "status_detail": "Manager and toplevel-decoration lifecycles, mode negotiation, configure events, and initial-configure ordering are implemented through v2."
     },
     {
       "id": "river-window-management",
@@ -279,15 +279,16 @@
       "interfaces": [
         {
           "name": "wp_presentation",
-          "current_version": null,
+          "current_version": 2,
           "target_version": 2
         }
       ],
-      "status": "not_started",
+      "status": "done",
       "privileged": false,
       "blocked_by": [
         "wl-output"
-      ]
+      ],
+      "status_detail": "Feedback is associated with exact applied, cached, and submitted surface commits. Nested mode forwards parent clock, timestamp, refresh, sequence, and timing flags; headless mode uses a monotonic nominal 60 Hz clock."
     },
     {
       "id": "xdg-activation",
@@ -417,16 +418,17 @@
       "interfaces": [
         {
           "name": "zwp_primary_selection_device_manager_v1",
-          "current_version": null,
+          "current_version": 1,
           "target_version": 1
         }
       ],
-      "status": "not_started",
+      "status": "done",
       "privileged": false,
       "blocked_by": [
         "wl-data-device-manager",
         "wl-seat"
-      ]
+      ],
+      "status_detail": "Source, device, offer, MIME transfer, focus propagation, selection replacement, and cancellation lifecycles are implemented through v1."
     },
     {
       "id": "relative-pointer",
