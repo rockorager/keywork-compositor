@@ -27,6 +27,9 @@ event_source: ?*wl.EventSource,
 context: *c.struct_libinput,
 listener: Listener,
 devices: std.AutoHashMapUnmanaged(std.posix.fd_t, Session.Device),
+input_devices: std.ArrayList(InputDevice),
+next_input_device_id: DeviceId,
+device_listener: ?DeviceListener,
 environ_map: ?*const std.process.Environ.Map,
 xkb_context: *c.struct_xkb_context,
 xkb_keymap: *c.struct_xkb_keymap,
@@ -51,6 +54,43 @@ initialized: bool,
 failed: bool,
 
 pub const Listener = NestedOutput.Listener;
+
+pub const DeviceId = u64;
+
+pub const DeviceType = enum {
+    keyboard,
+    pointer,
+    touch,
+    tablet,
+};
+
+pub const DeviceInfo = struct {
+    id: DeviceId,
+    device_type: DeviceType,
+    name: [:0]const u8,
+};
+
+pub const DeviceListener = struct {
+    context: *anyopaque,
+    added: *const fn (*anyopaque, DeviceInfo) void,
+    removed: *const fn (*anyopaque, DeviceId) void,
+};
+
+const InputDevice = struct {
+    info: DeviceInfo,
+    libinput_device: *c.struct_libinput_device,
+};
+
+pub const DeviceIterator = struct {
+    devices: []const InputDevice,
+    index: usize = 0,
+
+    pub fn next(self: *DeviceIterator) ?DeviceInfo {
+        if (self.index >= self.devices.len) return null;
+        defer self.index += 1;
+        return self.devices[self.index].info;
+    }
+};
 
 const Modifiers = struct {
     depressed: u32 = 0,
@@ -88,6 +128,9 @@ pub fn init(
         .context = undefined,
         .listener = listener,
         .devices = .empty,
+        .input_devices = .empty,
+        .next_input_device_id = 1,
+        .device_listener = null,
         .environ_map = null,
         .xkb_context = undefined,
         .xkb_keymap = undefined,
@@ -112,6 +155,7 @@ pub fn init(
         .failed = false,
     };
     errdefer self.devices.deinit(allocator);
+    errdefer self.input_devices.deinit(allocator);
 
     self.xkb_context = c.xkb_context_new(c.XKB_CONTEXT_NO_FLAGS) orelse
         return error.XkbContextFailed;
@@ -161,6 +205,7 @@ pub fn init(
 }
 
 pub fn deinit(self: *Self) void {
+    std.debug.assert(self.device_listener == null);
     self.initialized = false;
     self.session.removeListener(&self.session_listener);
     if (self.event_source) |source| {
@@ -171,6 +216,8 @@ pub fn deinit(self: *Self) void {
     _ = c.libinput_unref(self.context);
     std.debug.assert(self.devices.count() == 0);
     self.devices.deinit(self.allocator);
+    std.debug.assert(self.input_devices.items.len == 0);
+    self.input_devices.deinit(self.allocator);
     c.xkb_state_unref(self.xkb_state);
     c.xkb_keymap_unref(self.xkb_keymap);
     c.xkb_context_unref(self.xkb_context);
@@ -179,6 +226,23 @@ pub fn deinit(self: *Self) void {
 
 pub fn setEnvironMap(self: *Self, environ_map: *const std.process.Environ.Map) void {
     self.environ_map = environ_map;
+}
+
+pub fn setDeviceListener(self: *Self, listener: DeviceListener) void {
+    std.debug.assert(self.device_listener == null);
+    self.device_listener = listener;
+    for (self.input_devices.items) |device| {
+        listener.added(listener.context, device.info);
+    }
+}
+
+pub fn clearDeviceListener(self: *Self) void {
+    std.debug.assert(self.device_listener != null);
+    self.device_listener = null;
+}
+
+pub fn deviceIterator(self: *const Self) DeviceIterator {
+    return .{ .devices = self.input_devices.items };
 }
 
 pub fn retarget(self: *Self, size: render.Size, listener: Listener) void {
@@ -294,6 +358,25 @@ fn deviceAdded(self: *Self, device: *c.struct_libinput_device) void {
         "added {s} (keyboard={}, pointer={}, touch={})",
         .{ name, has_keyboard, has_pointer, has_touch },
     );
+    const old_device_count = self.input_devices.items.len;
+    if (has_keyboard) self.addInputDevice(device, .keyboard, name) catch {
+        self.rollbackInputDevices(old_device_count);
+        return self.fail(error.OutOfMemory);
+    };
+    if (has_pointer) self.addInputDevice(device, .pointer, name) catch {
+        self.rollbackInputDevices(old_device_count);
+        return self.fail(error.OutOfMemory);
+    };
+    if (has_touch) self.addInputDevice(device, .touch, name) catch {
+        self.rollbackInputDevices(old_device_count);
+        return self.fail(error.OutOfMemory);
+    };
+    if (c.libinput_device_has_capability(device, c.LIBINPUT_DEVICE_CAP_TABLET_TOOL) != 0) {
+        self.addInputDevice(device, .tablet, name) catch {
+            self.rollbackInputDevices(old_device_count);
+            return self.fail(error.OutOfMemory);
+        };
+    }
     if (has_keyboard) {
         self.keyboard_count += 1;
         if (self.keyboard_count == 1) {
@@ -316,6 +399,7 @@ fn deviceRemoved(self: *Self, device: *c.struct_libinput_device) void {
     const name_pointer = c.libinput_device_get_name(device);
     const name = if (name_pointer == null) "unknown" else std.mem.span(name_pointer);
     log.info("removed {s}", .{name});
+    self.removeInputDevices(device);
     if (c.libinput_device_has_capability(device, c.LIBINPUT_DEVICE_CAP_KEYBOARD) != 0) {
         std.debug.assert(self.keyboard_count > 0);
         self.keyboard_count -= 1;
@@ -333,6 +417,56 @@ fn deviceRemoved(self: *Self, device: *c.struct_libinput_device) void {
         std.debug.assert(self.touch_count > 0);
         self.touch_count -= 1;
         if (self.touch_count == 0) self.listener.touch_available(self.listener.context, false);
+    }
+}
+
+fn addInputDevice(
+    self: *Self,
+    libinput_device: *c.struct_libinput_device,
+    device_type: DeviceType,
+    name: []const u8,
+) error{OutOfMemory}!void {
+    const name_copy = try self.allocator.dupeSentinel(u8, name, 0);
+    errdefer self.allocator.free(name_copy);
+    const id = self.next_input_device_id;
+    self.next_input_device_id = std.math.add(DeviceId, id, 1) catch return error.OutOfMemory;
+    try self.input_devices.append(self.allocator, .{
+        .info = .{
+            .id = id,
+            .device_type = device_type,
+            .name = name_copy,
+        },
+        .libinput_device = libinput_device,
+    });
+    if (self.device_listener) |listener| {
+        listener.added(listener.context, self.input_devices.items[self.input_devices.items.len - 1].info);
+    }
+}
+
+fn rollbackInputDevices(self: *Self, old_count: usize) void {
+    while (self.input_devices.items.len > old_count) {
+        const device = self.input_devices.pop().?;
+        if (self.device_listener) |listener| listener.removed(listener.context, device.info.id);
+        self.allocator.free(device.info.name);
+    }
+}
+
+fn removeInputDevices(self: *Self, libinput_device: *c.struct_libinput_device) void {
+    var index = self.input_devices.items.len;
+    while (index > 0) {
+        index -= 1;
+        const device = self.input_devices.items[index];
+        if (device.libinput_device != libinput_device) continue;
+        _ = self.input_devices.orderedRemove(index);
+        if (self.device_listener) |listener| listener.removed(listener.context, device.info.id);
+        self.allocator.free(device.info.name);
+    }
+}
+
+fn removeAllInputDevices(self: *Self) void {
+    while (self.input_devices.pop()) |device| {
+        if (self.device_listener) |listener| listener.removed(listener.context, device.info.id);
+        self.allocator.free(device.info.name);
     }
 }
 
@@ -569,6 +703,7 @@ fn touchMotion(self: *Self, event: *c.struct_libinput_event_touch) void {
 }
 
 fn clearCapabilities(self: *Self) void {
+    self.removeAllInputDevices();
     if (self.keyboard_count != 0) self.listener.keyboard_available(self.listener.context, false);
     if (self.pointer_count != 0) self.listener.pointer_available(self.listener.context, false);
     if (self.touch_count != 0) self.listener.touch_available(self.listener.context, false);
