@@ -1,4 +1,4 @@
-//! Server-side wl_surface state and shared-memory buffer snapshots.
+//! Server-side wl_surface state and compositor-owned buffer snapshots.
 
 const Self = @This();
 
@@ -9,9 +9,11 @@ const Region = @import("../region.zig");
 const render_types = @import("../render/types.zig");
 const slot_map = @import("../slot_map.zig");
 const WaylandRegion = @import("region.zig");
+const LinuxDmabuf = @import("linux_dmabuf.zig");
 
 const wl = wayland.server.wl;
 const wp = wayland.server.wp;
+const log = std.log.scoped(.surface);
 
 allocator: std.mem.Allocator,
 store: *Store,
@@ -310,7 +312,7 @@ pub fn assignedRole(self: *Self) ?Role {
 }
 
 pub fn hasBufferAttachedOrCommitted(self: *Self) bool {
-    return self.pending_attachment.shm != null or self.state().current_buffer != null;
+    return self.pending_attachment.hasBuffer() or self.state().current_buffer != null;
 }
 
 pub fn releaseRole(self: *Self, context: *anyopaque) void {
@@ -544,7 +546,7 @@ fn handleRequest(resource: *wl.Surface, request: wl.Surface.Request, self: *Self
 fn commit(self: *Self) void {
     const surface_state = self.state();
     if (surface_state.release_callbacks.items.len > 0 and
-        (!self.has_pending_attachment or self.pending_attachment.shm == null))
+        (!self.has_pending_attachment or !self.pending_attachment.hasBuffer()))
     {
         self.resource.postError(
             .no_buffer,
@@ -578,7 +580,7 @@ fn pendingCommitInfo(self: *Self) CommitInfo {
         .attachment_changed = self.has_pending_attachment,
         .had_buffer = surface_state.current_buffer != null,
         .has_buffer = if (self.has_pending_attachment)
-            self.pending_attachment.shm != null
+            self.pending_attachment.hasBuffer()
         else if (surface_state.cached_attachment_changed)
             surface_state.cached_buffer != null
         else
@@ -590,6 +592,7 @@ fn pendingCommitInfo(self: *Self) CommitInfo {
 
 fn applyPending(self: *Self, commit_info: CommitInfo) void {
     const surface_state = self.state();
+    var applied_info = commit_info;
 
     surface_state.current_opaque.copyFrom(&surface_state.pending_opaque) catch {
         self.resource.postNoMemory();
@@ -601,19 +604,17 @@ fn applyPending(self: *Self, commit_info: CommitInfo) void {
     };
 
     if (self.has_pending_attachment) {
-        var snapshot: ?BufferSnapshot = null;
-        if (self.pending_attachment.shm) |shm_buffer| {
-            snapshot = BufferSnapshot.copyShm(
-                self.allocator,
-                shm_buffer,
-                surface_state.pending_scale,
-                surface_state.pending_transform,
-                surface_state.pending_viewport,
-            ) catch |err| {
+        const snapshot = snapshotPendingAttachment(self) catch |err| switch (err) {
+            error.ImportFailed => failed: {
+                log.warn("DMA-BUF became unavailable after successful import", .{});
+                applied_info.has_buffer = false;
+                break :failed null;
+            },
+            else => {
                 postBufferError(self, err);
                 return;
-            };
-        }
+            },
+        };
 
         if (surface_state.current_buffer) |*current| current.deinit();
         surface_state.current_buffer = snapshot;
@@ -645,13 +646,13 @@ fn applyPending(self: *Self, commit_info: CommitInfo) void {
     for (surface_state.callbacks.items) |callback| {
         if (callback.state == .pending) callback.state = .active;
     }
-    if (commit_info.has_buffer) {
+    if (applied_info.has_buffer) {
         setCommitFeedbackState(surface_state, .pending, .active);
     } else {
         discardCommitFeedbacks(surface_state, .pending);
     }
 
-    finishApplied(self, commit_info);
+    finishApplied(self, applied_info);
 }
 
 fn cachePending(self: *Self) bool {
@@ -660,18 +661,16 @@ fn cachePending(self: *Self) bool {
     defer if (snapshot) |*buffer| buffer.deinit();
 
     if (self.has_pending_attachment) {
-        if (self.pending_attachment.shm) |shm_buffer| {
-            snapshot = BufferSnapshot.copyShm(
-                self.allocator,
-                shm_buffer,
-                surface_state.pending_scale,
-                surface_state.pending_transform,
-                surface_state.pending_viewport,
-            ) catch |err| {
+        snapshot = snapshotPendingAttachment(self) catch |err| switch (err) {
+            error.ImportFailed => failed: {
+                log.warn("DMA-BUF became unavailable after successful import", .{});
+                break :failed null;
+            },
+            else => {
                 postBufferError(self, err);
                 return false;
-            };
-        }
+            },
+        };
     } else {
         const buffer = if (surface_state.cached_attachment_changed)
             if (surface_state.cached_buffer) |*cached| cached else null
@@ -816,7 +815,31 @@ fn postBufferError(self: *Self, err: BufferSnapshot.Error) void {
             handler.resource.postError(.out_of_buffer, "viewport source exceeds the buffer")
         else
             self.resource.getClient().postImplementationError("viewport object is missing"),
+        error.ImportFailed => unreachable,
     }
+}
+
+fn snapshotPendingAttachment(self: *Self) BufferSnapshot.Error!?BufferSnapshot {
+    const surface_state = self.state();
+    if (self.pending_attachment.shm) |shm_buffer| {
+        return try BufferSnapshot.copyShm(
+            self.allocator,
+            shm_buffer,
+            surface_state.pending_scale,
+            surface_state.pending_transform,
+            surface_state.pending_viewport,
+        );
+    }
+    if (self.pending_attachment.dmabuf) |dmabuf_buffer| {
+        return try BufferSnapshot.copyDmabuf(
+            self.allocator,
+            dmabuf_buffer,
+            surface_state.pending_scale,
+            surface_state.pending_transform,
+            surface_state.pending_viewport,
+        );
+    }
+    return null;
 }
 
 fn finishApplied(self: *Self, commit_info: CommitInfo) void {
@@ -1025,6 +1048,7 @@ const InputRegion = struct {
 const Attachment = struct {
     resource: ?*wl.Buffer = null,
     shm: ?*wl.shm.Buffer = null,
+    dmabuf: ?*LinuxDmabuf.Buffer = null,
     destroy_listener: wl.Listener(*wl.Resource) = undefined,
 
     const Error = error{UnsupportedBuffer};
@@ -1032,11 +1056,16 @@ const Attachment = struct {
     fn set(self: *Attachment, resource: ?*wl.Buffer) Error!void {
         self.clear();
         const buffer = resource orelse return;
-        const shm_buffer = wl.shm.Buffer.get(@ptrCast(buffer)) orelse
-            return error.UnsupportedBuffer;
+        const shm_buffer = wl.shm.Buffer.get(@ptrCast(buffer));
+        const dmabuf_buffer = if (shm_buffer == null)
+            LinuxDmabuf.Buffer.fromResource(buffer)
+        else
+            null;
+        if (shm_buffer == null and dmabuf_buffer == null) return error.UnsupportedBuffer;
 
         self.resource = buffer;
-        self.shm = wl_shm_buffer_ref(shm_buffer);
+        self.shm = if (shm_buffer) |shm| wl_shm_buffer_ref(shm) else null;
+        self.dmabuf = dmabuf_buffer;
         self.destroy_listener = wl.Listener(*wl.Resource).init(handleResourceDestroy);
         @as(*wl.Resource, @ptrCast(buffer)).addDestroyListener(&self.destroy_listener);
     }
@@ -1046,6 +1075,11 @@ const Attachment = struct {
         if (self.shm) |buffer| wl_shm_buffer_unref(buffer);
         self.resource = null;
         self.shm = null;
+        self.dmabuf = null;
+    }
+
+    fn hasBuffer(self: *const Attachment) bool {
+        return self.shm != null or self.dmabuf != null;
     }
 
     fn handleResourceDestroy(
@@ -1055,6 +1089,7 @@ const Attachment = struct {
         const self: *Attachment = @fieldParentPtr("destroy_listener", listener);
         listener.link.remove();
         self.resource = null;
+        self.dmabuf = null;
     }
 };
 
@@ -1073,6 +1108,7 @@ pub const BufferSnapshot = struct {
         InvalidBuffer,
         BadViewportSize,
         ViewportOutOfBuffer,
+        ImportFailed,
     };
 
     fn copyShm(
@@ -1124,6 +1160,31 @@ pub const BufferSnapshot = struct {
         if (format == xrgb8888) {
             for (pixels) |*pixel| pixel.* |= 0xff000000;
         }
+
+        return .{
+            .allocator = allocator,
+            .buffer_size = buffer_size,
+            .logical_size = geometry.logical_size,
+            .scale = scale,
+            .transform = transform,
+            .source = geometry.source,
+            .pixels = pixels,
+        };
+    }
+
+    fn copyDmabuf(
+        allocator: std.mem.Allocator,
+        buffer: *LinuxDmabuf.Buffer,
+        scale: i32,
+        transform: wl.Output.Transform,
+        viewport: ViewportState,
+    ) Error!BufferSnapshot {
+        const buffer_size = buffer.size();
+        const geometry = try viewportGeometry(buffer_size, scale, transform, viewport);
+        const pixels = buffer.copyPixels(allocator) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ImportFailed => return error.ImportFailed,
+        };
 
         return .{
             .allocator = allocator,
