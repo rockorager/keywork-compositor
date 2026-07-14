@@ -1,0 +1,760 @@
+//! Connected output-head discovery and complete configuration transactions.
+
+const Self = @This();
+
+const std = @import("std");
+const wayland = @import("wayland");
+const DrmOutput = @import("../backend/drm.zig");
+
+const wl = wayland.server.wl;
+const zwlr = wayland.server.zwlr;
+
+allocator: std.mem.Allocator,
+global: *wl.Global,
+serial: u32,
+heads: std.ArrayList(*Head),
+managers: std.ArrayList(*ManagerResource),
+head_resources: std.ArrayList(*HeadResource),
+mode_resources: std.ArrayList(*ModeResource),
+configurations: std.ArrayList(*Configuration),
+listener: Listener,
+
+pub const Change = struct {
+    output: *DrmOutput,
+    was_enabled: bool,
+    enabled: bool,
+    old_x: i32,
+    old_y: i32,
+    x: i32,
+    y: i32,
+};
+
+pub const Listener = struct {
+    context: *anyopaque,
+    apply: *const fn (*anyopaque, []const Change) bool,
+};
+
+const Head = struct {
+    output: ?*DrmOutput,
+    connected: bool,
+    name: [:0]u8,
+    enabled: bool,
+    x: i32,
+    y: i32,
+    size: struct { width: u32, height: u32 },
+    physical_size: struct { width: u32, height: u32 },
+    refresh_millihertz: i32,
+};
+
+const ManagerResource = struct {
+    manager: *Self,
+    resource: ?*zwlr.OutputManagerV1,
+    stopped: bool,
+};
+
+const HeadResource = struct {
+    head: *Head,
+    resource: ?*zwlr.OutputHeadV1,
+    mode: *ModeResource,
+    finished: bool,
+};
+
+const ModeResource = struct {
+    head: *Head,
+    resource: ?*zwlr.OutputModeV1,
+    finished: bool,
+};
+
+const Configuration = struct {
+    manager: *Self,
+    resource: *zwlr.OutputConfigurationV1,
+    serial: u32,
+    used: bool,
+    heads: std.ArrayList(*ConfiguredHead),
+};
+
+const ConfiguredHead = struct {
+    configuration: *Configuration,
+    head: *Head,
+    enabled: bool,
+    resource: ?*zwlr.OutputConfigurationHeadV1,
+    mode_set: bool = false,
+    custom_mode_set: bool = false,
+    position: ?struct { x: i32, y: i32 } = null,
+    transform: ?wl.Output.Transform = null,
+    scale: ?wl.Fixed = null,
+    adaptive_sync: ?zwlr.OutputHeadV1.AdaptiveSyncState = null,
+};
+
+pub fn init(
+    self: *Self,
+    allocator: std.mem.Allocator,
+    display: *wl.Server,
+    outputs: []const *DrmOutput,
+    listener: Listener,
+) !void {
+    self.* = .{
+        .allocator = allocator,
+        .global = undefined,
+        .serial = 1,
+        .heads = .empty,
+        .managers = .empty,
+        .head_resources = .empty,
+        .mode_resources = .empty,
+        .configurations = .empty,
+        .listener = listener,
+    };
+    errdefer self.deinitStorage();
+    for (outputs) |output| _ = try self.addHeadStorage(output);
+    self.global = try wl.Global.create(
+        display,
+        zwlr.OutputManagerV1,
+        4,
+        *Self,
+        self,
+        bind,
+    );
+}
+
+pub fn deinit(self: *Self) void {
+    std.debug.assert(self.configurations.items.len == 0);
+    for (self.managers.items) |manager| std.debug.assert(manager.resource == null);
+    for (self.head_resources.items) |resource| std.debug.assert(resource.resource == null);
+    for (self.mode_resources.items) |resource| std.debug.assert(resource.resource == null);
+    self.global.destroy();
+    self.deinitStorage();
+    self.* = undefined;
+}
+
+fn deinitStorage(self: *Self) void {
+    while (self.configurations.items.len > 0) {
+        self.destroyConfiguration(self.configurations.items[0]);
+    }
+    self.configurations.deinit(self.allocator);
+    for (self.mode_resources.items) |resource| self.allocator.destroy(resource);
+    self.mode_resources.deinit(self.allocator);
+    for (self.head_resources.items) |resource| self.allocator.destroy(resource);
+    self.head_resources.deinit(self.allocator);
+    for (self.managers.items) |manager| self.allocator.destroy(manager);
+    self.managers.deinit(self.allocator);
+    for (self.heads.items) |head| {
+        self.allocator.free(head.name);
+        self.allocator.destroy(head);
+    }
+    self.heads.deinit(self.allocator);
+}
+
+pub fn addHead(self: *Self, output: *DrmOutput) !void {
+    std.debug.assert(self.findHead(output) == null);
+    const head = try self.addHeadStorage(output);
+    for (self.managers.items) |manager| {
+        if (manager.resource == null or manager.stopped) continue;
+        self.createHeadResource(manager, head) catch {
+            manager.resource.?.postNoMemory();
+            continue;
+        };
+    }
+    self.changed();
+}
+
+fn addHeadStorage(self: *Self, output: *DrmOutput) !*Head {
+    const name = try self.allocator.dupeSentinel(u8, output.name(), 0);
+    errdefer self.allocator.free(name);
+    const head = try self.allocator.create(Head);
+    errdefer self.allocator.destroy(head);
+    head.* = .{
+        .output = output,
+        .connected = true,
+        .name = name,
+        .enabled = output.enabled,
+        .x = output.logical_x,
+        .y = output.logical_y,
+        .size = .{ .width = output.size.width, .height = output.size.height },
+        .physical_size = .{
+            .width = output.physical_size.width,
+            .height = output.physical_size.height,
+        },
+        .refresh_millihertz = output.refreshMillihertz(),
+    };
+    try self.heads.append(self.allocator, head);
+    return head;
+}
+
+pub fn removeHead(self: *Self, output: *DrmOutput) void {
+    const head = self.findHead(output) orelse return;
+    head.output = null;
+    head.connected = false;
+    for (self.mode_resources.items) |mode| {
+        if (mode.head != head or mode.resource == null or mode.finished) continue;
+        mode.resource.?.sendFinished();
+        mode.finished = true;
+    }
+    for (self.head_resources.items) |resource| {
+        if (resource.head != head or resource.resource == null or resource.finished) continue;
+        resource.resource.?.sendFinished();
+        resource.finished = true;
+    }
+    self.changed();
+}
+
+pub fn syncHead(self: *Self, output: *DrmOutput) void {
+    const head = self.findHead(output) orelse return;
+    const enabled_changed = head.enabled != output.enabled;
+    const position_changed = head.x != output.logical_x or head.y != output.logical_y;
+    if (!enabled_changed and !position_changed) return;
+    head.enabled = output.enabled;
+    head.x = output.logical_x;
+    head.y = output.logical_y;
+    for (self.head_resources.items) |advertised| {
+        if (advertised.head != head or advertised.resource == null or advertised.finished) continue;
+        const resource = advertised.resource.?;
+        if (enabled_changed) {
+            resource.sendEnabled(@intFromBool(head.enabled));
+            if (head.enabled) {
+                if (advertised.mode.resource) |mode| resource.sendCurrentMode(mode);
+                resource.sendTransform(.normal);
+                resource.sendScale(wl.Fixed.fromDouble(1));
+            }
+        }
+        if (head.enabled and (enabled_changed or position_changed)) {
+            resource.sendPosition(head.x, head.y);
+        }
+    }
+    self.changed();
+}
+
+fn findHead(self: *Self, output: *DrmOutput) ?*Head {
+    for (self.heads.items) |head| {
+        if (head.connected and head.output == output) return head;
+    }
+    return null;
+}
+
+fn changed(self: *Self) void {
+    self.serial +%= 1;
+    if (self.serial == 0) self.serial = 1;
+    for (self.managers.items) |manager| {
+        if (manager.resource) |resource| if (!manager.stopped) resource.sendDone(self.serial);
+    }
+}
+
+fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
+    const resource = zwlr.OutputManagerV1.create(client, version, id) catch {
+        client.postNoMemory();
+        return;
+    };
+    const manager = self.allocator.create(ManagerResource) catch {
+        resource.postNoMemory();
+        resource.destroy();
+        return;
+    };
+    manager.* = .{ .manager = self, .resource = resource, .stopped = false };
+    self.managers.append(self.allocator, manager) catch {
+        self.allocator.destroy(manager);
+        resource.postNoMemory();
+        resource.destroy();
+        return;
+    };
+    resource.setHandler(*ManagerResource, managerRequest, managerDestroyed, manager);
+    for (self.heads.items) |head| {
+        if (!head.connected) continue;
+        self.createHeadResource(manager, head) catch {
+            resource.postNoMemory();
+            return;
+        };
+    }
+    resource.sendDone(self.serial);
+}
+
+fn managerRequest(
+    resource: *zwlr.OutputManagerV1,
+    request: zwlr.OutputManagerV1.Request,
+    manager: *ManagerResource,
+) void {
+    switch (request) {
+        .create_configuration => |create| manager.manager.createConfiguration(
+            manager,
+            create.id,
+            create.serial,
+        ),
+        .stop => {
+            manager.stopped = true;
+            resource.destroySendFinished();
+        },
+    }
+}
+
+fn managerDestroyed(_: *zwlr.OutputManagerV1, manager: *ManagerResource) void {
+    manager.resource = null;
+    manager.stopped = true;
+}
+
+fn createHeadResource(self: *Self, manager: *ManagerResource, head: *Head) !void {
+    const manager_resource = manager.resource.?;
+    const head_resource = try zwlr.OutputHeadV1.create(
+        manager_resource.getClient(),
+        manager_resource.getVersion(),
+        0,
+    );
+    errdefer head_resource.destroy();
+    const mode_resource = try zwlr.OutputModeV1.create(
+        manager_resource.getClient(),
+        @min(manager_resource.getVersion(), zwlr.OutputModeV1.generated_version),
+        0,
+    );
+    errdefer mode_resource.destroy();
+    const mode = try self.allocator.create(ModeResource);
+    errdefer self.allocator.destroy(mode);
+    mode.* = .{
+        .head = head,
+        .resource = mode_resource,
+        .finished = false,
+    };
+    try self.mode_resources.append(self.allocator, mode);
+    errdefer _ = self.mode_resources.pop();
+    const managed = try self.allocator.create(HeadResource);
+    errdefer self.allocator.destroy(managed);
+    managed.* = .{
+        .head = head,
+        .resource = head_resource,
+        .mode = mode,
+        .finished = false,
+    };
+    try self.head_resources.append(self.allocator, managed);
+
+    head_resource.setHandler(*HeadResource, headRequest, headDestroyed, managed);
+    mode_resource.setHandler(*ModeResource, modeRequest, modeDestroyed, mode);
+    manager_resource.sendHead(head_resource);
+    head_resource.sendName(head.name);
+    head_resource.sendDescription("Keywork DRM output");
+    head_resource.sendPhysicalSize(
+        @intCast(head.physical_size.width),
+        @intCast(head.physical_size.height),
+    );
+    head_resource.sendMode(mode_resource);
+    mode_resource.sendSize(@intCast(head.size.width), @intCast(head.size.height));
+    if (head.refresh_millihertz > 0) mode_resource.sendRefresh(head.refresh_millihertz);
+    mode_resource.sendPreferred();
+    head_resource.sendEnabled(@intFromBool(head.enabled));
+    if (head.enabled) {
+        head_resource.sendCurrentMode(mode_resource);
+        head_resource.sendPosition(head.x, head.y);
+        head_resource.sendTransform(.normal);
+        head_resource.sendScale(wl.Fixed.fromDouble(1));
+    }
+    if (head_resource.getVersion() >= 2) {
+        head_resource.sendMake("keywork");
+        head_resource.sendModel(head.name);
+    }
+    if (head_resource.getVersion() >= 4) head_resource.sendAdaptiveSync(.disabled);
+}
+
+fn headRequest(
+    resource: *zwlr.OutputHeadV1,
+    request: zwlr.OutputHeadV1.Request,
+    _: *HeadResource,
+) void {
+    switch (request) {
+        .release => resource.destroy(),
+    }
+}
+
+fn headDestroyed(_: *zwlr.OutputHeadV1, managed: *HeadResource) void {
+    managed.resource = null;
+}
+
+fn modeRequest(
+    resource: *zwlr.OutputModeV1,
+    request: zwlr.OutputModeV1.Request,
+    _: *ModeResource,
+) void {
+    switch (request) {
+        .release => resource.destroy(),
+    }
+}
+
+fn modeDestroyed(_: *zwlr.OutputModeV1, managed: *ModeResource) void {
+    managed.resource = null;
+}
+
+fn createConfiguration(
+    self: *Self,
+    owner: *ManagerResource,
+    id: u32,
+    serial: u32,
+) void {
+    const manager = owner.resource.?;
+    const resource = zwlr.OutputConfigurationV1.create(
+        manager.getClient(),
+        manager.getVersion(),
+        id,
+    ) catch {
+        manager.postNoMemory();
+        return;
+    };
+    const configuration = self.allocator.create(Configuration) catch {
+        resource.postNoMemory();
+        resource.destroy();
+        return;
+    };
+    configuration.* = .{
+        .manager = self,
+        .resource = resource,
+        .serial = serial,
+        .used = false,
+        .heads = .empty,
+    };
+    self.configurations.append(self.allocator, configuration) catch {
+        self.allocator.destroy(configuration);
+        resource.postNoMemory();
+        resource.destroy();
+        return;
+    };
+    resource.setHandler(
+        *Configuration,
+        configurationRequest,
+        configurationDestroyed,
+        configuration,
+    );
+}
+
+fn configurationRequest(
+    resource: *zwlr.OutputConfigurationV1,
+    request: zwlr.OutputConfigurationV1.Request,
+    configuration: *Configuration,
+) void {
+    if (configuration.used and request != .destroy) {
+        resource.postError(.already_used, "output configuration has already been used");
+        return;
+    }
+    switch (request) {
+        .enable_head => |enable| configureHead(configuration, resource, enable.head, enable.id, true),
+        .disable_head => |disable| configureHead(configuration, resource, disable.head, null, false),
+        .apply => finish(configuration, true),
+        .@"test" => finish(configuration, false),
+        .destroy => resource.destroy(),
+    }
+}
+
+fn configurationDestroyed(_: *zwlr.OutputConfigurationV1, configuration: *Configuration) void {
+    configuration.manager.destroyConfiguration(configuration);
+}
+
+fn destroyConfiguration(self: *Self, configuration: *Configuration) void {
+    for (configuration.heads.items) |configured| {
+        if (configured.resource) |resource| resource.destroy();
+        self.allocator.destroy(configured);
+    }
+    configuration.heads.deinit(self.allocator);
+    for (self.configurations.items, 0..) |candidate, index| {
+        if (candidate != configuration) continue;
+        _ = self.configurations.orderedRemove(index);
+        self.allocator.destroy(configuration);
+        return;
+    }
+}
+
+fn configureHead(
+    self: *Configuration,
+    resource: *zwlr.OutputConfigurationV1,
+    head_resource: *zwlr.OutputHeadV1,
+    id: ?u32,
+    enabled: bool,
+) void {
+    const advertised: *HeadResource = @ptrCast(@alignCast(head_resource.getUserData() orelse {
+        resource.postError(.already_configured_head, "invalid output head");
+        return;
+    }));
+    for (self.heads.items) |configured| if (configured.head == advertised.head) {
+        resource.postError(.already_configured_head, "output head configured twice");
+        return;
+    };
+    const configured = self.manager.allocator.create(ConfiguredHead) catch {
+        resource.postNoMemory();
+        return;
+    };
+    configured.* = .{
+        .configuration = self,
+        .head = advertised.head,
+        .enabled = enabled,
+        .resource = null,
+    };
+    if (id) |new_id| {
+        const head_configuration = zwlr.OutputConfigurationHeadV1.create(
+            resource.getClient(),
+            resource.getVersion(),
+            new_id,
+        ) catch {
+            self.manager.allocator.destroy(configured);
+            resource.postNoMemory();
+            return;
+        };
+        configured.resource = head_configuration;
+        head_configuration.setHandler(
+            *ConfiguredHead,
+            configuredHeadRequest,
+            configuredHeadDestroyed,
+            configured,
+        );
+    }
+    self.heads.append(self.manager.allocator, configured) catch {
+        if (configured.resource) |head_configuration| head_configuration.destroy();
+        self.manager.allocator.destroy(configured);
+        resource.postNoMemory();
+    };
+}
+
+fn configuredHeadRequest(
+    resource: *zwlr.OutputConfigurationHeadV1,
+    request: zwlr.OutputConfigurationHeadV1.Request,
+    configured: *ConfiguredHead,
+) void {
+    if (configured.configuration.used) {
+        configured.configuration.resource.postError(
+            .already_used,
+            "output configuration has already been used",
+        );
+        return;
+    }
+    switch (request) {
+        .set_mode => |set| {
+            if (configured.mode_set or configured.custom_mode_set) {
+                resource.postError(.already_set, "output mode has already been set");
+                return;
+            }
+            const mode: *ModeResource = @ptrCast(@alignCast(set.mode.getUserData() orelse {
+                resource.postError(.invalid_mode, "invalid output mode");
+                return;
+            }));
+            if (mode.head != configured.head or mode.finished) {
+                resource.postError(.invalid_mode, "mode does not belong to output head");
+                return;
+            }
+            configured.mode_set = true;
+        },
+        .set_custom_mode => |set| {
+            if (configured.mode_set or configured.custom_mode_set) {
+                resource.postError(.already_set, "output mode has already been set");
+                return;
+            }
+            configured.custom_mode_set = true;
+            if (set.width <= 0 or set.height <= 0 or set.refresh < 0) {
+                resource.postError(.invalid_custom_mode, "invalid custom output mode");
+            }
+        },
+        .set_position => |set| {
+            if (configured.position != null) {
+                resource.postError(.already_set, "output position has already been set");
+                return;
+            }
+            configured.position = .{ .x = set.x, .y = set.y };
+        },
+        .set_transform => |set| {
+            if (configured.transform != null) {
+                resource.postError(.already_set, "output transform has already been set");
+                return;
+            }
+            if (@intFromEnum(set.transform) < 0 or @intFromEnum(set.transform) > 7) {
+                resource.postError(.invalid_transform, "invalid output transform");
+                return;
+            }
+            configured.transform = set.transform;
+        },
+        .set_scale => |set| {
+            if (configured.scale != null) {
+                resource.postError(.already_set, "output scale has already been set");
+                return;
+            }
+            if (set.scale.toDouble() <= 0) {
+                resource.postError(.invalid_scale, "output scale must be positive");
+                return;
+            }
+            configured.scale = set.scale;
+        },
+        .set_adaptive_sync => |set| {
+            if (configured.adaptive_sync != null) {
+                resource.postError(.already_set, "adaptive sync has already been set");
+                return;
+            }
+            if (set.state != .disabled and set.state != .enabled) {
+                resource.postError(.invalid_adaptive_sync_state, "invalid adaptive sync state");
+                return;
+            }
+            configured.adaptive_sync = set.state;
+        },
+    }
+}
+
+fn configuredHeadDestroyed(
+    _: *zwlr.OutputConfigurationHeadV1,
+    configured: *ConfiguredHead,
+) void {
+    configured.resource = null;
+}
+
+fn finish(configuration: *Configuration, apply: bool) void {
+    configuration.used = true;
+    for (configuration.heads.items) |configured| {
+        if (configured.resource) |resource| resource.destroy();
+    }
+    const manager = configuration.manager;
+    if (configuration.serial != manager.serial) {
+        configuration.resource.sendCancelled();
+        return;
+    }
+    var connected_count: usize = 0;
+    for (manager.heads.items) |head| {
+        if (!head.connected) continue;
+        connected_count += 1;
+        var found = false;
+        for (configuration.heads.items) |configured| {
+            if (configured.head == head) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            configuration.resource.postError(.unconfigured_head, "output head was omitted");
+            return;
+        }
+    }
+    if (configuration.heads.items.len != connected_count) {
+        configuration.resource.sendCancelled();
+        return;
+    }
+
+    var enabled_count: usize = 0;
+    for (configuration.heads.items) |configured| {
+        if (!configured.head.connected) {
+            configuration.resource.sendCancelled();
+            return;
+        }
+        if (!configured.enabled) continue;
+        enabled_count += 1;
+        if (configured.custom_mode_set or
+            (configured.transform != null and configured.transform.? != .normal) or
+            (configured.scale != null and configured.scale.?.toDouble() != 1) or
+            (configured.adaptive_sync != null and configured.adaptive_sync.? != .disabled))
+        {
+            configuration.resource.sendFailed();
+            return;
+        }
+    }
+    if (enabled_count == 0) {
+        configuration.resource.sendFailed();
+        return;
+    }
+
+    var changes: std.ArrayList(Change) = .empty;
+    defer changes.deinit(manager.allocator);
+    for (configuration.heads.items) |configured| {
+        const head = configured.head;
+        const x = if (configured.position) |position| position.x else head.x;
+        const y = if (configured.position) |position| position.y else head.y;
+        changes.append(manager.allocator, .{
+            .output = head.output.?,
+            .was_enabled = head.enabled,
+            .enabled = configured.enabled,
+            .old_x = head.x,
+            .old_y = head.y,
+            .x = x,
+            .y = y,
+        }) catch {
+            configuration.resource.postNoMemory();
+            return;
+        };
+    }
+    if (!apply) {
+        configuration.resource.sendSucceeded();
+        return;
+    }
+    if (!manager.listener.apply(manager.listener.context, changes.items)) {
+        configuration.resource.sendFailed();
+        return;
+    }
+
+    var state_changed = false;
+    for (changes.items) |change| {
+        const head = manager.findHead(change.output) orelse continue;
+        if (head.enabled != change.enabled) {
+            head.enabled = change.enabled;
+            state_changed = true;
+            for (manager.head_resources.items) |advertised| {
+                if (advertised.head != head or advertised.resource == null or advertised.finished) continue;
+                const resource = advertised.resource.?;
+                resource.sendEnabled(@intFromBool(head.enabled));
+                if (head.enabled) {
+                    if (advertised.mode.resource) |mode| resource.sendCurrentMode(mode);
+                    resource.sendPosition(change.x, change.y);
+                    resource.sendTransform(.normal);
+                    resource.sendScale(wl.Fixed.fromDouble(1));
+                }
+            }
+        } else if (head.enabled and (head.x != change.x or head.y != change.y)) {
+            state_changed = true;
+            for (manager.head_resources.items) |advertised| {
+                if (advertised.head == head and advertised.resource != null and !advertised.finished) {
+                    advertised.resource.?.sendPosition(change.x, change.y);
+                }
+            }
+        }
+        head.x = change.x;
+        head.y = change.y;
+    }
+    if (state_changed) manager.changed();
+    configuration.resource.sendSucceeded();
+}
+
+fn testDeviceFd(_: *anyopaque) ?std.posix.fd_t {
+    return null;
+}
+
+fn testDeviceActive(_: *anyopaque) bool {
+    return false;
+}
+
+fn testDeviceFail(_: *anyopaque, _: anyerror) void {
+    unreachable;
+}
+
+fn testApply(_: *anyopaque, _: []const Change) bool {
+    return true;
+}
+
+test "connected head storage survives disable and reconnect lifetimes" {
+    const display = try wl.Server.create();
+    defer display.destroy();
+
+    var context: u8 = 0;
+    var output: DrmOutput = undefined;
+    output.init(std.testing.io, .{
+        .context = &context,
+        .fd = testDeviceFd,
+        .active = testDeviceActive,
+        .fail = testDeviceFail,
+    });
+    defer output.deinit();
+    const name = "eDP-1";
+    @memcpy(output.connector_name[0..name.len], name);
+    output.connector_name_length = name.len;
+    output.size = .{ .width = 1920, .height = 1080 };
+    output.physical_size = .{ .width = 300, .height = 170 };
+    output.mode.vrefresh = 60;
+
+    var manager: Self = undefined;
+    try manager.init(
+        std.testing.allocator,
+        display,
+        &.{&output},
+        .{ .context = &context, .apply = testApply },
+    );
+    defer manager.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), manager.heads.items.len);
+    try std.testing.expect(manager.heads.items[0].connected);
+    manager.removeHead(&output);
+    try std.testing.expect(!manager.heads.items[0].connected);
+    try manager.addHead(&output);
+    try std.testing.expectEqual(@as(usize, 2), manager.heads.items.len);
+    try std.testing.expect(manager.heads.items[1].connected);
+}

@@ -97,7 +97,28 @@ pub fn setOutputEnabled(self: *Self, output: *DrmOutput, enabled: bool) !void {
         return error.SessionInactive;
     }
     if (self.findOutput(output.connector_id) != output) return error.UnknownOutput;
+    if (!enabled) try self.waitOutputIdle(output);
     try output.setEnabled(self.device.?.fd, enabled);
+}
+
+fn waitOutputIdle(self: *Self, output: *DrmOutput) !void {
+    const fd = self.device.?.fd;
+    var attempts: u8 = 0;
+    while (output.pending != null) : (attempts += 1) {
+        if (attempts == 4) return error.PageFlipTimeout;
+        var poll_fds = [_]std.posix.pollfd{.{
+            .fd = fd,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        if (try std.posix.poll(&poll_fds, 1000) == 0) return error.PageFlipTimeout;
+        if (poll_fds[0].revents &
+            (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL) != 0)
+        {
+            return error.DeviceDisconnected;
+        }
+        try output.dispatchEvent(fd);
+    }
 }
 
 pub fn setListener(self: *Self, listener: Listener) void {

@@ -89,6 +89,7 @@ test {
     _ = @import("wayland/seat.zig");
     _ = @import("wayland/output.zig");
     _ = @import("wayland/output_layout.zig");
+    _ = @import("wayland/output_management.zig");
     _ = @import("wayland/data_device.zig");
     _ = @import("wayland/primary_selection.zig");
     _ = @import("wayland/text_input.zig");

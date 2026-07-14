@@ -24,6 +24,7 @@ const LinuxDmabuf = @import("wayland/linux_dmabuf.zig");
 const XdgActivation = @import("wayland/xdg_activation.zig");
 const Output = @import("wayland/output.zig");
 const OutputLayout = @import("wayland/output_layout.zig");
+const OutputManagement = @import("wayland/output_management.zig");
 const OutputBackend = @import("backend/output.zig");
 const DrmDevice = @import("backend/drm_device.zig");
 const DrmOutput = @import("backend/drm.zig");
@@ -52,6 +53,8 @@ primary_render_output: RenderOutputId,
 outputs: OutputLayout,
 xdg_output: XdgOutput,
 xdg_output_initialized: bool,
+output_management: OutputManagement,
+output_management_initialized: bool,
 single_pixel_buffer: SinglePixelBuffer,
 compositor: Compositor,
 subcompositor: Subcompositor,
@@ -141,6 +144,8 @@ pub fn create(
         .outputs = undefined,
         .xdg_output = undefined,
         .xdg_output_initialized = false,
+        .output_management = undefined,
+        .output_management_initialized = false,
         .single_pixel_buffer = undefined,
         .compositor = undefined,
         .subcompositor = undefined,
@@ -216,6 +221,19 @@ pub fn create(
     errdefer {
         self.xdg_output.deinit();
         self.xdg_output_initialized = false;
+    }
+    if (output_kind == .drm) {
+        try self.output_management.init(
+            allocator,
+            display,
+            self.drm_device.outputs(),
+            .{ .context = self, .apply = applyOutputConfiguration },
+        );
+        self.output_management_initialized = true;
+        errdefer {
+            self.output_management.deinit();
+            self.output_management_initialized = false;
+        }
     }
     try self.single_pixel_buffer.init(allocator, display);
     errdefer self.single_pixel_buffer.deinit();
@@ -365,6 +383,10 @@ pub fn destroy(self: *Self) void {
     var render_outputs = self.render_outputs.iterator();
     while (render_outputs.next()) |entry| stopRenderOutput(entry.value.*);
     self.display.destroyClients();
+    if (self.output_management_initialized) {
+        self.output_management.deinit();
+        self.output_management_initialized = false;
+    }
     self.window_manager.deinit();
     self.input_method.deinit();
     self.text_input.deinit();
@@ -507,16 +529,20 @@ fn drmOutputAdded(context: *anyopaque, drm_output: *DrmOutput) void {
     }
     drm_output.logical_x = right;
     drm_output.logical_y = 0;
-    if (!drm_output.enabled) return;
-    _ = self.addRenderOutput(self.native_input.io, .{
-        .kind = .drm,
-        .size = drm_output.size,
-        .position = .{ .x = right },
-        .name = "DRM",
-        .description = "Keywork DRM output",
-        .model = "drm-kms",
-        .drm_output = drm_output,
-    }) catch return self.terminate();
+    if (drm_output.enabled) {
+        _ = self.addRenderOutput(self.native_input.io, .{
+            .kind = .drm,
+            .size = drm_output.size,
+            .position = .{ .x = right },
+            .name = "DRM",
+            .description = "Keywork DRM output",
+            .model = "drm-kms",
+            .drm_output = drm_output,
+        }) catch return self.terminate();
+    }
+    if (self.output_management_initialized) {
+        self.output_management.addHead(drm_output) catch return self.terminate();
+    }
     requestRepaint(self);
 }
 
@@ -592,22 +618,86 @@ fn replacePrimaryRenderOutput(self: *Self, removed_id: RenderOutputId) void {
 
 fn drmOutputRemoving(context: *anyopaque, drm_output: *DrmOutput) void {
     const self: *Self = @ptrCast(@alignCast(context));
+    if (self.output_management_initialized) self.output_management.removeHead(drm_output);
     const render_output = self.findDrmRenderOutput(drm_output) orelse return;
     const id = render_output.id;
     if (self.render_outputs.count == 1) {
-        if (self.native_input_initialized) {
-            self.native_input.deinit();
-            self.native_input_initialized = false;
+        var fallback: ?*DrmOutput = null;
+        for (self.drm_device.outputs()) |candidate| {
+            if (candidate != drm_output and !candidate.enabled) {
+                fallback = candidate;
+                break;
+            }
         }
-        std.debug.assert(self.removeRenderOutput(id));
-        self.terminate();
-        return;
+        if (fallback) |replacement| {
+            self.enableDrmOutput(replacement, .{
+                .x = replacement.logical_x,
+                .y = replacement.logical_y,
+            }) catch return self.terminate();
+            if (self.output_management_initialized) self.output_management.syncHead(replacement);
+        } else {
+            if (self.native_input_initialized) {
+                self.native_input.deinit();
+                self.native_input_initialized = false;
+            }
+            std.debug.assert(self.removeRenderOutput(id));
+            self.terminate();
+            return;
+        }
     }
     if (std.meta.eql(id, self.primary_render_output)) {
         self.replacePrimaryRenderOutput(id);
     }
     std.debug.assert(self.removeRenderOutput(id));
     requestRepaint(self);
+}
+
+fn applyOutputConfiguration(context: *anyopaque, changes: []const OutputManagement.Change) bool {
+    const self: *Self = @ptrCast(@alignCast(context));
+    for (changes) |change| {
+        if (change.was_enabled or !change.enabled) continue;
+        self.enableDrmOutput(change.output, .{ .x = change.x, .y = change.y }) catch {
+            rollbackOutputConfiguration(self, changes);
+            return false;
+        };
+    }
+
+    for (changes) |change| {
+        if (change.enabled) self.setDrmOutputPosition(
+            change.output,
+            .{ .x = change.x, .y = change.y },
+        );
+    }
+    for (changes) |change| {
+        if (!change.was_enabled or change.enabled) continue;
+        self.disableDrmOutput(change.output) catch {
+            rollbackOutputConfiguration(self, changes);
+            return false;
+        };
+    }
+    return true;
+}
+
+fn rollbackOutputConfiguration(self: *Self, changes: []const OutputManagement.Change) void {
+    // Restore previously enabled heads first so rolling back a newly enabled
+    // head never violates the compositor's one-enabled-output invariant.
+    for (changes) |change| {
+        if (!change.was_enabled or change.output.enabled) continue;
+        self.enableDrmOutput(
+            change.output,
+            .{ .x = change.old_x, .y = change.old_y },
+        ) catch return self.terminate();
+    }
+    for (changes) |change| {
+        if (change.was_enabled) self.setDrmOutputPosition(
+            change.output,
+            .{ .x = change.old_x, .y = change.old_y },
+        );
+    }
+    for (changes) |change| {
+        if (change.was_enabled or !change.output.enabled) continue;
+        self.disableDrmOutput(change.output) catch return self.terminate();
+    }
 }
 
 fn drmDeviceFailed(context: *anyopaque) void {

@@ -69,7 +69,7 @@
       "status": "done",
       "privileged": false,
       "blocked_by": [],
-      "status_detail": "The protocol is implemented for the current single output, including parent-derived nested refresh updates; multi-output and hotplug are backend work."
+      "status_detail": "Version 4 is implemented for independent native DRM outputs, nested output, and headless output, including correct pixel modes, physical geometry, refresh updates, dynamic positions, connector hotplug, and output-global teardown."
     },
     {
       "id": "wl-seat",
@@ -512,7 +512,7 @@
       "blocked_by": [
         "wl-output"
       ],
-      "status_detail": "Version 3 reports the single output's logical position, logical size, stable name, and description, with version-correct done events."
+      "status_detail": "Version 3 reports each output's logical position, logical size, stable name, and description, refreshes position changes, tears resources down on hotplug, and emits version-correct done events."
     },
     {
       "id": "xdg-foreign-v2",
@@ -899,16 +899,17 @@
       "interfaces": [
         {
           "name": "zwlr_output_manager_v1",
-          "current_version": null,
+          "current_version": 4,
           "target_version": 4
         }
       ],
-      "status": "not_started",
+      "status": "in_progress",
       "privileged": true,
       "blocked_by": [
         "security-context",
         "wl-output"
-      ]
+      ],
+      "status_detail": "Version 4 head discovery, current-mode advertisement, hotplug lifecycles, stale-serial cancellation, complete test/apply transactions, positions, and native DRM enable/disable are implemented for Kanshi. The current hardware mode, unit scale, normal transform, and disabled adaptive sync are supported; unsupported custom modes, transforms, fractional scales, and adaptive sync are rejected. The global is temporarily visible to all clients until security-context authorization is implemented."
     },
     {
       "id": "wlr-output-power-management",
