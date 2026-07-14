@@ -186,7 +186,8 @@ pub fn create(
     try self.fractional_scale.init(
         allocator,
         display,
-        render_output.backend.renderScale(),
+        &self.outputs,
+        render_output.protocol_id,
     );
     errdefer self.fractional_scale.deinit();
     try self.fixes.init(display);
@@ -390,6 +391,7 @@ fn addRenderOutput(
         .size = render_output.backend.size(),
         .physical_size = render_output.backend.physicalSize(),
         .scale = render_output.backend.clientScale(),
+        .preferred_scale = render_output.backend.renderScale(),
         .name = config.name,
         .description = config.description,
         .make = config.make,
@@ -1211,7 +1213,7 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
     while (input_popups.next()) |popup| self.submitSurfaceTree(output, popup.surface_id);
     if (drag_icon) |info| self.submitSurfaceTree(output, info.surface_id);
     if (cursor) |info| self.submitSurfaceTree(output, info.surface_id);
-    self.discardUnsubmittedFeedbackIfIdle();
+    self.finishRepaintIfIdle();
     if (presented) |info| outputPresented(render_output, info);
     const keyboard_focus = self.layer_shell.keyboardFocus(
         self.xdg_shell.popupKeyboardFocus(),
@@ -1223,13 +1225,33 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
     self.seat.setKeyboardFocus(keyboard_focus);
 }
 
-fn discardUnsubmittedFeedbackIfIdle(self: *Self) void {
+fn finishRepaintIfIdle(self: *Self) void {
     var render_outputs = self.render_outputs.iterator();
     while (render_outputs.next()) |entry| {
         const render_output = entry.value.*;
         if (render_output.repaint_needed or render_output.render_scheduled) return;
     }
+    self.fractional_scale.refresh();
+    self.refreshSurfaceOutputPreferences();
     Surface.discardUnsubmittedFeedback(self.compositor.surfaceStore());
+}
+
+fn refreshSurfaceOutputPreferences(self: *Self) void {
+    const default_scale = self.outputs.get(self.primaryRenderOutput().protocol_id).?.clientScale();
+    const surfaces = self.compositor.surfaceStore();
+    var surface_iterator = surfaces.iterator();
+    while (surface_iterator.next()) |surface_entry| {
+        var preferred_scale = default_scale;
+        var found = false;
+        var outputs = self.outputs.iterator();
+        while (outputs.next()) |output_entry| {
+            if (!output_entry.output.containsSurface(surface_entry.id)) continue;
+            const output_scale = output_entry.output.clientScale();
+            if (!found or output_scale > preferred_scale) preferred_scale = output_scale;
+            found = true;
+        }
+        Surface.setPreferredBufferScale(surfaces, surface_entry.id, preferred_scale);
+    }
 }
 
 fn renderLayerSurfaces(

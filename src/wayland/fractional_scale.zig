@@ -5,6 +5,7 @@ const Self = @This();
 const std = @import("std");
 const wayland = @import("wayland");
 const render = @import("../render/types.zig");
+const OutputLayout = @import("output_layout.zig");
 const Surface = @import("surface.zig");
 
 const wl = wayland.server.wl;
@@ -12,7 +13,8 @@ const wp = wayland.server.wp;
 
 allocator: std.mem.Allocator,
 global: *wl.Global,
-preferred_scale: render.Scale,
+outputs: *OutputLayout,
+default_output_id: OutputLayout.Id,
 by_surface: std.AutoHashMapUnmanaged(Surface.Id, *FractionalScale),
 resource_count: usize,
 
@@ -20,9 +22,10 @@ pub fn init(
     self: *Self,
     allocator: std.mem.Allocator,
     display: *wl.Server,
-    preferred_scale: render.Scale,
+    outputs: *OutputLayout,
+    default_output_id: OutputLayout.Id,
 ) !void {
-    if (preferred_scale.numerator == 0) return error.InvalidScale;
+    if (outputs.get(default_output_id) == null) return error.InvalidOutput;
     self.* = .{
         .allocator = allocator,
         .global = try wl.Global.create(
@@ -33,7 +36,8 @@ pub fn init(
             self,
             bind,
         ),
-        .preferred_scale = preferred_scale,
+        .outputs = outputs,
+        .default_output_id = default_output_id,
         .by_surface = .empty,
         .resource_count = 0,
     };
@@ -70,6 +74,35 @@ fn handleRequest(
     }
 }
 
+pub fn refresh(self: *Self) void {
+    var fractional_scales = self.by_surface.iterator();
+    while (fractional_scales.next()) |entry| {
+        const fractional_scale = entry.value_ptr.*;
+        const preferred_scale = self.preferredScale(entry.key_ptr.*);
+        if (preferred_scale.numerator == fractional_scale.preferred_scale.numerator) continue;
+        fractional_scale.preferred_scale = preferred_scale;
+        fractional_scale.resource.sendPreferredScale(preferred_scale.numerator);
+    }
+}
+
+fn preferredScale(self: *Self, surface_id: Surface.Id) render.Scale {
+    var preferred_scale = if (self.outputs.get(self.default_output_id)) |output|
+        output.preferredScale()
+    else
+        render.Scale{};
+    var found = false;
+    var outputs = self.outputs.iterator();
+    while (outputs.next()) |entry| {
+        if (!entry.output.containsSurface(surface_id)) continue;
+        const output_scale = entry.output.preferredScale();
+        if (!found or output_scale.numerator > preferred_scale.numerator) {
+            preferred_scale = output_scale;
+        }
+        found = true;
+    }
+    return preferred_scale;
+}
+
 fn createFractionalScale(
     self: *Self,
     manager: *wp.FractionalScaleManagerV1,
@@ -97,10 +130,13 @@ fn createFractionalScale(
         resource.destroy();
         return;
     };
+    const preferred_scale = self.preferredScale(surface_id);
     fractional_scale.* = .{
         .manager = self,
         .surface = surface,
         .surface_id = surface_id,
+        .resource = resource,
+        .preferred_scale = preferred_scale,
         .listener = undefined,
     };
     fractional_scale.listener = .{
@@ -123,13 +159,15 @@ fn createFractionalScale(
     };
     self.resource_count += 1;
     resource.setHandler(*FractionalScale, handleResourceRequest, handleResourceDestroy, fractional_scale);
-    resource.sendPreferredScale(self.preferred_scale.numerator);
+    resource.sendPreferredScale(preferred_scale.numerator);
 }
 
 const FractionalScale = struct {
     manager: *Self,
     surface: ?*Surface,
     surface_id: Surface.Id,
+    resource: *wp.FractionalScaleV1,
+    preferred_scale: render.Scale,
     listener: Surface.CommitListener,
 };
 

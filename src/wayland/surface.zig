@@ -52,6 +52,7 @@ pub const State = struct {
     commit_feedbacks: std.ArrayList(*CommitFeedback),
     presentation_output: ?*anyopaque,
     commit_after_submission: bool,
+    preferred_buffer_scale: ?i32,
     current_buffer: ?BufferSnapshot,
     cached_buffer: ?BufferSnapshot,
     cached_attachment_changed: bool,
@@ -92,6 +93,7 @@ pub const State = struct {
             .commit_feedbacks = .empty,
             .presentation_output = null,
             .commit_after_submission = false,
+            .preferred_buffer_scale = null,
             .current_buffer = null,
             .cached_buffer = null,
             .cached_attachment_changed = false,
@@ -428,6 +430,18 @@ pub fn sendFrameDoneFor(store: *Store, id: Id, time_milliseconds: u32) void {
 
         callback.resource.destroySendDone(time_milliseconds);
     }
+}
+
+pub fn setPreferredBufferScale(store: *Store, id: Id, scale: u32) void {
+    std.debug.assert(scale > 0 and scale <= std.math.maxInt(i32));
+    const surface_state = store.get(id) orelse return;
+    const resource = surface_state.resource;
+    if (resource.getVersion() < wl.Surface.preferred_buffer_scale_since_version) return;
+    const scale_value: i32 = @intCast(scale);
+    if (surface_state.preferred_buffer_scale == scale_value) return;
+    surface_state.preferred_buffer_scale = scale_value;
+    resource.sendPreferredBufferScale(scale_value);
+    resource.sendPreferredBufferTransform(.normal);
 }
 
 pub fn submitPresentationFor(store: *Store, id: Id, output_context: *anyopaque) void {

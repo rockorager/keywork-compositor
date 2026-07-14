@@ -126,6 +126,7 @@ test "output handles are stable across additions and stale after removal" {
         .size = .{ .width = 1920, .height = 1080 },
         .physical_size = .{ .width = 3840, .height = 2160 },
         .scale = 2,
+        .preferred_scale = .{ .numerator = 180 },
         .name = "HEADLESS-2",
         .description = "Keywork headless output 2",
         .model = "headless",
@@ -135,6 +136,7 @@ test "output handles are stable across additions and stale after removal" {
     try std.testing.expectEqualStrings("HEADLESS-1", layout.get(first).?.name());
     try std.testing.expectEqualStrings("HEADLESS-2", layout.get(second).?.name());
     try std.testing.expectEqual(Output.Position{ .x = 1280 }, layout.get(second).?.logicalPosition());
+    try std.testing.expectEqual(@as(u32, 180), layout.get(second).?.preferredScale().numerator);
     try std.testing.expectError(error.DuplicateName, layout.add(.{
         .position = .{ .x = 3200 },
         .size = .{ .width = 1024, .height = 768 },

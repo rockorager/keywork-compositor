@@ -16,6 +16,7 @@ position: Position,
 size: render.Size,
 physical_size: render.Size,
 scale: i32,
+preferred_scale: render.Scale,
 refresh_millihertz: i32,
 name_value: [:0]u8,
 description_value: [:0]u8,
@@ -36,6 +37,7 @@ pub const Config = struct {
     size: render.Size,
     physical_size: render.Size,
     scale: u32,
+    preferred_scale: render.Scale = .{},
     name: []const u8,
     description: []const u8,
     make: []const u8 = "keywork",
@@ -63,6 +65,7 @@ pub fn init(
     if (config.size.width == 0 or config.size.height == 0 or
         config.size.width > std.math.maxInt(i32) or config.size.height > std.math.maxInt(i32) or
         config.scale == 0 or config.scale > std.math.maxInt(i32) or
+        config.preferred_scale.numerator == 0 or
         config.physical_size.width == 0 or config.physical_size.height == 0 or
         config.physical_size.width > std.math.maxInt(i32) or
         config.physical_size.height > std.math.maxInt(i32))
@@ -86,6 +89,7 @@ pub fn init(
         .size = config.size,
         .physical_size = config.physical_size,
         .scale = @intCast(config.scale),
+        .preferred_scale = config.preferred_scale,
         .refresh_millihertz = 60_000,
         .name_value = name_value,
         .description_value = description_value,
@@ -121,6 +125,14 @@ pub fn logicalSize(self: *const Self) render.Size {
 
 pub fn logicalPosition(self: *const Self) Position {
     return self.position;
+}
+
+pub fn preferredScale(self: *const Self) render.Scale {
+    return self.preferred_scale;
+}
+
+pub fn clientScale(self: *const Self) u32 {
+    return @intCast(self.scale);
 }
 
 pub fn logicalRect(self: *const Self) render.Rect {
@@ -182,10 +194,6 @@ pub fn markSurfaceVisible(self: *Self, surface_id: Surface.Id) error{OutOfMemory
     });
     for (self.resources.items) |resource| {
         if (resource.getClient() == surface.getClient()) surface.sendEnter(resource);
-    }
-    if (surface.getVersion() >= wl.Surface.preferred_buffer_scale_since_version) {
-        surface.sendPreferredBufferScale(self.scale);
-        surface.sendPreferredBufferTransform(.normal);
     }
 }
 
