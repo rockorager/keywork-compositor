@@ -264,8 +264,8 @@ fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
 fn sendMode(self: *const Self, resource: *wl.Output) void {
     resource.sendMode(
         .{ .current = true, .preferred = true },
-        @intCast(self.physical_size.width),
-        @intCast(self.physical_size.height),
+        @intCast(self.size.width),
+        @intCast(self.size.height),
         self.refresh_millihertz,
     );
 }
