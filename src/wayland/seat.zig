@@ -4,6 +4,7 @@ const Self = @This();
 
 const std = @import("std");
 const wayland = @import("wayland");
+const render = @import("../render/types.zig");
 const Surface = @import("surface.zig");
 
 const wl = wayland.server.wl;
@@ -124,10 +125,15 @@ const PressedPointerButton = struct {
     serial: u32,
 };
 
-const ActiveCursor = struct {
+const SurfaceCursor = struct {
     surface_id: Surface.Id,
     hotspot_x: i32,
     hotspot_y: i32,
+};
+
+const ActiveCursor = union(enum) {
+    surface: SurfaceCursor,
+    shape: ShapeCursor,
 };
 
 const CursorController = struct {
@@ -141,10 +147,24 @@ pub const PointerFocus = struct {
     y: f64,
 };
 
-pub const CursorInfo = struct {
-    surface_id: Surface.Id,
-    x: i32,
-    y: i32,
+pub const ShapeCursor = struct {
+    client: *wl.Client,
+    buffer: render.PixelBuffer,
+    hotspot_x: i32,
+    hotspot_y: i32,
+};
+
+pub const CursorInfo = union(enum) {
+    surface: struct {
+        surface_id: Surface.Id,
+        x: i32,
+        y: i32,
+    },
+    shape: struct {
+        buffer: render.PixelBuffer,
+        x: i32,
+        y: i32,
+    },
 };
 
 pub const RepaintListener = struct {
@@ -261,6 +281,20 @@ pub fn globalName(self: *const Self, client: *const wl.Client) u32 {
 
 pub fn ownsResource(self: *Self, resource: *wl.Seat) bool {
     return resource.getUserData() == @as(?*anyopaque, @ptrCast(self));
+}
+
+pub fn ownsPointerResource(self: *const Self, resource: *wl.Pointer) bool {
+    for (self.pointer_resources.items) |entry| {
+        if (entry.resource == resource) return true;
+    }
+    return false;
+}
+
+pub fn pointerResourceIsActive(self: *const Self, resource: *wl.Pointer) bool {
+    for (self.pointer_resources.items) |entry| {
+        if (entry.resource == resource) return self.pointerResourceActive(entry);
+    }
+    return false;
 }
 
 pub fn setRepaintListener(self: *Self, listener: RepaintListener) void {
@@ -447,10 +481,17 @@ pub fn keyboardFocusedSurface(self: *const Self) ?Surface.Id {
 pub fn cursorInfo(self: *const Self) ?CursorInfo {
     const cursor = self.active_cursor orelse return null;
     const position = self.pointer_position orelse return null;
-    return .{
-        .surface_id = cursor.surface_id,
-        .x = cursorCoordinate(position.x, cursor.hotspot_x),
-        .y = cursorCoordinate(position.y, cursor.hotspot_y),
+    return switch (cursor) {
+        .surface => |surface| .{ .surface = .{
+            .surface_id = surface.surface_id,
+            .x = cursorCoordinate(position.x, surface.hotspot_x),
+            .y = cursorCoordinate(position.y, surface.hotspot_y),
+        } },
+        .shape => |shape| .{ .shape = .{
+            .buffer = shape.buffer,
+            .x = cursorCoordinate(position.x, shape.hotspot_x),
+            .y = cursorCoordinate(position.y, shape.hotspot_y),
+        } },
     };
 }
 
@@ -1190,13 +1231,6 @@ fn pointerResourceActive(self: *const Self, entry: PointerResource) bool {
     );
 }
 
-fn pointerResourceIsActive(self: *const Self, resource: *wl.Pointer) bool {
-    for (self.pointer_resources.items) |entry| {
-        if (entry.resource == resource) return self.pointerResourceActive(entry);
-    }
-    return false;
-}
-
 fn touchResourceActive(self: *const Self, entry: TouchResource) bool {
     return capabilityResourceActive(
         self.touch_available,
@@ -1441,17 +1475,13 @@ fn setCursor(
         surface.getClient() == pointer.getClient()
     else
         false;
-    const current_surface = if (self.active_cursor) |cursor|
-        if (cursor_surface) |surface| std.meta.eql(cursor.surface_id, surface.handle()) else false
-    else
-        false;
-    if (!controller and !focused_client and !current_surface) return;
+    if (!controller and !focused_client and !self.activeCursorOwnedBy(pointer.getClient())) return;
 
-    const requested: ?ActiveCursor = if (cursor_surface) |surface| .{
+    const requested: ?ActiveCursor = if (cursor_surface) |surface| .{ .surface = .{
         .surface_id = surface.handle(),
         .hotspot_x = hotspot_x,
         .hotspot_y = hotspot_y,
-    } else null;
+    } } else null;
     if (manager_controller and !drag_controller) {
         self.cursor_controller.?.cursor = requested;
         if (self.pointer_focus) |focus| {
@@ -1461,6 +1491,61 @@ fn setCursor(
     }
     self.active_cursor = requested;
     self.requestRepaint();
+}
+
+pub fn setCursorShape(
+    self: *Self,
+    client: *wl.Client,
+    serial: u32,
+    shape: ShapeCursor,
+) void {
+    std.debug.assert(shape.client == client);
+    const manager_controller = self.isUnfocusedCursorController(client);
+    const drag_controller = if (self.drag_cursor_client) |drag_client|
+        drag_client == client
+    else
+        false;
+    const controller = manager_controller or drag_controller;
+    const enter = self.latest_pointer_enter;
+    if (!controller and (enter == null or enter.?.client != client or enter.?.serial != serial)) return;
+    const focused_client = if (self.pointerSurface()) |surface|
+        surface.getClient() == client
+    else
+        false;
+    if (!controller and !focused_client and !self.activeCursorOwnedBy(client)) return;
+
+    const requested: ActiveCursor = .{ .shape = shape };
+    if (manager_controller and !drag_controller) {
+        self.cursor_controller.?.cursor = requested;
+        if (self.pointer_focus) |focus| {
+            const focused_surface = self.surface_store.get(focus.surface_id);
+            if (focused_surface == null or focused_surface.?.resource.getClient() != client) return;
+        }
+    }
+    self.active_cursor = requested;
+    self.requestRepaint();
+}
+
+pub fn clearCursorShapes(self: *Self) void {
+    if (self.active_cursor) |cursor| switch (cursor) {
+        .surface => {},
+        .shape => self.clearCursor(),
+    };
+    if (self.cursor_controller) |*controller| if (controller.cursor) |cursor| switch (cursor) {
+        .surface => {},
+        .shape => controller.cursor = null,
+    };
+}
+
+fn activeCursorOwnedBy(self: *Self, client: *wl.Client) bool {
+    const cursor = self.active_cursor orelse return false;
+    return switch (cursor) {
+        .surface => |surface| if (Surface.resourceFor(self.surface_store, surface.surface_id)) |resource|
+            resource.getClient() == client
+        else
+            false,
+        .shape => |shape| shape.client == client,
+    };
 }
 
 fn restoreControllerCursor(self: *Self) void {
@@ -1476,26 +1561,40 @@ fn clearCursor(self: *Self) void {
 
 fn cursorSurfaceCommitted(self: *Self, id: Surface.Id, info: Surface.CommitInfo) void {
     var repaint = false;
-    if (self.active_cursor) |*cursor| if (std.meta.eql(cursor.surface_id, id)) {
-        cursor.hotspot_x -|= info.offset_x;
-        cursor.hotspot_y -|= info.offset_y;
-        repaint = true;
+    if (self.active_cursor) |*cursor| switch (cursor.*) {
+        .shape => {},
+        .surface => |*surface| if (std.meta.eql(surface.surface_id, id)) {
+            surface.hotspot_x -|= info.offset_x;
+            surface.hotspot_y -|= info.offset_y;
+            repaint = true;
+        },
     };
-    if (self.cursor_controller) |*controller| if (controller.cursor) |*remembered| {
-        if (std.meta.eql(remembered.surface_id, id)) {
-            remembered.hotspot_x -|= info.offset_x;
-            remembered.hotspot_y -|= info.offset_y;
-        }
+    if (self.cursor_controller) |*controller| if (controller.cursor) |*remembered| switch (remembered.*) {
+        .shape => {},
+        .surface => |*surface| if (std.meta.eql(surface.surface_id, id)) {
+            surface.hotspot_x -|= info.offset_x;
+            surface.hotspot_y -|= info.offset_y;
+        },
     };
     if (repaint) self.requestRepaint();
 }
 
 fn cursorSurfaceDestroyed(self: *Self, id: Surface.Id) void {
     if (self.active_cursor) |cursor| {
-        if (std.meta.eql(cursor.surface_id, id)) self.clearCursor();
+        switch (cursor) {
+            .shape => {},
+            .surface => |surface| {
+                if (std.meta.eql(surface.surface_id, id)) self.clearCursor();
+            },
+        }
     }
     if (self.cursor_controller) |*controller| if (controller.cursor) |cursor| {
-        if (std.meta.eql(cursor.surface_id, id)) controller.cursor = null;
+        switch (cursor) {
+            .shape => {},
+            .surface => |surface| {
+                if (std.meta.eql(surface.surface_id, id)) controller.cursor = null;
+            },
+        }
     };
 }
 

@@ -12,6 +12,7 @@ const XdgOutput = @import("wayland/xdg_output.zig");
 const XdgShell = @import("wayland/xdg_shell.zig");
 const LayerShell = @import("wayland/layer_shell.zig");
 const SinglePixelBuffer = @import("wayland/single_pixel_buffer.zig");
+const CursorShape = @import("wayland/cursor_shape.zig");
 const Seat = @import("wayland/seat.zig");
 const DataDevice = @import("wayland/data_device.zig");
 const PrimarySelection = @import("wayland/primary_selection.zig");
@@ -56,6 +57,7 @@ xdg_output_initialized: bool,
 output_management: OutputManagement,
 output_management_initialized: bool,
 single_pixel_buffer: SinglePixelBuffer,
+cursor_shape: CursorShape,
 compositor: Compositor,
 subcompositor: Subcompositor,
 scene: Scene,
@@ -148,6 +150,7 @@ pub fn create(
         .output_management = undefined,
         .output_management_initialized = false,
         .single_pixel_buffer = undefined,
+        .cursor_shape = undefined,
         .compositor = undefined,
         .subcompositor = undefined,
         .scene = undefined,
@@ -239,6 +242,8 @@ pub fn create(
     }
     try self.single_pixel_buffer.init(allocator, display);
     errdefer self.single_pixel_buffer.deinit();
+    try self.cursor_shape.init(allocator, display, &self.seat);
+    errdefer self.cursor_shape.deinit();
     try self.presentation_protocol.init(
         allocator,
         display,
@@ -409,6 +414,7 @@ pub fn destroy(self: *Self) void {
     self.fractional_scale.deinit();
     self.viewporter.deinit();
     self.presentation_protocol.deinit();
+    self.cursor_shape.deinit();
     self.single_pixel_buffer.deinit();
     self.xdg_output.deinit();
     self.xdg_output_initialized = false;
@@ -1575,14 +1581,25 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
 
     const cursor = self.seat.cursorInfo();
     if (cursor) |info| {
-        try self.renderSurfaceTree(
-            &frame,
-            info.surface_id,
-            info.x,
-            info.y,
-            null,
-            null,
-        );
+        switch (info) {
+            .surface => |surface| try self.renderSurfaceTree(
+                &frame,
+                surface.surface_id,
+                surface.x,
+                surface.y,
+                null,
+                null,
+            ),
+            .shape => |shape| {
+                const command = [_]render.Command{.{ .image = .{
+                    .x = shape.x,
+                    .y = shape.y,
+                    .size = shape.buffer.size,
+                    .buffer = shape.buffer,
+                } }};
+                try self.renderCommands(&frame, &command);
+            },
+        }
     }
 
     const presented = render_output.backend.present() catch return error.InvalidTarget;
@@ -1616,7 +1633,10 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
     input_popups = self.input_method.popupIterator();
     while (input_popups.next()) |popup| self.submitSurfaceTree(output, popup.surface_id);
     if (drag_icon) |info| self.submitSurfaceTree(output, info.surface_id);
-    if (cursor) |info| self.submitSurfaceTree(output, info.surface_id);
+    if (cursor) |info| switch (info) {
+        .surface => |surface| self.submitSurfaceTree(output, surface.surface_id),
+        .shape => {},
+    };
     self.finishRepaintIfIdle();
     if (presented) |info| outputPresented(render_output, info);
     const keyboard_focus = self.layer_shell.keyboardFocus(
