@@ -63,6 +63,7 @@ pub fn build(b: *std.Build) void {
     root_module.addImport("wayland", wayland);
     root_module.addImport("vulkan", vulkan);
     root_module.linkSystemLibrary("pixman-1", .{});
+    root_module.linkSystemLibrary("libseat", .{});
     root_module.linkSystemLibrary("wayland-client", .{});
     root_module.linkSystemLibrary("wayland-server", .{});
 

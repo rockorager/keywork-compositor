@@ -54,6 +54,7 @@ test {
     _ = @import("backend/headless.zig");
     _ = @import("backend/nested_wayland.zig");
     _ = @import("backend/output.zig");
+    _ = @import("backend/session.zig");
     _ = @import("presentation.zig");
     _ = @import("region.zig");
     _ = @import("scene.zig");
