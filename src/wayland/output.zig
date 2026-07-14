@@ -103,8 +103,8 @@ pub fn init(
 }
 
 pub fn deinit(self: *Self) void {
-    std.debug.assert(self.resources.items.len == 0);
     std.debug.assert(!self.frame_active);
+    while (self.resources.items.len > 0) self.resources.items[0].destroy();
     self.global.destroy();
     self.resources.deinit(self.allocator);
     self.memberships.deinit(self.allocator);
@@ -125,6 +125,15 @@ pub fn logicalSize(self: *const Self) render.Size {
 
 pub fn logicalPosition(self: *const Self) Position {
     return self.position;
+}
+
+pub fn setPosition(self: *Self, position: Position) void {
+    if (std.meta.eql(self.position, position)) return;
+    self.position = position;
+    for (self.resources.items) |resource| {
+        self.sendGeometry(resource);
+        if (resource.getVersion() >= wl.Output.done_since_version) resource.sendDone();
+    }
 }
 
 pub fn preferredScale(self: *const Self) render.Scale {
@@ -238,16 +247,7 @@ fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
         return;
     };
     resource.setHandler(*Self, handleRequest, handleDestroy, self);
-    resource.sendGeometry(
-        self.position.x,
-        self.position.y,
-        0,
-        0,
-        .unknown,
-        self.make,
-        self.model,
-        .normal,
-    );
+    self.sendGeometry(resource);
     self.sendMode(resource);
     if (version >= wl.Output.scale_since_version) resource.sendScale(self.scale);
     if (version >= wl.Output.name_since_version) {
@@ -259,6 +259,19 @@ fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
         const surface = Surface.resourceFor(self.surfaces, membership.surface_id) orelse continue;
         if (surface.getClient() == client) surface.sendEnter(resource);
     }
+}
+
+fn sendGeometry(self: *const Self, resource: *wl.Output) void {
+    resource.sendGeometry(
+        self.position.x,
+        self.position.y,
+        @intCast(self.physical_size.width),
+        @intCast(self.physical_size.height),
+        .unknown,
+        self.make,
+        self.model,
+        .normal,
+    );
 }
 
 fn sendMode(self: *const Self, resource: *wl.Output) void {

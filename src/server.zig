@@ -51,6 +51,7 @@ render_outputs: RenderOutputStore,
 primary_render_output: RenderOutputId,
 outputs: OutputLayout,
 xdg_output: XdgOutput,
+xdg_output_initialized: bool,
 single_pixel_buffer: SinglePixelBuffer,
 compositor: Compositor,
 subcompositor: Subcompositor,
@@ -139,6 +140,7 @@ pub fn create(
         .primary_render_output = undefined,
         .outputs = undefined,
         .xdg_output = undefined,
+        .xdg_output_initialized = false,
         .single_pixel_buffer = undefined,
         .compositor = undefined,
         .subcompositor = undefined,
@@ -207,8 +209,12 @@ pub fn create(
     });
     self.primary_render_output = render_output_id;
     const render_output = self.render_outputs.get(render_output_id).?.*;
-    try self.xdg_output.init(display, &self.outputs);
-    errdefer self.xdg_output.deinit();
+    try self.xdg_output.init(allocator, display, &self.outputs);
+    self.xdg_output_initialized = true;
+    errdefer {
+        self.xdg_output.deinit();
+        self.xdg_output_initialized = false;
+    }
     try self.single_pixel_buffer.init(allocator, display);
     errdefer self.single_pixel_buffer.deinit();
     try self.presentation_protocol.init(
@@ -374,6 +380,7 @@ pub fn destroy(self: *Self) void {
     self.presentation_protocol.deinit();
     self.single_pixel_buffer.deinit();
     self.xdg_output.deinit();
+    self.xdg_output_initialized = false;
     render_outputs = self.render_outputs.iterator();
     while (render_outputs.next()) |entry| {
         std.debug.assert(self.removeRenderOutput(entry.id));
@@ -480,6 +487,7 @@ fn removeRenderOutput(self: *Self, id: RenderOutputId) bool {
     stopRenderOutput(render_output);
     const protocol_output = self.outputs.get(render_output.protocol_id).?;
     Surface.discardPresentation(self.compositor.surfaceStore(), protocol_output);
+    if (self.xdg_output_initialized) self.xdg_output.removeOutput(protocol_output);
     std.debug.assert(self.outputs.remove(render_output.protocol_id));
     render_output.backend.deinit();
     self.allocator.destroy(render_output);

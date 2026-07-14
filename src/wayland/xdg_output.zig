@@ -10,21 +10,46 @@ const OutputLayout = @import("output_layout.zig");
 const wl = wayland.server.wl;
 const zxdg = wayland.server.zxdg;
 
+allocator: std.mem.Allocator,
 global: *wl.Global,
 outputs: *OutputLayout,
-resource_count: usize = 0,
+resources: std.ArrayList(*OutputResource),
 
-pub fn init(self: *Self, display: *wl.Server, outputs: *OutputLayout) !void {
+pub fn init(
+    self: *Self,
+    allocator: std.mem.Allocator,
+    display: *wl.Server,
+    outputs: *OutputLayout,
+) !void {
     self.* = .{
+        .allocator = allocator,
         .global = try wl.Global.create(display, zxdg.OutputManagerV1, 3, *Self, self, bind),
         .outputs = outputs,
+        .resources = .empty,
     };
 }
 
 pub fn deinit(self: *Self) void {
-    std.debug.assert(self.resource_count == 0);
+    std.debug.assert(self.resources.items.len == 0);
     self.global.destroy();
+    self.resources.deinit(self.allocator);
     self.* = undefined;
+}
+
+pub fn refresh(self: *Self, output: *Output) void {
+    for (self.resources.items) |managed| {
+        if (managed.output != output) continue;
+        managed.sendState();
+    }
+}
+
+pub fn removeOutput(self: *Self, output: *Output) void {
+    var index = self.resources.items.len;
+    while (index > 0) {
+        index -= 1;
+        const managed = self.resources.items[index];
+        if (managed.output == output) managed.resource.destroy();
+    }
 }
 
 fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
@@ -69,31 +94,67 @@ fn createOutput(
         manager.postNoMemory();
         return;
     };
-    self.resource_count += 1;
-    resource.setHandler(*Self, outputRequest, outputDestroyed, self);
-
-    const position = output.logicalPosition();
-    const size = output.logicalSize();
-    resource.sendLogicalPosition(position.x, position.y);
-    resource.sendLogicalSize(@intCast(size.width), @intCast(size.height));
-    if (resource.getVersion() >= zxdg.OutputV1.name_since_version) {
-        resource.sendName(output.name());
-        resource.sendDescription(output.description());
-    }
-    if (resource.getVersion() < 3) {
-        resource.sendDone();
-    } else if (output_resource.getVersion() >= wl.Output.done_since_version) {
-        output_resource.sendDone();
-    }
+    const managed = self.allocator.create(OutputResource) catch {
+        resource.postNoMemory();
+        resource.destroy();
+        return;
+    };
+    managed.* = .{
+        .manager = self,
+        .resource = resource,
+        .wl_output = output_resource,
+        .output = output,
+    };
+    self.resources.append(self.allocator, managed) catch {
+        self.allocator.destroy(managed);
+        resource.postNoMemory();
+        resource.destroy();
+        return;
+    };
+    resource.setHandler(*OutputResource, outputRequest, outputDestroyed, managed);
+    managed.sendState();
 }
 
-fn outputRequest(resource: *zxdg.OutputV1, request: zxdg.OutputV1.Request, _: *Self) void {
+const OutputResource = struct {
+    manager: *Self,
+    resource: *zxdg.OutputV1,
+    wl_output: *wl.Output,
+    output: *Output,
+
+    fn sendState(self: *OutputResource) void {
+        const position = self.output.logicalPosition();
+        const size = self.output.logicalSize();
+        self.resource.sendLogicalPosition(position.x, position.y);
+        self.resource.sendLogicalSize(@intCast(size.width), @intCast(size.height));
+        if (self.resource.getVersion() >= zxdg.OutputV1.name_since_version) {
+            self.resource.sendName(self.output.name());
+            self.resource.sendDescription(self.output.description());
+        }
+        if (self.resource.getVersion() < 3) {
+            self.resource.sendDone();
+        } else if (self.wl_output.getVersion() >= wl.Output.done_since_version) {
+            self.wl_output.sendDone();
+        }
+    }
+};
+
+fn outputRequest(
+    resource: *zxdg.OutputV1,
+    request: zxdg.OutputV1.Request,
+    _: *OutputResource,
+) void {
     switch (request) {
         .destroy => resource.destroy(),
     }
 }
 
-fn outputDestroyed(_: *zxdg.OutputV1, self: *Self) void {
-    std.debug.assert(self.resource_count > 0);
-    self.resource_count -= 1;
+fn outputDestroyed(_: *zxdg.OutputV1, managed: *OutputResource) void {
+    const self = managed.manager;
+    for (self.resources.items, 0..) |candidate, index| {
+        if (candidate != managed) continue;
+        _ = self.resources.orderedRemove(index);
+        self.allocator.destroy(managed);
+        return;
+    }
+    unreachable;
 }
