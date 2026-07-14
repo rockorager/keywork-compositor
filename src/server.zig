@@ -22,6 +22,7 @@ const FractionalScale = @import("wayland/fractional_scale.zig");
 const Fixes = @import("wayland/fixes.zig");
 const LinuxDmabuf = @import("wayland/linux_dmabuf.zig");
 const XdgActivation = @import("wayland/xdg_activation.zig");
+const Output = @import("wayland/output.zig");
 const OutputLayout = @import("wayland/output_layout.zig");
 const OutputBackend = @import("backend/output.zig");
 const renderer_types = @import("render/renderer.zig");
@@ -83,6 +84,12 @@ const RenderOutput = struct {
 
 const RenderOutputStore = slot_map.SlotMap(*RenderOutput, enum { render_output });
 const RenderOutputId = RenderOutputStore.Id;
+
+const OutputFrame = struct {
+    render_output: *RenderOutput,
+    output: *Output,
+    target: renderer_types.Target,
+};
 
 pub fn create(
     allocator: std.mem.Allocator,
@@ -1045,17 +1052,20 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
     const output = self.outputs.get(render_output.protocol_id).?;
     output.beginFrame();
     errdefer output.cancelFrame();
-    const output_size = render_output.backend.size();
-    const target = self.renderer.makeTarget(pixel_target);
+    const frame: OutputFrame = .{
+        .render_output = render_output,
+        .output = output,
+        .target = self.renderer.makeTarget(pixel_target),
+    };
     const clear_command = [_]render.Command{
         .{ .clear = render.Color.rgba(24, 24, 27, 255) },
     };
-    try self.renderCommands(output_size, &clear_command, target);
+    try self.renderCommands(&frame, &clear_command);
 
-    try self.renderLayerSurfaces(.background, target);
-    try self.renderLayerSurfaces(.bottom, target);
+    try self.renderLayerSurfaces(&frame, .background);
+    try self.renderLayerSurfaces(&frame, .bottom);
     const top_fullscreen = self.scene.topFullscreen();
-    if (top_fullscreen != null) try self.renderLayerSurfaces(.top, target);
+    if (top_fullscreen != null) try self.renderLayerSurfaces(&frame, .top);
     var fullscreen_reached = top_fullscreen == null;
     var nodes = self.scene.nodeIterator();
     while (nodes.next()) |entry| switch (entry) {
@@ -1065,67 +1075,67 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
                 if (!std.meta.eql(window_entry.id, id)) continue;
                 fullscreen_reached = true;
             }
-            try self.renderWindow(window_entry.id, window_entry.window, output_size, target);
+            try self.renderWindow(&frame, window_entry.id, window_entry.window);
         },
         .shell_surface => |shell_entry| {
             if (!fullscreen_reached or !shell_entry.shell_surface.mapped) continue;
             try self.renderSurfaceTree(
+                &frame,
                 shell_entry.shell_surface.surface_id,
                 shell_entry.shell_surface.position.x,
                 shell_entry.shell_surface.position.y,
                 null,
                 null,
-                target,
             );
         },
     };
-    if (top_fullscreen == null) try self.renderLayerSurfaces(.top, target);
-    try self.renderLayerSurfaces(.overlay, target);
-    try self.renderLayerPopups(target);
+    if (top_fullscreen == null) try self.renderLayerSurfaces(&frame, .top);
+    try self.renderLayerSurfaces(&frame, .overlay);
+    try self.renderLayerPopups(&frame);
 
     self.input_method.refreshPopups();
     var input_popups = self.input_method.popupIterator();
     while (input_popups.next()) |popup| {
         try self.renderSurfaceTree(
+            &frame,
             popup.surface_id,
             popup.position.x,
             popup.position.y,
             null,
             null,
-            target,
         );
     }
 
     const drag_icon = self.data_device.iconInfo();
     if (drag_icon) |info| {
         try self.renderSurfaceTree(
+            &frame,
             info.surface_id,
             info.x,
             info.y,
             null,
             null,
-            target,
         );
     }
 
     const cursor = self.seat.cursorInfo();
     if (cursor) |info| {
         try self.renderSurfaceTree(
+            &frame,
             info.surface_id,
             info.x,
             info.y,
             null,
             null,
-            target,
         );
     }
 
     const presented = render_output.backend.present() catch return error.InvalidTarget;
     output.endFrame();
 
-    self.submitLayerSurfaces(.background);
-    self.submitLayerSurfaces(.bottom);
-    if (top_fullscreen != null) self.submitLayerSurfaces(.top);
+    self.submitLayerSurfaces(output, .background);
+    self.submitLayerSurfaces(output, .bottom);
+    if (top_fullscreen != null) self.submitLayerSurfaces(output, .top);
     fullscreen_reached = top_fullscreen == null;
     nodes = self.scene.nodeIterator();
     while (nodes.next()) |entry| switch (entry) {
@@ -1135,23 +1145,23 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
                 if (!std.meta.eql(window_entry.id, id)) continue;
                 fullscreen_reached = true;
             }
-            self.submitWindowDecorations(window_entry.id, .below);
-            self.submitSurfaceTree(window_entry.window.surface_id);
-            self.submitWindowDecorations(window_entry.id, .above);
-            self.submitWindowPopups(window_entry.id);
+            self.submitWindowDecorations(output, window_entry.id, .below);
+            self.submitSurfaceTree(output, window_entry.window.surface_id);
+            self.submitWindowDecorations(output, window_entry.id, .above);
+            self.submitWindowPopups(output, window_entry.id);
         },
         .shell_surface => |shell_entry| {
             if (!fullscreen_reached or !shell_entry.shell_surface.mapped) continue;
-            self.submitSurfaceTree(shell_entry.shell_surface.surface_id);
+            self.submitSurfaceTree(output, shell_entry.shell_surface.surface_id);
         },
     };
-    if (top_fullscreen == null) self.submitLayerSurfaces(.top);
-    self.submitLayerSurfaces(.overlay);
-    self.submitLayerPopups();
+    if (top_fullscreen == null) self.submitLayerSurfaces(output, .top);
+    self.submitLayerSurfaces(output, .overlay);
+    self.submitLayerPopups(output);
     input_popups = self.input_method.popupIterator();
-    while (input_popups.next()) |popup| self.submitSurfaceTree(popup.surface_id);
-    if (drag_icon) |info| self.submitSurfaceTree(info.surface_id);
-    if (cursor) |info| self.submitSurfaceTree(info.surface_id);
+    while (input_popups.next()) |popup| self.submitSurfaceTree(output, popup.surface_id);
+    if (drag_icon) |info| self.submitSurfaceTree(output, info.surface_id);
+    if (cursor) |info| self.submitSurfaceTree(output, info.surface_id);
     Surface.discardUnsubmittedFeedback(self.compositor.surfaceStore());
     if (presented) |info| outputPresented(render_output, info);
     const keyboard_focus = self.layer_shell.keyboardFocus(
@@ -1166,34 +1176,34 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
 
 fn renderLayerSurfaces(
     self: *Self,
+    frame: *const OutputFrame,
     layer: Scene.Layer,
-    target: renderer_types.Target,
 ) renderer_types.Renderer.Error!void {
     var surfaces = self.scene.layerSurfaceIterator(layer);
     while (surfaces.next()) |entry| {
         const layer_surface = entry.layer_surface;
         if (!layer_surface.mapped) continue;
         try self.renderSurfaceTree(
+            frame,
             layer_surface.surface_id,
             layer_surface.position.x,
             layer_surface.position.y,
             null,
             null,
-            target,
         );
     }
 }
 
-fn submitLayerSurfaces(self: *Self, layer: Scene.Layer) void {
+fn submitLayerSurfaces(self: *Self, output: *Output, layer: Scene.Layer) void {
     var surfaces = self.scene.layerSurfaceIterator(layer);
     while (surfaces.next()) |entry| {
         if (entry.layer_surface.mapped) {
-            self.submitSurfaceTree(entry.layer_surface.surface_id);
+            self.submitSurfaceTree(output, entry.layer_surface.surface_id);
         }
     }
 }
 
-fn renderLayerPopups(self: *Self, target: renderer_types.Target) renderer_types.Renderer.Error!void {
+fn renderLayerPopups(self: *Self, frame: *const OutputFrame) renderer_types.Renderer.Error!void {
     inline for (.{
         Scene.Layer.background,
         Scene.Layer.bottom,
@@ -1213,19 +1223,19 @@ fn renderLayerPopups(self: *Self, target: renderer_types.Target) renderer_types.
                     .size = buffer.logical_size,
                 };
                 try self.renderSurfaceTree(
+                    frame,
                     entry.popup.surface_id,
                     entry.position.x -| geometry.offset.x,
                     entry.position.y -| geometry.offset.y,
                     null,
                     null,
-                    target,
                 );
             }
         }
     }
 }
 
-fn submitLayerPopups(self: *Self) void {
+fn submitLayerPopups(self: *Self, output: *Output) void {
     inline for (.{
         Scene.Layer.background,
         Scene.Layer.bottom,
@@ -1236,7 +1246,7 @@ fn submitLayerPopups(self: *Self) void {
         while (roots.next()) |root| {
             var popups = self.scene.layerPopupIterator(root.id);
             while (popups.next()) |entry| {
-                if (entry.popup.mapped) self.submitSurfaceTree(entry.popup.surface_id);
+                if (entry.popup.mapped) self.submitSurfaceTree(output, entry.popup.surface_id);
             }
         }
     }
@@ -1244,23 +1254,21 @@ fn submitLayerPopups(self: *Self) void {
 
 fn renderCommands(
     self: *Self,
-    output_size: render.Size,
+    frame: *const OutputFrame,
     commands: []const render.Command,
-    target: renderer_types.Target,
 ) renderer_types.Renderer.Error!void {
     try self.renderer.render(.{
-        .size = output_size,
+        .size = frame.render_output.backend.size(),
         .commands = commands,
-        .scale = self.primaryRenderOutput().backend.renderScale(),
-    }, target);
+        .scale = frame.render_output.backend.renderScale(),
+    }, frame.target);
 }
 
 fn renderWindow(
     self: *Self,
+    frame: *const OutputFrame,
     id: Scene.Id,
     window: *const Scene.Window,
-    output_size: render.Size,
-    target: renderer_types.Target,
 ) renderer_types.Renderer.Error!void {
     const root_buffer = Surface.currentBuffer(
         self.compositor.surfaceStore(),
@@ -1290,7 +1298,7 @@ fn renderWindow(
                 .clip = window_clip,
             } },
         };
-        try self.renderCommands(output_size, &shadow_command, target);
+        try self.renderCommands(frame, &shadow_command);
     }
     if (window.effects.blur) |blur| {
         const blur_command = [_]render.Command{
@@ -1301,9 +1309,9 @@ fn renderWindow(
                 .clip = window_clip,
             } },
         };
-        try self.renderCommands(output_size, &blur_command, target);
+        try self.renderCommands(frame, &blur_command);
     }
-    try self.renderWindowDecorations(id, window, .below, window_clip, target);
+    try self.renderWindowDecorations(frame, id, window, .below, window_clip);
     var content_visible = true;
     var content_clip = if (window.content_clip_box != null) content_rect else null;
     if (window_clip) |clip| {
@@ -1322,23 +1330,23 @@ fn renderWindow(
         else
             .{ .rect = content_rect, .radius = window.effects.corner_radius };
         try self.renderSurfaceTree(
+            frame,
             window.surface_id,
             window.position.x -| content_geometry.offset.x,
             window.position.y -| content_geometry.offset.y,
             rounded_clip,
             content_clip,
-            target,
         );
     }
-    try self.renderWindowBorders(window, content_rect, window_clip, target);
-    try self.renderWindowDecorations(id, window, .above, window_clip, target);
-    try self.renderWindowPopups(id, target);
+    try self.renderWindowBorders(frame, window, content_rect, window_clip);
+    try self.renderWindowDecorations(frame, id, window, .above, window_clip);
+    try self.renderWindowPopups(frame, id);
 }
 
 fn renderWindowPopups(
     self: *Self,
+    frame: *const OutputFrame,
     window_id: Scene.Id,
-    target: renderer_types.Target,
 ) renderer_types.Renderer.Error!void {
     var popups = self.scene.popupIterator(window_id);
     while (popups.next()) |entry| {
@@ -1352,24 +1360,24 @@ fn renderWindowPopups(
             .size = buffer.logical_size,
         };
         try self.renderSurfaceTree(
+            frame,
             popup.surface_id,
             entry.position.x -| content_geometry.offset.x,
             entry.position.y -| content_geometry.offset.y,
             null,
             null,
-            target,
         );
     }
 }
 
 fn renderSurfaceTree(
     self: *Self,
+    frame: *const OutputFrame,
     surface_id: Surface.Id,
     x: i32,
     y: i32,
     rounded_clip: ?render.RoundedClip,
     clip: ?render.Rect,
-    target: renderer_types.Target,
 ) renderer_types.Renderer.Error!void {
     if (Surface.currentBuffer(self.compositor.surfaceStore(), surface_id) == null) return;
 
@@ -1386,12 +1394,11 @@ fn renderSurfaceTree(
                 .width = buffer.logical_size.width,
                 .height = buffer.logical_size.height,
             };
-            const output = self.outputs.get(self.primaryRenderOutput().protocol_id).?;
-            const visible_rect = surface_rect.intersection(output.logicalRect()) orelse continue;
+            const visible_rect = surface_rect.intersection(frame.output.logicalRect()) orelse continue;
             if (clip) |clip_rect| {
                 if (visible_rect.intersection(clip_rect) == null) continue;
             }
-            try output.markSurfaceVisible(surface_id);
+            try frame.output.markSurfaceVisible(surface_id);
             if (buffer.transform != .normal) continue;
             const image_command = [_]render.Command{
                 .{ .image = .{
@@ -1404,25 +1411,25 @@ fn renderSurfaceTree(
                     .clip = clip,
                 } },
             };
-            try self.renderCommands(self.primaryRenderOutput().backend.size(), &image_command, target);
+            try self.renderCommands(frame, &image_command);
         },
         .child => |child| try self.renderSurfaceTree(
+            frame,
             child.surface_id,
             x +| child.position.x,
             y +| child.position.y,
             rounded_clip,
             clip,
-            target,
         ),
     };
 }
 
 fn renderWindowBorders(
     self: *Self,
+    frame: *const OutputFrame,
     window: *const Scene.Window,
     content_rect: render.Rect,
     clip: ?render.Rect,
-    target: renderer_types.Target,
 ) renderer_types.Renderer.Error!void {
     const borders = window.borders orelse return;
     var commands: [4]render.Command = undefined;
@@ -1432,27 +1439,27 @@ fn renderWindowBorders(
         clip,
         &commands,
     );
-    try self.renderCommands(self.primaryRenderOutput().backend.size(), border_commands, target);
+    try self.renderCommands(frame, border_commands);
 }
 
 fn renderWindowDecorations(
     self: *Self,
+    frame: *const OutputFrame,
     window_id: Scene.Id,
     window: *const Scene.Window,
     layer: Scene.DecorationLayer,
     clip: ?render.Rect,
-    target: renderer_types.Target,
 ) renderer_types.Renderer.Error!void {
     var decorations = self.scene.decorationIterator(window_id, layer);
     while (decorations.next()) |entry| {
         if (!entry.decoration.mapped) continue;
         try self.renderSurfaceTree(
+            frame,
             entry.decoration.surface_id,
             window.position.x +| entry.decoration.offset.x,
             window.position.y +| entry.decoration.offset.y,
             null,
             clip,
-            target,
         );
     }
 }
@@ -1549,35 +1556,36 @@ fn windowContentRect(window: *const Scene.Window, content_size: render.Size) ?re
     return content_rect.intersection(clip_box.translated(window.position.x, window.position.y));
 }
 
-fn submitSurfaceTree(self: *Self, surface_id: Surface.Id) void {
+fn submitSurfaceTree(self: *Self, output: *Output, surface_id: Surface.Id) void {
     if (Surface.currentBuffer(self.compositor.surfaceStore(), surface_id) == null) return;
 
     var stack = self.subcompositor.stackIterator(surface_id);
     while (stack.next()) |entry| switch (entry) {
-        .parent => if (self.outputs.get(self.primaryRenderOutput().protocol_id).?.containsSurface(surface_id)) {
+        .parent => if (output.containsSurface(surface_id)) {
             Surface.submitPresentationFor(self.compositor.surfaceStore(), surface_id);
         },
-        .child => |child| self.submitSurfaceTree(child.surface_id),
+        .child => |child| self.submitSurfaceTree(output, child.surface_id),
     };
 }
 
 fn submitWindowDecorations(
     self: *Self,
+    output: *Output,
     window_id: Scene.Id,
     layer: Scene.DecorationLayer,
 ) void {
     var decorations = self.scene.decorationIterator(window_id, layer);
     while (decorations.next()) |entry| {
         if (!entry.decoration.mapped) continue;
-        self.submitSurfaceTree(entry.decoration.surface_id);
+        self.submitSurfaceTree(output, entry.decoration.surface_id);
     }
 }
 
-fn submitWindowPopups(self: *Self, window_id: Scene.Id) void {
+fn submitWindowPopups(self: *Self, output: *Output, window_id: Scene.Id) void {
     var popups = self.scene.popupIterator(window_id);
     while (popups.next()) |entry| {
         if (!entry.popup.mapped) continue;
-        self.submitSurfaceTree(entry.popup.surface_id);
+        self.submitSurfaceTree(output, entry.popup.surface_id);
     }
 }
 
