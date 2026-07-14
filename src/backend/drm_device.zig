@@ -210,8 +210,8 @@ fn deactivate(self: *Self) void {
 fn removeAt(self: *Self, index: usize, fd: std.posix.fd_t) void {
     const output = self.active_outputs.items[index];
     if (self.listener) |listener| listener.removing(listener.context, output);
-    output.deactivate(fd);
     output.retire();
+    output.disconnect(fd);
     self.retired_outputs.append(self.allocator, output) catch return self.fail(error.OutOfMemory);
     _ = self.active_outputs.orderedRemove(index);
 }

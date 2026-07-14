@@ -261,6 +261,19 @@ pub fn isPrimaryNode(path: []const u8) bool {
 
 pub fn deactivate(self: *Self, fd: std.posix.fd_t) void {
     if (self.old_crtc) |old_crtc| restoreCrtc(fd, self.connector_id, old_crtc);
+    self.release(fd);
+}
+
+pub fn disconnect(self: *Self, fd: std.posix.fd_t) void {
+    if (self.enabled and
+        c.drmModeSetCrtc(fd, self.crtc_id, 0, 0, 0, null, 0, null) != 0)
+    {
+        log.warn("failed to disable disconnected CRTC {d}", .{self.crtc_id});
+    }
+    self.release(fd);
+}
+
+fn release(self: *Self, fd: std.posix.fd_t) void {
     self.mode_set = false;
     self.acquired = null;
     self.pending = null;
