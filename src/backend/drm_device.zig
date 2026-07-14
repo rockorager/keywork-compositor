@@ -9,12 +9,12 @@ const Session = @import("session.zig");
 
 const c = @cImport({
     @cInclude("libudev.h");
+    @cInclude("sys/stat.h");
     @cInclude("xf86drm.h");
     @cInclude("xf86drmMode.h");
 });
 const wl = wayland.server.wl;
 const log = std.log.scoped(.drm);
-const rescan_interval_milliseconds = 1000;
 
 allocator: std.mem.Allocator,
 io: std.Io,
@@ -25,9 +25,9 @@ event_source: ?*wl.EventSource,
 udev: ?*c.struct_udev,
 udev_monitor: ?*c.struct_udev_monitor,
 hotplug_source: ?*wl.EventSource,
-rescan_source: ?*wl.EventSource,
 device_path: ?[:0]u8,
 device: ?Session.Device,
+device_number: ?c.dev_t,
 active_outputs: std.ArrayList(*DrmOutput),
 retired_outputs: std.ArrayList(*DrmOutput),
 listener: ?Listener,
@@ -53,9 +53,9 @@ pub fn init(self: *Self, allocator: std.mem.Allocator, io: std.Io, event_loop: *
         .udev = null,
         .udev_monitor = null,
         .hotplug_source = null,
-        .rescan_source = null,
         .device_path = path,
         .device = null,
+        .device_number = null,
         .active_outputs = .empty,
         .retired_outputs = .empty,
         .listener = null,
@@ -152,6 +152,7 @@ fn activate(self: *Self) !void {
     const device = if (self.device_path) |path| try self.openDevice(path) else try self.discoverDevice();
     self.device = device;
     errdefer self.deactivate();
+    self.device_number = try deviceNumber(device.fd);
     log.info("opened DRM device {s}", .{self.device_path.?});
     const selections = try DrmOutput.selectOutputs(
         self.allocator,
@@ -202,6 +203,7 @@ fn deactivate(self: *Self) void {
     for (self.active_outputs.items) |output| output.deactivate(device.fd);
     self.session.closeDevice(device) catch |err| log.err("failed to close DRM device: {t}", .{err});
     self.device = null;
+    self.device_number = null;
     self.destroyList(&self.retired_outputs);
 }
 
@@ -324,19 +326,9 @@ fn initHotplugMonitor(self: *Self) !void {
         self.hotplug_source.?.remove();
         self.hotplug_source = null;
     }
-    self.rescan_source = try self.event_loop.addTimer(*Self, handleRescanTimer, self);
-    errdefer {
-        self.rescan_source.?.remove();
-        self.rescan_source = null;
-    }
-    try self.scheduleRescan();
 }
 
 fn deinitHotplugMonitor(self: *Self) void {
-    if (self.rescan_source) |source| {
-        source.remove();
-        self.rescan_source = null;
-    }
     if (self.hotplug_source) |source| {
         source.remove();
         self.hotplug_source = null;
@@ -349,10 +341,6 @@ fn deinitHotplugMonitor(self: *Self) void {
         _ = c.udev_unref(udev);
         self.udev = null;
     }
-}
-
-fn scheduleRescan(self: *Self) !void {
-    try self.rescan_source.?.timerUpdate(rescan_interval_milliseconds);
 }
 
 fn fail(self: *Self, err: anyerror) void {
@@ -394,22 +382,40 @@ fn handleHotplugEvent(_: c_int, mask: wl.EventMask, self: *Self) c_int {
         return 0;
     }
     if (!mask.readable) return 0;
-    var received = false;
-    while (c.udev_monitor_receive_device(self.udev_monitor.?)) |device| {
-        received = true;
-        _ = c.udev_device_unref(device);
-    }
-    if (received and self.device != null) self.reconcile() catch |err| self.fail(err);
+    const device = c.udev_monitor_receive_device(self.udev_monitor.?) orelse return 0;
+    defer _ = c.udev_device_unref(device);
+    self.handleDeviceEvent(device) catch |err| self.fail(err);
     return 0;
 }
 
-fn handleRescanTimer(self: *Self) c_int {
-    if (self.device != null) self.reconcile() catch |err| {
-        self.fail(err);
-        return 0;
-    };
-    if (!self.failed) self.scheduleRescan() catch |err| self.fail(err);
-    return 0;
+fn handleDeviceEvent(self: *Self, device: *c.struct_udev_device) !void {
+    const sysname = std.mem.span(c.udev_device_get_sysname(device) orelse return);
+    if (!DrmOutput.isPrimaryNode(sysname)) return;
+    const action = std.mem.span(c.udev_device_get_action(device) orelse return);
+    const devnode = std.mem.span(c.udev_device_get_devnode(device) orelse return);
+    const event_seat = if (c.udev_device_get_property_value(device, "ID_SEAT")) |value|
+        std.mem.span(value)
+    else
+        "seat0";
+    if (!std.mem.eql(u8, event_seat, self.session.name())) return;
+    if (self.device_number == null or
+        c.udev_device_get_devnum(device) != self.device_number.?) return;
+
+    log.info(
+        "DRM device event action={s} sysname={s} devnode={s} seat={s}",
+        .{ action, sysname, devnode, event_seat },
+    );
+    if (std.mem.eql(u8, action, "change")) {
+        if (self.device != null and self.session.isActive()) try self.reconcile();
+    } else if (std.mem.eql(u8, action, "remove")) {
+        return error.DeviceDisconnected;
+    }
+}
+
+fn deviceNumber(fd: std.posix.fd_t) !c.dev_t {
+    var status: c.struct_stat = undefined;
+    if (c.fstat(fd, &status) != 0) return error.StatDeviceFailed;
+    return status.st_rdev;
 }
 
 fn accessFd(context: *anyopaque) ?std.posix.fd_t {
