@@ -219,6 +219,10 @@ fn reconcile(self: *Self) !void {
         self.active_outputs.items,
     );
     defer self.allocator.free(selections);
+    log.info(
+        "reconciling DRM hotplug: {d} active output(s), {d} usable connected output(s)",
+        .{ self.active_outputs.items.len, selections.len },
+    );
     for (selections) |selection| if (self.findOutput(selection.connector_id)) |output| {
         if (!std.meta.eql(output.size, selection.size) or output.crtc_id != selection.crtc_id)
             return error.OutputChanged;
