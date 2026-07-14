@@ -74,6 +74,7 @@ pub fn add(self: *Self, config: Config) !Id {
 
 pub fn remove(self: *Self, id: Id) bool {
     const output = self.outputs.remove(id) orelse return false;
+    output.retire();
     output.deinit();
     self.allocator.destroy(output);
     return true;

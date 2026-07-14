@@ -115,6 +115,20 @@ pub fn deinit(self: *Self) void {
     self.* = undefined;
 }
 
+pub fn retire(self: *Self) void {
+    std.debug.assert(!self.frame_active);
+    self.global.remove();
+    for (self.memberships.items) |membership| {
+        const surface = Surface.resourceFor(self.surfaces, membership.surface_id) orelse continue;
+        for (self.resources.items) |resource| {
+            if (resource.getClient() == surface.getClient()) surface.sendLeave(resource);
+        }
+    }
+    self.memberships.clearRetainingCapacity();
+    for (self.resources.items) |resource| makeResourceInert(resource);
+    self.resources.clearRetainingCapacity();
+}
+
 pub fn globalName(self: *const Self, client: *const wl.Client) u32 {
     return self.global.getName(client);
 }
@@ -296,6 +310,60 @@ fn handleDestroy(resource: *wl.Output, self: *Self) void {
         return;
     }
     unreachable;
+}
+
+fn makeResourceInert(resource: *wl.Output) void {
+    resource.setHandler(?*anyopaque, inertRequest, null, null);
+}
+
+fn inertRequest(resource: *wl.Output, request: wl.Output.Request, _: ?*anyopaque) void {
+    switch (request) {
+        .release => resource.destroy(),
+    }
+}
+
+test "retiring an output leaves client-owned resources alive" {
+    const display = try wl.Server.create();
+    defer display.destroy();
+
+    var sockets: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.CLOEXEC, 0, &sockets),
+    );
+    defer _ = std.c.close(sockets[1]);
+    const client = wl.Client.create(display, sockets[0]) orelse return error.OutOfMemory;
+    defer client.destroy();
+
+    var surfaces: Surface.Store = .{};
+    defer surfaces.deinit(std.testing.allocator);
+
+    var output: Self = undefined;
+    try output.init(
+        std.testing.allocator,
+        display,
+        .{
+            .size = .{ .width = 1280, .height = 720 },
+            .physical_size = .{ .width = 1280, .height = 720 },
+            .scale = 1,
+            .name = "HEADLESS-1",
+            .description = "Keywork headless output",
+            .model = "headless",
+        },
+        &surfaces,
+    );
+    defer output.deinit();
+
+    const resource = try wl.Output.create(client, 4, 0);
+    try output.resources.append(std.testing.allocator, resource);
+    resource.setHandler(*Self, handleRequest, handleDestroy, &output);
+    const resource_id = resource.getId();
+    try std.testing.expect(client.getObject(resource_id) != null);
+
+    output.retire();
+    try std.testing.expect(client.getObject(resource_id) != null);
+    inertRequest(resource, .release, null);
+    try std.testing.expect(client.getObject(resource_id) == null);
 }
 
 test "frame membership removes surfaces which are no longer visible" {
