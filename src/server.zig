@@ -15,6 +15,7 @@ const PresentationProtocol = @import("wayland/presentation.zig");
 const FractionalScale = @import("wayland/fractional_scale.zig");
 const Fixes = @import("wayland/fixes.zig");
 const LinuxDmabuf = @import("wayland/linux_dmabuf.zig");
+const XdgActivation = @import("wayland/xdg_activation.zig");
 const Output = @import("wayland/output.zig");
 const OutputBackend = @import("backend/output.zig");
 const renderer_types = @import("render/renderer.zig");
@@ -42,6 +43,7 @@ presentation_protocol: PresentationProtocol,
 fractional_scale: FractionalScale,
 fixes: Fixes,
 linux_dmabuf: LinuxDmabuf,
+xdg_activation: XdgActivation,
 viewporter: Viewporter,
 window_manager: WindowManager,
 renderer: renderer_types.Renderer,
@@ -80,6 +82,7 @@ pub fn create(
         .fractional_scale = undefined,
         .fixes = undefined,
         .linux_dmabuf = undefined,
+        .xdg_activation = undefined,
         .viewporter = undefined,
         .window_manager = undefined,
         .renderer = try renderer_types.Renderer.init(allocator, renderer_kind),
@@ -171,6 +174,8 @@ pub fn create(
         self.render_output.size(),
     );
     errdefer self.xdg_shell.deinit();
+    try self.xdg_activation.init(allocator, io, display, &self.seat);
+    errdefer self.xdg_activation.deinit();
     try self.data_device.init(allocator, display, &self.seat);
     errdefer self.data_device.deinit();
     try self.primary_selection.init(allocator, display, &self.seat);
@@ -212,6 +217,7 @@ pub fn destroy(self: *Self) void {
     self.window_manager.deinit();
     self.primary_selection.deinit();
     self.data_device.deinit();
+    self.xdg_activation.deinit();
     self.xdg_shell.deinit();
     self.scene.deinit();
     self.subcompositor.deinit();

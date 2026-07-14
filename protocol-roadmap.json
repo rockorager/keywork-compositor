@@ -301,16 +301,17 @@
       "interfaces": [
         {
           "name": "xdg_activation_v1",
-          "current_version": null,
+          "current_version": 1,
           "target_version": 1
         }
       ],
-      "status": "not_started",
+      "status": "done",
       "privileged": false,
       "blocked_by": [
         "wl-seat",
         "xdg-shell"
-      ]
+      ],
+      "status_detail": "Version 1 issues unpredictable single-use tokens, validates optional seat serial and requesting-surface focus, and expires unused tokens. Activation consumes valid tokens but intentionally leaves focus policy unchanged until river-window-management gains an activation-request extension."
     },
     {
       "id": "wlr-layer-shell",

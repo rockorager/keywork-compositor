@@ -209,6 +209,28 @@ pub fn acceptsSelectionSerial(self: *Self, client: *wl.Client, serial: u32) bool
     return false;
 }
 
+pub fn acceptsActivationSerial(
+    self: *Self,
+    resource: *wl.Seat,
+    client: *wl.Client,
+    serial: u32,
+) bool {
+    if (!self.ownsResource(resource)) return false;
+    if (self.acceptsSelectionSerial(client, serial)) return true;
+    const pointer_enter = self.latest_pointer_enter orelse return false;
+    return pointer_enter.client == client and pointer_enter.serial == serial;
+}
+
+pub fn activationSurfaceFocused(self: *const Self, surface_id: Surface.Id) bool {
+    if (self.focus) |focus| {
+        if (std.meta.eql(focus, surface_id)) return true;
+    }
+    if (self.pointer_focus) |focus| {
+        if (std.meta.eql(focus.surface_id, surface_id)) return true;
+    }
+    return false;
+}
+
 pub fn acceptsClientUserActionSerial(self: *const Self, client: *wl.Client, serial: u32) bool {
     const action = self.last_user_action orelse return false;
     return action.client == client and action.serial == serial;

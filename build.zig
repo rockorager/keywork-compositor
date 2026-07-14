@@ -17,6 +17,7 @@ pub fn build(b: *std.Build) void {
     scanner.addSystemProtocol("staging/fractional-scale/fractional-scale-v1.xml");
     scanner.addSystemProtocol("stable/presentation-time/presentation-time.xml");
     scanner.addSystemProtocol("stable/linux-dmabuf/linux-dmabuf-v1.xml");
+    scanner.addSystemProtocol("staging/xdg-activation/xdg-activation-v1.xml");
     scanner.addCustomProtocol(river.path("protocol/river-window-management-v1.xml"));
     scanner.generate("wl_compositor", 7);
     scanner.generate("wl_subcompositor", 1);
@@ -32,6 +33,7 @@ pub fn build(b: *std.Build) void {
     scanner.generate("wp_fractional_scale_manager_v1", 1);
     scanner.generate("wp_presentation", 2);
     scanner.generate("zwp_linux_dmabuf_v1", 6);
+    scanner.generate("xdg_activation_v1", 1);
     scanner.generate("river_window_manager_v1", 5);
 
     const wayland = b.createModule(.{
