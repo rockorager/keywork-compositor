@@ -400,8 +400,6 @@ pub fn create(
         self.session_lock.deinit();
         self.session_lock_initialized = false;
     }
-    try self.cursor_shape.init(allocator, display, &self.seat);
-    errdefer self.cursor_shape.deinit();
     try self.tablet.init(
         allocator,
         display,
@@ -409,9 +407,15 @@ pub fn create(
         .{
             .context = self,
             .surface_coordinates = tabletSurfaceCoordinates,
+            .repaint = requestRepaint,
         },
     );
     errdefer self.tablet.deinit();
+    try self.cursor_shape.init(allocator, display, &self.tablet, .{
+        .context = self,
+        .clear_shapes = clearCursorShapes,
+    });
+    errdefer self.cursor_shape.deinit();
     try self.relative_pointer.init(allocator, display, &self.seat);
     errdefer self.relative_pointer.deinit();
     try self.pointer_gestures.init(allocator, display);
@@ -722,8 +726,8 @@ pub fn destroy(self: *Self) void {
     self.pointer_constraints.deinit();
     self.pointer_gestures.deinit();
     self.relative_pointer.deinit();
-    self.tablet.deinit();
     self.cursor_shape.deinit();
+    self.tablet.deinit();
     self.session_lock.deinit();
     self.session_lock_initialized = false;
     self.security_context.deinit();
@@ -1434,6 +1438,13 @@ fn requestRepaint(context: *anyopaque) void {
     }
 }
 
+fn clearCursorShapes(context: *anyopaque) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.seat.clearCursorShapes();
+    for (self.dynamic_seats.items) |entry| entry.seat.clearCursorShapes();
+    self.tablet.clearCursorShapes();
+}
+
 fn idleInhibitorsChanged(context: *anyopaque) void {
     const self: *Self = @ptrCast(@alignCast(context));
     self.refreshIdleInhibition();
@@ -1464,6 +1475,7 @@ fn sessionLockStateChanged(context: *anyopaque, locked: bool) void {
     self.refreshIdleInhibition();
     self.pointer_constraints.deactivateAll();
     self.data_device.cancel();
+    self.tablet.cancelFocus();
     self.cancelSeatTouches(&self.seat);
     self.seat.suppressPointerFocus(true);
     self.window_manager.pointerMoved(null);
@@ -2919,6 +2931,7 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
     for (self.dynamic_seats.items) |entry| {
         if (!entry.removed) try self.renderSeatCursor(&frame, &entry.seat, false);
     }
+    try self.renderTabletCursors(&frame, false);
 
     const presented = render_output.backend.present() catch return error.InvalidTarget;
     output.endFrame();
@@ -2955,6 +2968,7 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
     for (self.dynamic_seats.items) |entry| {
         if (!entry.removed) self.submitSeatCursor(output, &entry.seat, false);
     }
+    self.submitTabletCursors(output, false);
     self.finishRepaintIfIdle();
     if (presented) |info| outputPresented(render_output, info);
     self.refreshKeyboardFocus();
@@ -2980,6 +2994,7 @@ fn renderSessionLockFrame(
     for (self.dynamic_seats.items) |entry| {
         if (!entry.removed) try self.renderSeatCursor(frame, &entry.seat, true);
     }
+    try self.renderTabletCursors(frame, true);
 
     const presented = frame.render_output.backend.present() catch return error.InvalidTarget;
     frame.render_output.lock_frame_pending = true;
@@ -2989,6 +3004,7 @@ fn renderSessionLockFrame(
     for (self.dynamic_seats.items) |entry| {
         if (!entry.removed) self.submitSeatCursor(frame.output, &entry.seat, true);
     }
+    self.submitTabletCursors(frame.output, true);
     self.finishRepaintIfIdle();
     if (presented) |info| outputPresented(frame.render_output, info);
     self.refreshKeyboardFocus();
@@ -3028,6 +3044,26 @@ fn renderSeatCursor(
     locked: bool,
 ) renderer_types.Renderer.Error!void {
     const info = self.seatCursorInfo(seat, locked) orelse return;
+    try self.renderCursor(frame, info);
+}
+
+fn renderTabletCursors(
+    self: *Self,
+    frame: *const OutputFrame,
+    locked: bool,
+) renderer_types.Renderer.Error!void {
+    var cursors = self.tablet.cursorIterator();
+    while (cursors.next()) |info| {
+        if (!self.tabletCursorVisible(info.focus_surface, locked)) continue;
+        try self.renderCursor(frame, info.cursor);
+    }
+}
+
+fn renderCursor(
+    self: *Self,
+    frame: *const OutputFrame,
+    info: Seat.CursorInfo,
+) renderer_types.Renderer.Error!void {
     switch (info) {
         .surface => |surface| try self.renderSurfaceTree(
             frame,
@@ -3051,6 +3087,18 @@ fn renderSeatCursor(
 
 fn submitSeatCursor(self: *Self, output: *Output, seat: *Seat, locked: bool) void {
     const info = self.seatCursorInfo(seat, locked) orelse return;
+    self.submitCursor(output, info);
+}
+
+fn submitTabletCursors(self: *Self, output: *Output, locked: bool) void {
+    var cursors = self.tablet.cursorIterator();
+    while (cursors.next()) |info| {
+        if (!self.tabletCursorVisible(info.focus_surface, locked)) continue;
+        self.submitCursor(output, info.cursor);
+    }
+}
+
+fn submitCursor(self: *Self, output: *Output, info: Seat.CursorInfo) void {
     switch (info) {
         .surface => |surface| self.submitSurfaceTree(output, surface.surface_id),
         .shape => {},
@@ -3064,6 +3112,12 @@ fn seatCursorInfo(self: *Self, seat: *Seat, locked: bool) ?Seat.CursorInfo {
         if (!self.session_lock.ownsSurface(root)) return null;
     }
     return seat.cursorInfo();
+}
+
+fn tabletCursorVisible(self: *Self, focus_surface: Surface.Id, locked: bool) bool {
+    if (!locked) return true;
+    const root = self.subcompositor.rootSurface(focus_surface);
+    return self.session_lock.ownsSurface(root);
 }
 
 fn finishRepaintIfIdle(self: *Self) void {

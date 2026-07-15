@@ -316,6 +316,17 @@ pub const RoleHandler = struct {
     before_commit: *const fn (*anyopaque, CommitInfo) CommitAction,
     after_commit: *const fn (*anyopaque, CommitInfo) void,
     surface_destroyed: *const fn (*anyopaque) void,
+    role_tag: ?RoleTag = null,
+};
+
+pub const RoleTag = enum {
+    pointer_cursor,
+    tablet_tool_cursor,
+};
+
+pub const RoleIdentity = struct {
+    tag: RoleTag,
+    context: *anyopaque,
 };
 
 pub const CommitListener = struct {
@@ -357,10 +368,24 @@ pub fn assignReservedRole(self: *Self, role: Role, context: *anyopaque) RoleErro
     const handler = self.role_handler orelse return error.NotReserved;
     if (handler.context != context) return error.NotReserved;
     surface_state.role = role;
+    if (role == .cursor) {
+        surface_state.pending_input.setEmpty();
+        surface_state.current_input.setEmpty();
+        surface_state.cached_input.setEmpty();
+    }
 }
 
 pub fn assignedRole(self: *Self) ?Role {
     return self.state().role;
+}
+
+pub fn roleIdentity(self: *Self, role: Role) ?RoleIdentity {
+    if (self.state().role != role) return null;
+    const handler = self.role_handler orelse return null;
+    return .{
+        .tag = handler.role_tag orelse return null,
+        .context = handler.context,
+    };
 }
 
 pub fn hasBufferAttachedOrCommitted(self: *Self) bool {
@@ -598,6 +623,7 @@ fn handleRequest(resource: *wl.Surface, request: wl.Surface.Request, self: *Self
             }
         },
         .set_input_region => |set| {
+            if (surface_state.role == .cursor) return;
             if (set.region) |region_resource| {
                 const region = WaylandRegion.fromResource(region_resource);
                 surface_state.pending_input.set(&region.value) catch {
@@ -1154,6 +1180,11 @@ const InputRegion = struct {
     fn setInfinite(self: *InputRegion) void {
         self.value.clear();
         self.infinite = true;
+    }
+
+    fn setEmpty(self: *InputRegion) void {
+        self.value.clear();
+        self.infinite = false;
     }
 
     fn copyFrom(self: *InputRegion, other: *const InputRegion) Region.Error!void {

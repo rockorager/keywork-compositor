@@ -5,6 +5,7 @@ const Self = @This();
 const std = @import("std");
 const wayland = @import("wayland");
 const Seat = @import("seat.zig");
+const Tablet = @import("tablet.zig");
 
 const xcursor = @cImport({
     @cInclude("X11/Xcursor/Xcursor.h");
@@ -20,7 +21,8 @@ const default_cursor_size = 24;
 
 allocator: std.mem.Allocator,
 global: *wl.Global,
-seat: *Seat,
+tablet: *Tablet,
+listener: Listener,
 images: [shape_count]?*xcursor.XcursorImage,
 theme: ?[*:0]u8,
 size: c_int,
@@ -30,7 +32,8 @@ pub fn init(
     self: *Self,
     allocator: std.mem.Allocator,
     display: *wl.Server,
-    seat: *Seat,
+    tablet: *Tablet,
+    listener: Listener,
 ) !void {
     self.* = .{
         .allocator = allocator,
@@ -42,7 +45,8 @@ pub fn init(
             self,
             bind,
         ),
-        .seat = seat,
+        .tablet = tablet,
+        .listener = listener,
         .images = @splat(null),
         .theme = std.c.getenv("XCURSOR_THEME"),
         .size = configuredSize(),
@@ -52,11 +56,16 @@ pub fn init(
 
 pub fn deinit(self: *Self) void {
     std.debug.assert(self.device_count == 0);
-    self.seat.clearCursorShapes();
+    self.listener.clear_shapes(self.listener.context);
     self.global.destroy();
     for (self.images) |image| if (image) |loaded| xcursor.XcursorImageDestroy(loaded);
     self.* = undefined;
 }
+
+pub const Listener = struct {
+    context: *anyopaque,
+    clear_shapes: *const fn (*anyopaque) void,
+};
 
 fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
     const resource = wp.CursorShapeManagerV1.create(client, version, id) catch {
@@ -77,15 +86,19 @@ fn handleManagerRequest(
             self,
             resource,
             get.cursor_shape_device,
-            self.seat.pointerHandle(get.pointer),
+            if (Seat.pointerBinding(get.pointer)) |pointer|
+                .{ .pointer = pointer }
+            else
+                null,
         ) catch resource.postNoMemory(),
-        // Keywork does not advertise tablet-v2 yet, so a client cannot supply a
-        // live tablet tool. Keep the device inert until tablet support lands.
         .get_tablet_tool_v2 => |get| Device.create(
             self,
             resource,
             get.cursor_shape_device,
-            null,
+            if (self.tablet.toolBinding(get.tablet_tool)) |tool|
+                .{ .tablet_tool = tool }
+            else
+                null,
         ) catch resource.postNoMemory(),
     }
 }
@@ -127,13 +140,18 @@ fn cursor(self: *Self, client: *wl.Client, shape: Shape) ?Seat.ShapeCursor {
 const Device = struct {
     manager: *Self,
     client: *wl.Client,
-    pointer: ?Seat.PointerHandle,
+    target: ?Target,
+
+    const Target = union(enum) {
+        pointer: Seat.PointerBinding,
+        tablet_tool: Tablet.ToolBinding,
+    };
 
     fn create(
         manager: *Self,
         manager_resource: *wp.CursorShapeManagerV1,
         id: u32,
-        pointer: ?Seat.PointerHandle,
+        target: ?Target,
     ) !void {
         const resource = try wp.CursorShapeDeviceV1.create(
             manager_resource.getClient(),
@@ -145,7 +163,7 @@ const Device = struct {
         self.* = .{
             .manager = manager,
             .client = manager_resource.getClient(),
-            .pointer = pointer,
+            .target = target,
         };
         manager.device_count += 1;
         resource.setHandler(*Device, handleRequest, handleDestroy, self);
@@ -166,10 +184,19 @@ const Device = struct {
                     resource.postError(.invalid_shape, "shape is unavailable at this protocol version");
                     return;
                 }
-                const pointer = self.pointer orelse return;
-                if (!self.manager.seat.pointerHandleIsActive(pointer)) return;
+                const target = self.target orelse return;
                 const cursor_image = self.manager.cursor(self.client, set.shape) orelse return;
-                self.manager.seat.setCursorShape(self.client, set.serial, cursor_image);
+                switch (target) {
+                    .pointer => |pointer| {
+                        if (!pointer.isActive()) return;
+                        pointer.seat.setCursorShape(self.client, set.serial, cursor_image);
+                    },
+                    .tablet_tool => |tool| tool.setCursorShape(
+                        self.client,
+                        set.serial,
+                        cursor_image,
+                    ),
+                }
             },
         }
     }

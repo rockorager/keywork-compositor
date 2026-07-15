@@ -1612,7 +1612,7 @@ fn setCursor(
     const cursor_surface = if (surface_resource) |resource| cursor: {
         const surface = Surface.fromResource(resource);
         if (surface.assignedRole()) |role| {
-            if (role != .cursor) {
+            if (role != .cursor or !CursorSurface.ownedBy(surface, self)) {
                 pointer.postError(.role, "wl_surface already has another role");
                 return;
             }
@@ -1808,10 +1808,18 @@ const CursorSurface = struct {
             .before_commit = beforeCommit,
             .after_commit = afterCommit,
             .surface_destroyed = surfaceDestroyed,
+            .role_tag = .pointer_cursor,
         }) catch return error.RoleUnavailable;
         errdefer surface.releaseRole(self);
         surface.assignReservedRole(.cursor, self) catch return error.RoleUnavailable;
         seat.cursor_surface_count += 1;
+    }
+
+    fn ownedBy(surface: *Surface, seat: *Self) bool {
+        const identity = surface.roleIdentity(.cursor) orelse return false;
+        if (identity.tag != .pointer_cursor) return false;
+        const cursor_surface: *CursorSurface = @ptrCast(@alignCast(identity.context));
+        return cursor_surface.seat == seat;
     }
 
     fn beforeCommit(_: *anyopaque, _: Surface.CommitInfo) Surface.CommitAction {
@@ -1833,7 +1841,7 @@ const CursorSurface = struct {
     }
 };
 
-fn cursorCoordinate(value: f64, hotspot: i32) i32 {
+pub fn cursorCoordinate(value: f64, hotspot: i32) i32 {
     const coordinate: i64 = @intFromFloat(@floor(value));
     return @intCast(std.math.clamp(
         coordinate - @as(i64, hotspot),

@@ -21,6 +21,9 @@ devices: std.ArrayList(*Device),
 tools: std.ArrayList(*Tool),
 tablet_resources: std.ArrayList(*TabletResource),
 tool_resources: std.ArrayList(*ToolResource),
+next_tool_cursor_owner_id: u64,
+next_tool_resource_generation: u64,
+cursor_surface_count: usize,
 
 pub fn init(
     self: *Self,
@@ -40,6 +43,9 @@ pub fn init(
         .tools = .empty,
         .tablet_resources = .empty,
         .tool_resources = .empty,
+        .next_tool_cursor_owner_id = 1,
+        .next_tool_resource_generation = 1,
+        .cursor_surface_count = 0,
     };
 }
 
@@ -47,6 +53,7 @@ pub fn deinit(self: *Self) void {
     std.debug.assert(self.seat_bindings.items.len == 0);
     std.debug.assert(self.tablet_resources.items.len == 0);
     std.debug.assert(self.tool_resources.items.len == 0);
+    std.debug.assert(self.cursor_surface_count == 0);
     while (self.tools.pop()) |tool| self.destroyTool(tool);
     while (self.devices.pop()) |device| self.destroyDevice(device);
     self.global.destroy();
@@ -250,10 +257,106 @@ pub const Point = struct { x: f64, y: f64 };
 pub const Listener = struct {
     context: *anyopaque,
     surface_coordinates: *const fn (*anyopaque, Surface.Id, f64, f64) ?Point,
+    repaint: *const fn (*anyopaque) void,
 };
+
+const SurfaceCursor = struct {
+    surface_id: Surface.Id,
+    hotspot_x: i32,
+    hotspot_y: i32,
+};
+
+const Cursor = union(enum) {
+    surface: SurfaceCursor,
+    shape: Seat.ShapeCursor,
+};
+
+pub const CursorInfo = struct {
+    focus_surface: Surface.Id,
+    cursor: Seat.CursorInfo,
+};
+
+pub const CursorIterator = struct {
+    manager: *const Self,
+    index: usize = 0,
+
+    pub fn next(self: *CursorIterator) ?CursorInfo {
+        while (self.index < self.manager.tools.items.len) {
+            const tool = self.manager.tools.items[self.index];
+            self.index += 1;
+            const focus_surface = tool.focus orelse continue;
+            const position = tool.position orelse continue;
+            const cursor = tool.cursor orelse continue;
+            return .{
+                .focus_surface = focus_surface,
+                .cursor = switch (cursor) {
+                    .surface => |surface| .{ .surface = .{
+                        .surface_id = surface.surface_id,
+                        .x = Seat.cursorCoordinate(position.x, surface.hotspot_x),
+                        .y = Seat.cursorCoordinate(position.y, surface.hotspot_y),
+                    } },
+                    .shape => |shape| .{ .shape = .{
+                        .buffer = shape.buffer,
+                        .x = Seat.cursorCoordinate(position.x, shape.hotspot_x),
+                        .y = Seat.cursorCoordinate(position.y, shape.hotspot_y),
+                    } },
+                },
+            };
+        }
+        return null;
+    }
+};
+
+pub fn cursorIterator(self: *const Self) CursorIterator {
+    return .{ .manager = self };
+}
+
+pub const ToolBinding = struct {
+    manager: *Self,
+    generation: u64,
+
+    pub fn setCursorShape(
+        self: ToolBinding,
+        client: *wl.Client,
+        serial: u32,
+        shape: Seat.ShapeCursor,
+    ) void {
+        self.manager.setToolCursorShape(self.generation, client, serial, shape);
+    }
+};
+
+pub fn toolBinding(self: *Self, resource: *zwp.TabletToolV2) ?ToolBinding {
+    for (self.tool_resources.items) |adapter| {
+        if (adapter.resource == resource and adapter.tool != null) return .{
+            .manager = self,
+            .generation = adapter.generation,
+        };
+    }
+    return null;
+}
+
+pub fn clearCursorShapes(self: *Self) void {
+    var repaint = false;
+    for (self.tools.items) |tool| {
+        const cursor = tool.cursor orelse continue;
+        switch (cursor) {
+            .surface => {},
+            .shape => {
+                tool.cursor = null;
+                repaint = true;
+            },
+        }
+    }
+    if (repaint) self.requestRepaint();
+}
+
+pub fn cancelFocus(self: *Self) void {
+    for (self.tools.items) |tool| self.leaveFocus(tool, 0, true);
+}
 
 const Tool = struct {
     manager: *Self,
+    cursor_owner_id: u64,
     info: NativeInput.TabletToolInfo,
     device: *Device,
     in_proximity: bool,
@@ -262,6 +365,8 @@ const Tool = struct {
     focus_destroy_listener: wl.Listener(*wl.Resource),
     tip_down: bool,
     pressed_buttons: std.ArrayList(u32),
+    position: ?Point,
+    cursor: ?Cursor,
 };
 
 const SeatBinding = struct {
@@ -281,8 +386,10 @@ const TabletResource = struct {
 const ToolResource = struct {
     binding: *SeatBinding,
     resource: *zwp.TabletToolV2,
+    generation: u64,
     tool: ?*Tool,
     active: bool,
+    proximity_serial: ?u32,
 };
 
 fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
@@ -412,9 +519,16 @@ fn createToolResource(self: *Self, binding: *SeatBinding, tool: *Tool) !void {
     adapter.* = .{
         .binding = binding,
         .resource = resource,
+        .generation = self.next_tool_resource_generation,
         .tool = tool,
         .active = false,
+        .proximity_serial = null,
     };
+    self.next_tool_resource_generation = std.math.add(
+        u64,
+        self.next_tool_resource_generation,
+        1,
+    ) catch unreachable;
     try self.tool_resources.append(self.allocator, adapter);
     retainBinding(binding);
     resource.setHandler(*ToolResource, handleToolRequest, handleToolDestroy, adapter);
@@ -447,6 +561,7 @@ fn createToolResource(self: *Self, binding: *SeatBinding, tool: *Tool) !void {
     const tablet = self.tabletResource(binding, tool.device) orelse return;
     const serial = self.display.nextSerial();
     adapter.active = true;
+    adapter.proximity_serial = serial;
     resource.sendProximityIn(serial, tablet.resource, surface);
     for (tool.pressed_buttons.items) |button_code| {
         resource.sendButton(serial, button_code, .pressed);
@@ -458,19 +573,115 @@ fn createToolResource(self: *Self, binding: *SeatBinding, tool: *Tool) !void {
 fn handleToolRequest(
     resource: *zwp.TabletToolV2,
     request: zwp.TabletToolV2.Request,
-    _: *ToolResource,
+    adapter: *ToolResource,
 ) void {
     switch (request) {
         .destroy => resource.destroy(),
-        .set_cursor => {},
+        .set_cursor => |set| adapter.binding.manager.setToolCursor(
+            adapter,
+            set.serial,
+            set.surface,
+            set.hotspot_x,
+            set.hotspot_y,
+        ),
     }
 }
 
 fn handleToolDestroy(_: *zwp.TabletToolV2, adapter: *ToolResource) void {
     const manager = adapter.binding.manager;
     const binding = adapter.binding;
+    const tool = adapter.tool;
+    const clear_cursor = if (tool) |active_tool| adapter.active and !manager.hasOtherActiveResource(
+        active_tool,
+        adapter.binding.client,
+        adapter,
+    ) else false;
     removeAdapter(ToolResource, manager.allocator, &manager.tool_resources, adapter);
+    if (clear_cursor) manager.clearToolCursor(tool.?);
     releaseBinding(binding);
+}
+
+fn setToolCursor(
+    self: *Self,
+    adapter: *ToolResource,
+    serial: u32,
+    surface_resource: ?*wl.Surface,
+    hotspot_x: i32,
+    hotspot_y: i32,
+) void {
+    const tool = adapter.tool orelse return;
+    const cursor_surface = if (surface_resource) |resource| cursor: {
+        const surface = Surface.fromResource(resource);
+        if (surface.assignedRole()) |role| {
+            if (role != .cursor or !ToolCursorSurface.ownedBy(surface, self, tool.cursor_owner_id)) {
+                adapter.resource.postError(.role, "wl_surface is unavailable for this tablet tool cursor");
+                return;
+            }
+        } else {
+            ToolCursorSurface.create(self, surface, tool.cursor_owner_id) catch |err| switch (err) {
+                error.OutOfMemory => {
+                    adapter.resource.postNoMemory();
+                    return;
+                },
+                error.RoleUnavailable => {
+                    adapter.resource.postError(.role, "wl_surface is unavailable for this tablet tool cursor");
+                    return;
+                },
+            };
+        }
+        break :cursor surface;
+    } else null;
+
+    if (activeToolResource(adapter, serial, adapter.binding.client) == null) return;
+    tool.cursor = if (cursor_surface) |surface| .{ .surface = .{
+        .surface_id = surface.handle(),
+        .hotspot_x = hotspot_x,
+        .hotspot_y = hotspot_y,
+    } } else null;
+    self.requestRepaint();
+}
+
+fn setToolCursorShape(
+    self: *Self,
+    generation: u64,
+    client: *wl.Client,
+    serial: u32,
+    shape: Seat.ShapeCursor,
+) void {
+    std.debug.assert(shape.client == client);
+    for (self.tool_resources.items) |adapter| {
+        if (adapter.generation != generation) continue;
+        const tool = activeToolResource(adapter, serial, client) orelse return;
+        tool.cursor = .{ .shape = shape };
+        self.requestRepaint();
+        return;
+    }
+}
+
+fn activeToolResource(
+    adapter: *ToolResource,
+    serial: u32,
+    client: *wl.Client,
+) ?*Tool {
+    if (!adapter.active or adapter.binding.client != client or
+        adapter.proximity_serial == null or adapter.proximity_serial.? != serial) return null;
+    const tool = adapter.tool orelse return null;
+    const surface = tool.focus_resource orelse return null;
+    if (!tool.in_proximity or surface.getClient() != client) return null;
+    return tool;
+}
+
+fn hasOtherActiveResource(
+    self: *const Self,
+    tool: *Tool,
+    client: *wl.Client,
+    ignored: *ToolResource,
+) bool {
+    for (self.tool_resources.items) |adapter| {
+        if (adapter != ignored and adapter.tool == tool and adapter.active and
+            adapter.binding.client == client) return true;
+    }
+    return false;
 }
 
 fn ensureTool(
@@ -483,6 +694,7 @@ fn ensureTool(
     errdefer self.allocator.destroy(tool);
     tool.* = .{
         .manager = self,
+        .cursor_owner_id = self.next_tool_cursor_owner_id,
         .info = info,
         .device = device,
         .in_proximity = false,
@@ -491,7 +703,14 @@ fn ensureTool(
         .focus_destroy_listener = wl.Listener(*wl.Resource).init(handleFocusDestroyed),
         .tip_down = false,
         .pressed_buttons = .empty,
+        .position = null,
+        .cursor = null,
     };
+    self.next_tool_cursor_owner_id = std.math.add(
+        u64,
+        self.next_tool_cursor_owner_id,
+        1,
+    ) catch unreachable;
     errdefer tool.pressed_buttons.deinit(self.allocator);
     try self.tools.append(self.allocator, tool);
     for (self.seat_bindings.items) |binding| {
@@ -519,6 +738,7 @@ fn updateFocus(self: *Self, tool: *Tool, target: ?Seat.PointerFocus, time: u32) 
         if (adapter.tool != tool or adapter.binding.client != surface.getClient()) continue;
         const tablet = self.tabletResource(adapter.binding, tool.device) orelse continue;
         adapter.active = true;
+        adapter.proximity_serial = serial;
         adapter.resource.sendProximityIn(serial, tablet.resource, surface);
         for (tool.pressed_buttons.items) |button_code| {
             adapter.resource.sendButton(serial, button_code, .pressed);
@@ -529,6 +749,8 @@ fn updateFocus(self: *Self, tool: *Tool, target: ?Seat.PointerFocus, time: u32) 
 
 fn leaveFocus(self: *Self, tool: *Tool, time: u32, release_state: bool) void {
     if (tool.focus == null) {
+        tool.position = null;
+        self.clearToolCursor(tool);
         if (release_state) self.clearToolState(tool);
         return;
     }
@@ -547,10 +769,13 @@ fn leaveFocus(self: *Self, tool: *Tool, time: u32, release_state: bool) void {
         adapter.resource.sendProximityOut();
         adapter.resource.sendFrame(time);
         adapter.active = false;
+        adapter.proximity_serial = null;
     }
     tool.focus_destroy_listener.link.remove();
     tool.focus = null;
     tool.focus_resource = null;
+    tool.position = null;
+    self.clearToolCursor(tool);
     if (release_state) self.clearToolState(tool);
 }
 
@@ -560,12 +785,26 @@ fn clearToolState(self: *Self, tool: *Tool) void {
     _ = self;
 }
 
+fn clearToolCursor(self: *Self, tool: *Tool) void {
+    if (tool.cursor == null) return;
+    tool.cursor = null;
+    self.requestRepaint();
+}
+
+fn requestRepaint(self: *Self) void {
+    self.listener.repaint(self.listener.context);
+}
+
 fn sendAxes(
     self: *Self,
     tool: *Tool,
     target: ?Seat.PointerFocus,
     axes: NativeInput.TabletToolAxes,
 ) void {
+    if (axes.position) |position| {
+        tool.position = .{ .x = position.x, .y = position.y };
+        if (tool.cursor != null) self.requestRepaint();
+    }
     const motion = if (axes.position) |position| blk: {
         const focus = tool.focus orelse break :blk null;
         if (target) |candidate| {
@@ -627,6 +866,7 @@ fn unadvertiseTool(self: *Self, tool: *Tool, removed: bool) void {
         adapter.resource.sendRemoved();
         adapter.tool = null;
         adapter.active = false;
+        adapter.proximity_serial = null;
     }
 }
 
@@ -645,7 +885,10 @@ fn handleFocusDestroyed(listener: *wl.Listener(*wl.Resource), _: *wl.Resource) v
         adapter.resource.sendProximityOut();
         adapter.resource.sendFrame(0);
         adapter.active = false;
+        adapter.proximity_serial = null;
     }
+    tool.position = null;
+    tool.manager.clearToolCursor(tool);
     tool.manager.clearToolState(tool);
 }
 
@@ -672,7 +915,15 @@ fn findTool(
     return null;
 }
 
+fn findToolByCursorOwner(self: *const Self, owner_id: u64) ?*Tool {
+    for (self.tools.items) |tool| {
+        if (tool.cursor_owner_id == owner_id) return tool;
+    }
+    return null;
+}
+
 fn destroyTool(self: *Self, tool: *Tool) void {
+    self.clearToolCursor(tool);
     if (tool.focus_resource != null) tool.focus_destroy_listener.link.remove();
     tool.pressed_buttons.deinit(self.allocator);
     self.allocator.destroy(tool);
@@ -683,6 +934,77 @@ fn destroyDevice(self: *Self, device: *Device) void {
     self.allocator.free(device.name);
     self.allocator.destroy(device);
 }
+
+const ToolCursorSurface = struct {
+    manager: *Self,
+    surface_id: Surface.Id,
+    owner_id: u64,
+
+    fn create(
+        manager: *Self,
+        surface: *Surface,
+        owner_id: u64,
+    ) error{ OutOfMemory, RoleUnavailable }!void {
+        const self = manager.allocator.create(ToolCursorSurface) catch return error.OutOfMemory;
+        errdefer manager.allocator.destroy(self);
+        self.* = .{
+            .manager = manager,
+            .surface_id = surface.handle(),
+            .owner_id = owner_id,
+        };
+        surface.reserveRole(.cursor, .{
+            .context = self,
+            .before_commit = beforeCommit,
+            .after_commit = afterCommit,
+            .surface_destroyed = surfaceDestroyed,
+            .role_tag = .tablet_tool_cursor,
+        }) catch return error.RoleUnavailable;
+        errdefer surface.releaseRole(self);
+        surface.assignReservedRole(.cursor, self) catch return error.RoleUnavailable;
+        manager.cursor_surface_count += 1;
+    }
+
+    fn ownedBy(surface: *Surface, manager: *Self, owner_id: u64) bool {
+        const identity = surface.roleIdentity(.cursor) orelse return false;
+        if (identity.tag != .tablet_tool_cursor) return false;
+        const cursor_surface: *ToolCursorSurface = @ptrCast(@alignCast(identity.context));
+        return cursor_surface.manager == manager and cursor_surface.owner_id == owner_id;
+    }
+
+    fn beforeCommit(_: *anyopaque, _: Surface.CommitInfo) Surface.CommitAction {
+        return .apply;
+    }
+
+    fn afterCommit(context: *anyopaque, info: Surface.CommitInfo) void {
+        const self: *ToolCursorSurface = @ptrCast(@alignCast(context));
+        const tool = self.manager.findToolByCursorOwner(self.owner_id) orelse return;
+        if (tool.cursor) |*cursor| switch (cursor.*) {
+            .shape => {},
+            .surface => |*surface| if (std.meta.eql(surface.surface_id, self.surface_id)) {
+                surface.hotspot_x -|= info.offset_x;
+                surface.hotspot_y -|= info.offset_y;
+                self.manager.requestRepaint();
+            },
+        };
+    }
+
+    fn surfaceDestroyed(context: *anyopaque) void {
+        const self: *ToolCursorSurface = @ptrCast(@alignCast(context));
+        const manager = self.manager;
+        if (manager.findToolByCursorOwner(self.owner_id)) |tool| {
+            const cursor = tool.cursor;
+            if (cursor != null) switch (cursor.?) {
+                .shape => {},
+                .surface => |surface| if (std.meta.eql(surface.surface_id, self.surface_id)) {
+                    manager.clearToolCursor(tool);
+                },
+            };
+        }
+        std.debug.assert(manager.cursor_surface_count > 0);
+        manager.cursor_surface_count -= 1;
+        manager.allocator.destroy(self);
+    }
+};
 
 fn retainBinding(binding: *SeatBinding) void {
     binding.references = std.math.add(usize, binding.references, 1) catch unreachable;

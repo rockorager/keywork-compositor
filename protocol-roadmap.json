@@ -418,7 +418,7 @@
       "blocked_by": [
         "wl-seat"
       ],
-      "status_detail": "Version 2 implements wl_pointer-backed shape devices, validates shape availability by bound version, follows pointer capability lifetimes and enter serials, and renders all 36 named shapes from the XCURSOR_THEME and XCURSOR_SIZE environment with default-theme fallback. Tablet-tool devices remain unreachable and inert until tablet-v2 is advertised."
+      "status_detail": "Version 2 implements wl_pointer and tablet-tool shape devices, validates shape availability by bound version, follows pointer capability and tablet-tool lifetimes, enforces enter/proximity serials, supports dynamic seats, and renders all 36 named shapes from XCURSOR_THEME and XCURSOR_SIZE with default-theme fallback."
     },
     {
       "id": "primary-selection",
@@ -810,7 +810,7 @@
         "cursor-shape",
         "wl-seat"
       ],
-      "status_detail": "Stable version 2 advertises seat-scoped tablet and tool objects and forwards libinput proximity, motion, pressure, distance, tilt, rotation, slider, wheel, tip, and button events to the focused surface. Device hotplug, dynamic seat reassignment, surface destruction, implicit tool grabs, framing, and tablet metadata are implemented; tablet pads and tool cursor requests remain."
+      "status_detail": "Stable version 2 advertises seat-scoped tablet and tool objects and forwards libinput proximity, motion, pressure, distance, tilt, rotation, slider, wheel, tip, and button events to the focused surface. Device hotplug, dynamic seat reassignment, surface destruction, implicit tool grabs, framing, tablet metadata, per-tool cursor surfaces, and cursor-shape-v1 integration are implemented; tablet pads remain."
     },
     {
       "id": "ext-data-control",
