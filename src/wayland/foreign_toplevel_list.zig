@@ -55,6 +55,7 @@ pub const XwaylandController = struct {
     close: *const fn (*anyopaque, Xwm.WindowId) void,
     request_fullscreen: *const fn (*anyopaque, Xwm.WindowId, bool, ?OutputLayout.Id) void,
     request_maximized: *const fn (*anyopaque, Xwm.WindowId, bool) void,
+    request_minimized: *const fn (*anyopaque, Xwm.WindowId, bool) void,
 };
 
 const List = struct {
@@ -298,8 +299,6 @@ const WlrHandle = struct {
                 .destroy => unreachable,
                 .close => self.owner.xwayland.close(self.owner.xwayland.context, window_id),
                 .set_rectangle => |rectangle| validateRectangle(resource, rectangle.width, rectangle.height),
-                .set_minimized,
-                .unset_minimized,
                 .activate,
                 => {},
                 .set_maximized => self.owner.xwayland.request_maximized(
@@ -308,6 +307,16 @@ const WlrHandle = struct {
                     true,
                 ),
                 .unset_maximized => self.owner.xwayland.request_maximized(
+                    self.owner.xwayland.context,
+                    window_id,
+                    false,
+                ),
+                .set_minimized => self.owner.xwayland.request_minimized(
+                    self.owner.xwayland.context,
+                    window_id,
+                    true,
+                ),
+                .unset_minimized => self.owner.xwayland.request_minimized(
                     self.owner.xwayland.context,
                     window_id,
                     false,
@@ -612,6 +621,7 @@ fn mappingConfiguration(self: *Self, mapping: *const Mapping) XdgShell.ToplevelC
             break :configuration .{
                 .fullscreen = info.fullscreen,
                 .maximized = info.maximized,
+                .suspended = info.minimized,
             };
         },
     };

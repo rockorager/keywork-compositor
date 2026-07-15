@@ -55,6 +55,7 @@ pub const WindowInfo = struct {
     can_close: bool,
     fullscreen: bool,
     maximized: bool,
+    minimized: bool,
 };
 
 const Window = struct {
@@ -76,6 +77,7 @@ const Window = struct {
     fullscreen: bool = false,
     maximized_horz: bool = false,
     maximized_vert: bool = false,
+    minimized: bool = false,
 
     fn deinit(self: *Window, allocator: std.mem.Allocator) void {
         if (self.title) |value| allocator.free(value);
@@ -97,11 +99,13 @@ const Atom = enum {
     net_wm_state_fullscreen,
     net_wm_state_maximized_horz,
     net_wm_state_maximized_vert,
+    net_wm_state_hidden,
     utf8_string,
     wm_protocols,
     wm_take_focus,
     wm_delete_window,
     wm_state,
+    wm_change_state,
     wl_surface_serial,
 };
 
@@ -117,11 +121,13 @@ const atom_names: [atom_count][]const u8 = .{
     "_NET_WM_STATE_FULLSCREEN",
     "_NET_WM_STATE_MAXIMIZED_HORZ",
     "_NET_WM_STATE_MAXIMIZED_VERT",
+    "_NET_WM_STATE_HIDDEN",
     "UTF8_STRING",
     "WM_PROTOCOLS",
     "WM_TAKE_FOCUS",
     "WM_DELETE_WINDOW",
     "WM_STATE",
+    "WM_CHANGE_STATE",
     "WL_SURFACE_SERIAL",
 };
 
@@ -135,6 +141,7 @@ pub const Listener = struct {
     metadata_changed: *const fn (*anyopaque, WindowId) void,
     fullscreen_requested: *const fn (*anyopaque, WindowId, bool) void,
     maximize_requested: *const fn (*anyopaque, WindowId, bool) void,
+    minimize_requested: *const fn (*anyopaque, WindowId, bool) void,
     serial: *const fn (*anyopaque, WindowId, u64) void,
     associated: *const fn (*anyopaque, WindowId, Surface.Id) void,
     dissociated: *const fn (*anyopaque, WindowId, Surface.Id) void,
@@ -376,6 +383,34 @@ pub fn setMaximized(
     return true;
 }
 
+pub fn setMinimized(
+    self: *Self,
+    window_id: WindowId,
+    minimized: bool,
+) error{ InvalidWindow, OutOfMemory, XcbFlushFailed }!bool {
+    const window = self.windows.getPtr(window_id) orelse return error.InvalidWindow;
+    if (window.override_redirect) return error.InvalidWindow;
+    if (window.minimized == minimized) return false;
+
+    const hidden_atom = self.atomValue(.net_wm_state_hidden);
+    try self.replaceNetWmStateAtoms(
+        window_id,
+        window,
+        &.{hidden_atom},
+        if (minimized) &.{hidden_atom} else &.{},
+    );
+    window.minimized = minimized;
+    if (window.mapped) self.setWmState(
+        window_id,
+        if (minimized)
+            c.XCB_ICCCM_WM_STATE_ICONIC
+        else
+            c.XCB_ICCCM_WM_STATE_NORMAL,
+    );
+    if (c.xcb_flush(self.connection) <= 0) return error.XcbFlushFailed;
+    return true;
+}
+
 fn replaceNetWmStateAtoms(
     self: *Self,
     window_id: WindowId,
@@ -533,6 +568,7 @@ fn publishWmIdentity(self: *Self) !void {
         self.atomValue(.net_wm_state_fullscreen),
         self.atomValue(.net_wm_state_maximized_horz),
         self.atomValue(.net_wm_state_maximized_vert),
+        self.atomValue(.net_wm_state_hidden),
     };
     try checkRequest(self.connection, c.xcb_change_property_checked(
         self.connection,
@@ -598,6 +634,7 @@ fn refreshProtocols(self: *Self, window_id: WindowId, window: *Window) void {
 const NetWmStateChanges = struct {
     fullscreen: bool = false,
     maximized: bool = false,
+    minimized: bool = false,
 };
 
 fn refreshNetWmState(self: *Self, window_id: WindowId, window: *Window) !NetWmStateChanges {
@@ -608,6 +645,7 @@ fn refreshNetWmState(self: *Self, window_id: WindowId, window: *Window) !NetWmSt
     }
     const previous_fullscreen = window.fullscreen;
     const previous_maximized = window.maximized_horz and window.maximized_vert;
+    const previous_minimized = window.minimized;
     self.allocator.free(window.net_wm_state);
     window.net_wm_state = replacement;
     window.fullscreen = std.mem.indexOfScalar(
@@ -625,9 +663,15 @@ fn refreshNetWmState(self: *Self, window_id: WindowId, window: *Window) !NetWmSt
         replacement,
         self.atomValue(.net_wm_state_maximized_vert),
     ) != null;
+    window.minimized = std.mem.indexOfScalar(
+        c.xcb_atom_t,
+        replacement,
+        self.atomValue(.net_wm_state_hidden),
+    ) != null;
     return .{
         .fullscreen = previous_fullscreen != window.fullscreen,
         .maximized = previous_maximized != (window.maximized_horz and window.maximized_vert),
+        .minimized = previous_minimized != window.minimized,
     };
 }
 
@@ -926,7 +970,12 @@ fn handleEvents(_: std.posix.fd_t, mask: wl.EventMask, self: *Self) c_int {
     while (c.xcb_poll_for_event(self.connection)) |event| {
         processed = true;
         if (event.*.response_type & 0x7f == 0) {
-            logX11Error("event", @ptrCast(event));
+            const x_error: *const c.xcb_generic_error_t = @ptrCast(event);
+            if (expectedDestroyedWindowError(x_error)) {
+                log.debug("ignored X11 request racing window destruction", .{});
+            } else {
+                logX11Error("event", x_error);
+            }
         } else {
             self.dispatchEvent(event) catch |err| {
                 log.err("failed to process X11 event: {t}", .{err});
@@ -1021,7 +1070,13 @@ fn handleMapRequest(self: *Self, event: *const c.xcb_map_request_event_t) !void 
     self.refreshInputModel(event.window, window);
     self.refreshProtocols(event.window, window);
     if (!window.override_redirect) {
-        self.setWmState(event.window, c.XCB_ICCCM_WM_STATE_NORMAL);
+        self.setWmState(
+            event.window,
+            if (window.minimized)
+                c.XCB_ICCCM_WM_STATE_ICONIC
+            else
+                c.XCB_ICCCM_WM_STATE_NORMAL,
+        );
     }
     _ = c.xcb_map_window(self.connection, event.window);
 }
@@ -1095,6 +1150,20 @@ fn handlePropertyNotify(self: *Self, event: *const c.xcb_property_notify_event_t
                     self.listener.context,
                     event.window,
                     window.maximized_horz and window.maximized_vert,
+                );
+            }
+            if (changed.minimized) {
+                self.setWmState(
+                    event.window,
+                    if (window.minimized)
+                        c.XCB_ICCCM_WM_STATE_ICONIC
+                    else
+                        c.XCB_ICCCM_WM_STATE_NORMAL,
+                );
+                self.listener.minimize_requested(
+                    self.listener.context,
+                    event.window,
+                    window.minimized,
                 );
             }
         }
@@ -1184,6 +1253,10 @@ fn handleClientMessage(
     event: *const c.xcb_client_message_event_t,
 ) !void {
     if (event.format != 32) return;
+    if (event.type == self.atomValue(.wm_change_state)) {
+        self.handleWmChangeStateMessage(event);
+        return;
+    }
     if (event.type == self.atomValue(.net_wm_state)) {
         self.handleNetWmStateMessage(event);
         return;
@@ -1206,6 +1279,7 @@ fn handleNetWmStateMessage(self: *Self, event: *const c.xcb_client_message_event
     var requested_fullscreen = window.fullscreen;
     var requested_maximized_horz = window.maximized_horz;
     var requested_maximized_vert = window.maximized_vert;
+    var requested_minimized = window.minimized;
     const atoms = [_]c.xcb_atom_t{ event.data.data32[1], event.data.data32[2] };
     for (atoms) |atom| {
         if (atom == self.atomValue(.net_wm_state_fullscreen)) {
@@ -1221,6 +1295,11 @@ fn handleNetWmStateMessage(self: *Self, event: *const c.xcb_client_message_event
         } else if (atom == self.atomValue(.net_wm_state_maximized_vert)) {
             requested_maximized_vert = applyStateAction(
                 requested_maximized_vert,
+                event.data.data32[0],
+            ) orelse return;
+        } else if (atom == self.atomValue(.net_wm_state_hidden)) {
+            requested_minimized = applyStateAction(
+                requested_minimized,
                 event.data.data32[0],
             ) orelse return;
         }
@@ -1241,6 +1320,20 @@ fn handleNetWmStateMessage(self: *Self, event: *const c.xcb_client_message_event
             requested_maximized,
         );
     }
+    if (requested_minimized != window.minimized) {
+        self.listener.minimize_requested(
+            self.listener.context,
+            event.window,
+            requested_minimized,
+        );
+    }
+}
+
+fn handleWmChangeStateMessage(self: *Self, event: *const c.xcb_client_message_event_t) void {
+    const window = self.windows.get(event.window) orelse return;
+    if (!window.mapped or window.override_redirect or window.minimized or
+        event.data.data32[0] != c.XCB_ICCCM_WM_STATE_ICONIC) return;
+    self.listener.minimize_requested(self.listener.context, event.window, true);
 }
 
 fn info(window_id: WindowId, window: Window) WindowInfo {
@@ -1259,6 +1352,7 @@ fn info(window_id: WindowId, window: Window) WindowInfo {
         .can_close = window.delete_window,
         .fullscreen = window.fullscreen,
         .maximized = window.maximized_horz and window.maximized_vert,
+        .minimized = window.minimized,
     };
 }
 
@@ -1286,6 +1380,11 @@ fn logX11Error(operation: []const u8, x_error: *const c.xcb_generic_error_t) voi
             x_error.resource_id,
         },
     );
+}
+
+fn expectedDestroyedWindowError(x_error: *const c.xcb_generic_error_t) bool {
+    return x_error.error_code == c.XCB_WINDOW and
+        x_error.major_code == c.XCB_CHANGE_PROPERTY;
 }
 
 test "XWM atom table covers every atom" {
