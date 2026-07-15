@@ -311,6 +311,11 @@ pub fn ownsResource(self: *Self, resource: *wl.Seat) bool {
     return resource.getUserData() == @as(?*anyopaque, @ptrCast(self));
 }
 
+pub fn fromResource(resource: *wl.Seat) *Self {
+    const data = resource.getUserData() orelse unreachable;
+    return @ptrCast(@alignCast(data));
+}
+
 pub fn pointerHandle(self: *const Self, resource: *wl.Pointer) ?PointerHandle {
     for (self.pointer_resources.items) |entry| {
         if (entry.resource == resource) return .{

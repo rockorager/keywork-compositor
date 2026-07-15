@@ -741,15 +741,16 @@
       "interfaces": [
         {
           "name": "ext_idle_notifier_v1",
-          "current_version": null,
+          "current_version": 2,
           "target_version": 2
         }
       ],
-      "status": "not_started",
+      "status": "done",
       "privileged": false,
       "blocked_by": [
         "wl-seat"
-      ]
+      ],
+      "status_detail": "Version 2 provides seat-scoped idle and input-idle notifications using a shared monotonic timer. Keyboard, pointer, scroll, and touch activity resume and restart matching notifications; input-idle notifications ignore inhibitors, while regular notifications track visible idle-inhibited surfaces and restart their timeout when inhibition ends."
     },
     {
       "id": "keyboard-shortcuts-inhibit",

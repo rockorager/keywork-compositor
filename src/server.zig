@@ -20,6 +20,7 @@ const CursorShape = @import("wayland/cursor_shape.zig");
 const RelativePointer = @import("wayland/relative_pointer.zig");
 const PointerConstraints = @import("wayland/pointer_constraints.zig");
 const IdleInhibit = @import("wayland/idle_inhibit.zig");
+const IdleNotify = @import("wayland/idle_notify.zig");
 const Seat = @import("wayland/seat.zig");
 const DataDevice = @import("wayland/data_device.zig");
 const PrimarySelection = @import("wayland/primary_selection.zig");
@@ -85,6 +86,8 @@ cursor_shape: CursorShape,
 relative_pointer: RelativePointer,
 pointer_constraints: PointerConstraints,
 idle_inhibit: IdleInhibit,
+idle_notify: IdleNotify,
+idle_notify_initialized: bool,
 compositor: Compositor,
 subcompositor: Subcompositor,
 scene: Scene,
@@ -227,6 +230,8 @@ pub fn create(
         .relative_pointer = undefined,
         .pointer_constraints = undefined,
         .idle_inhibit = undefined,
+        .idle_notify = undefined,
+        .idle_notify_initialized = false,
         .compositor = undefined,
         .subcompositor = undefined,
         .scene = undefined,
@@ -367,7 +372,10 @@ pub fn create(
         self.compositor.surfaceStore(),
     );
     errdefer self.pointer_constraints.deinit();
-    try self.idle_inhibit.init(allocator, display);
+    try self.idle_inhibit.init(allocator, display, .{
+        .context = self,
+        .changed = idleInhibitorsChanged,
+    });
     errdefer self.idle_inhibit.deinit();
     try self.presentation_protocol.init(
         allocator,
@@ -393,6 +401,15 @@ pub fn create(
     errdefer self.subcompositor.deinit();
     self.scene.init(allocator);
     errdefer self.scene.deinit();
+    try self.idle_notify.init(allocator, io, display, .{
+        .context = self,
+        .failed = idleNotifyFailed,
+    });
+    self.idle_notify_initialized = true;
+    errdefer {
+        self.idle_notify.deinit();
+        self.idle_notify_initialized = false;
+    }
     try self.xdg_shell.init(
         allocator,
         display,
@@ -634,6 +651,8 @@ pub fn destroy(self: *Self) void {
     self.primary_selection.deinit();
     self.data_device.deinit();
     self.xdg_activation.deinit();
+    self.idle_notify.deinit();
+    self.idle_notify_initialized = false;
     self.layer_shell.deinit();
     self.xdg_foreign.deinit();
     self.xdg_shell.deinit();
@@ -1283,6 +1302,7 @@ pub fn terminate(self: *Self) void {
 
 fn requestRepaint(context: *anyopaque) void {
     const self: *Self = @ptrCast(@alignCast(context));
+    self.refreshIdleInhibition();
     var render_outputs = self.render_outputs.iterator();
     while (render_outputs.next()) |entry| {
         const render_output = entry.value.*;
@@ -1291,8 +1311,34 @@ fn requestRepaint(context: *anyopaque) void {
     }
 }
 
+fn idleInhibitorsChanged(context: *anyopaque) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.refreshIdleInhibition();
+}
+
+fn idleNotifyFailed(context: *anyopaque) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.terminate();
+}
+
+fn refreshIdleInhibition(self: *Self) void {
+    if (!self.idle_notify_initialized) return;
+    self.idle_notify.setInhibited(self.idle_inhibit.hasVisibleInhibitor(
+        self,
+        idleInhibitorSurfaceVisible,
+    ));
+}
+
+fn idleInhibitorSurfaceVisible(context: *anyopaque, surface_id: Surface.Id) bool {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const root = self.subcompositor.rootSurface(surface_id);
+    if (self.session_lock.isLocked()) return self.session_lock.ownsSurface(root);
+    return self.scene.surfaceMapped(root);
+}
+
 fn sessionLockStateChanged(context: *anyopaque, locked: bool) void {
     const self: *Self = @ptrCast(@alignCast(context));
+    self.refreshIdleInhibition();
     self.pointer_constraints.deactivateAll();
     self.data_device.cancel();
     self.cancelSeatTouches(&self.seat);
@@ -1435,7 +1481,10 @@ fn nativePointerButton(context: *anyopaque, id: NativeInput.DeviceId, time: u32,
     self.routePointerButton(id, time, button, state);
 }
 fn nativePointerAxis(context: *anyopaque, id: NativeInput.DeviceId, time: u32, axis: wl.Pointer.Axis, value: wl.Fixed) void {
-    serverForOutput(context).seatForDevice(id).pointerAxis(time, axis, value);
+    const self = serverForOutput(context);
+    const seat = self.seatForDevice(id);
+    self.idle_notify.notifyActivity(seat);
+    seat.pointerAxis(time, axis, value);
 }
 fn nativePointerFrame(context: *anyopaque, id: NativeInput.DeviceId) void {
     serverForOutput(context).seatForDevice(id).pointerFrame();
@@ -1480,6 +1529,7 @@ fn routeKeyboardKey(
     state: wl.Keyboard.KeyState,
 ) void {
     const seat = self.seatForDevice(device_id);
+    self.idle_notify.notifyActivity(seat);
     switch (state) {
         .pressed => {
             for (self.routed_keys.items) |routed| {
@@ -1538,6 +1588,7 @@ fn routePointerButton(
     state: wl.Pointer.ButtonState,
 ) void {
     const seat = self.seatForDevice(device_id);
+    self.idle_notify.notifyActivity(seat);
     switch (state) {
         .pressed => {
             for (self.routed_buttons.items) |routed| {
@@ -1600,6 +1651,7 @@ fn routeTouchDown(
         if (touch.device_id == device_id and touch.native_id == native_id) return;
     }
     const seat = self.seatForDevice(device_id);
+    self.idle_notify.notifyActivity(seat);
     const protocol_id = self.allocateTouchId(seat);
     self.routed_touches.append(self.allocator, .{
         .device_id = device_id,
@@ -1631,6 +1683,7 @@ fn routeTouchDown(
 fn routeTouchUp(self: *Self, device_id: NativeInput.DeviceId, time: u32, native_id: i32) void {
     for (self.routed_touches.items, 0..) |touch, index| {
         if (touch.device_id != device_id or touch.native_id != native_id) continue;
+        self.idle_notify.notifyActivity(touch.seat);
         _ = self.routed_touches.orderedRemove(index);
         touch.seat.touchUp(time, touch.protocol_id) catch self.terminate();
         return;
@@ -1648,6 +1701,7 @@ fn routeTouchMotion(
 ) void {
     for (self.routed_touches.items) |touch| {
         if (touch.device_id != device_id or touch.native_id != native_id) continue;
+        self.idle_notify.notifyActivity(touch.seat);
         const point = output.globalPoint(x, y);
         touch.seat.touchMotion(time, touch.protocol_id, point.x, point.y) catch self.terminate();
         return;
@@ -1722,6 +1776,7 @@ fn keyboardKey(
     state: wl.Keyboard.KeyState,
 ) void {
     const self = serverForOutput(context);
+    self.idle_notify.notifyActivity(&self.seat);
     self.seat.key(time, key, state) catch {
         log.err("failed to store keyboard state", .{});
         self.terminate();
@@ -1795,6 +1850,7 @@ fn pointerMotion(context: *anyopaque, time: u32, x: f64, y: f64) void {
 
 fn pointerMotionForSeat(output: *RenderOutput, seat: *Seat, time: u32, x: f64, y: f64) void {
     const self = output.server;
+    self.idle_notify.notifyActivity(seat);
     const target = output.globalPoint(x, y);
     if (self.session_lock.isLocked()) {
         seat.pointerMotion(
@@ -1870,6 +1926,7 @@ fn pointerButton(
     state: wl.Pointer.ButtonState,
 ) void {
     const self = serverForOutput(context);
+    self.idle_notify.notifyActivity(&self.seat);
     self.pointerButtonForSeat(&self.seat, time, button, state);
 }
 
@@ -1957,6 +2014,7 @@ fn dragEnded(context: *anyopaque) void {
 
 fn pointerAxis(context: *anyopaque, time: u32, axis: wl.Pointer.Axis, value: wl.Fixed) void {
     const self = serverForOutput(context);
+    self.idle_notify.notifyActivity(&self.seat);
     self.seat.pointerAxis(time, axis, value);
 }
 
@@ -2002,6 +2060,7 @@ fn touchAvailable(context: *anyopaque, available: bool) void {
 fn touchDown(context: *anyopaque, time: u32, id: i32, x: f64, y: f64) void {
     const output: *RenderOutput = @ptrCast(@alignCast(context));
     const self = output.server;
+    self.idle_notify.notifyActivity(&self.seat);
     const point = output.globalPoint(x, y);
     const focus = self.pointerFocus(point.x, point.y);
     if (self.session_lock.isLocked()) {
@@ -2028,6 +2087,7 @@ fn touchDown(context: *anyopaque, time: u32, id: i32, x: f64, y: f64) void {
 
 fn touchUp(context: *anyopaque, time: u32, id: i32) void {
     const self = serverForOutput(context);
+    self.idle_notify.notifyActivity(&self.seat);
     self.seat.touchUp(time, id) catch {
         log.err("failed to finish touch point", .{});
         self.terminate();
@@ -2037,6 +2097,7 @@ fn touchUp(context: *anyopaque, time: u32, id: i32) void {
 fn touchMotion(context: *anyopaque, time: u32, id: i32, x: f64, y: f64) void {
     const output: *RenderOutput = @ptrCast(@alignCast(context));
     const self = output.server;
+    self.idle_notify.notifyActivity(&self.seat);
     const point = output.globalPoint(x, y);
     self.seat.touchMotion(time, id, point.x, point.y) catch {
         log.err("failed to update touch point", .{});

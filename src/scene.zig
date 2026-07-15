@@ -880,6 +880,32 @@ pub fn surfacePosition(self: *Self, surface_id: Surface.Id) ?Position {
     return null;
 }
 
+pub fn surfaceMapped(self: *Self, surface_id: Surface.Id) bool {
+    var windows = self.windows.iterator();
+    while (windows.next()) |entry| {
+        if (std.meta.eql(entry.value.surface_id, surface_id)) return entry.value.mapped;
+    }
+    var shell_surfaces = self.shell_surfaces.iterator();
+    while (shell_surfaces.next()) |entry| {
+        if (std.meta.eql(entry.value.surface_id, surface_id)) return entry.value.mapped;
+    }
+    var layer_surfaces = self.layer_surfaces.iterator();
+    while (layer_surfaces.next()) |entry| {
+        if (std.meta.eql(entry.value.surface_id, surface_id)) return entry.value.mapped;
+    }
+    var popups = self.popups.iterator();
+    while (popups.next()) |entry| {
+        if (std.meta.eql(entry.value.surface_id, surface_id)) return entry.value.mapped;
+    }
+    var decorations = self.decorations.iterator();
+    while (decorations.next()) |entry| {
+        if (!std.meta.eql(entry.value.surface_id, surface_id)) continue;
+        const window = self.windows.get(entry.value.window_id) orelse return false;
+        return entry.value.mapped and window.mapped;
+    }
+    return false;
+}
+
 pub fn topFullscreen(self: *Self) ?Id {
     var index = self.stack.items.len;
     while (index > 0) {

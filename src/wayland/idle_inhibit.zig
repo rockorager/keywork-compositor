@@ -12,8 +12,19 @@ const zwp = wayland.server.zwp;
 allocator: std.mem.Allocator,
 global: *wl.Global,
 inhibitors: std.ArrayList(*Inhibitor),
+listener: Listener,
 
-pub fn init(self: *Self, allocator: std.mem.Allocator, display: *wl.Server) !void {
+pub const Listener = struct {
+    context: *anyopaque,
+    changed: *const fn (*anyopaque) void,
+};
+
+pub fn init(
+    self: *Self,
+    allocator: std.mem.Allocator,
+    display: *wl.Server,
+    listener: Listener,
+) !void {
     self.* = .{
         .allocator = allocator,
         .global = try wl.Global.create(
@@ -25,6 +36,7 @@ pub fn init(self: *Self, allocator: std.mem.Allocator, display: *wl.Server) !voi
             bind,
         ),
         .inhibitors = .empty,
+        .listener = listener,
     };
 }
 
@@ -41,6 +53,21 @@ pub fn hasInhibitor(self: *const Self, surface_id: Surface.Id) bool {
     for (self.inhibitors.items) |inhibitor| {
         if (inhibitor.surface_resource != null and
             std.meta.eql(inhibitor.surface_id, surface_id))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+pub fn hasVisibleInhibitor(
+    self: *const Self,
+    context: *anyopaque,
+    is_visible: *const fn (*anyopaque, Surface.Id) bool,
+) bool {
+    for (self.inhibitors.items) |inhibitor| {
+        if (inhibitor.surface_resource != null and
+            is_visible(context, inhibitor.surface_id))
         {
             return true;
         }
@@ -106,6 +133,7 @@ const Inhibitor = struct {
         errdefer self.surface_destroy_listener.link.remove();
         try manager.inhibitors.append(manager.allocator, self);
         resource.setHandler(*Inhibitor, handleRequest, handleDestroy, self);
+        manager.listener.changed(manager.listener.context);
     }
 
     fn handleRequest(
@@ -123,6 +151,7 @@ const Inhibitor = struct {
         for (self.manager.inhibitors.items, 0..) |inhibitor, index| {
             if (inhibitor != self) continue;
             _ = self.manager.inhibitors.orderedRemove(index);
+            self.manager.listener.changed(self.manager.listener.context);
             self.manager.allocator.destroy(self);
             return;
         }
@@ -133,5 +162,6 @@ const Inhibitor = struct {
         const self: *Inhibitor = @fieldParentPtr("surface_destroy_listener", listener);
         listener.link.remove();
         self.surface_resource = null;
+        self.manager.listener.changed(self.manager.listener.context);
     }
 };
