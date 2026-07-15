@@ -71,6 +71,7 @@ pub const XwaylandController = struct {
     window_info: *const fn (*anyopaque, Xwm.WindowId) ?Xwm.WindowInfo,
     resize: *const fn (*anyopaque, Xwm.WindowId, u16, u16) bool,
     move: *const fn (*anyopaque, Xwm.WindowId, i16, i16) bool,
+    set_fullscreen: *const fn (*anyopaque, Xwm.WindowId, bool) void,
     close: *const fn (*anyopaque, Xwm.WindowId) void,
     refresh_scene: *const fn (*anyopaque, Xwm.WindowId) void,
 };
@@ -827,7 +828,11 @@ fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
     while (xwayland_windows.next()) |entry| {
         const info = self.xwayland.window_info(self.xwayland.context, entry.key_ptr.*) orelse continue;
         if (!info.mapped or info.override_redirect) continue;
-        _ = self.ensureXwaylandWindow(entry.key_ptr.*) catch {
+        const managed_id = self.ensureXwaylandWindow(entry.key_ptr.*) catch {
+            resource.postNoMemory();
+            return;
+        };
+        if (info.fullscreen) self.appendXwaylandFullscreenRequest(managed_id, true, null) catch {
             resource.postNoMemory();
             return;
         };
@@ -934,7 +939,8 @@ pub fn xwaylandWindowAssociated(
     if (self.active == null) return;
     const info = self.xwayland.window_info(self.xwayland.context, xwayland_id) orelse return;
     if (!info.mapped or info.override_redirect) return;
-    _ = try self.ensureXwaylandWindow(xwayland_id);
+    const id = try self.ensureXwaylandWindow(xwayland_id);
+    if (info.fullscreen) try self.appendXwaylandFullscreenRequest(id, true, null);
     var windows = self.windows.iterator();
     while (windows.next()) |entry| entry.value.metadata_dirty = true;
     self.xwayland.refresh_scene(self.xwayland.context, xwayland_id);
@@ -955,7 +961,11 @@ pub fn xwaylandWindowMapped(self: *Self, xwayland_id: Xwm.WindowId, mapped: bool
     if (!self.known_xwayland_windows.contains(xwayland_id)) return;
     const info = self.xwayland.window_info(self.xwayland.context, xwayland_id) orelse return;
     if (!info.mapped or info.override_redirect) return;
-    _ = self.ensureXwaylandWindow(xwayland_id) catch {
+    const id = self.ensureXwaylandWindow(xwayland_id) catch {
+        manager.postNoMemory();
+        return;
+    };
+    if (info.fullscreen) self.appendXwaylandFullscreenRequest(id, true, null) catch {
         manager.postNoMemory();
         return;
     };
@@ -993,6 +1003,39 @@ pub fn xwaylandWindowMetadataChanged(self: *Self, xwayland_id: Xwm.WindowId) voi
     const window = self.windows.get(id) orelse return;
     window.metadata_dirty = true;
     self.requestManage();
+}
+
+pub fn xwaylandWindowFullscreenRequested(
+    self: *Self,
+    xwayland_id: Xwm.WindowId,
+    fullscreen: bool,
+    preferred_output: ?OutputLayout.Id,
+) void {
+    const manager = self.active orelse return;
+    const info = self.xwayland.window_info(self.xwayland.context, xwayland_id) orelse return;
+    if (!info.mapped or info.override_redirect or
+        !self.known_xwayland_windows.contains(xwayland_id)) return;
+    const id = self.ensureXwaylandWindow(xwayland_id) catch {
+        manager.postNoMemory();
+        return;
+    };
+    self.appendXwaylandFullscreenRequest(id, fullscreen, preferred_output) catch {
+        manager.postNoMemory();
+        return;
+    };
+    self.requestManage();
+}
+
+fn appendXwaylandFullscreenRequest(
+    self: *Self,
+    id: WindowId,
+    fullscreen: bool,
+    preferred_output: ?OutputLayout.Id,
+) error{OutOfMemory}!void {
+    try self.window_requests.append(self.allocator, .{
+        .id = id,
+        .request = if (fullscreen) .{ .fullscreen = preferred_output } else .exit_fullscreen,
+    });
 }
 
 pub fn xwaylandWindowDisplayed(self: *Self, xwayland_id: Xwm.WindowId) bool {
@@ -1544,6 +1587,13 @@ fn finishXwaylandWindowRender(
 
     self.scene.setFocused(window.scene_id, self.windowFocusedByAnySeat(id));
     self.scene.setFullscreen(window.scene_id, window.fullscreen_output != null);
+    if (window.resource != null) {
+        self.xwayland.set_fullscreen(
+            self.xwayland.context,
+            xwayland_id,
+            window.fullscreen_output != null,
+        );
+    }
     switch (window.pending_borders) {
         .unchanged => {},
         .set => |borders| {
@@ -1931,6 +1981,7 @@ fn releaseWindows(self: *Self) void {
         } else if (entry.value.xwaylandId()) |xwayland_id| {
             self.scene.setFocused(entry.value.scene_id, false);
             self.scene.setFullscreen(entry.value.scene_id, false);
+            self.xwayland.set_fullscreen(self.xwayland.context, xwayland_id, false);
             self.scene.setBorders(entry.value.scene_id, null);
             self.scene.setClipBox(entry.value.scene_id, null);
             self.scene.setContentClipBox(entry.value.scene_id, null);

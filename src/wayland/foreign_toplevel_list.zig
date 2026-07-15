@@ -53,6 +53,7 @@ pub const XwaylandController = struct {
     context: *anyopaque,
     window_info: *const fn (*anyopaque, Xwm.WindowId) ?Xwm.WindowInfo,
     close: *const fn (*anyopaque, Xwm.WindowId) void,
+    request_fullscreen: *const fn (*anyopaque, Xwm.WindowId, bool, ?OutputLayout.Id) void,
 };
 
 const List = struct {
@@ -301,9 +302,25 @@ const WlrHandle = struct {
                 .set_minimized,
                 .unset_minimized,
                 .activate,
-                .set_fullscreen,
-                .unset_fullscreen,
                 => {},
+                .set_fullscreen => |fullscreen| self.owner.xwayland.request_fullscreen(
+                    self.owner.xwayland.context,
+                    window_id,
+                    true,
+                    if (fullscreen.output) |output_resource|
+                        if (self.owner.outputs.findResource(output_resource)) |output|
+                            output.id
+                        else
+                            null
+                    else
+                        null,
+                ),
+                .unset_fullscreen => self.owner.xwayland.request_fullscreen(
+                    self.owner.xwayland.context,
+                    window_id,
+                    false,
+                    null,
+                ),
             },
         }
     }
@@ -576,9 +593,15 @@ fn mappingMetadata(self: *Self, mapping: *const Mapping) ?MappingMetadata {
 }
 
 fn mappingConfiguration(self: *Self, mapping: *const Mapping) XdgShell.ToplevelConfigure {
-    const window_id = mapping.xdgId() orelse return .{};
-    const info = self.xdg_shell.windowInfo(window_id) orelse return .{};
-    return info.configuration;
+    return switch (mapping.backend) {
+        .xdg => |window_id| (self.xdg_shell.windowInfo(window_id) orelse return .{}).configuration,
+        .xwayland => |window_id| .{
+            .fullscreen = (self.xwayland.window_info(
+                self.xwayland.context,
+                window_id,
+            ) orelse return .{}).fullscreen,
+        },
+    };
 }
 
 fn mappingParent(self: *Self, mapping: *const Mapping) ?*Mapping {
@@ -777,6 +800,16 @@ pub fn xwaylandWindowConfigured(
 
 pub fn xwaylandWindowMetadataChanged(self: *Self, window_id: Xwm.WindowId) void {
     self.sendMetadata(self.mappingForXwayland(window_id) orelse return);
+}
+
+pub fn xwaylandWindowStateChanged(self: *Self, window_id: Xwm.WindowId) void {
+    const mapping = self.mappingForXwayland(window_id) orelse return;
+    const configuration = self.mappingConfiguration(mapping);
+    for (self.wlr_handles.items) |handle| {
+        if (handle.mapping != mapping or !handle.initialized or handle.closed) continue;
+        handle.sendState(configuration);
+        handle.resource.sendDone();
+    }
 }
 
 fn identifierFor(allocator: std.mem.Allocator, generation: u64) ![:0]u8 {

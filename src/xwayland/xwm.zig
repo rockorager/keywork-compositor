@@ -53,6 +53,7 @@ pub const WindowInfo = struct {
     min_size: Size,
     max_size: Size,
     can_close: bool,
+    fullscreen: bool,
 };
 
 const Window = struct {
@@ -70,11 +71,14 @@ const Window = struct {
     accepts_input: bool = true,
     take_focus: bool = false,
     delete_window: bool = false,
+    net_wm_state: []c.xcb_atom_t = &.{},
+    fullscreen: bool = false,
 
     fn deinit(self: *Window, allocator: std.mem.Allocator) void {
         if (self.title) |value| allocator.free(value);
         if (self.app_id) |value| allocator.free(value);
         if (self.instance) |value| allocator.free(value);
+        allocator.free(self.net_wm_state);
         self.* = undefined;
     }
 };
@@ -86,6 +90,8 @@ const Atom = enum {
     net_supporting_wm_check,
     net_wm_name,
     net_active_window,
+    net_wm_state,
+    net_wm_state_fullscreen,
     utf8_string,
     wm_protocols,
     wm_take_focus,
@@ -102,6 +108,8 @@ const atom_names: [atom_count][]const u8 = .{
     "_NET_SUPPORTING_WM_CHECK",
     "_NET_WM_NAME",
     "_NET_ACTIVE_WINDOW",
+    "_NET_WM_STATE",
+    "_NET_WM_STATE_FULLSCREEN",
     "UTF8_STRING",
     "WM_PROTOCOLS",
     "WM_TAKE_FOCUS",
@@ -118,6 +126,7 @@ pub const Listener = struct {
     mapped: *const fn (*anyopaque, WindowId, bool) void,
     configured: *const fn (*anyopaque, WindowId, Geometry, bool) void,
     metadata_changed: *const fn (*anyopaque, WindowId) void,
+    fullscreen_requested: *const fn (*anyopaque, WindowId, bool) void,
     serial: *const fn (*anyopaque, WindowId, u64) void,
     associated: *const fn (*anyopaque, WindowId, Surface.Id) void,
     dissociated: *const fn (*anyopaque, WindowId, Surface.Id) void,
@@ -313,6 +322,47 @@ pub fn closeWindow(self: *Self, window_id: WindowId) void {
     _ = c.xcb_flush(self.connection);
 }
 
+pub fn setFullscreen(
+    self: *Self,
+    window_id: WindowId,
+    fullscreen: bool,
+) error{ InvalidWindow, OutOfMemory, XcbFlushFailed }!bool {
+    const window = self.windows.getPtr(window_id) orelse return error.InvalidWindow;
+    if (window.override_redirect) return error.InvalidWindow;
+    if (window.fullscreen == fullscreen) return false;
+
+    const fullscreen_atom = self.atomValue(.net_wm_state_fullscreen);
+    var retained_count: usize = 0;
+    for (window.net_wm_state) |atom| {
+        if (atom != fullscreen_atom) retained_count += 1;
+    }
+    const state_atom_count = retained_count + @intFromBool(fullscreen);
+    const atoms = try self.allocator.alloc(c.xcb_atom_t, state_atom_count);
+    var index: usize = 0;
+    for (window.net_wm_state) |atom| {
+        if (atom == fullscreen_atom) continue;
+        atoms[index] = atom;
+        index += 1;
+    }
+    if (fullscreen) atoms[index] = fullscreen_atom;
+
+    self.allocator.free(window.net_wm_state);
+    window.net_wm_state = atoms;
+    window.fullscreen = fullscreen;
+    _ = c.xcb_change_property(
+        self.connection,
+        c.XCB_PROP_MODE_REPLACE,
+        window_id,
+        self.atomValue(.net_wm_state),
+        c.XCB_ATOM_ATOM,
+        32,
+        @intCast(atoms.len),
+        if (atoms.len == 0) null else atoms.ptr,
+    );
+    if (c.xcb_flush(self.connection) <= 0) return error.XcbFlushFailed;
+    return true;
+}
+
 pub fn resizeWindow(
     self: *Self,
     window_id: WindowId,
@@ -431,6 +481,8 @@ fn publishWmIdentity(self: *Self) !void {
         self.atomValue(.net_supporting_wm_check),
         self.atomValue(.net_wm_name),
         self.atomValue(.net_active_window),
+        self.atomValue(.net_wm_state),
+        self.atomValue(.net_wm_state_fullscreen),
     };
     try checkRequest(self.connection, c.xcb_change_property_checked(
         self.connection,
@@ -491,6 +543,64 @@ fn refreshProtocols(self: *Self, window_id: WindowId, window: *Window) void {
             }
         }
     }
+}
+
+fn refreshNetWmState(self: *Self, window_id: WindowId, window: *Window) !bool {
+    const replacement = (try self.readAtomList(window_id, .net_wm_state)) orelse return false;
+    if (std.mem.eql(c.xcb_atom_t, window.net_wm_state, replacement)) {
+        self.allocator.free(replacement);
+        return false;
+    }
+    const previous_fullscreen = window.fullscreen;
+    self.allocator.free(window.net_wm_state);
+    window.net_wm_state = replacement;
+    window.fullscreen = std.mem.indexOfScalar(
+        c.xcb_atom_t,
+        replacement,
+        self.atomValue(.net_wm_state_fullscreen),
+    ) != null;
+    return previous_fullscreen != window.fullscreen;
+}
+
+fn readAtomList(self: *Self, window_id: WindowId, property: Atom) !?[]c.xcb_atom_t {
+    const max_atoms = 1024;
+    var x_error: ?*c.xcb_generic_error_t = null;
+    const reply = c.xcb_get_property_reply(
+        self.connection,
+        c.xcb_get_property(
+            self.connection,
+            0,
+            window_id,
+            self.atomValue(property),
+            c.XCB_ATOM_ATOM,
+            0,
+            max_atoms,
+        ),
+        &x_error,
+    ) orelse {
+        if (x_error) |err| {
+            logX11Error("read atom property", err);
+            std.c.free(err);
+        }
+        return null;
+    };
+    defer std.c.free(reply);
+    if (x_error) |err| {
+        logX11Error("read atom property", err);
+        std.c.free(err);
+        return null;
+    }
+    if (reply.*.type == c.XCB_ATOM_NONE or reply.*.value_len == 0) return &.{};
+    if (reply.*.type != c.XCB_ATOM_ATOM or reply.*.format != 32 or reply.*.bytes_after != 0) {
+        log.warn("ignored invalid atom property on X11 window {d}", .{window_id});
+        return null;
+    }
+    const count: usize = @intCast(reply.*.value_len);
+    const data = c.xcb_get_property_value(reply) orelse return null;
+    const source: [*]const c.xcb_atom_t = @ptrCast(@alignCast(data));
+    const atoms = try self.allocator.alloc(c.xcb_atom_t, count);
+    @memcpy(atoms, source[0..count]);
+    return atoms;
 }
 
 fn sendWmMessage(self: *Self, window_id: WindowId, message: Atom) void {
@@ -838,6 +948,7 @@ fn handleMapRequest(self: *Self, event: *const c.xcb_map_request_event_t) !void 
     if (try self.refreshMetadata(event.window, window)) {
         self.listener.metadata_changed(self.listener.context, event.window);
     }
+    _ = try self.refreshNetWmState(event.window, window);
     self.refreshInputModel(event.window, window);
     self.refreshProtocols(event.window, window);
     if (!window.override_redirect) {
@@ -900,6 +1011,16 @@ fn handlePropertyNotify(self: *Self, event: *const c.xcb_property_notify_event_t
         self.refreshInputModel(event.window, window);
     } else if (event.atom == self.atomValue(.wm_protocols)) {
         self.refreshProtocols(event.window, window);
+    } else if (event.atom == self.atomValue(.net_wm_state)) {
+        if (try self.refreshNetWmState(event.window, window) and
+            window.mapped and !window.override_redirect)
+        {
+            self.listener.fullscreen_requested(
+                self.listener.context,
+                event.window,
+                window.fullscreen,
+            );
+        }
     }
 }
 
@@ -985,7 +1106,12 @@ fn handleClientMessage(
     self: *Self,
     event: *const c.xcb_client_message_event_t,
 ) !void {
-    if (event.type != self.atomValue(.wl_surface_serial) or event.format != 32) return;
+    if (event.format != 32) return;
+    if (event.type == self.atomValue(.net_wm_state)) {
+        self.handleNetWmStateMessage(event);
+        return;
+    }
+    if (event.type != self.atomValue(.wl_surface_serial)) return;
     const window = self.windows.getPtr(event.window) orelse return;
     const serial = @as(u64, event.data.data32[1]) << 32 | event.data.data32[0];
     if (serial == 0 or window.serial != null or self.serial_windows.contains(serial)) {
@@ -995,6 +1121,20 @@ fn handleClientMessage(
     try self.serial_windows.put(self.allocator, serial, event.window);
     window.serial = serial;
     self.listener.serial(self.listener.context, event.window, serial);
+}
+
+fn handleNetWmStateMessage(self: *Self, event: *const c.xcb_client_message_event_t) void {
+    const window = self.windows.get(event.window) orelse return;
+    if (!window.mapped or window.override_redirect) return;
+    var requested = window.fullscreen;
+    const atoms = [_]c.xcb_atom_t{ event.data.data32[1], event.data.data32[2] };
+    for (atoms) |atom| {
+        if (atom != self.atomValue(.net_wm_state_fullscreen)) continue;
+        requested = applyStateAction(requested, event.data.data32[0]) orelse return;
+    }
+    if (requested != window.fullscreen) {
+        self.listener.fullscreen_requested(self.listener.context, event.window, requested);
+    }
 }
 
 fn info(window_id: WindowId, window: Window) WindowInfo {
@@ -1011,6 +1151,16 @@ fn info(window_id: WindowId, window: Window) WindowInfo {
         .min_size = window.min_size,
         .max_size = window.max_size,
         .can_close = window.delete_window,
+        .fullscreen = window.fullscreen,
+    };
+}
+
+fn applyStateAction(current: bool, action: u32) ?bool {
+    return switch (action) {
+        0 => false,
+        1 => true,
+        2 => !current,
+        else => null,
     };
 }
 
@@ -1033,4 +1183,12 @@ fn logX11Error(operation: []const u8, x_error: *const c.xcb_generic_error_t) voi
 
 test "XWM atom table covers every atom" {
     try std.testing.expectEqual(atom_count, atom_names.len);
+}
+
+test "EWMH state actions apply remove add and toggle" {
+    try std.testing.expectEqual(false, applyStateAction(true, 0).?);
+    try std.testing.expectEqual(true, applyStateAction(false, 1).?);
+    try std.testing.expectEqual(false, applyStateAction(true, 2).?);
+    try std.testing.expectEqual(true, applyStateAction(false, 2).?);
+    try std.testing.expectEqual(null, applyStateAction(false, 3));
 }
