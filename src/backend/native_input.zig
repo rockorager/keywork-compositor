@@ -33,7 +33,7 @@ tablet_tools: std.ArrayList(TabletTool),
 next_tablet_tool_id: TabletToolId,
 device_listener: ?DeviceListener,
 environ_map: ?*const std.process.Environ.Map,
-xkb_context: *c.struct_xkb_context,
+keymap_compiler: KeymapCompiler,
 default_keymap: *Keymap,
 active_keyboard: ?DeviceId,
 keyboard_state_listener: ?KeyboardStateListener,
@@ -165,6 +165,85 @@ pub const Keymap = struct {
         self.file.close(self.io);
         c.xkb_keymap_unref(self.native);
         self.allocator.destroy(self);
+    }
+};
+
+pub const KeymapCompiler = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    context: *c.struct_xkb_context,
+
+    pub fn init(self: *KeymapCompiler, allocator: std.mem.Allocator, io: std.Io) !void {
+        self.* = .{
+            .allocator = allocator,
+            .io = io,
+            .context = c.xkb_context_new(c.XKB_CONTEXT_NO_FLAGS) orelse
+                return error.XkbContextFailed,
+        };
+    }
+
+    pub fn deinit(self: *KeymapCompiler) void {
+        c.xkb_context_unref(self.context);
+        self.* = undefined;
+    }
+
+    pub fn defaultKeymap(self: *KeymapCompiler) !*Keymap {
+        const native = c.xkb_keymap_new_from_names2(
+            self.context,
+            null,
+            c.XKB_KEYMAP_FORMAT_TEXT_V1,
+            c.XKB_KEYMAP_COMPILE_NO_FLAGS,
+        ) orelse return error.XkbKeymapFailed;
+        return self.wrap(native);
+    }
+
+    pub fn compile(self: *KeymapCompiler, format: KeymapFormat, text: []const u8) !?*Keymap {
+        if (text.len == 0) return null;
+        const native = c.xkb_keymap_new_from_buffer(
+            self.context,
+            text.ptr,
+            text.len,
+            @as(c.enum_xkb_keymap_format, @intFromEnum(format)),
+            c.XKB_KEYMAP_COMPILE_NO_FLAGS,
+        ) orelse return null;
+        return try self.wrap(native);
+    }
+
+    fn wrap(self: *KeymapCompiler, native: *c.struct_xkb_keymap) !*Keymap {
+        errdefer c.xkb_keymap_unref(native);
+        const text_pointer = c.xkb_keymap_get_as_string(
+            native,
+            c.XKB_KEYMAP_FORMAT_TEXT_V1,
+        ) orelse return error.SerializeKeymapFailed;
+        defer c.free(text_pointer);
+        const text = std.mem.span(text_pointer);
+        const size = std.math.add(usize, text.len, 1) catch return error.KeymapTooLarge;
+        if (size > std.math.maxInt(u32)) return error.KeymapTooLarge;
+
+        const fd = try std.posix.memfd_create(
+            "keywork-keymap",
+            std.os.linux.MFD.CLOEXEC | std.os.linux.MFD.ALLOW_SEALING,
+        );
+        const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
+        errdefer file.close(self.io);
+        try file.setLength(self.io, size);
+        try file.writeStreamingAll(self.io, text.ptr[0..size]);
+        const seals = std.os.linux.F.SEAL_SHRINK |
+            std.os.linux.F.SEAL_GROW |
+            std.os.linux.F.SEAL_WRITE |
+            std.os.linux.F.SEAL_SEAL;
+        if (std.c.fcntl(fd, std.os.linux.F.ADD_SEALS, @as(c_int, seals)) < 0) {
+            return error.SealKeymapFailed;
+        }
+        const keymap = try self.allocator.create(Keymap);
+        keymap.* = .{
+            .allocator = self.allocator,
+            .io = self.io,
+            .native = native,
+            .file = file,
+            .size = @intCast(size),
+        };
+        return keymap;
     }
 };
 
@@ -429,7 +508,7 @@ pub fn init(
         .next_tablet_tool_id = 1,
         .device_listener = null,
         .environ_map = null,
-        .xkb_context = undefined,
+        .keymap_compiler = undefined,
         .default_keymap = undefined,
         .active_keyboard = null,
         .keyboard_state_listener = null,
@@ -458,16 +537,9 @@ pub fn init(
     errdefer self.input_devices.deinit(allocator);
     errdefer self.tablet_tools.deinit(allocator);
 
-    self.xkb_context = c.xkb_context_new(c.XKB_CONTEXT_NO_FLAGS) orelse
-        return error.XkbContextFailed;
-    errdefer c.xkb_context_unref(self.xkb_context);
-    const default_native_keymap = c.xkb_keymap_new_from_names2(
-        self.xkb_context,
-        null,
-        c.XKB_KEYMAP_FORMAT_TEXT_V1,
-        c.XKB_KEYMAP_COMPILE_NO_FLAGS,
-    ) orelse return error.XkbKeymapFailed;
-    self.default_keymap = try self.wrapKeymap(default_native_keymap);
+    try self.keymap_compiler.init(allocator, io);
+    errdefer self.keymap_compiler.deinit();
+    self.default_keymap = try self.keymap_compiler.defaultKeymap();
     errdefer self.default_keymap.unref();
     try self.installKeymap(null, self.default_keymap);
     listener.keyboard_repeat_info(listener.context, null, 25, 600);
@@ -524,7 +596,7 @@ pub fn deinit(self: *Self) void {
     self.tablet_tools.deinit(self.allocator);
     std.debug.assert(self.default_keymap.references == 1);
     self.default_keymap.unref();
-    c.xkb_context_unref(self.xkb_context);
+    self.keymap_compiler.deinit();
     self.* = undefined;
 }
 
@@ -587,15 +659,7 @@ pub fn tabletToolInfo(self: *const Self, id: TabletToolId) ?TabletToolInfo {
 }
 
 pub fn compileKeymap(self: *Self, format: KeymapFormat, text: []const u8) !?*Keymap {
-    if (text.len == 0) return null;
-    const native = c.xkb_keymap_new_from_buffer(
-        self.xkb_context,
-        text.ptr,
-        text.len,
-        @as(c.enum_xkb_keymap_format, @intFromEnum(format)),
-        c.XKB_KEYMAP_COMPILE_NO_FLAGS,
-    ) orelse return null;
-    return try self.wrapKeymap(native);
+    return self.keymap_compiler.compile(format, text);
 }
 
 pub fn keyboardState(self: *Self, id: DeviceId) ?KeyboardState {
@@ -880,43 +944,6 @@ pub fn setPointerPosition(self: *Self, x: f64, y: f64) void {
     std.debug.assert(self.initialized);
     self.pointer_x = clampCoordinate(x, self.size.width);
     self.pointer_y = clampCoordinate(y, self.size.height);
-}
-
-fn wrapKeymap(self: *Self, native: *c.struct_xkb_keymap) !*Keymap {
-    errdefer c.xkb_keymap_unref(native);
-    const text_pointer = c.xkb_keymap_get_as_string(
-        native,
-        c.XKB_KEYMAP_FORMAT_TEXT_V1,
-    ) orelse return error.SerializeKeymapFailed;
-    defer c.free(text_pointer);
-    const text = std.mem.span(text_pointer);
-    const size = std.math.add(usize, text.len, 1) catch return error.KeymapTooLarge;
-    if (size > std.math.maxInt(u32)) return error.KeymapTooLarge;
-
-    const fd = try std.posix.memfd_create(
-        "keywork-keymap",
-        std.os.linux.MFD.CLOEXEC | std.os.linux.MFD.ALLOW_SEALING,
-    );
-    const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
-    errdefer file.close(self.io);
-    try file.setLength(self.io, size);
-    try file.writeStreamingAll(self.io, text.ptr[0..size]);
-    const seals = std.os.linux.F.SEAL_SHRINK |
-        std.os.linux.F.SEAL_GROW |
-        std.os.linux.F.SEAL_WRITE |
-        std.os.linux.F.SEAL_SEAL;
-    if (std.c.fcntl(fd, std.os.linux.F.ADD_SEALS, @as(c_int, seals)) < 0) {
-        return error.SealKeymapFailed;
-    }
-    const keymap = try self.allocator.create(Keymap);
-    keymap.* = .{
-        .allocator = self.allocator,
-        .io = self.io,
-        .native = native,
-        .file = file,
-        .size = @intCast(size),
-    };
-    return keymap;
 }
 
 fn duplicateKeymapFd(keymap: *const Keymap) !std.posix.fd_t {
@@ -2379,6 +2406,22 @@ test "function keys map to virtual terminals" {
     try std.testing.expectEqual(@as(?u32, 11), virtualTerminalForKey(c.KEY_F11));
     try std.testing.expectEqual(@as(?u32, 12), virtualTerminalForKey(c.KEY_F12));
     try std.testing.expectEqual(@as(?u32, null), virtualTerminalForKey(c.KEY_ENTER));
+}
+
+test "keymap compiler works without native input" {
+    var compiler: KeymapCompiler = undefined;
+    try compiler.init(std.testing.allocator, std.testing.io);
+    defer compiler.deinit();
+
+    const default = try compiler.defaultKeymap();
+    defer default.unref();
+    const text_pointer = c.xkb_keymap_get_as_string(
+        default.native,
+        c.XKB_KEYMAP_FORMAT_TEXT_V1,
+    ) orelse return error.SerializeKeymapFailed;
+    defer c.free(text_pointer);
+    const compiled = (try compiler.compile(.text_v1, std.mem.span(text_pointer))).?;
+    compiled.unref();
 }
 
 test "native pointer coordinates stay inside the output" {

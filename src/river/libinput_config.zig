@@ -13,7 +13,7 @@ allocator: std.mem.Allocator,
 global: *wl.Global,
 security_context: *SecurityContext,
 input_manager: *InputManager,
-native_input: *NativeInput,
+native_input: ?*NativeInput,
 managers: std.ArrayList(*Manager),
 devices: std.ArrayList(*Device),
 accels: std.ArrayList(*Accel),
@@ -46,7 +46,7 @@ pub fn init(
     display: *wl.Server,
     security_context: *SecurityContext,
     input_manager: *InputManager,
-    native_input: *NativeInput,
+    native_input: ?*NativeInput,
 ) !void {
     self.* = .{
         .allocator = allocator,
@@ -77,7 +77,12 @@ pub fn init(
     try input_manager.addDeviceListener(&self.device_listener);
 }
 
+pub fn detachNativeInput(self: *Self) void {
+    self.native_input = null;
+}
+
 pub fn deinit(self: *Self) void {
+    self.detachNativeInput();
     self.input_manager.removeDeviceListener(&self.device_listener);
     self.input_manager.removeResourceListener(&self.resource_listener);
     for (self.managers.items) |m| std.debug.assert(m.resource == null);
@@ -220,7 +225,8 @@ fn inputResourceCreated(ctx: *anyopaque, d: *InputManager.Device, ir: *river.Inp
 }
 fn createDevice(self: *Self, m: *Manager, d: *InputManager.Device, ir: *river.InputDeviceV1) !void {
     for (self.devices.items) |x| if (x.manager == m and x.device == d and x.resource != null) return;
-    const cfg = self.native_input.deviceConfig(d.id) orelse return;
+    const native_input = self.native_input orelse return;
+    const cfg = native_input.deviceConfig(d.id) orelse return;
     const r = try river.LibinputDeviceV1.create(m.resource.?.getClient(), @min(m.resource.?.getVersion(), 2), 0);
     errdefer r.destroy();
     const x = try self.allocator.create(Device);
@@ -272,7 +278,7 @@ fn apply(d: *Device, result_id: u32, status: ?NativeInput.Status) void {
 fn deviceRequest(r: *river.LibinputDeviceV1, req: river.LibinputDeviceV1.Request, d: *Device) void {
     if (req == .destroy) return r.destroy();
     if (d.removed or !d.device.connected) return;
-    const n = d.owner.native_input;
+    const n = d.owner.native_input orelse return;
     const id = d.device.id;
     switch (req) {
         .destroy => unreachable,
@@ -324,12 +330,14 @@ fn deviceRequest(r: *river.LibinputDeviceV1, req: river.LibinputDeviceV1.Request
 fn setEnum(d: *Device, r: *river.LibinputDeviceV1, result: u32, comptime T: type, raw: u32, setter: anytype) void {
     const value = enumValue(T, raw) orelse
         return r.postError(.invalid_arg, "invalid libinput configuration value");
-    apply(d, result, setter(d.owner.native_input, d.device.id, value));
+    const native_input = d.owner.native_input orelse return;
+    apply(d, result, setter(native_input, d.device.id, value));
 }
 fn broadcast(self: *Self, physical_id: NativeInput.PhysicalDeviceId) void {
+    const native_input = self.native_input orelse return;
     for (self.devices.items) |d| {
         if (d.resource == null or d.removed or d.device.physical_id != physical_id) continue;
-        const cfg = self.native_input.deviceConfig(d.device.id) orelse continue;
+        const cfg = native_input.deviceConfig(d.device.id) orelse continue;
         sendCurrents(d.resource.?, cfg);
         if (d.resource.?.getVersion() >= 2) d.resource.?.sendDone();
     }

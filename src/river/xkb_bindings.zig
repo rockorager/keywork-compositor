@@ -88,7 +88,7 @@ pub fn init(
     window_manager: *WindowManager,
     input_manager: *InputManager,
     keyboard_shortcuts_inhibit: *KeyboardShortcutsInhibit,
-    native_input: *NativeInput,
+    native_input: ?*NativeInput,
 ) !void {
     self.* = .{
         .allocator = allocator,
@@ -115,11 +115,13 @@ pub fn init(
     errdefer security_context.unrestrictGlobal(self.global);
     try input_manager.addDeviceListener(&self.device_listener);
     errdefer input_manager.removeDeviceListener(&self.device_listener);
-    native_input.setKeyboardEventListener(.{
-        .context = self,
-        .key = keyboardKey,
-        .modifiers = modifiersChanged,
-    });
+    if (native_input) |input| {
+        input.setKeyboardEventListener(.{
+            .context = self,
+            .key = keyboardKey,
+            .modifiers = modifiersChanged,
+        });
+    }
 }
 
 pub fn detachNativeInput(self: *Self) void {
@@ -346,12 +348,15 @@ fn keyPressed(self: *Self, event: NativeInput.KeyboardEvent) NativeInput.Keyboar
         if (!binding.active() or !seatMatchesDevice(binding.seat.?, event_device) or
             !binding.enabled or binding.modifiers != event.modifiers) continue;
         const keysym_matches = if (binding.layout_override) |layout|
-            self.native_input.?.keyboardMatchesKeysym(
-                event.device_id,
-                event.key_code,
-                layout,
-                binding.keysym,
-            )
+            if (self.native_input) |native_input|
+                native_input.keyboardMatchesKeysym(
+                    event.device_id,
+                    event.key_code,
+                    layout,
+                    binding.keysym,
+                )
+            else
+                false
         else
             containsKeysym(event.keysyms, binding.keysym);
         if (!keysym_matches) continue;

@@ -77,7 +77,7 @@ pub fn init(
     allocator: std.mem.Allocator,
     display: *wl.Server,
     security_context: *SecurityContext,
-    native_input: *NativeInput,
+    native_input: ?*NativeInput,
     outputs: *OutputLayout,
     target_output: OutputLayout.Id,
 ) !void {
@@ -102,11 +102,13 @@ pub fn init(
     errdefer self.global.destroy();
     try security_context.restrictGlobal(self.global);
     errdefer security_context.unrestrictGlobal(self.global);
-    native_input.setDeviceListener(.{
-        .context = self,
-        .added = deviceAdded,
-        .removed = deviceRemoved,
-    });
+    if (native_input) |input| {
+        input.setDeviceListener(.{
+            .context = self,
+            .added = deviceAdded,
+            .removed = deviceRemoved,
+        });
+    }
 }
 
 pub fn deinit(self: *Self) void {

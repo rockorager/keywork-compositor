@@ -790,68 +790,69 @@ pub fn create(
             self.native_input.deinit();
             self.native_input_initialized = false;
         }
-        try self.input_manager.init(
-            allocator,
-            display,
-            &self.security_context,
-            &self.native_input,
-            &self.outputs,
-            render_output.protocol_id,
-        );
-        self.input_manager_initialized = true;
-        errdefer {
-            self.input_manager.detachNativeInput();
-            self.input_manager.deinit();
-            self.input_manager_initialized = false;
-        }
-        self.input_manager.setSeatListener(.{
-            .context = self,
-            .created = inputSeatCreated,
-            .device_changed = inputDeviceSeatChanged,
-            .destroyed = inputSeatDestroyed,
-        });
-        errdefer self.input_manager.clearSeatListener();
-        try self.input_manager.addDeviceListener(&self.input_device_listener);
-        errdefer self.input_manager.removeDeviceListener(&self.input_device_listener);
-        try self.libinput_config.init(
-            allocator,
-            display,
-            &self.security_context,
-            &self.input_manager,
-            &self.native_input,
-        );
-        self.libinput_config_initialized = true;
-        errdefer {
-            self.libinput_config.deinit();
-            self.libinput_config_initialized = false;
-        }
-        try self.xkb_config.init(
-            allocator,
-            io,
-            display,
-            &self.security_context,
-            &self.input_manager,
-            &self.native_input,
-        );
-        self.xkb_config_initialized = true;
-        errdefer {
-            self.xkb_config.deinit();
-            self.xkb_config_initialized = false;
-        }
-        try self.xkb_bindings.init(
-            allocator,
-            display,
-            &self.security_context,
-            &self.window_manager,
-            &self.input_manager,
-            &self.keyboard_shortcuts_inhibit,
-            &self.native_input,
-        );
-        self.xkb_bindings_initialized = true;
-        errdefer {
-            self.xkb_bindings.deinit();
-            self.xkb_bindings_initialized = false;
-        }
+    }
+    const native_input = if (self.native_input_initialized) &self.native_input else null;
+    try self.input_manager.init(
+        allocator,
+        display,
+        &self.security_context,
+        native_input,
+        &self.outputs,
+        render_output.protocol_id,
+    );
+    self.input_manager_initialized = true;
+    errdefer {
+        self.input_manager.detachNativeInput();
+        self.input_manager.deinit();
+        self.input_manager_initialized = false;
+    }
+    self.input_manager.setSeatListener(.{
+        .context = self,
+        .created = inputSeatCreated,
+        .device_changed = inputDeviceSeatChanged,
+        .destroyed = inputSeatDestroyed,
+    });
+    errdefer self.input_manager.clearSeatListener();
+    try self.input_manager.addDeviceListener(&self.input_device_listener);
+    errdefer self.input_manager.removeDeviceListener(&self.input_device_listener);
+    try self.libinput_config.init(
+        allocator,
+        display,
+        &self.security_context,
+        &self.input_manager,
+        native_input,
+    );
+    self.libinput_config_initialized = true;
+    errdefer {
+        self.libinput_config.deinit();
+        self.libinput_config_initialized = false;
+    }
+    try self.xkb_config.init(
+        allocator,
+        io,
+        display,
+        &self.security_context,
+        &self.input_manager,
+        native_input,
+    );
+    self.xkb_config_initialized = true;
+    errdefer {
+        self.xkb_config.deinit();
+        self.xkb_config_initialized = false;
+    }
+    try self.xkb_bindings.init(
+        allocator,
+        display,
+        &self.security_context,
+        &self.window_manager,
+        &self.input_manager,
+        &self.keyboard_shortcuts_inhibit,
+        native_input,
+    );
+    self.xkb_bindings_initialized = true;
+    errdefer {
+        self.xkb_bindings.deinit();
+        self.xkb_bindings_initialized = false;
     }
     requestRepaint(self);
 
@@ -871,6 +872,7 @@ pub fn destroy(self: *Self) void {
     self.data_device.cancel();
     if (self.xkb_bindings_initialized) self.xkb_bindings.detachNativeInput();
     if (self.xkb_config_initialized) self.xkb_config.detachNativeInput();
+    if (self.libinput_config_initialized) self.libinput_config.detachNativeInput();
     if (self.input_manager_initialized) {
         self.input_manager.detachNativeInput();
         self.input_manager.removeDeviceListener(&self.input_device_listener);
@@ -1561,6 +1563,7 @@ fn drmOutputRemoving(context: *anyopaque, drm_output: *DrmOutput) void {
             if (self.native_input_initialized) {
                 if (self.xkb_bindings_initialized) self.xkb_bindings.detachNativeInput();
                 if (self.xkb_config_initialized) self.xkb_config.detachNativeInput();
+                if (self.libinput_config_initialized) self.libinput_config.detachNativeInput();
                 if (self.input_manager_initialized) self.input_manager.detachNativeInput();
                 self.native_input.deinit();
                 self.native_input_initialized = false;
@@ -5080,7 +5083,12 @@ fn submitWindowPopups(self: *Self, output: *Output, window_id: Scene.Id) void {
 
 test "server creates and destroys protocol globals" {
     const server = try Self.create(std.testing.allocator, std.testing.io, .cpu, .headless, null);
-    server.destroy();
+    defer server.destroy();
+    try std.testing.expect(!server.native_input_initialized);
+    try std.testing.expect(server.input_manager_initialized);
+    try std.testing.expect(server.libinput_config_initialized);
+    try std.testing.expect(server.xkb_config_initialized);
+    try std.testing.expect(server.xkb_bindings_initialized);
 }
 
 test "server adds and removes independent render outputs" {

@@ -17,6 +17,7 @@ global: *wl.Global,
 security_context: *SecurityContext,
 input_manager: *InputManager,
 native_input: ?*NativeInput,
+keymap_compiler: NativeInput.KeymapCompiler,
 managers: std.ArrayList(*Manager),
 keymaps: std.ArrayList(*Keymap),
 keyboards: std.ArrayList(*Keyboard),
@@ -59,7 +60,7 @@ pub fn init(
     display: *wl.Server,
     security_context: *SecurityContext,
     input_manager: *InputManager,
-    native_input: *NativeInput,
+    native_input: ?*NativeInput,
 ) !void {
     self.* = .{
         .allocator = allocator,
@@ -68,6 +69,7 @@ pub fn init(
         .security_context = security_context,
         .input_manager = input_manager,
         .native_input = native_input,
+        .keymap_compiler = undefined,
         .managers = .empty,
         .keymaps = .empty,
         .keyboards = .empty,
@@ -82,6 +84,8 @@ pub fn init(
         },
     };
     errdefer self.deinitStorage();
+    try self.keymap_compiler.init(allocator, io);
+    errdefer self.keymap_compiler.deinit();
     self.global = try wl.Global.create(display, river.XkbConfigV1, 2, *Self, self, bind);
     errdefer self.global.destroy();
     try security_context.restrictGlobal(self.global);
@@ -90,10 +94,12 @@ pub fn init(
     errdefer input_manager.removeResourceListener(&self.resource_listener);
     try input_manager.addDeviceListener(&self.device_listener);
     errdefer input_manager.removeDeviceListener(&self.device_listener);
-    native_input.setKeyboardStateListener(.{
-        .context = self,
-        .changed = keyboardStateChanged,
-    });
+    if (native_input) |input| {
+        input.setKeyboardStateListener(.{
+            .context = self,
+            .changed = keyboardStateChanged,
+        });
+    }
 }
 
 pub fn detachNativeInput(self: *Self) void {
@@ -112,6 +118,7 @@ pub fn deinit(self: *Self) void {
     self.security_context.unrestrictGlobal(self.global);
     self.global.destroy();
     self.deinitStorage();
+    self.keymap_compiler.deinit();
     self.* = undefined;
 }
 
@@ -240,7 +247,7 @@ fn createKeymap(
         else => return resource.sendFailure("failed to map keymap fd"),
     };
     defer std.posix.munmap(mapping);
-    keymap.keymap = self.native_input.?.compileKeymap(format, mapping) catch |err| switch (err) {
+    keymap.keymap = self.keymap_compiler.compile(format, mapping) catch |err| switch (err) {
         error.OutOfMemory => return resource.postNoMemory(),
         else => return resource.sendFailure("failed to store compiled keymap"),
     };
@@ -300,7 +307,8 @@ fn createKeyboard(
     for (self.keyboards.items) |keyboard| {
         if (keyboard.manager == manager and keyboard.device == device and keyboard.resource != null) return;
     }
-    const native_state = self.native_input.?.keyboardState(device.id) orelse return;
+    const native_input = self.native_input orelse return;
+    const native_state = native_input.keyboardState(device.id) orelse return;
     const resource = try river.XkbKeyboardV1.create(
         manager.resource.?.getClient(),
         @min(manager.resource.?.getVersion(), river.XkbKeyboardV1.generated_version),
