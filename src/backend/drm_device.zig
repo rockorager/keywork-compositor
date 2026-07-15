@@ -104,6 +104,15 @@ pub fn setOutputEnabled(self: *Self, output: *DrmOutput, enabled: bool) !void {
     try output.setEnabled(self.device.?.fd, enabled);
 }
 
+pub fn setOutputPowered(self: *Self, output: *DrmOutput, powered: bool) !void {
+    if (self.failed or self.device == null or !self.session.isActive()) {
+        return error.SessionInactive;
+    }
+    if (self.findOutput(output.connector_id) != output) return error.UnknownOutput;
+    if (!powered) try self.waitOutputIdle(output);
+    try output.setPowered(self.device.?.fd, powered);
+}
+
 pub fn setOutputMode(self: *Self, output: *DrmOutput, mode_index: usize) !void {
     if (self.failed or self.device == null or !self.session.isActive()) {
         return error.SessionInactive;

@@ -47,6 +47,7 @@ acquired: ?usize,
 pending: ?usize,
 displayed: ?usize,
 enabled: bool,
+powered: bool,
 mode_set: bool,
 retired: bool,
 
@@ -137,6 +138,7 @@ pub fn init(
         .pending = null,
         .displayed = null,
         .enabled = true,
+        .powered = true,
         .mode_set = false,
         .retired = false,
     };
@@ -201,7 +203,7 @@ pub fn logicalSize(self: *const Self) render.Size {
 }
 
 pub fn ready(self: *const Self) bool {
-    if (!self.enabled or !self.device_access.active(self.device_access.context) or
+    if (!self.enabled or !self.powered or !self.device_access.active(self.device_access.context) or
         self.acquired != null or self.pending != null) return false;
     return self.availableBuffer() != null;
 }
@@ -328,7 +330,7 @@ pub fn activate(self: *Self, fd: std.posix.fd_t, selection: Selection, device_pa
         self.old_crtc = null;
     }
 
-    if (self.enabled) {
+    if (self.powered) {
         log.info(
             "allocating scanout buffers for connector {s} at {d}x{d}",
             .{ self.name(), self.size.width, self.size.height },
@@ -339,8 +341,8 @@ pub fn activate(self: *Self, fd: std.posix.fd_t, selection: Selection, device_pa
         }
     }
     log.info(
-        "activated connector {s} ({d}) on {s} at {d}x{d}, CRTC {d}, enabled={}: {s}",
-        .{ self.name(), self.connector_id, device_path, self.size.width, self.size.height, self.crtc_id, self.enabled, self.description() },
+        "activated connector {s} ({d}) on {s} at {d}x{d}, CRTC {d}, enabled={}, powered={}: {s}",
+        .{ self.name(), self.connector_id, device_path, self.size.width, self.size.height, self.crtc_id, self.enabled, self.powered, self.description() },
     );
 }
 
@@ -397,7 +399,7 @@ pub fn deactivate(self: *Self, fd: std.posix.fd_t) void {
 }
 
 pub fn disconnect(self: *Self, fd: std.posix.fd_t) void {
-    if (self.enabled and
+    if (self.powered and
         c.drmModeSetCrtc(fd, self.crtc_id, 0, 0, 0, null, 0, null) != 0)
     {
         log.warn("failed to disable disconnected CRTC {d}", .{self.crtc_id});
@@ -421,9 +423,24 @@ pub fn setEnabled(self: *Self, fd: std.posix.fd_t, enabled: bool) !void {
     if (self.enabled == enabled) return;
     std.debug.assert(self.old_crtc != null);
     if (enabled) {
+        self.enabled = true;
+        errdefer self.enabled = false;
+        try self.setPowered(fd, true);
+        return;
+    }
+
+    if (self.powered) try self.setPowered(fd, false);
+    self.enabled = false;
+}
+
+pub fn setPowered(self: *Self, fd: std.posix.fd_t, powered: bool) !void {
+    if (!self.enabled) return error.OutputDisabled;
+    if (self.powered == powered) return;
+    std.debug.assert(self.old_crtc != null);
+    if (powered) {
         errdefer for (&self.buffers) |*buffer| destroyBuffer(fd, buffer);
         for (&self.buffers) |*buffer| try createBuffer(fd, self.size, buffer);
-        self.enabled = true;
+        self.powered = true;
         self.mode_set = false;
         return;
     }
@@ -437,7 +454,7 @@ pub fn setEnabled(self: *Self, fd: std.posix.fd_t, enabled: bool) !void {
         return error.DisableFailed;
     }
     self.notifyDeactivated();
-    self.enabled = false;
+    self.powered = false;
     self.mode_set = false;
     self.displayed = null;
     for (&self.buffers) |*buffer| destroyBuffer(fd, buffer);
@@ -450,7 +467,7 @@ pub fn setMode(self: *Self, fd: std.posix.fd_t, mode_index: usize) !void {
     const mode = self.modes[mode_index];
     const size = mode.size();
 
-    if (self.enabled) {
+    if (self.powered) {
         var buffers: [buffer_count]Buffer = .{ .{}, .{} };
         errdefer for (&buffers) |*buffer| destroyBuffer(fd, buffer);
         for (&buffers) |*buffer| try createBuffer(fd, size, buffer);

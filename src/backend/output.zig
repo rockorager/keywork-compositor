@@ -160,6 +160,13 @@ pub fn ready(self: *const Self) bool {
     };
 }
 
+pub fn powered(self: *const Self) bool {
+    return switch (self.backend) {
+        .drm => |output| output.powered,
+        .headless, .nested => true,
+    };
+}
+
 pub fn repaintDelayMilliseconds(self: *const Self) i32 {
     return switch (self.backend) {
         .drm => 1,
