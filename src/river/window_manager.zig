@@ -1728,6 +1728,29 @@ fn windowRequest(
         manager.postNoMemory();
         return;
     };
+    switch (request) {
+        // River has no activation or unminimize request events, so apply these
+        // compatibility requests at the window-policy ownership boundary.
+        .activate => |seat| {
+            const seat_state = self.seatState(seat) orelse return;
+            if (self.layer_focus == .exclusive or self.layer_focus_sent == .exclusive) return;
+            const window = self.windows.get(id) orelse return;
+            _ = self.layer_shell.relinquishNonExclusiveFocus();
+            seat_state.pending_focus = .{ .window = id };
+            window.requested_visible = true;
+            window.requested_configuration.suspended = false;
+            self.requestManage();
+            return;
+        },
+        .unminimize => {
+            const window = self.windows.get(id) orelse return;
+            window.requested_visible = true;
+            window.requested_configuration.suspended = false;
+            self.requestManage();
+            return;
+        },
+        else => {},
+    }
     const pending: PendingWindowRequest.Request = switch (request) {
         .pointer_move => .pointer_move,
         .pointer_resize => |edges| .{ .pointer_resize = .{
@@ -1745,6 +1768,7 @@ fn windowRequest(
             null },
         .exit_fullscreen => .exit_fullscreen,
         .minimize => .minimize,
+        .unminimize, .activate => unreachable,
     };
     self.window_requests.append(self.allocator, .{ .id = id, .request = pending }) catch {
         manager.postNoMemory();

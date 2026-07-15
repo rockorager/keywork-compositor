@@ -115,6 +115,7 @@ data_device: DataDevice,
 primary_selection: PrimarySelection,
 data_control: DataControl,
 foreign_toplevel_list: ForeignToplevelList,
+foreign_toplevel_list_initialized: bool,
 text_input: TextInput,
 input_method: InputMethod,
 virtual_keyboard: VirtualKeyboard,
@@ -278,6 +279,7 @@ pub fn create(
         .primary_selection = undefined,
         .data_control = undefined,
         .foreign_toplevel_list = undefined,
+        .foreign_toplevel_list_initialized = false,
         .text_input = undefined,
         .input_method = undefined,
         .virtual_keyboard = undefined,
@@ -572,8 +574,13 @@ pub fn create(
         display,
         &self.security_context,
         &self.xdg_shell,
+        &self.outputs,
     );
-    errdefer self.foreign_toplevel_list.deinit();
+    self.foreign_toplevel_list_initialized = true;
+    errdefer {
+        self.foreign_toplevel_list.deinit();
+        self.foreign_toplevel_list_initialized = false;
+    }
     self.subcompositor.setRepaintListener(.{
         .context = self,
         .request = requestRepaint,
@@ -725,6 +732,7 @@ pub fn destroy(self: *Self) void {
         self.output_management_initialized = false;
     }
     self.foreign_toplevel_list.deinit();
+    self.foreign_toplevel_list_initialized = false;
     self.window_manager.deinit();
     self.window_manager_initialized = false;
     self.virtual_keyboard.deinit();
@@ -1115,6 +1123,9 @@ fn removeRenderOutput(self: *Self, id: RenderOutputId) bool {
     const render_output = self.render_outputs.remove(id) orelse return false;
     stopRenderOutput(render_output);
     const protocol_output = self.outputs.get(render_output.protocol_id).?;
+    if (self.foreign_toplevel_list_initialized) {
+        self.foreign_toplevel_list.removeOutput(render_output.protocol_id);
+    }
     if (self.output_power_initialized) self.output_power.removeOutput(render_output.protocol_id);
     if (self.window_manager_initialized) {
         self.window_manager.outputRemoved(render_output.protocol_id);
@@ -3038,6 +3049,7 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
 
     const presented = render_output.backend.present() catch return error.InvalidTarget;
     output.endFrame();
+    self.foreign_toplevel_list.syncOutput(render_output.protocol_id);
 
     self.submitLayerSurfaces(output, .background);
     self.submitLayerSurfaces(output, .bottom);
@@ -3102,6 +3114,7 @@ fn renderSessionLockFrame(
     const presented = frame.render_output.backend.present() catch return error.InvalidTarget;
     frame.render_output.lock_frame_pending = true;
     frame.output.endFrame();
+    self.foreign_toplevel_list.syncOutput(frame.render_output.protocol_id);
     if (lock_surface) |info| self.submitSurfaceTree(frame.output, info.surface_id);
     self.submitSeatCursor(frame.output, &self.seat, true);
     for (self.dynamic_seats.items) |entry| {

@@ -149,6 +149,7 @@ pub const WindowState = struct {
     current_max_size: SizeHint = .{},
     decoration_preference: DecorationPreference = .only_csd,
     decoration_configure_requested: bool = false,
+    configuration: ToplevelConfigure = .{},
     mapped: bool = false,
     ready: bool = false,
 
@@ -177,6 +178,7 @@ pub const WindowState = struct {
         self.pending_max_size = .{};
         self.current_min_size = .{};
         self.current_max_size = .{};
+        self.configuration = .{};
         self.mapped = false;
         self.ready = false;
     }
@@ -255,6 +257,8 @@ pub const WindowRequest = union(enum) {
     fullscreen: ?*wl.Output,
     exit_fullscreen,
     minimize,
+    unminimize,
+    activate: *Seat,
 };
 
 pub const WindowInfo = struct {
@@ -267,6 +271,7 @@ pub const WindowInfo = struct {
     max_size: SizeHint,
     decoration_preference: DecorationPreference,
     decoration_configure_requested: bool,
+    configuration: ToplevelConfigure,
     dimensions: ?Dimensions,
     ready: bool,
     mapped: bool,
@@ -288,6 +293,7 @@ pub const WindowObserver = struct {
     unmapped: *const fn (*anyopaque, WindowId) void,
     destroyed: *const fn (*anyopaque, WindowId) void,
     metadata_changed: *const fn (*anyopaque, WindowId) void,
+    state_changed: *const fn (*anyopaque, WindowId) void,
 };
 
 pub const WindowIterator = struct {
@@ -421,6 +427,7 @@ pub fn windowInfo(self: *Self, id: WindowId) ?WindowInfo {
         .max_size = window.current_max_size,
         .decoration_preference = window.decoration_preference,
         .decoration_configure_requested = window.decoration_configure_requested,
+        .configuration = window.configuration,
         .dimensions = dimensions,
         .ready = window.ready,
         .mapped = window.mapped,
@@ -431,6 +438,11 @@ pub fn windowSurface(self: *Self, id: WindowId) ?Surface.Id {
     const window = self.windows.get(id) orelse return null;
     const xdg_surface = self.xdg_surfaces.get(window.xdg_surface_id) orelse return null;
     return xdg_surface.surface_id;
+}
+
+pub fn requestWindow(self: *Self, id: WindowId, request: WindowRequest) void {
+    if (self.windows.get(id) == null) return;
+    if (self.window_listener) |listener| listener.request(listener.context, id, request);
 }
 
 pub const AttachPopupError = error{
@@ -622,6 +634,10 @@ pub fn configureWindowState(
     toplevel.sendConfigure(dimensions.width, dimensions.height, &states_array);
     adapter.xdg_surface_resource.resource.sendConfigure(serial);
     state.initial_configure_sent = true;
+    if (!std.meta.eql(window.configuration, configuration)) {
+        window.configuration = configuration;
+        self.notifyWindowStateChanged(id);
+    }
     return serial;
 }
 
@@ -959,6 +975,10 @@ fn notifyWindowUnmapped(self: *Self, window_id: WindowId) void {
 fn notifyWindowDestroyed(self: *Self, window_id: WindowId) void {
     if (self.window_listener) |listener| listener.destroyed(listener.context, window_id);
     for (self.window_observers.items) |observer| observer.destroyed(observer.context, window_id);
+}
+
+fn notifyWindowStateChanged(self: *Self, window_id: WindowId) void {
+    for (self.window_observers.items) |observer| observer.state_changed(observer.context, window_id);
 }
 
 fn isTopmostPopup(self: *Self, id: PopupId) bool {
@@ -2270,9 +2290,7 @@ const ToplevelResource = struct {
     }
 
     fn forwardRequest(self: *ToplevelResource, request: WindowRequest) void {
-        if (self.shell.window_listener) |listener| {
-            listener.request(listener.context, self.id, request);
-        }
+        self.shell.requestWindow(self.id, request);
     }
 
     fn acceptsUserAction(

@@ -883,15 +883,16 @@
       "interfaces": [
         {
           "name": "zwlr_foreign_toplevel_manager_v1",
-          "current_version": null,
+          "current_version": 3,
           "target_version": 3
         }
       ],
-      "status": "not_started",
+      "status": "done",
       "privileged": true,
       "blocked_by": [
         "ext-foreign-toplevel-list"
-      ]
+      ],
+      "status_detail": "Deprecated compatibility protocol version 3 shares the ext foreign-toplevel mapping inventory and provides title/app-id, parent, state, output membership, close, activation, maximize, minimize, fullscreen, rectangle validation, stopped-manager teardown, and sandboxed-client global filtering."
     },
     {
       "id": "workspace",
