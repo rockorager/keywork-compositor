@@ -4,14 +4,11 @@ const Self = @This();
 
 const std = @import("std");
 const wayland = @import("wayland");
+const DataDevice = @import("../wayland/data_device.zig");
 const Surface = @import("../wayland/surface.zig");
+const XSelection = @import("selection.zig");
 
-const c = @cImport({
-    @cInclude("stdlib.h");
-    @cInclude("xcb/xcb.h");
-    @cInclude("xcb/composite.h");
-    @cInclude("xcb/xcb_icccm.h");
-});
+const c = @import("xcb.zig").c;
 const wl = wayland.server.wl;
 const log = std.log.scoped(.xwm);
 
@@ -24,6 +21,7 @@ atoms: [atom_count]c.xcb_atom_t,
 windows: std.AutoHashMapUnmanaged(WindowId, Window),
 serial_windows: std.AutoHashMapUnmanaged(u64, WindowId),
 focused_window: ?WindowId,
+clipboard_selection: XSelection,
 listener: Listener,
 
 pub const WindowId = u32;
@@ -109,6 +107,9 @@ const Atom = enum {
     wm_state,
     wm_change_state,
     wl_surface_serial,
+    clipboard,
+    targets,
+    text,
 };
 
 const atom_count = std.meta.fields(Atom).len;
@@ -132,6 +133,9 @@ const atom_names: [atom_count][]const u8 = .{
     "WM_STATE",
     "WM_CHANGE_STATE",
     "WL_SURFACE_SERIAL",
+    "CLIPBOARD",
+    "TARGETS",
+    "TEXT",
 };
 
 pub const Listener = struct {
@@ -157,6 +161,7 @@ pub fn init(
     allocator: std.mem.Allocator,
     event_loop: *wl.EventLoop,
     fd: std.posix.fd_t,
+    data_device: *DataDevice,
     listener: Listener,
 ) !void {
     const connection = c.xcb_connect_to_fd(fd, null) orelse {
@@ -182,6 +187,7 @@ pub fn init(
         .windows = .empty,
         .serial_windows = .empty,
         .focused_window = null,
+        .clipboard_selection = undefined,
         .listener = listener,
     };
 
@@ -222,6 +228,20 @@ pub fn init(
     try self.publishWmIdentity();
     try self.claimSelection(.wm_s0);
     try self.claimSelection(.net_wm_cm_s0);
+    try self.clipboard_selection.init(
+        allocator,
+        event_loop,
+        connection,
+        screen,
+        .{
+            .selection = self.atomValue(.clipboard),
+            .targets = self.atomValue(.targets),
+            .utf8_string = self.atomValue(.utf8_string),
+            .text = self.atomValue(.text),
+        },
+        .{ .clipboard = data_device },
+    );
+    errdefer self.clipboard_selection.deinit();
     if (c.xcb_flush(connection) <= 0) return error.XcbFlushFailed;
 
     const event_fd = c.xcb_get_file_descriptor(connection);
@@ -238,6 +258,7 @@ pub fn init(
 
 pub fn deinit(self: *Self) void {
     self.event_source.remove();
+    self.clipboard_selection.deinit();
     while (self.windows.count() > 0) {
         var iterator = self.windows.iterator();
         const entry = iterator.next().?;
@@ -1019,6 +1040,7 @@ fn dispatchEvent(self: *Self, event: [*c]c.xcb_generic_event_t) !void {
         c.XCB_CONFIGURE_NOTIFY => self.handleConfigureNotify(@ptrCast(event)),
         c.XCB_PROPERTY_NOTIFY => try self.handlePropertyNotify(@ptrCast(event)),
         c.XCB_CLIENT_MESSAGE => try self.handleClientMessage(@ptrCast(event)),
+        c.XCB_SELECTION_REQUEST => self.handleSelectionRequest(@ptrCast(event)),
         else => {},
     }
 }
@@ -1047,7 +1069,14 @@ fn handleCreate(self: *Self, event: *const c.xcb_create_notify_event_t) !void {
 }
 
 fn handleDestroy(self: *Self, event: *const c.xcb_destroy_notify_event_t) void {
+    self.clipboard_selection.handleRequestorDestroyed(event.window);
     self.removeWindow(event.window);
+}
+
+fn handleSelectionRequest(self: *Self, event: *const c.xcb_selection_request_event_t) void {
+    if (self.clipboard_selection.handlesSelection(event.selection)) {
+        self.clipboard_selection.handleRequest(event);
+    }
 }
 
 fn removeWindow(self: *Self, window_id: WindowId) void {

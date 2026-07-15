@@ -3238,7 +3238,7 @@ fn xwaylandReady(
 ) bool {
     const self: *Self = @ptrCast(@alignCast(context));
     std.debug.assert(!self.xwm_initialized);
-    self.xwm.init(self.allocator, self.display.getEventLoop(), wm_fd, .{
+    self.xwm.init(self.allocator, self.display.getEventLoop(), wm_fd, &self.data_device, .{
         .context = self,
         .failed = xwmFailed,
         .created = xwmWindowCreated,
