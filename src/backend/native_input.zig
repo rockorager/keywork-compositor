@@ -1369,8 +1369,6 @@ fn pointerButton(self: *Self, event: *c.struct_libinput_event_pointer) void {
     const device = self.eventInputDevice(c.libinput_event_pointer_get_base_event(event).?, .pointer) orelse return;
     const pressed = c.libinput_event_pointer_get_button_state(event) ==
         c.LIBINPUT_BUTTON_STATE_PRESSED;
-    const seat_button_count = c.libinput_event_pointer_get_seat_button_count(event);
-    if ((pressed and seat_button_count != 1) or (!pressed and seat_button_count != 0)) return;
     self.listener.pointer_button(
         self.listener.context,
         device.info.id,

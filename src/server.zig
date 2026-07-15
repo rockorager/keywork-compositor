@@ -95,6 +95,9 @@ seat: Seat,
 dynamic_seats: std.ArrayList(*SeatEntry),
 input_device_listener: InputManager.DeviceListener,
 routed_keys: std.ArrayList(RoutedKey),
+routed_buttons: std.ArrayList(RoutedButton),
+routed_touches: std.ArrayList(RoutedTouch),
+next_touch_id: u31,
 data_device: DataDevice,
 primary_selection: PrimarySelection,
 text_input: TextInput,
@@ -142,6 +145,19 @@ const RoutedKey = struct {
     device_id: NativeInput.DeviceId,
     seat: *Seat,
     key: u32,
+};
+
+const RoutedButton = struct {
+    device_id: NativeInput.DeviceId,
+    seat: *Seat,
+    button: u32,
+};
+
+const RoutedTouch = struct {
+    device_id: NativeInput.DeviceId,
+    native_id: i32,
+    seat: *Seat,
+    protocol_id: i32,
 };
 
 const RenderOutputStore = slot_map.SlotMap(*RenderOutput, enum { render_output });
@@ -225,6 +241,9 @@ pub fn create(
             .removed = inputDeviceRemoved,
         },
         .routed_keys = .empty,
+        .routed_buttons = .empty,
+        .routed_touches = .empty,
+        .next_touch_id = 0,
         .data_device = undefined,
         .primary_selection = undefined,
         .text_input = undefined,
@@ -242,6 +261,8 @@ pub fn create(
         .socket_buffer = undefined,
         .listening = false,
     };
+    errdefer self.routed_touches.deinit(allocator);
+    errdefer self.routed_buttons.deinit(allocator);
     errdefer self.routed_keys.deinit(allocator);
     errdefer self.dynamic_seats.deinit(allocator);
     errdefer self.render_outputs.deinit(allocator);
@@ -640,6 +661,8 @@ pub fn destroy(self: *Self) void {
     }
     self.outputs.deinit();
     self.render_outputs.deinit(allocator);
+    self.routed_touches.deinit(allocator);
+    self.routed_buttons.deinit(allocator);
     self.routed_keys.deinit(allocator);
     for (self.dynamic_seats.items) |entry| {
         entry.seat.deinit();
@@ -841,6 +864,8 @@ fn inputDeviceRemoved(context: *anyopaque, device: *InputManager.Device) void {
     const self: *Self = @ptrCast(@alignCast(context));
     const seat = self.seatForName(device.seat_name) orelse return;
     if (device.device_type == .keyboard) self.releaseDeviceKeys(device.id);
+    if (device.device_type == .pointer) self.releaseDeviceButtons(device.id);
+    if (device.device_type == .touch) self.cancelDeviceTouches(device.id);
     self.refreshSeatCapabilities(seat, device.seat_name);
     if (device.device_type == .keyboard) self.prepareAnySeatKeyboard(seat, device.seat_name);
 }
@@ -852,6 +877,8 @@ fn inputDeviceSeatChanged(
 ) void {
     const self: *Self = @ptrCast(@alignCast(context));
     if (device.device_type == .keyboard) self.releaseDeviceKeys(device.id);
+    if (device.device_type == .pointer) self.releaseDeviceButtons(device.id);
+    if (device.device_type == .touch) self.cancelDeviceTouches(device.id);
     if (self.seatForName(previous_name)) |previous| {
         self.refreshSeatCapabilities(previous, previous_name);
         if (device.device_type == .keyboard) self.prepareAnySeatKeyboard(previous, previous_name);
@@ -1268,12 +1295,12 @@ fn sessionLockStateChanged(context: *anyopaque, locked: bool) void {
     const self: *Self = @ptrCast(@alignCast(context));
     self.pointer_constraints.deactivateAll();
     self.data_device.cancel();
-    self.seat.touchCancel();
+    self.cancelSeatTouches(&self.seat);
     self.seat.suppressPointerFocus(true);
     self.window_manager.pointerMoved(null);
     for (self.dynamic_seats.items) |entry| {
         if (entry.removed) continue;
-        entry.seat.touchCancel();
+        self.cancelSeatTouches(&entry.seat);
         entry.seat.suppressPointerFocus(true);
         self.window_manager.pointerMovedForSeat(&entry.seat, null);
     }
@@ -1393,47 +1420,56 @@ fn nativeKeyboardRepeatInfo(context: *anyopaque, source: ?NativeInput.DeviceId, 
     const seat = if (source) |id| self.seatForDevice(id) else &self.seat;
     seat.setRepeatInfo(rate, delay);
 }
-fn nativePointerMotion(context: *anyopaque, _: NativeInput.DeviceId, time: u32, x: f64, y: f64) void {
-    pointerMotion(context, time, x, y);
+fn nativePointerMotion(context: *anyopaque, id: NativeInput.DeviceId, time: u32, x: f64, y: f64) void {
+    const output: *RenderOutput = @ptrCast(@alignCast(context));
+    pointerMotionForSeat(output, output.server.seatForDevice(id), time, x, y);
 }
-fn nativePointerRelativeMotion(context: *anyopaque, _: NativeInput.DeviceId, time: u64, dx: f64, dy: f64, dx_unaccelerated: f64, dy_unaccelerated: f64) void {
-    pointerRelativeMotion(context, time, dx, dy, dx_unaccelerated, dy_unaccelerated);
+fn nativePointerRelativeMotion(context: *anyopaque, id: NativeInput.DeviceId, time: u64, dx: f64, dy: f64, dx_unaccelerated: f64, dy_unaccelerated: f64) void {
+    const self = serverForOutput(context);
+    if (self.seatForDevice(id) == &self.seat) {
+        self.relative_pointer.motion(time, dx, dy, dx_unaccelerated, dy_unaccelerated);
+    }
 }
-fn nativePointerButton(context: *anyopaque, _: NativeInput.DeviceId, time: u32, button: u32, state: wl.Pointer.ButtonState) void {
-    pointerButton(context, time, button, state);
+fn nativePointerButton(context: *anyopaque, id: NativeInput.DeviceId, time: u32, button: u32, state: wl.Pointer.ButtonState) void {
+    const self = serverForOutput(context);
+    self.routePointerButton(id, time, button, state);
 }
-fn nativePointerAxis(context: *anyopaque, _: NativeInput.DeviceId, time: u32, axis: wl.Pointer.Axis, value: wl.Fixed) void {
-    pointerAxis(context, time, axis, value);
+fn nativePointerAxis(context: *anyopaque, id: NativeInput.DeviceId, time: u32, axis: wl.Pointer.Axis, value: wl.Fixed) void {
+    serverForOutput(context).seatForDevice(id).pointerAxis(time, axis, value);
 }
-fn nativePointerFrame(context: *anyopaque, _: NativeInput.DeviceId) void {
-    pointerFrame(context);
+fn nativePointerFrame(context: *anyopaque, id: NativeInput.DeviceId) void {
+    serverForOutput(context).seatForDevice(id).pointerFrame();
 }
-fn nativePointerAxisSource(context: *anyopaque, _: NativeInput.DeviceId, source: wl.Pointer.AxisSource) void {
-    pointerAxisSource(context, source);
+fn nativePointerAxisSource(context: *anyopaque, id: NativeInput.DeviceId, source: wl.Pointer.AxisSource) void {
+    serverForOutput(context).seatForDevice(id).pointerAxisSource(source);
 }
-fn nativePointerAxisStop(context: *anyopaque, _: NativeInput.DeviceId, time: u32, axis: wl.Pointer.Axis) void {
-    pointerAxisStop(context, time, axis);
+fn nativePointerAxisStop(context: *anyopaque, id: NativeInput.DeviceId, time: u32, axis: wl.Pointer.Axis) void {
+    serverForOutput(context).seatForDevice(id).pointerAxisStop(time, axis);
 }
-fn nativePointerAxisDiscrete(context: *anyopaque, _: NativeInput.DeviceId, axis: wl.Pointer.Axis, discrete: i32) void {
-    pointerAxisDiscrete(context, axis, discrete);
+fn nativePointerAxisDiscrete(context: *anyopaque, id: NativeInput.DeviceId, axis: wl.Pointer.Axis, discrete: i32) void {
+    serverForOutput(context).seatForDevice(id).pointerAxisDiscrete(axis, discrete);
 }
-fn nativePointerAxisValue120(context: *anyopaque, _: NativeInput.DeviceId, axis: wl.Pointer.Axis, value: i32) void {
-    pointerAxisValue120(context, axis, value);
+fn nativePointerAxisValue120(context: *anyopaque, id: NativeInput.DeviceId, axis: wl.Pointer.Axis, value: i32) void {
+    serverForOutput(context).seatForDevice(id).pointerAxisValue120(axis, value);
 }
-fn nativeTouchDown(context: *anyopaque, _: NativeInput.DeviceId, time: u32, id: i32, x: f64, y: f64) void {
-    touchDown(context, time, id, x, y);
+fn nativeTouchDown(context: *anyopaque, device_id: NativeInput.DeviceId, time: u32, id: i32, x: f64, y: f64) void {
+    const output: *RenderOutput = @ptrCast(@alignCast(context));
+    output.server.routeTouchDown(output, device_id, time, id, x, y);
 }
-fn nativeTouchUp(context: *anyopaque, _: NativeInput.DeviceId, time: u32, id: i32) void {
-    touchUp(context, time, id);
+fn nativeTouchUp(context: *anyopaque, device_id: NativeInput.DeviceId, time: u32, id: i32) void {
+    serverForOutput(context).routeTouchUp(device_id, time, id);
 }
-fn nativeTouchMotion(context: *anyopaque, _: NativeInput.DeviceId, time: u32, id: i32, x: f64, y: f64) void {
-    touchMotion(context, time, id, x, y);
+fn nativeTouchMotion(context: *anyopaque, device_id: NativeInput.DeviceId, time: u32, id: i32, x: f64, y: f64) void {
+    const output: *RenderOutput = @ptrCast(@alignCast(context));
+    output.server.routeTouchMotion(output, device_id, time, id, x, y);
 }
-fn nativeTouchFrame(context: *anyopaque, _: NativeInput.DeviceId) void {
-    touchFrame(context);
+fn nativeTouchFrame(context: *anyopaque, device_id: NativeInput.DeviceId) void {
+    const self = serverForOutput(context);
+    const seat = self.touchSeatForDevice(device_id) orelse self.seatForDevice(device_id);
+    seat.touchFrame();
 }
-fn nativeTouchCancel(context: *anyopaque, _: NativeInput.DeviceId) void {
-    touchCancel(context);
+fn nativeTouchCancel(context: *anyopaque, device_id: NativeInput.DeviceId) void {
+    serverForOutput(context).cancelDeviceTouches(device_id);
 }
 
 fn routeKeyboardKey(
@@ -1492,6 +1528,163 @@ fn seatKeyHeld(self: *const Self, seat: *Seat, key: u32) bool {
         if (routed.seat == seat and routed.key == key) return true;
     }
     return false;
+}
+
+fn routePointerButton(
+    self: *Self,
+    device_id: NativeInput.DeviceId,
+    time: u32,
+    button: u32,
+    state: wl.Pointer.ButtonState,
+) void {
+    const seat = self.seatForDevice(device_id);
+    switch (state) {
+        .pressed => {
+            for (self.routed_buttons.items) |routed| {
+                if (routed.device_id == device_id and routed.button == button) return;
+            }
+            const already_pressed = self.seatButtonHeld(seat, button);
+            self.routed_buttons.append(self.allocator, .{
+                .device_id = device_id,
+                .seat = seat,
+                .button = button,
+            }) catch return self.terminate();
+            if (already_pressed) return;
+        },
+        .released => {
+            for (self.routed_buttons.items, 0..) |routed, index| {
+                if (routed.device_id != device_id or routed.button != button) continue;
+                _ = self.routed_buttons.orderedRemove(index);
+                if (self.seatButtonHeld(routed.seat, button)) return;
+                self.pointerButtonForSeat(routed.seat, time, button, state);
+                return;
+            }
+            return;
+        },
+        else => return,
+    }
+    self.pointerButtonForSeat(seat, time, button, state);
+}
+
+fn releaseDeviceButtons(self: *Self, device_id: NativeInput.DeviceId) void {
+    var index: usize = 0;
+    while (index < self.routed_buttons.items.len) {
+        const routed = self.routed_buttons.items[index];
+        if (routed.device_id != device_id) {
+            index += 1;
+            continue;
+        }
+        _ = self.routed_buttons.orderedRemove(index);
+        if (self.seatButtonHeld(routed.seat, routed.button)) continue;
+        self.pointerButtonForSeat(routed.seat, 0, routed.button, .released);
+    }
+}
+
+fn seatButtonHeld(self: *const Self, seat: *Seat, button: u32) bool {
+    for (self.routed_buttons.items) |routed| {
+        if (routed.seat == seat and routed.button == button) return true;
+    }
+    return false;
+}
+
+fn routeTouchDown(
+    self: *Self,
+    output: *RenderOutput,
+    device_id: NativeInput.DeviceId,
+    time: u32,
+    native_id: i32,
+    x: f64,
+    y: f64,
+) void {
+    for (self.routed_touches.items) |touch| {
+        if (touch.device_id == device_id and touch.native_id == native_id) return;
+    }
+    const seat = self.seatForDevice(device_id);
+    const protocol_id = self.allocateTouchId(seat);
+    self.routed_touches.append(self.allocator, .{
+        .device_id = device_id,
+        .native_id = native_id,
+        .seat = seat,
+        .protocol_id = protocol_id,
+    }) catch return self.terminate();
+
+    const point = output.globalPoint(x, y);
+    const focus = self.pointerFocus(point.x, point.y);
+    if (self.session_lock.isLocked()) {
+        if (focus) |target| {
+            self.session_lock.pointerPressed(self.subcompositor.rootSurface(target.surface_id));
+        }
+    } else if (seat == &self.seat) {
+        if (focus) |target| {
+            self.layer_shell.pointerPressed(self.subcompositor.rootSurface(target.surface_id));
+            requestRepaint(self);
+        } else if (self.xdg_shell.hasPopupGrab()) {
+            self.xdg_shell.dismissPopupGrab();
+        }
+    }
+    seat.touchDown(time, protocol_id, point.x, point.y, focus) catch {
+        _ = self.routed_touches.pop();
+        self.terminate();
+    };
+}
+
+fn routeTouchUp(self: *Self, device_id: NativeInput.DeviceId, time: u32, native_id: i32) void {
+    for (self.routed_touches.items, 0..) |touch, index| {
+        if (touch.device_id != device_id or touch.native_id != native_id) continue;
+        _ = self.routed_touches.orderedRemove(index);
+        touch.seat.touchUp(time, touch.protocol_id) catch self.terminate();
+        return;
+    }
+}
+
+fn routeTouchMotion(
+    self: *Self,
+    output: *RenderOutput,
+    device_id: NativeInput.DeviceId,
+    time: u32,
+    native_id: i32,
+    x: f64,
+    y: f64,
+) void {
+    for (self.routed_touches.items) |touch| {
+        if (touch.device_id != device_id or touch.native_id != native_id) continue;
+        const point = output.globalPoint(x, y);
+        touch.seat.touchMotion(time, touch.protocol_id, point.x, point.y) catch self.terminate();
+        return;
+    }
+}
+
+fn cancelDeviceTouches(self: *Self, device_id: NativeInput.DeviceId) void {
+    while (self.touchSeatForDevice(device_id)) |seat| self.cancelSeatTouches(seat);
+}
+
+fn cancelSeatTouches(self: *Self, seat: *Seat) void {
+    seat.touchCancel();
+    var index: usize = 0;
+    while (index < self.routed_touches.items.len) {
+        if (self.routed_touches.items[index].seat == seat) {
+            _ = self.routed_touches.orderedRemove(index);
+        } else {
+            index += 1;
+        }
+    }
+}
+
+fn touchSeatForDevice(self: *Self, device_id: NativeInput.DeviceId) ?*Seat {
+    for (self.routed_touches.items) |touch| {
+        if (touch.device_id == device_id) return touch.seat;
+    }
+    return null;
+}
+
+fn allocateTouchId(self: *Self, seat: *Seat) i32 {
+    while (true) {
+        const id: i32 = @intCast(self.next_touch_id);
+        self.next_touch_id +%= 1;
+        for (self.routed_touches.items) |touch| {
+            if (touch.seat == seat and touch.protocol_id == id) break;
+        } else return id;
+    }
 }
 
 fn keyboardAvailable(context: *anyopaque, available: bool) void {
@@ -1597,30 +1790,40 @@ fn pointerLeave(context: *anyopaque) void {
 
 fn pointerMotion(context: *anyopaque, time: u32, x: f64, y: f64) void {
     const output: *RenderOutput = @ptrCast(@alignCast(context));
+    pointerMotionForSeat(output, &output.server.seat, time, x, y);
+}
+
+fn pointerMotionForSeat(output: *RenderOutput, seat: *Seat, time: u32, x: f64, y: f64) void {
     const self = output.server;
     const target = output.globalPoint(x, y);
     if (self.session_lock.isLocked()) {
-        self.seat.pointerMotion(
+        seat.pointerMotion(
             time,
             target.x,
             target.y,
             self.pointerFocus(target.x, target.y),
         );
-        self.window_manager.pointerMoved(null);
+        self.window_manager.pointerMovedForSeat(seat, null);
         return;
     }
-    if (self.data_device.isDragging()) {
+    if (seat == &self.seat and self.data_device.isDragging()) {
         self.pointer_constraints.deactivateAll();
         const route = self.pointerRoute(target.x, target.y);
-        self.seat.pointerMotion(time, target.x, target.y, null);
+        seat.pointerMotion(time, target.x, target.y, null);
         self.data_device.pointerMotion(time, route.focus);
-        self.window_manager.pointerMoved(null);
+        self.window_manager.pointerMovedForSeat(seat, null);
         return;
     }
-    if (self.window_manager.pointerGrabbed()) {
-        self.pointer_constraints.deactivateAll();
-        self.seat.pointerMotion(time, target.x, target.y, null);
-        self.window_manager.pointerMoved(null);
+    if (self.window_manager.pointerGrabbedForSeat(seat)) {
+        if (seat == &self.seat) self.pointer_constraints.deactivateAll();
+        seat.pointerMotion(time, target.x, target.y, null);
+        self.window_manager.pointerMovedForSeat(seat, null);
+        return;
+    }
+    if (seat != &self.seat) {
+        const route = self.pointerRoute(target.x, target.y);
+        seat.pointerMotion(time, target.x, target.y, route.focus);
+        self.window_manager.pointerMovedForSeat(seat, route.root);
         return;
     }
     const motion = self.pointer_constraints.constrainMotion(.{ .x = target.x, .y = target.y });
@@ -1629,13 +1832,13 @@ fn pointerMotion(context: *anyopaque, time: u32, x: f64, y: f64) void {
     }
     if (motion.locked) return;
     const route = self.pointerRoute(motion.point.x, motion.point.y);
-    self.seat.pointerMotion(
+    seat.pointerMotion(
         time,
         motion.point.x,
         motion.point.y,
         route.focus,
     );
-    self.window_manager.pointerMoved(route.root);
+    self.window_manager.pointerMovedForSeat(seat, route.root);
     self.pointer_constraints.syncFocus();
 }
 
@@ -1667,22 +1870,32 @@ fn pointerButton(
     state: wl.Pointer.ButtonState,
 ) void {
     const self = serverForOutput(context);
+    self.pointerButtonForSeat(&self.seat, time, button, state);
+}
+
+fn pointerButtonForSeat(
+    self: *Self,
+    seat: *Seat,
+    time: u32,
+    button: u32,
+    state: wl.Pointer.ButtonState,
+) void {
     if (self.session_lock.isLocked()) {
         if (state == .pressed) {
-            const focused = if (self.seat.pointerFocusedSurface()) |surface_id|
+            const focused = if (seat.pointerFocusedSurface()) |surface_id|
                 self.subcompositor.rootSurface(surface_id)
             else
                 null;
             self.session_lock.pointerPressed(focused);
         }
-        _ = self.seat.pointerButton(time, button, state) catch {
+        _ = seat.pointerButton(time, button, state) catch {
             log.err("failed to store pointer button state", .{});
             self.terminate();
         };
         return;
     }
-    if (self.data_device.isDragging()) {
-        const grab_ended = self.seat.pointerButton(time, button, state) catch {
+    if (seat == &self.seat and self.data_device.isDragging()) {
+        const grab_ended = seat.pointerButton(time, button, state) catch {
             log.err("failed to store pointer button state", .{});
             self.terminate();
             return;
@@ -1690,30 +1903,30 @@ fn pointerButton(
         if (state == .released and grab_ended) self.data_device.drop();
         return;
     }
-    const root = if (self.seat.pointerPosition()) |position|
+    const root = if (seat.pointerPosition()) |position|
         self.pointerRoute(position.x, position.y).root
     else
         null;
-    if (self.window_manager.pointerButton(button, state, root)) {
-        self.pointer_constraints.deactivateAll();
-        self.seat.suppressPointerFocus(true);
+    if (self.window_manager.pointerButtonForSeat(seat, button, state, root)) {
+        if (seat == &self.seat) self.pointer_constraints.deactivateAll();
+        seat.suppressPointerFocus(true);
         return;
     }
     if (state == .pressed) {
-        const focused = if (self.seat.pointerFocusedSurface()) |surface_id|
+        const focused = if (seat.pointerFocusedSurface()) |surface_id|
             self.subcompositor.rootSurface(surface_id)
         else
             null;
-        self.layer_shell.pointerPressed(focused);
+        if (seat == &self.seat) self.layer_shell.pointerPressed(focused);
         requestRepaint(self);
     }
-    if (state == .pressed and self.xdg_shell.hasPopupGrab() and
-        self.seat.pointerFocusedSurface() == null)
+    if (seat == &self.seat and state == .pressed and self.xdg_shell.hasPopupGrab() and
+        seat.pointerFocusedSurface() == null)
     {
         self.xdg_shell.dismissPopupGrab();
         return;
     }
-    _ = self.seat.pointerButton(time, button, state) catch {
+    _ = seat.pointerButton(time, button, state) catch {
         log.err("failed to store pointer button state", .{});
         self.terminate();
     };
@@ -2274,27 +2487,9 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
         );
     }
 
-    const cursor = self.seat.cursorInfo();
-    if (cursor) |info| {
-        switch (info) {
-            .surface => |surface| try self.renderSurfaceTree(
-                &frame,
-                surface.surface_id,
-                surface.x,
-                surface.y,
-                null,
-                null,
-            ),
-            .shape => |shape| {
-                const command = [_]render.Command{.{ .image = .{
-                    .x = shape.x,
-                    .y = shape.y,
-                    .size = shape.buffer.size,
-                    .buffer = shape.buffer,
-                } }};
-                try self.renderCommands(&frame, &command);
-            },
-        }
+    try self.renderSeatCursor(&frame, &self.seat, false);
+    for (self.dynamic_seats.items) |entry| {
+        if (!entry.removed) try self.renderSeatCursor(&frame, &entry.seat, false);
     }
 
     const presented = render_output.backend.present() catch return error.InvalidTarget;
@@ -2328,10 +2523,10 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
     input_popups = self.input_method.popupIterator();
     while (input_popups.next()) |popup| self.submitSurfaceTree(output, popup.surface_id);
     if (drag_icon) |info| self.submitSurfaceTree(output, info.surface_id);
-    if (cursor) |info| switch (info) {
-        .surface => |surface| self.submitSurfaceTree(output, surface.surface_id),
-        .shape => {},
-    };
+    self.submitSeatCursor(output, &self.seat, false);
+    for (self.dynamic_seats.items) |entry| {
+        if (!entry.removed) self.submitSeatCursor(output, &entry.seat, false);
+    }
     self.finishRepaintIfIdle();
     if (presented) |info| outputPresented(render_output, info);
     self.refreshKeyboardFocus();
@@ -2353,35 +2548,19 @@ fn renderSessionLockFrame(
         );
     }
 
-    const cursor = self.sessionLockCursorInfo();
-    if (cursor) |info| switch (info) {
-        .surface => |surface| try self.renderSurfaceTree(
-            frame,
-            surface.surface_id,
-            surface.x,
-            surface.y,
-            null,
-            null,
-        ),
-        .shape => |shape| {
-            const command = [_]render.Command{.{ .image = .{
-                .x = shape.x,
-                .y = shape.y,
-                .size = shape.buffer.size,
-                .buffer = shape.buffer,
-            } }};
-            try self.renderCommands(frame, &command);
-        },
-    };
+    try self.renderSeatCursor(frame, &self.seat, true);
+    for (self.dynamic_seats.items) |entry| {
+        if (!entry.removed) try self.renderSeatCursor(frame, &entry.seat, true);
+    }
 
     const presented = frame.render_output.backend.present() catch return error.InvalidTarget;
     frame.render_output.lock_frame_pending = true;
     frame.output.endFrame();
     if (lock_surface) |info| self.submitSurfaceTree(frame.output, info.surface_id);
-    if (cursor) |info| switch (info) {
-        .surface => |surface| self.submitSurfaceTree(frame.output, surface.surface_id),
-        .shape => {},
-    };
+    self.submitSeatCursor(frame.output, &self.seat, true);
+    for (self.dynamic_seats.items) |entry| {
+        if (!entry.removed) self.submitSeatCursor(frame.output, &entry.seat, true);
+    }
     self.finishRepaintIfIdle();
     if (presented) |info| outputPresented(frame.render_output, info);
     self.refreshKeyboardFocus();
@@ -2414,11 +2593,49 @@ fn refreshKeyboardFocus(self: *Self) void {
     }
 }
 
-fn sessionLockCursorInfo(self: *Self) ?Seat.CursorInfo {
-    const surface_id = self.seat.pointerFocusedSurface() orelse return null;
-    const root = self.subcompositor.rootSurface(surface_id);
-    if (!self.session_lock.ownsSurface(root)) return null;
-    return self.seat.cursorInfo();
+fn renderSeatCursor(
+    self: *Self,
+    frame: *const OutputFrame,
+    seat: *Seat,
+    locked: bool,
+) renderer_types.Renderer.Error!void {
+    const info = self.seatCursorInfo(seat, locked) orelse return;
+    switch (info) {
+        .surface => |surface| try self.renderSurfaceTree(
+            frame,
+            surface.surface_id,
+            surface.x,
+            surface.y,
+            null,
+            null,
+        ),
+        .shape => |shape| {
+            const command = [_]render.Command{.{ .image = .{
+                .x = shape.x,
+                .y = shape.y,
+                .size = shape.buffer.size,
+                .buffer = shape.buffer,
+            } }};
+            try self.renderCommands(frame, &command);
+        },
+    }
+}
+
+fn submitSeatCursor(self: *Self, output: *Output, seat: *Seat, locked: bool) void {
+    const info = self.seatCursorInfo(seat, locked) orelse return;
+    switch (info) {
+        .surface => |surface| self.submitSurfaceTree(output, surface.surface_id),
+        .shape => {},
+    }
+}
+
+fn seatCursorInfo(self: *Self, seat: *Seat, locked: bool) ?Seat.CursorInfo {
+    if (locked) {
+        const surface_id = seat.pointerFocusedSurface() orelse return null;
+        const root = self.subcompositor.rootSurface(surface_id);
+        if (!self.session_lock.ownsSurface(root)) return null;
+    }
+    return seat.cursorInfo();
 }
 
 fn finishRepaintIfIdle(self: *Self) void {
