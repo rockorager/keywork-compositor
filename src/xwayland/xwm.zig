@@ -162,6 +162,7 @@ const Atom = enum {
     net_wm_state_maximized_vert,
     net_wm_state_hidden,
     net_wm_state_skip_taskbar,
+    net_wm_state_focused,
     net_wm_window_type,
     net_wm_window_type_desktop,
     net_wm_window_type_dock,
@@ -224,6 +225,7 @@ const atom_names: [atom_count][]const u8 = .{
     "_NET_WM_STATE_MAXIMIZED_VERT",
     "_NET_WM_STATE_HIDDEN",
     "_NET_WM_STATE_SKIP_TASKBAR",
+    "_NET_WM_STATE_FOCUSED",
     "_NET_WM_WINDOW_TYPE",
     "_NET_WM_WINDOW_TYPE_DESKTOP",
     "_NET_WM_WINDOW_TYPE_DOCK",
@@ -562,7 +564,10 @@ pub fn dragSourceDestroyed(self: *Self, generation: u64) void {
     self.dnd.sourceDestroyed(generation);
 }
 
-pub fn focusWindow(self: *Self, requested_window: ?WindowId) error{XcbFlushFailed}!void {
+pub fn focusWindow(
+    self: *Self,
+    requested_window: ?WindowId,
+) error{ OutOfMemory, XcbFlushFailed }!void {
     const window_id = if (requested_window) |id| focus: {
         const window = self.windows.get(id) orelse break :focus null;
         if (!window.mapped or window.override_redirect) break :focus null;
@@ -571,6 +576,40 @@ pub fn focusWindow(self: *Self, requested_window: ?WindowId) error{XcbFlushFaile
     const previous_window = self.focused_window;
     if (previous_window == window_id) return;
 
+    const focused_atom = self.atomValue(.net_wm_state_focused);
+    var previous_state: ?[]c.xcb_atom_t = null;
+    errdefer if (previous_state) |atoms| self.allocator.free(atoms);
+    if (previous_window) |id| {
+        const window = self.windows.get(id) orelse unreachable;
+        previous_state = try replacedAtomList(
+            self.allocator,
+            window.net_wm_state,
+            &.{focused_atom},
+            &.{},
+        );
+    }
+    var focused_state: ?[]c.xcb_atom_t = null;
+    errdefer if (focused_state) |atoms| self.allocator.free(atoms);
+    if (window_id) |id| {
+        const window = self.windows.get(id) orelse unreachable;
+        focused_state = try replacedAtomList(
+            self.allocator,
+            window.net_wm_state,
+            &.{focused_atom},
+            &.{focused_atom},
+        );
+    }
+
+    if (previous_window) |id| {
+        const window = self.windows.getPtr(id) orelse unreachable;
+        self.setNetWmStateAtoms(id, window, previous_state.?);
+        previous_state = null;
+    }
+    if (window_id) |id| {
+        const window = self.windows.getPtr(id) orelse unreachable;
+        self.setNetWmStateAtoms(id, window, focused_state.?);
+        focused_state = null;
+    }
     self.focused_window = window_id;
     const active_window = window_id orelse c.XCB_WINDOW_NONE;
     _ = c.xcb_change_property(
@@ -699,22 +738,53 @@ fn replaceNetWmStateAtoms(
     removed_atoms: []const c.xcb_atom_t,
     added_atoms: []const c.xcb_atom_t,
 ) error{OutOfMemory}!void {
+    const atoms = try replacedAtomList(
+        self.allocator,
+        window.net_wm_state,
+        removed_atoms,
+        added_atoms,
+    );
+    self.setNetWmStateAtoms(window_id, window, atoms);
+}
+
+fn replacedAtomList(
+    allocator: std.mem.Allocator,
+    current_atoms: []const c.xcb_atom_t,
+    removed_atoms: []const c.xcb_atom_t,
+    added_atoms: []const c.xcb_atom_t,
+) error{OutOfMemory}![]c.xcb_atom_t {
     var retained_count: usize = 0;
-    for (window.net_wm_state) |atom| {
+    for (current_atoms) |atom| {
         if (std.mem.indexOfScalar(c.xcb_atom_t, removed_atoms, atom) == null) retained_count += 1;
     }
     const state_atom_count = retained_count + added_atoms.len;
-    const atoms = try self.allocator.alloc(c.xcb_atom_t, state_atom_count);
+    const atoms = try allocator.alloc(c.xcb_atom_t, state_atom_count);
     var index: usize = 0;
-    for (window.net_wm_state) |atom| {
+    for (current_atoms) |atom| {
         if (std.mem.indexOfScalar(c.xcb_atom_t, removed_atoms, atom) != null) continue;
         atoms[index] = atom;
         index += 1;
     }
     @memcpy(atoms[index..], added_atoms);
+    return atoms;
+}
 
+fn setNetWmStateAtoms(
+    self: *Self,
+    window_id: WindowId,
+    window: *Window,
+    atoms: []c.xcb_atom_t,
+) void {
     self.allocator.free(window.net_wm_state);
     window.net_wm_state = atoms;
+    self.publishNetWmStateAtoms(window_id, atoms);
+}
+
+fn publishNetWmStateAtoms(
+    self: *Self,
+    window_id: WindowId,
+    atoms: []const c.xcb_atom_t,
+) void {
     _ = c.xcb_change_property(
         self.connection,
         c.XCB_PROP_MODE_REPLACE,
@@ -889,6 +959,7 @@ fn publishWmIdentity(self: *Self) !void {
         self.atomValue(.net_wm_state_maximized_vert),
         self.atomValue(.net_wm_state_hidden),
         self.atomValue(.net_wm_state_skip_taskbar),
+        self.atomValue(.net_wm_state_focused),
         self.atomValue(.net_wm_window_type),
         self.atomValue(.net_wm_window_type_desktop),
         self.atomValue(.net_wm_window_type_dock),
@@ -1027,7 +1098,26 @@ const NetWmStateChanges = struct {
 };
 
 fn refreshNetWmState(self: *Self, window_id: WindowId, window: *Window) !NetWmStateChanges {
-    const replacement = (try self.readAtomList(window_id, .net_wm_state)) orelse return .{};
+    var replacement = (try self.readAtomList(window_id, .net_wm_state)) orelse return .{};
+    errdefer self.allocator.free(replacement);
+    const focused_atom = self.atomValue(.net_wm_state_focused);
+    const property_focused = std.mem.indexOfScalar(
+        c.xcb_atom_t,
+        replacement,
+        focused_atom,
+    ) != null;
+    const actually_focused = self.focused_window == window_id;
+    if (property_focused != actually_focused) {
+        const normalized = try replacedAtomList(
+            self.allocator,
+            replacement,
+            &.{focused_atom},
+            if (actually_focused) &.{focused_atom} else &.{},
+        );
+        self.allocator.free(replacement);
+        replacement = normalized;
+        self.publishNetWmStateAtoms(window_id, replacement);
+    }
     if (std.mem.eql(c.xcb_atom_t, window.net_wm_state, replacement)) {
         self.allocator.free(replacement);
         return .{};
@@ -1993,6 +2083,17 @@ test "EWMH state actions apply remove add and toggle" {
     try std.testing.expectEqual(false, applyStateAction(true, 2).?);
     try std.testing.expectEqual(true, applyStateAction(false, 2).?);
     try std.testing.expectEqual(null, applyStateAction(false, 3));
+}
+
+test "EWMH state replacement removes duplicates before appending" {
+    const atoms = try replacedAtomList(
+        std.testing.allocator,
+        &.{ 1, 2, 3, 2 },
+        &.{2},
+        &.{4},
+    );
+    defer std.testing.allocator.free(atoms);
+    try std.testing.expectEqualSlices(c.xcb_atom_t, &.{ 1, 3, 4 }, atoms);
 }
 
 test "EWMH window type fallback follows transient and override-redirect rules" {
