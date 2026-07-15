@@ -97,6 +97,7 @@ pub const WindowInfo = struct {
     id: WindowId,
     geometry: Geometry,
     override_redirect: bool,
+    override_redirect_wants_focus: bool,
     mapped: bool,
     activated: bool,
     surface_id: ?Surface.Id,
@@ -129,6 +130,7 @@ pub const WindowInfo = struct {
 const Window = struct {
     geometry: Geometry,
     override_redirect: bool,
+    override_redirect_wants_focus: bool = true,
     mapped: bool = false,
     serial: ?u64 = null,
     surface_id: ?Surface.Id = null,
@@ -596,7 +598,8 @@ pub fn focusWindow(
 ) error{ OutOfMemory, XcbFlushFailed }!void {
     const window_id = if (requested_window) |id| focus: {
         const window = self.windows.get(id) orelse break :focus null;
-        if (!window.mapped or window.override_redirect) break :focus null;
+        if (!window.mapped or
+            (window.override_redirect and !window.override_redirect_wants_focus)) break :focus null;
         break :focus id;
     } else null;
     const previous_window = self.focused_window;
@@ -1354,11 +1357,20 @@ fn wouldCreateParentLoop(self: *const Self, window_id: WindowId, requested_paren
 fn refreshWindowType(self: *Self, window_id: WindowId, window: *Window) !bool {
     const type_atoms = (try self.readAtomList(window_id, .net_wm_window_type)) orelse return false;
     defer self.allocator.free(type_atoms);
+    var override_redirect_wants_focus = true;
     const window_type = for (type_atoms) |type_atom| {
         if (self.windowTypeForAtom(type_atom)) |value| break value;
     } else defaultWindowType(window.override_redirect, window.parent != null);
-    if (window.window_type == window_type) return false;
+    for (type_atoms) |type_atom| {
+        const value = self.windowTypeForAtom(type_atom) orelse continue;
+        if (windowTypePreventsOverrideRedirectFocus(value)) {
+            override_redirect_wants_focus = false;
+        }
+    }
+    if (window.window_type == window_type and
+        window.override_redirect_wants_focus == override_redirect_wants_focus) return false;
     window.window_type = window_type;
+    window.override_redirect_wants_focus = override_redirect_wants_focus;
     return true;
 }
 
@@ -1386,6 +1398,22 @@ fn windowTypeForAtom(self: *const Self, atom: c.xcb_atom_t) ?WindowType {
 
 fn defaultWindowType(override_redirect: bool, transient: bool) WindowType {
     return if (!override_redirect and transient) .dialog else .normal;
+}
+
+fn windowTypePreventsOverrideRedirectFocus(window_type: WindowType) bool {
+    return switch (window_type) {
+        .menu,
+        .utility,
+        .splash,
+        .dropdown_menu,
+        .popup_menu,
+        .tooltip,
+        .notification,
+        .combo,
+        .dnd,
+        => true,
+        .desktop, .dock, .toolbar, .dialog, .normal => false,
+    };
 }
 
 fn refreshMotifHints(self: *Self, window_id: WindowId, window: *Window) bool {
@@ -2116,6 +2144,7 @@ fn info(self: *const Self, window_id: WindowId, window: Window) WindowInfo {
         .id = window_id,
         .geometry = window.geometry,
         .override_redirect = window.override_redirect,
+        .override_redirect_wants_focus = window.override_redirect_wants_focus,
         .mapped = window.mapped,
         .activated = self.focused_window == window_id,
         .surface_id = window.surface_id,
@@ -2240,6 +2269,20 @@ test "EWMH auxiliary window types bypass toplevel policy" {
     try std.testing.expect(!WindowType.tooltip.participatesInWindowManagement());
     try std.testing.expect(!WindowType.notification.participatesInWindowManagement());
     try std.testing.expect(!WindowType.dnd.participatesInWindowManagement());
+}
+
+test "override-redirect input heuristic excludes transient UI types" {
+    try std.testing.expect(!windowTypePreventsOverrideRedirectFocus(.normal));
+    try std.testing.expect(!windowTypePreventsOverrideRedirectFocus(.dialog));
+    try std.testing.expect(windowTypePreventsOverrideRedirectFocus(.menu));
+    try std.testing.expect(windowTypePreventsOverrideRedirectFocus(.utility));
+    try std.testing.expect(windowTypePreventsOverrideRedirectFocus(.splash));
+    try std.testing.expect(windowTypePreventsOverrideRedirectFocus(.dropdown_menu));
+    try std.testing.expect(windowTypePreventsOverrideRedirectFocus(.popup_menu));
+    try std.testing.expect(windowTypePreventsOverrideRedirectFocus(.tooltip));
+    try std.testing.expect(windowTypePreventsOverrideRedirectFocus(.notification));
+    try std.testing.expect(windowTypePreventsOverrideRedirectFocus(.combo));
+    try std.testing.expect(windowTypePreventsOverrideRedirectFocus(.dnd));
 }
 
 test "Motif hints reduce partial decorations to client-side decoration" {

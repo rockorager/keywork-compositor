@@ -141,6 +141,7 @@ xwm: Xwm,
 xwm_initialized: bool,
 xwayland_windows: std.AutoHashMapUnmanaged(Xwm.WindowId, XwaylandWindow),
 xwayland_client_stack: std.ArrayList(Xwm.WindowId),
+xwayland_override_redirect_focus: ?Surface.Id,
 workspace: Workspace,
 workspace_initialized: bool,
 text_input: TextInput,
@@ -334,6 +335,7 @@ pub fn create(
         .xwm_initialized = false,
         .xwayland_windows = .empty,
         .xwayland_client_stack = .empty,
+        .xwayland_override_redirect_focus = null,
         .workspace = undefined,
         .workspace_initialized = false,
         .text_input = undefined,
@@ -3281,6 +3283,7 @@ fn xwaylandSurfaceCommitted(
     const window = self.xwayland_windows.get(window_id) orelse return;
     if (!std.meta.eql(window.surface_id, surface_id)) return;
     refreshXwaylandSceneWindow(self, window_id);
+    updateXwaylandOverrideRedirectFocus(self, window_id);
     self.scene.surfaceCommitted(window.scene_id);
 }
 
@@ -3374,6 +3377,7 @@ fn xwmWindowMapped(context: *anyopaque, window_id: Xwm.WindowId, mapped: bool) v
     }
     refreshXwaylandSceneWindow(self, window_id);
     applyXwaylandSceneStacking(self, window_id);
+    updateXwaylandOverrideRedirectFocus(self, window_id);
 }
 
 fn xwmWindowConfigured(
@@ -3399,6 +3403,7 @@ fn xwmWindowConfigured(
         };
     }
     applyXwaylandSceneStacking(self, window_id);
+    updateXwaylandOverrideRedirectFocus(self, window_id);
 }
 
 fn xwmWindowMetadataChanged(context: *anyopaque, window_id: Xwm.WindowId) void {
@@ -3420,6 +3425,7 @@ fn xwmWindowMetadataChanged(context: *anyopaque, window_id: Xwm.WindowId) void {
         };
     }
     applyXwaylandSceneStacking(self, window_id);
+    updateXwaylandOverrideRedirectFocus(self, window_id);
 }
 
 fn xwmWindowFullscreenRequested(context: *anyopaque, window_id: Xwm.WindowId, fullscreen: bool) void {
@@ -3554,6 +3560,7 @@ fn xwmWindowAssociated(context: *anyopaque, window_id: Xwm.WindowId, surface_id:
     configureXwaylandSceneWindow(self, scene_id, info.geometry);
     refreshXwaylandSceneWindow(self, window_id);
     applyXwaylandSceneStacking(self, window_id);
+    updateXwaylandOverrideRedirectFocus(self, window_id);
 }
 
 fn xwmWindowDissociated(context: *anyopaque, window_id: Xwm.WindowId, _: Surface.Id) void {
@@ -3627,6 +3634,38 @@ fn syncXwaylandClientStacking(self: *Self) void {
         log.err("failed to publish X11 client stacking", .{});
         self.terminate();
     };
+}
+
+fn updateXwaylandOverrideRedirectFocus(self: *Self, window_id: Xwm.WindowId) void {
+    const window = self.xwayland_windows.get(window_id) orelse return;
+    const info = self.xwm.windowInfo(window_id) orelse return;
+    if (info.mapped and info.override_redirect and info.override_redirect_wants_focus and
+        self.scene.surfaceMapped(window.surface_id))
+    {
+        if (self.xwayland_override_redirect_focus) |current| {
+            if (std.meta.eql(current, window.surface_id)) return;
+        }
+        self.xwayland_override_redirect_focus = window.surface_id;
+        refreshKeyboardFocus(self);
+        return;
+    }
+    const current = self.xwayland_override_redirect_focus orelse return;
+    if (!std.meta.eql(current, window.surface_id)) return;
+    var replacement: ?Surface.Id = null;
+    if (info.parent) |parent_id| {
+        if (self.xwayland_windows.get(parent_id)) |parent| {
+            if (self.xwm.windowInfo(parent_id)) |parent_info| {
+                if (parent_info.mapped and parent_info.override_redirect and
+                    parent_info.override_redirect_wants_focus and
+                    self.scene.surfaceMapped(parent.surface_id))
+                {
+                    replacement = parent.surface_id;
+                }
+            }
+        }
+    }
+    self.xwayland_override_redirect_focus = replacement;
+    refreshKeyboardFocus(self);
 }
 
 fn riverXwaylandWindowInfo(context: *anyopaque, window_id: Xwm.WindowId) ?Xwm.WindowInfo {
@@ -3781,6 +3820,12 @@ fn removeXwaylandWindow(self: *Self, window_id: Xwm.WindowId) void {
     const removed = self.xwayland_windows.fetchRemove(window_id) orelse return;
     self.scene.removeWindow(removed.value.scene_id);
     syncXwaylandClientStacking(self);
+    if (self.xwayland_override_redirect_focus) |current| {
+        if (std.meta.eql(current, removed.value.surface_id)) {
+            self.xwayland_override_redirect_focus = null;
+            refreshKeyboardFocus(self);
+        }
+    }
 }
 
 fn xwaylandWindowForSurface(self: *Self, surface_id: Surface.Id) ?Xwm.WindowId {
@@ -4481,6 +4526,7 @@ fn refreshKeyboardFocus(self: *Self) void {
     const default_focus = self.layer_shell.keyboardFocus(
         self.xdg_shell.popupKeyboardFocus(),
     ) orelse
+        self.xwayland_override_redirect_focus orelse
         self.window_manager.focusedShellSurface() orelse self.scene.focusedSurface() orelse if (!self.window_manager.hasActiveManager())
         self.scene.topWindowSurface()
     else
