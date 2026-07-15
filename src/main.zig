@@ -103,6 +103,7 @@ test {
     _ = @import("wayland/screencopy.zig");
     _ = @import("wayland/xwayland_shell.zig");
     _ = @import("xwayland/server.zig");
+    _ = @import("xwayland/xwm.zig");
     _ = @import("wayland/workspace.zig");
     _ = @import("wayland/text_input.zig");
     _ = @import("wayland/input_method.zig");

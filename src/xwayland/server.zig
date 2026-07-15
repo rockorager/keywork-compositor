@@ -58,7 +58,8 @@ previous_display: ?[]u8,
 
 pub const Listener = struct {
     context: *anyopaque,
-    ready: *const fn (*anyopaque, []const u8) void,
+    /// Takes ownership of wm_fd, including on failure.
+    ready: *const fn (*anyopaque, []const u8, std.posix.fd_t) bool,
     stopped: *const fn (*anyopaque) void,
 };
 
@@ -169,6 +170,10 @@ pub fn displayName(self: *const Self) []const u8 {
 
 pub fn isReady(self: *const Self) bool {
     return self.ready;
+}
+
+pub fn terminate(self: *Self) void {
+    self.stop(true);
 }
 
 fn spawn(
@@ -359,7 +364,11 @@ fn markReady(self: *Self) !void {
     closeFd(&self.notify_fd);
     self.ready = true;
     log.info("Xwayland {s} is ready", .{self.displayName()});
-    self.listener.ready(self.listener.context, self.displayName());
+    const wm_fd = self.wm_fd;
+    std.debug.assert(wm_fd >= 0);
+    self.wm_fd = invalid_fd;
+    if (!self.listener.ready(self.listener.context, self.displayName(), wm_fd))
+        self.fail("failed to initialize the X window manager");
 }
 
 fn fail(self: *Self, message: []const u8) void {

@@ -128,6 +128,8 @@ pub fn build(b: *std.Build) void {
     root_module.linkSystemLibrary("wayland-client", .{});
     root_module.linkSystemLibrary("wayland-server", .{});
     root_module.linkSystemLibrary("xkbcommon", .{});
+    root_module.linkSystemLibrary("xcb", .{});
+    root_module.linkSystemLibrary("xcb-composite", .{});
 
     const exe = b.addExecutable(.{
         .name = "keywork_compositor",

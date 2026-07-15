@@ -33,6 +33,7 @@ const ImageCopyCapture = @import("wayland/image_copy_capture.zig");
 const Screencopy = @import("wayland/screencopy.zig");
 const XwaylandShell = @import("wayland/xwayland_shell.zig");
 const XwaylandServer = @import("xwayland/server.zig");
+const Xwm = @import("xwayland/xwm.zig");
 const Workspace = @import("wayland/workspace.zig");
 const TextInput = @import("wayland/text_input.zig");
 const InputMethod = @import("wayland/input_method.zig");
@@ -133,6 +134,8 @@ xwayland_shell: XwaylandShell,
 xwayland_shell_initialized: bool,
 xwayland_server: XwaylandServer,
 xwayland_server_initialized: bool,
+xwm: Xwm,
+xwm_initialized: bool,
 workspace: Workspace,
 workspace_initialized: bool,
 text_input: TextInput,
@@ -315,6 +318,8 @@ pub fn create(
         .xwayland_shell_initialized = false,
         .xwayland_server = undefined,
         .xwayland_server_initialized = false,
+        .xwm = undefined,
+        .xwm_initialized = false,
         .workspace = undefined,
         .workspace_initialized = false,
         .text_input = undefined,
@@ -3152,12 +3157,40 @@ fn xwaylandSurfaceAssociated(_: *anyopaque, _: u64, _: Surface.Id) void {}
 
 fn xwaylandSurfaceRemoved(_: *anyopaque, _: u64, _: Surface.Id) void {}
 
-fn xwaylandReady(_: *anyopaque, display_name: []const u8) void {
+fn xwaylandReady(
+    context: *anyopaque,
+    display_name: []const u8,
+    wm_fd: std.posix.fd_t,
+) bool {
+    const self: *Self = @ptrCast(@alignCast(context));
+    std.debug.assert(!self.xwm_initialized);
+    self.xwm.init(self.display.getEventLoop(), wm_fd, .{
+        .context = self,
+        .failed = xwmFailed,
+    }) catch |err| {
+        log.err("failed to initialize XWM: {t}", .{err});
+        return false;
+    };
+    self.xwm_initialized = true;
     log.info("X11 clients may use DISPLAY={s}", .{display_name});
+    return true;
 }
 
-fn xwaylandStopped(_: *anyopaque) void {
+fn xwaylandStopped(context: *anyopaque) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    if (self.xwm_initialized) {
+        self.xwm.deinit();
+        self.xwm_initialized = false;
+    }
     log.warn("Xwayland stopped", .{});
+}
+
+fn xwmFailed(context: *anyopaque) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    std.debug.assert(self.xwm_initialized);
+    self.xwm.deinit();
+    self.xwm_initialized = false;
+    self.xwayland_server.terminate();
 }
 
 fn captureImage(
