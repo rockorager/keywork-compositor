@@ -113,6 +113,8 @@ const IncomingTransfer = struct {
     event_source: ?*wl.EventSource = null,
     data: []u8 = &.{},
     offset: usize = 0,
+    incremental: bool = false,
+    final_chunk: bool = false,
 
     fn destroy(self: *IncomingTransfer) void {
         const selection = self.selection;
@@ -159,7 +161,24 @@ const IncomingTransfer = struct {
             self.destroy();
             return;
         }
-        self.destroy();
+        if (!self.incremental) {
+            self.destroy();
+            return;
+        }
+        if (self.event_source) |source| {
+            self.event_source = null;
+            source.remove();
+        }
+        self.selection.allocator.free(self.data);
+        self.data = &.{};
+        self.offset = 0;
+        _ = c.xcb_delete_property(
+            self.selection.connection,
+            self.window,
+            self.selection.atoms.selection_data,
+        );
+        _ = c.xcb_flush(self.selection.connection);
+        if (self.final_chunk) self.destroy();
     }
 
     fn writable(_: std.posix.fd_t, mask: wl.EventMask, self: *IncomingTransfer) c_int {
@@ -177,12 +196,17 @@ const OutgoingTransfer = struct {
     request: c.xcb_selection_request_event_t,
     property: c.xcb_atom_t,
     fd: std.posix.fd_t,
-    event_source: *wl.EventSource,
+    event_source: ?*wl.EventSource,
     data: std.ArrayList(u8) = .empty,
+    incremental: bool = false,
+    source_eof: bool = false,
+    requestor_ready: bool = false,
+    terminator_sent: bool = false,
 
     fn destroy(self: *OutgoingTransfer) void {
         const selection = self.selection;
-        self.event_source.remove();
+        log.debug("destroyed outgoing X11 selection transfer to window {d}", .{self.request.requestor});
+        if (self.event_source) |source| source.remove();
         closeFd(&self.fd);
         self.data.deinit(selection.allocator);
         for (selection.outgoing_transfers.items, 0..) |transfer, index| {
@@ -194,11 +218,11 @@ const OutgoingTransfer = struct {
     }
 
     fn fail(self: *OutgoingTransfer) void {
-        self.selection.sendNotify(self.request, c.XCB_ATOM_NONE);
+        if (!self.incremental) self.selection.sendNotify(self.request, c.XCB_ATOM_NONE);
         self.destroy();
     }
 
-    fn finish(self: *OutgoingTransfer) void {
+    fn finishDirect(self: *OutgoingTransfer) void {
         _ = c.xcb_change_property(
             self.selection.connection,
             c.XCB_PROP_MODE_REPLACE,
@@ -213,26 +237,160 @@ const OutgoingTransfer = struct {
         self.destroy();
     }
 
+    fn pauseRead(self: *OutgoingTransfer) bool {
+        const source = self.event_source orelse return true;
+        self.event_source = null;
+        source.remove();
+        return true;
+    }
+
+    fn resumeRead(self: *OutgoingTransfer) bool {
+        if (self.source_eof) return true;
+        if (self.event_source != null) return true;
+        self.event_source = self.selection.event_loop.addFd(
+            *OutgoingTransfer,
+            self.fd,
+            .{ .readable = true, .hangup = true, .@"error" = true },
+            readable,
+            self,
+        ) catch {
+            self.fail();
+            return false;
+        };
+        return true;
+    }
+
+    fn stopRead(self: *OutgoingTransfer) void {
+        if (self.event_source) |source| {
+            self.event_source = null;
+            source.remove();
+        }
+        closeFd(&self.fd);
+    }
+
+    fn beginIncremental(self: *OutgoingTransfer) void {
+        self.incremental = true;
+        log.debug("started outgoing INCR transfer to window {d}", .{self.request.requestor});
+        const event_mask: u32 = c.XCB_EVENT_MASK_PROPERTY_CHANGE;
+        _ = c.xcb_change_window_attributes(
+            self.selection.connection,
+            self.request.requestor,
+            c.XCB_CW_EVENT_MASK,
+            &event_mask,
+        );
+        const size_hint: u32 = max_direct_transfer_size;
+        _ = c.xcb_change_property(
+            self.selection.connection,
+            c.XCB_PROP_MODE_REPLACE,
+            self.request.requestor,
+            self.property,
+            self.selection.atoms.incr,
+            32,
+            1,
+            &size_hint,
+        );
+        self.selection.sendNotify(self.request, self.property);
+        _ = self.pauseRead();
+    }
+
+    fn sendChunk(self: *OutgoingTransfer) void {
+        std.debug.assert(self.incremental and self.requestor_ready and self.data.items.len > 0);
+        log.debug("sent outgoing INCR chunk of {d} bytes to window {d}", .{
+            self.data.items.len,
+            self.request.requestor,
+        });
+        _ = c.xcb_change_property(
+            self.selection.connection,
+            c.XCB_PROP_MODE_REPLACE,
+            self.request.requestor,
+            self.property,
+            self.request.target,
+            8,
+            @intCast(self.data.items.len),
+            self.data.items.ptr,
+        );
+        self.data.clearRetainingCapacity();
+        self.requestor_ready = false;
+        _ = c.xcb_flush(self.selection.connection);
+        if (!self.source_eof) _ = self.resumeRead();
+    }
+
+    fn sendTerminator(self: *OutgoingTransfer) void {
+        std.debug.assert(self.incremental and self.requestor_ready and self.source_eof);
+        log.debug("sent outgoing INCR terminator to window {d}", .{self.request.requestor});
+        _ = c.xcb_change_property(
+            self.selection.connection,
+            c.XCB_PROP_MODE_REPLACE,
+            self.request.requestor,
+            self.property,
+            self.request.target,
+            8,
+            0,
+            null,
+        );
+        self.terminator_sent = true;
+        self.requestor_ready = false;
+        _ = c.xcb_flush(self.selection.connection);
+    }
+
+    fn propertyDeleted(self: *OutgoingTransfer) void {
+        std.debug.assert(self.incremental);
+        log.debug("received outgoing INCR property deletion from window {d}", .{self.request.requestor});
+        if (self.terminator_sent) {
+            self.destroy();
+            return;
+        }
+        self.requestor_ready = true;
+        if (self.data.items.len > 0) {
+            self.sendChunk();
+        } else if (self.source_eof) {
+            self.sendTerminator();
+        } else {
+            _ = self.resumeRead();
+        }
+    }
+
     fn readable(_: std.posix.fd_t, mask: wl.EventMask, self: *OutgoingTransfer) c_int {
         if (!(mask.readable or mask.hangup or mask.@"error")) return 0;
+        if (self.data.items.len >= max_direct_transfer_size) {
+            _ = self.pauseRead();
+            return 0;
+        }
         var buffer: [4096]u8 = undefined;
         while (true) {
-            const result = std.c.read(self.fd, &buffer, buffer.len);
+            const available = max_direct_transfer_size - self.data.items.len;
+            const result = std.c.read(self.fd, &buffer, @min(buffer.len, available));
             if (result > 0) {
                 const count: usize = @intCast(result);
-                if (self.data.items.len + count > max_direct_transfer_size) {
-                    log.warn("X11 selection transfer requires unsupported INCR transport", .{});
-                    self.fail();
-                    return 0;
-                }
                 self.data.appendSlice(self.selection.allocator, buffer[0..count]) catch {
                     self.fail();
                     return 0;
                 };
+                if (self.data.items.len >= max_direct_transfer_size) {
+                    if (!self.incremental) {
+                        self.beginIncremental();
+                    } else if (self.requestor_ready) {
+                        self.sendChunk();
+                    } else {
+                        _ = self.pauseRead();
+                    }
+                    return 0;
+                }
                 continue;
             }
             if (result == 0) {
-                self.finish();
+                self.source_eof = true;
+                log.debug("reached outgoing INCR source EOF for window {d}", .{self.request.requestor});
+                self.stopRead();
+                if (!self.incremental) {
+                    self.finishDirect();
+                } else if (self.requestor_ready) {
+                    if (self.data.items.len > 0) {
+                        self.sendChunk();
+                    } else {
+                        self.sendTerminator();
+                    }
+                }
                 return 0;
             }
             switch (std.posix.errno(result)) {
@@ -372,6 +530,7 @@ pub fn handleRequestorDestroyed(self: *Self, window: c.xcb_window_t) void {
     while (index < self.outgoing_transfers.items.len) {
         const transfer = self.outgoing_transfers.items[index];
         if (transfer.request.requestor == window) {
+            log.debug("cancelled outgoing selection transfer for destroyed window {d}", .{window});
             transfer.destroy();
         } else {
             index += 1;
@@ -412,6 +571,28 @@ pub fn handleNotify(self: *Self, event: *const c.xcb_selection_notify_event_t) v
         self.receiveData(transfer, event);
         return;
     }
+}
+
+pub fn handlePropertyNotify(self: *Self, event: *const c.xcb_property_notify_event_t) bool {
+    if (event.state == c.XCB_PROPERTY_DELETE) {
+        for (self.outgoing_transfers.items) |transfer| {
+            if (!transfer.incremental or
+                transfer.request.requestor != event.window or
+                transfer.property != event.atom) continue;
+            transfer.propertyDeleted();
+            return true;
+        }
+    } else if (event.state == c.XCB_PROPERTY_NEW_VALUE) {
+        for (self.incoming_transfers.items) |transfer| {
+            if (!transfer.incremental or
+                transfer.window != event.window or
+                event.atom != self.atoms.selection_data or
+                transfer.data.len != 0) continue;
+            self.receiveIncrementalChunk(transfer);
+            return true;
+        }
+    }
+    return self.ownsWindow(event.window);
 }
 
 fn waylandSelectionChanged(context: *anyopaque) void {
@@ -635,8 +816,8 @@ fn receiveData(
     };
     defer std.c.free(reply);
     if (reply.*.type == self.atoms.incr) {
-        log.warn("X11 selection transfer requires unsupported INCR transport", .{});
-        transfer.destroy();
+        transfer.incremental = true;
+        _ = c.xcb_flush(self.connection);
         return;
     }
     const length: usize = @intCast(c.xcb_get_property_value_length(reply));
@@ -646,6 +827,41 @@ fn receiveData(
         transfer.destroy();
         return;
     }
+    const value = c.xcb_get_property_value(reply);
+    transfer.data = self.allocator.alloc(u8, length) catch {
+        transfer.destroy();
+        return;
+    };
+    if (length > 0) @memcpy(transfer.data, @as([*]const u8, @ptrCast(value))[0..length]);
+    transfer.write();
+}
+
+fn receiveIncrementalChunk(self: *Self, transfer: *IncomingTransfer) void {
+    const reply = c.xcb_get_property_reply(
+        self.connection,
+        c.xcb_get_property(
+            self.connection,
+            0,
+            transfer.window,
+            self.atoms.selection_data,
+            c.XCB_GET_PROPERTY_TYPE_ANY,
+            0,
+            max_direct_transfer_size / 4 + 1,
+        ),
+        null,
+    ) orelse {
+        transfer.destroy();
+        return;
+    };
+    defer std.c.free(reply);
+    const length: usize = @intCast(c.xcb_get_property_value_length(reply));
+    if (reply.*.type == c.XCB_ATOM_NONE or reply.*.format != 8 or
+        reply.*.bytes_after != 0 or length > max_direct_transfer_size)
+    {
+        transfer.destroy();
+        return;
+    }
+    transfer.final_chunk = length == 0;
     const value = c.xcb_get_property_value(reply);
     transfer.data = self.allocator.alloc(u8, length) catch {
         transfer.destroy();
@@ -717,6 +933,15 @@ fn sendData(self: *Self, request: c.xcb_selection_request_event_t, property: c.x
         self.sendNotify(request, c.XCB_ATOM_NONE);
         return;
     };
+    var transfer_index: usize = 0;
+    while (transfer_index < self.outgoing_transfers.items.len) {
+        const transfer = self.outgoing_transfers.items[transfer_index];
+        if (transfer.request.requestor == request.requestor) {
+            transfer.fail();
+        } else {
+            transfer_index += 1;
+        }
+    }
 
     var fds: [2]std.posix.fd_t = undefined;
     if (std.c.pipe2(&fds, .{ .CLOEXEC = true }) < 0) {

@@ -1210,6 +1210,7 @@ fn handleUnmapNotify(self: *Self, event: *const c.xcb_unmap_notify_event_t) void
 }
 
 fn handlePropertyNotify(self: *Self, event: *const c.xcb_property_notify_event_t) !void {
+    if (self.clipboard_selection.handlePropertyNotify(event)) return;
     const window = self.windows.getPtr(event.window) orelse return;
     if (event.atom == self.atomValue(.net_wm_name) or
         event.atom == c.XCB_ATOM_WM_NAME or
