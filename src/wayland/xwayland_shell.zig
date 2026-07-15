@@ -22,6 +22,7 @@ listener: Listener,
 pub const Listener = struct {
     context: *anyopaque,
     associated: *const fn (*anyopaque, u64, Surface.Id) void,
+    committed: *const fn (*anyopaque, u64, Surface.Id, bool) void,
     removed: *const fn (*anyopaque, u64, Surface.Id) void,
 };
 
@@ -206,24 +207,32 @@ const Role = struct {
         return .apply;
     }
 
-    fn afterCommit(context: *anyopaque, _: Surface.CommitInfo) void {
+    fn afterCommit(context: *anyopaque, info: Surface.CommitInfo) void {
         const self: *Role = @ptrCast(@alignCast(context));
-        const serial = self.pending_serial orelse return;
-        self.manager.associations.put(
-            self.manager.allocator,
-            serial,
-            self.surface_id,
-        ) catch {
-            const surface = self.surface orelse return;
-            surface.waylandResource().postNoMemory();
-            return;
-        };
-        self.pending_serial = null;
-        self.current_serial = serial;
-        self.manager.listener.associated(
+        if (self.pending_serial) |serial| {
+            self.manager.associations.put(
+                self.manager.allocator,
+                serial,
+                self.surface_id,
+            ) catch {
+                const surface = self.surface orelse return;
+                surface.waylandResource().postNoMemory();
+                return;
+            };
+            self.pending_serial = null;
+            self.current_serial = serial;
+            self.manager.listener.associated(
+                self.manager.listener.context,
+                serial,
+                self.surface_id,
+            );
+        }
+        const serial = self.current_serial orelse return;
+        self.manager.listener.committed(
             self.manager.listener.context,
             serial,
             self.surface_id,
+            info.has_buffer,
         );
     }
 

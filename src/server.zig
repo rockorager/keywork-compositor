@@ -136,6 +136,7 @@ xwayland_server: XwaylandServer,
 xwayland_server_initialized: bool,
 xwm: Xwm,
 xwm_initialized: bool,
+xwayland_windows: std.AutoHashMapUnmanaged(Xwm.WindowId, XwaylandWindow),
 workspace: Workspace,
 workspace_initialized: bool,
 text_input: TextInput,
@@ -208,6 +209,11 @@ const RoutedTouch = struct {
 
 const RenderOutputStore = slot_map.SlotMap(*RenderOutput, enum { render_output });
 const RenderOutputId = RenderOutputStore.Id;
+
+const XwaylandWindow = struct {
+    scene_id: Scene.Id,
+    surface_id: Surface.Id,
+};
 
 const RenderOutputConfig = struct {
     kind: OutputBackend.Kind,
@@ -320,6 +326,7 @@ pub fn create(
         .xwayland_server_initialized = false,
         .xwm = undefined,
         .xwm_initialized = false,
+        .xwayland_windows = .empty,
         .workspace = undefined,
         .workspace_initialized = false,
         .text_input = undefined,
@@ -343,6 +350,7 @@ pub fn create(
     errdefer self.routed_keys.deinit(allocator);
     errdefer self.dynamic_seats.deinit(allocator);
     errdefer self.render_outputs.deinit(allocator);
+    errdefer self.xwayland_windows.deinit(allocator);
     errdefer self.renderer.deinit();
     if (output_kind == .drm) {
         try self.session.init(allocator, display.getEventLoop());
@@ -678,6 +686,7 @@ pub fn create(
         .{
             .context = self,
             .associated = xwaylandSurfaceAssociated,
+            .committed = xwaylandSurfaceCommitted,
             .removed = xwaylandSurfaceRemoved,
         },
     );
@@ -861,6 +870,8 @@ pub fn destroy(self: *Self) void {
     self.workspace_initialized = false;
     self.xwayland_server.deinit();
     self.xwayland_server_initialized = false;
+    std.debug.assert(self.xwayland_windows.count() == 0);
+    self.xwayland_windows.deinit(allocator);
     self.xwayland_shell.deinit();
     self.xwayland_shell_initialized = false;
     self.screencopy.deinit();
@@ -3158,6 +3169,22 @@ fn xwaylandSurfaceAssociated(context: *anyopaque, serial: u64, surface_id: Surfa
     if (self.xwm_initialized) _ = self.xwm.associateSurface(serial, surface_id);
 }
 
+fn xwaylandSurfaceCommitted(
+    context: *anyopaque,
+    serial: u64,
+    surface_id: Surface.Id,
+    has_buffer: bool,
+) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    if (!self.xwm_initialized) return;
+    const window_id = self.xwm.windowForSerial(serial) orelse return;
+    const window = self.xwayland_windows.get(window_id) orelse return;
+    if (!std.meta.eql(window.surface_id, surface_id)) return;
+    const info = self.xwm.windowInfo(window_id) orelse return;
+    self.scene.setMapped(window.scene_id, info.mapped and has_buffer);
+    if (info.mapped and has_buffer) self.scene.surfaceCommitted(window.scene_id);
+}
+
 fn xwaylandSurfaceRemoved(context: *anyopaque, serial: u64, surface_id: Surface.Id) void {
     const self: *Self = @ptrCast(@alignCast(context));
     if (self.xwm_initialized) self.xwm.removeSurfaceAssociation(serial, surface_id);
@@ -3208,11 +3235,31 @@ fn xwmFailed(context: *anyopaque) void {
 
 fn xwmWindowCreated(_: *anyopaque, _: Xwm.WindowInfo) void {}
 
-fn xwmWindowDestroyed(_: *anyopaque, _: Xwm.WindowId) void {}
+fn xwmWindowDestroyed(context: *anyopaque, window_id: Xwm.WindowId) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    removeXwaylandWindow(self, window_id);
+}
 
-fn xwmWindowMapped(_: *anyopaque, _: Xwm.WindowId, _: bool) void {}
+fn xwmWindowMapped(context: *anyopaque, window_id: Xwm.WindowId, mapped: bool) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const window = self.xwayland_windows.get(window_id) orelse return;
+    const has_buffer = Surface.currentBuffer(
+        self.compositor.surfaceStore(),
+        window.surface_id,
+    ) != null;
+    self.scene.setMapped(window.scene_id, mapped and has_buffer);
+}
 
-fn xwmWindowConfigured(_: *anyopaque, _: Xwm.WindowId, _: Xwm.Geometry, _: bool) void {}
+fn xwmWindowConfigured(
+    context: *anyopaque,
+    window_id: Xwm.WindowId,
+    geometry: Xwm.Geometry,
+    _: bool,
+) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const window = self.xwayland_windows.get(window_id) orelse return;
+    configureXwaylandSceneWindow(self, window.scene_id, geometry);
+}
 
 fn xwmWindowSerial(context: *anyopaque, _: Xwm.WindowId, serial: u64) void {
     const self: *Self = @ptrCast(@alignCast(context));
@@ -3220,9 +3267,51 @@ fn xwmWindowSerial(context: *anyopaque, _: Xwm.WindowId, serial: u64) void {
     _ = self.xwm.associateSurface(serial, surface_id);
 }
 
-fn xwmWindowAssociated(_: *anyopaque, _: Xwm.WindowId, _: Surface.Id) void {}
+fn xwmWindowAssociated(context: *anyopaque, window_id: Xwm.WindowId, surface_id: Surface.Id) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const info = self.xwm.windowInfo(window_id) orelse return;
+    const scene_id = self.scene.addWindow(surface_id) catch {
+        log.err("failed to add X11 window {d} to the scene", .{window_id});
+        self.terminate();
+        return;
+    };
+    self.xwayland_windows.put(self.allocator, window_id, .{
+        .scene_id = scene_id,
+        .surface_id = surface_id,
+    }) catch {
+        self.scene.removeWindow(scene_id);
+        log.err("failed to track X11 window {d}", .{window_id});
+        self.terminate();
+        return;
+    };
+    configureXwaylandSceneWindow(self, scene_id, info.geometry);
+    const has_buffer = Surface.currentBuffer(
+        self.compositor.surfaceStore(),
+        surface_id,
+    ) != null;
+    self.scene.setMapped(scene_id, info.mapped and has_buffer);
+}
 
-fn xwmWindowDissociated(_: *anyopaque, _: Xwm.WindowId, _: Surface.Id) void {}
+fn xwmWindowDissociated(context: *anyopaque, window_id: Xwm.WindowId, _: Surface.Id) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    removeXwaylandWindow(self, window_id);
+}
+
+fn configureXwaylandSceneWindow(
+    self: *Self,
+    scene_id: Scene.Id,
+    geometry: Xwm.Geometry,
+) void {
+    self.scene.setPosition(scene_id, .{ .x = geometry.x, .y = geometry.y });
+    self.scene.setContentGeometry(scene_id, .{
+        .size = .{ .width = geometry.width, .height = geometry.height },
+    });
+}
+
+fn removeXwaylandWindow(self: *Self, window_id: Xwm.WindowId) void {
+    const removed = self.xwayland_windows.fetchRemove(window_id) orelse return;
+    self.scene.removeWindow(removed.value.scene_id);
+}
 
 fn captureImage(
     context: *anyopaque,

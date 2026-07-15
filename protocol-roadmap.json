@@ -1043,7 +1043,7 @@
         "security-context",
         "wl-compositor"
       ],
-      "status_detail": "Version 1 private-global filtering, the xwayland_surface role, double-buffered non-zero unique serial association, commit-time publication, and destruction-safe serial lookup are implemented. Keywork launches and authorizes rootless Xwayland, bootstraps XWM/Composite/EWMH, tracks create/map/configure/unmap/destroy lifecycle, acknowledges map and configure requests, and pairs X11 windows with committed Wayland surfaces through WL_SURFACE_SERIAL regardless of transport arrival order. Input/focus, properties/policy, and scene integration remain before X11 windows are usable."
+      "status_detail": "Version 1 private-global filtering, the xwayland_surface role, double-buffered non-zero unique serial association, commit-time publication, and destruction-safe serial lookup are implemented. Keywork launches and authorizes rootless Xwayland, bootstraps XWM/Composite/EWMH, tracks create/map/configure/unmap/destroy lifecycle, acknowledges map and configure requests, and pairs X11 windows with committed Wayland surfaces through WL_SURFACE_SERIAL regardless of transport arrival order. Paired X11 surfaces are enrolled in the compositor scene with synchronized position, size, map, commit, dissociation, and destruction state. Explicit X11 input focus, properties, and window-management policy remain before X11 support is complete."
     },
     {
       "id": "xwayland-keyboard-grab",

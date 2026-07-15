@@ -211,6 +211,10 @@ pub fn windowInfo(self: *const Self, window_id: WindowId) ?WindowInfo {
     return info(window_id, window);
 }
 
+pub fn windowForSerial(self: *const Self, serial: u64) ?WindowId {
+    return self.serial_windows.get(serial);
+}
+
 fn resolveAtoms(self: *Self) !void {
     var cookies: [atom_count]c.xcb_intern_atom_cookie_t = undefined;
     for (atom_names, &cookies) |name, *cookie| {
