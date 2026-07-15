@@ -1240,7 +1240,10 @@ fn sendPendingState(self: *Self, manager: *river.WindowManagerV1) !void {
                     break :parent managed_parent.resource;
                 } else null;
                 resource.sendParent(parent_resource);
-                resource.sendDecorationHint(.no_preference);
+                resource.sendDecorationHint(if (info.prefers_server_decorations)
+                    .no_preference
+                else
+                    .only_supports_csd);
             },
         }
         window.metadata_dirty = false;

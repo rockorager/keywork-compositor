@@ -96,6 +96,7 @@ pub const WindowInfo = struct {
     maximized: bool,
     minimized: bool,
     skip_taskbar: bool,
+    prefers_server_decorations: bool,
 
     pub fn participatesInWindowManagement(self: WindowInfo) bool {
         return self.mapped and !self.override_redirect and
@@ -129,6 +130,7 @@ const Window = struct {
     maximized_vert: bool = false,
     minimized: bool = false,
     skip_taskbar: bool = false,
+    prefers_server_decorations: bool = true,
 
     fn deinit(self: *Window, allocator: std.mem.Allocator) void {
         if (self.title) |value| allocator.free(value);
@@ -168,6 +170,7 @@ const Atom = enum {
     net_wm_window_type_combo,
     net_wm_window_type_dnd,
     net_wm_window_type_normal,
+    motif_wm_hints,
     utf8_string,
     wm_protocols,
     wm_take_focus,
@@ -226,6 +229,7 @@ const atom_names: [atom_count][]const u8 = .{
     "_NET_WM_WINDOW_TYPE_COMBO",
     "_NET_WM_WINDOW_TYPE_DND",
     "_NET_WM_WINDOW_TYPE_NORMAL",
+    "_MOTIF_WM_HINTS",
     "UTF8_STRING",
     "WM_PROTOCOLS",
     "WM_TAKE_FOCUS",
@@ -1042,9 +1046,10 @@ fn refreshMetadata(self: *Self, window_id: WindowId, window: *Window) !bool {
     const class_changed = try self.refreshClass(window_id, window);
     const parent_changed = self.refreshTransientFor(window_id, window);
     const window_type_changed = try self.refreshWindowType(window_id, window);
+    const decorations_changed = self.refreshMotifHints(window_id, window);
     const size_hints_changed = self.refreshNormalHints(window_id, window);
     return title_changed or class_changed or parent_changed or window_type_changed or
-        size_hints_changed;
+        decorations_changed or size_hints_changed;
 }
 
 fn refreshTransientFor(self: *Self, window_id: WindowId, window: *Window) bool {
@@ -1114,6 +1119,40 @@ fn windowTypeForAtom(self: *const Self, atom: c.xcb_atom_t) ?WindowType {
 
 fn defaultWindowType(override_redirect: bool, transient: bool) WindowType {
     return if (!override_redirect and transient) .dialog else .normal;
+}
+
+fn refreshMotifHints(self: *Self, window_id: WindowId, window: *Window) bool {
+    const reply = c.xcb_get_property_reply(
+        self.connection,
+        c.xcb_get_property(
+            self.connection,
+            0,
+            window_id,
+            self.atomValue(.motif_wm_hints),
+            c.XCB_GET_PROPERTY_TYPE_ANY,
+            0,
+            5,
+        ),
+        null,
+    ) orelse return false;
+    defer std.c.free(reply);
+    if (reply.*.format != 32 or reply.*.value_len < 5) return false;
+    const value = c.xcb_get_property_value(reply) orelse return false;
+    const hints: [*]const u32 = @ptrCast(@alignCast(value));
+    const prefers_server_decorations = motifPrefersServerDecorations(hints[0..5]) orelse
+        return false;
+    if (window.prefers_server_decorations == prefers_server_decorations) return false;
+    window.prefers_server_decorations = prefers_server_decorations;
+    return true;
+}
+
+fn motifPrefersServerDecorations(hints: []const u32) ?bool {
+    std.debug.assert(hints.len >= 5);
+    const decorations_valid = hints[0] & (1 << 1) != 0;
+    if (!decorations_valid) return null;
+    const decorations = hints[2];
+    if (decorations & (1 << 0) != 0) return true;
+    return decorations & (1 << 1) != 0 and decorations & (1 << 3) != 0;
 }
 
 fn refreshNormalHints(self: *Self, window_id: WindowId, window: *Window) bool {
@@ -1507,7 +1546,8 @@ fn handlePropertyNotify(self: *Self, event: *const c.xcb_property_notify_event_t
         event.atom == c.XCB_ATOM_WM_CLASS or
         event.atom == c.XCB_ATOM_WM_TRANSIENT_FOR or
         event.atom == c.XCB_ATOM_WM_NORMAL_HINTS or
-        event.atom == self.atomValue(.net_wm_window_type))
+        event.atom == self.atomValue(.net_wm_window_type) or
+        event.atom == self.atomValue(.motif_wm_hints))
     {
         if (try self.refreshMetadata(event.window, window)) {
             self.listener.metadata_changed(self.listener.context, event.window);
@@ -1782,6 +1822,7 @@ fn info(self: *const Self, window_id: WindowId, window: Window) WindowInfo {
         .maximized = window.maximized_horz and window.maximized_vert,
         .minimized = window.minimized,
         .skip_taskbar = window.skip_taskbar,
+        .prefers_server_decorations = window.prefers_server_decorations,
     };
 }
 
@@ -1845,4 +1886,13 @@ test "EWMH auxiliary window types bypass toplevel policy" {
     try std.testing.expect(!WindowType.tooltip.participatesInWindowManagement());
     try std.testing.expect(!WindowType.notification.participatesInWindowManagement());
     try std.testing.expect(!WindowType.dnd.participatesInWindowManagement());
+}
+
+test "Motif hints reduce partial decorations to client-side decoration" {
+    try std.testing.expectEqual(null, motifPrefersServerDecorations(&.{ 0, 0, 0, 0, 0 }));
+    try std.testing.expectEqual(true, motifPrefersServerDecorations(&.{ 2, 0, 1, 0, 0 }));
+    try std.testing.expectEqual(true, motifPrefersServerDecorations(&.{ 2, 0, 10, 0, 0 }));
+    try std.testing.expectEqual(false, motifPrefersServerDecorations(&.{ 2, 0, 0, 0, 0 }));
+    try std.testing.expectEqual(false, motifPrefersServerDecorations(&.{ 2, 0, 2, 0, 0 }));
+    try std.testing.expectEqual(false, motifPrefersServerDecorations(&.{ 2, 0, 8, 0, 0 }));
 }
