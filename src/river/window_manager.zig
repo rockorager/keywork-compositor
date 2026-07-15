@@ -72,6 +72,7 @@ pub const XwaylandController = struct {
     resize: *const fn (*anyopaque, Xwm.WindowId, u16, u16) bool,
     move: *const fn (*anyopaque, Xwm.WindowId, i16, i16) bool,
     set_fullscreen: *const fn (*anyopaque, Xwm.WindowId, bool) void,
+    set_maximized: *const fn (*anyopaque, Xwm.WindowId, bool) void,
     close: *const fn (*anyopaque, Xwm.WindowId) void,
     refresh_scene: *const fn (*anyopaque, Xwm.WindowId) void,
 };
@@ -836,6 +837,10 @@ fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
             resource.postNoMemory();
             return;
         };
+        if (info.maximized) self.appendXwaylandMaximizeRequest(managed_id, true) catch {
+            resource.postNoMemory();
+            return;
+        };
         self.xwayland.refresh_scene(self.xwayland.context, entry.key_ptr.*);
     }
     _ = self.reroutePointer(self.default_seat_state);
@@ -941,6 +946,7 @@ pub fn xwaylandWindowAssociated(
     if (!info.mapped or info.override_redirect) return;
     const id = try self.ensureXwaylandWindow(xwayland_id);
     if (info.fullscreen) try self.appendXwaylandFullscreenRequest(id, true, null);
+    if (info.maximized) try self.appendXwaylandMaximizeRequest(id, true);
     var windows = self.windows.iterator();
     while (windows.next()) |entry| entry.value.metadata_dirty = true;
     self.xwayland.refresh_scene(self.xwayland.context, xwayland_id);
@@ -966,6 +972,10 @@ pub fn xwaylandWindowMapped(self: *Self, xwayland_id: Xwm.WindowId, mapped: bool
         return;
     };
     if (info.fullscreen) self.appendXwaylandFullscreenRequest(id, true, null) catch {
+        manager.postNoMemory();
+        return;
+    };
+    if (info.maximized) self.appendXwaylandMaximizeRequest(id, true) catch {
         manager.postNoMemory();
         return;
     };
@@ -1035,6 +1045,37 @@ fn appendXwaylandFullscreenRequest(
     try self.window_requests.append(self.allocator, .{
         .id = id,
         .request = if (fullscreen) .{ .fullscreen = preferred_output } else .exit_fullscreen,
+    });
+}
+
+pub fn xwaylandWindowMaximizeRequested(
+    self: *Self,
+    xwayland_id: Xwm.WindowId,
+    maximized: bool,
+) void {
+    const manager = self.active orelse return;
+    const info = self.xwayland.window_info(self.xwayland.context, xwayland_id) orelse return;
+    if (!info.mapped or info.override_redirect or
+        !self.known_xwayland_windows.contains(xwayland_id)) return;
+    const id = self.ensureXwaylandWindow(xwayland_id) catch {
+        manager.postNoMemory();
+        return;
+    };
+    self.appendXwaylandMaximizeRequest(id, maximized) catch {
+        manager.postNoMemory();
+        return;
+    };
+    self.requestManage();
+}
+
+fn appendXwaylandMaximizeRequest(
+    self: *Self,
+    id: WindowId,
+    maximized: bool,
+) error{OutOfMemory}!void {
+    try self.window_requests.append(self.allocator, .{
+        .id = id,
+        .request = if (maximized) .maximize else .unmaximize,
     });
 }
 
@@ -1593,6 +1634,11 @@ fn finishXwaylandWindowRender(
             xwayland_id,
             window.fullscreen_output != null,
         );
+        self.xwayland.set_maximized(
+            self.xwayland.context,
+            xwayland_id,
+            window.requested_configuration.maximized,
+        );
     }
     switch (window.pending_borders) {
         .unchanged => {},
@@ -1982,6 +2028,7 @@ fn releaseWindows(self: *Self) void {
             self.scene.setFocused(entry.value.scene_id, false);
             self.scene.setFullscreen(entry.value.scene_id, false);
             self.xwayland.set_fullscreen(self.xwayland.context, xwayland_id, false);
+            self.xwayland.set_maximized(self.xwayland.context, xwayland_id, false);
             self.scene.setBorders(entry.value.scene_id, null);
             self.scene.setClipBox(entry.value.scene_id, null);
             self.scene.setContentClipBox(entry.value.scene_id, null);

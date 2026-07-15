@@ -54,6 +54,7 @@ pub const XwaylandController = struct {
     window_info: *const fn (*anyopaque, Xwm.WindowId) ?Xwm.WindowInfo,
     close: *const fn (*anyopaque, Xwm.WindowId) void,
     request_fullscreen: *const fn (*anyopaque, Xwm.WindowId, bool, ?OutputLayout.Id) void,
+    request_maximized: *const fn (*anyopaque, Xwm.WindowId, bool) void,
 };
 
 const List = struct {
@@ -297,12 +298,20 @@ const WlrHandle = struct {
                 .destroy => unreachable,
                 .close => self.owner.xwayland.close(self.owner.xwayland.context, window_id),
                 .set_rectangle => |rectangle| validateRectangle(resource, rectangle.width, rectangle.height),
-                .set_maximized,
-                .unset_maximized,
                 .set_minimized,
                 .unset_minimized,
                 .activate,
                 => {},
+                .set_maximized => self.owner.xwayland.request_maximized(
+                    self.owner.xwayland.context,
+                    window_id,
+                    true,
+                ),
+                .unset_maximized => self.owner.xwayland.request_maximized(
+                    self.owner.xwayland.context,
+                    window_id,
+                    false,
+                ),
                 .set_fullscreen => |fullscreen| self.owner.xwayland.request_fullscreen(
                     self.owner.xwayland.context,
                     window_id,
@@ -595,11 +604,15 @@ fn mappingMetadata(self: *Self, mapping: *const Mapping) ?MappingMetadata {
 fn mappingConfiguration(self: *Self, mapping: *const Mapping) XdgShell.ToplevelConfigure {
     return switch (mapping.backend) {
         .xdg => |window_id| (self.xdg_shell.windowInfo(window_id) orelse return .{}).configuration,
-        .xwayland => |window_id| .{
-            .fullscreen = (self.xwayland.window_info(
+        .xwayland => |window_id| configuration: {
+            const info = self.xwayland.window_info(
                 self.xwayland.context,
                 window_id,
-            ) orelse return .{}).fullscreen,
+            ) orelse return .{};
+            break :configuration .{
+                .fullscreen = info.fullscreen,
+                .maximized = info.maximized,
+            };
         },
     };
 }

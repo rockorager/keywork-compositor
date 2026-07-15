@@ -54,6 +54,7 @@ pub const WindowInfo = struct {
     max_size: Size,
     can_close: bool,
     fullscreen: bool,
+    maximized: bool,
 };
 
 const Window = struct {
@@ -73,6 +74,8 @@ const Window = struct {
     delete_window: bool = false,
     net_wm_state: []c.xcb_atom_t = &.{},
     fullscreen: bool = false,
+    maximized_horz: bool = false,
+    maximized_vert: bool = false,
 
     fn deinit(self: *Window, allocator: std.mem.Allocator) void {
         if (self.title) |value| allocator.free(value);
@@ -92,6 +95,8 @@ const Atom = enum {
     net_active_window,
     net_wm_state,
     net_wm_state_fullscreen,
+    net_wm_state_maximized_horz,
+    net_wm_state_maximized_vert,
     utf8_string,
     wm_protocols,
     wm_take_focus,
@@ -110,6 +115,8 @@ const atom_names: [atom_count][]const u8 = .{
     "_NET_ACTIVE_WINDOW",
     "_NET_WM_STATE",
     "_NET_WM_STATE_FULLSCREEN",
+    "_NET_WM_STATE_MAXIMIZED_HORZ",
+    "_NET_WM_STATE_MAXIMIZED_VERT",
     "UTF8_STRING",
     "WM_PROTOCOLS",
     "WM_TAKE_FOCUS",
@@ -127,6 +134,7 @@ pub const Listener = struct {
     configured: *const fn (*anyopaque, WindowId, Geometry, bool) void,
     metadata_changed: *const fn (*anyopaque, WindowId) void,
     fullscreen_requested: *const fn (*anyopaque, WindowId, bool) void,
+    maximize_requested: *const fn (*anyopaque, WindowId, bool) void,
     serial: *const fn (*anyopaque, WindowId, u64) void,
     associated: *const fn (*anyopaque, WindowId, Surface.Id) void,
     dissociated: *const fn (*anyopaque, WindowId, Surface.Id) void,
@@ -332,23 +340,65 @@ pub fn setFullscreen(
     if (window.fullscreen == fullscreen) return false;
 
     const fullscreen_atom = self.atomValue(.net_wm_state_fullscreen);
+    try self.replaceNetWmStateAtoms(
+        window_id,
+        window,
+        &.{fullscreen_atom},
+        if (fullscreen) &.{fullscreen_atom} else &.{},
+    );
+    window.fullscreen = fullscreen;
+    if (c.xcb_flush(self.connection) <= 0) return error.XcbFlushFailed;
+    return true;
+}
+
+pub fn setMaximized(
+    self: *Self,
+    window_id: WindowId,
+    maximized: bool,
+) error{ InvalidWindow, OutOfMemory, XcbFlushFailed }!bool {
+    const window = self.windows.getPtr(window_id) orelse return error.InvalidWindow;
+    if (window.override_redirect) return error.InvalidWindow;
+    if (window.maximized_horz == maximized and window.maximized_vert == maximized) return false;
+
+    const maximized_atoms = [_]c.xcb_atom_t{
+        self.atomValue(.net_wm_state_maximized_horz),
+        self.atomValue(.net_wm_state_maximized_vert),
+    };
+    try self.replaceNetWmStateAtoms(
+        window_id,
+        window,
+        &maximized_atoms,
+        if (maximized) &maximized_atoms else &.{},
+    );
+    window.maximized_horz = maximized;
+    window.maximized_vert = maximized;
+    if (c.xcb_flush(self.connection) <= 0) return error.XcbFlushFailed;
+    return true;
+}
+
+fn replaceNetWmStateAtoms(
+    self: *Self,
+    window_id: WindowId,
+    window: *Window,
+    removed_atoms: []const c.xcb_atom_t,
+    added_atoms: []const c.xcb_atom_t,
+) error{OutOfMemory}!void {
     var retained_count: usize = 0;
     for (window.net_wm_state) |atom| {
-        if (atom != fullscreen_atom) retained_count += 1;
+        if (std.mem.indexOfScalar(c.xcb_atom_t, removed_atoms, atom) == null) retained_count += 1;
     }
-    const state_atom_count = retained_count + @intFromBool(fullscreen);
+    const state_atom_count = retained_count + added_atoms.len;
     const atoms = try self.allocator.alloc(c.xcb_atom_t, state_atom_count);
     var index: usize = 0;
     for (window.net_wm_state) |atom| {
-        if (atom == fullscreen_atom) continue;
+        if (std.mem.indexOfScalar(c.xcb_atom_t, removed_atoms, atom) != null) continue;
         atoms[index] = atom;
         index += 1;
     }
-    if (fullscreen) atoms[index] = fullscreen_atom;
+    @memcpy(atoms[index..], added_atoms);
 
     self.allocator.free(window.net_wm_state);
     window.net_wm_state = atoms;
-    window.fullscreen = fullscreen;
     _ = c.xcb_change_property(
         self.connection,
         c.XCB_PROP_MODE_REPLACE,
@@ -359,8 +409,6 @@ pub fn setFullscreen(
         @intCast(atoms.len),
         if (atoms.len == 0) null else atoms.ptr,
     );
-    if (c.xcb_flush(self.connection) <= 0) return error.XcbFlushFailed;
-    return true;
 }
 
 pub fn resizeWindow(
@@ -483,6 +531,8 @@ fn publishWmIdentity(self: *Self) !void {
         self.atomValue(.net_active_window),
         self.atomValue(.net_wm_state),
         self.atomValue(.net_wm_state_fullscreen),
+        self.atomValue(.net_wm_state_maximized_horz),
+        self.atomValue(.net_wm_state_maximized_vert),
     };
     try checkRequest(self.connection, c.xcb_change_property_checked(
         self.connection,
@@ -545,13 +595,19 @@ fn refreshProtocols(self: *Self, window_id: WindowId, window: *Window) void {
     }
 }
 
-fn refreshNetWmState(self: *Self, window_id: WindowId, window: *Window) !bool {
-    const replacement = (try self.readAtomList(window_id, .net_wm_state)) orelse return false;
+const NetWmStateChanges = struct {
+    fullscreen: bool = false,
+    maximized: bool = false,
+};
+
+fn refreshNetWmState(self: *Self, window_id: WindowId, window: *Window) !NetWmStateChanges {
+    const replacement = (try self.readAtomList(window_id, .net_wm_state)) orelse return .{};
     if (std.mem.eql(c.xcb_atom_t, window.net_wm_state, replacement)) {
         self.allocator.free(replacement);
-        return false;
+        return .{};
     }
     const previous_fullscreen = window.fullscreen;
+    const previous_maximized = window.maximized_horz and window.maximized_vert;
     self.allocator.free(window.net_wm_state);
     window.net_wm_state = replacement;
     window.fullscreen = std.mem.indexOfScalar(
@@ -559,7 +615,20 @@ fn refreshNetWmState(self: *Self, window_id: WindowId, window: *Window) !bool {
         replacement,
         self.atomValue(.net_wm_state_fullscreen),
     ) != null;
-    return previous_fullscreen != window.fullscreen;
+    window.maximized_horz = std.mem.indexOfScalar(
+        c.xcb_atom_t,
+        replacement,
+        self.atomValue(.net_wm_state_maximized_horz),
+    ) != null;
+    window.maximized_vert = std.mem.indexOfScalar(
+        c.xcb_atom_t,
+        replacement,
+        self.atomValue(.net_wm_state_maximized_vert),
+    ) != null;
+    return .{
+        .fullscreen = previous_fullscreen != window.fullscreen,
+        .maximized = previous_maximized != (window.maximized_horz and window.maximized_vert),
+    };
 }
 
 fn readAtomList(self: *Self, window_id: WindowId, property: Atom) !?[]c.xcb_atom_t {
@@ -1012,14 +1081,22 @@ fn handlePropertyNotify(self: *Self, event: *const c.xcb_property_notify_event_t
     } else if (event.atom == self.atomValue(.wm_protocols)) {
         self.refreshProtocols(event.window, window);
     } else if (event.atom == self.atomValue(.net_wm_state)) {
-        if (try self.refreshNetWmState(event.window, window) and
-            window.mapped and !window.override_redirect)
-        {
-            self.listener.fullscreen_requested(
-                self.listener.context,
-                event.window,
-                window.fullscreen,
-            );
+        const changed = try self.refreshNetWmState(event.window, window);
+        if (window.mapped and !window.override_redirect) {
+            if (changed.fullscreen) {
+                self.listener.fullscreen_requested(
+                    self.listener.context,
+                    event.window,
+                    window.fullscreen,
+                );
+            }
+            if (changed.maximized) {
+                self.listener.maximize_requested(
+                    self.listener.context,
+                    event.window,
+                    window.maximized_horz and window.maximized_vert,
+                );
+            }
         }
     }
 }
@@ -1126,14 +1203,43 @@ fn handleClientMessage(
 fn handleNetWmStateMessage(self: *Self, event: *const c.xcb_client_message_event_t) void {
     const window = self.windows.get(event.window) orelse return;
     if (!window.mapped or window.override_redirect) return;
-    var requested = window.fullscreen;
+    var requested_fullscreen = window.fullscreen;
+    var requested_maximized_horz = window.maximized_horz;
+    var requested_maximized_vert = window.maximized_vert;
     const atoms = [_]c.xcb_atom_t{ event.data.data32[1], event.data.data32[2] };
     for (atoms) |atom| {
-        if (atom != self.atomValue(.net_wm_state_fullscreen)) continue;
-        requested = applyStateAction(requested, event.data.data32[0]) orelse return;
+        if (atom == self.atomValue(.net_wm_state_fullscreen)) {
+            requested_fullscreen = applyStateAction(
+                requested_fullscreen,
+                event.data.data32[0],
+            ) orelse return;
+        } else if (atom == self.atomValue(.net_wm_state_maximized_horz)) {
+            requested_maximized_horz = applyStateAction(
+                requested_maximized_horz,
+                event.data.data32[0],
+            ) orelse return;
+        } else if (atom == self.atomValue(.net_wm_state_maximized_vert)) {
+            requested_maximized_vert = applyStateAction(
+                requested_maximized_vert,
+                event.data.data32[0],
+            ) orelse return;
+        }
     }
-    if (requested != window.fullscreen) {
-        self.listener.fullscreen_requested(self.listener.context, event.window, requested);
+    if (requested_fullscreen != window.fullscreen) {
+        self.listener.fullscreen_requested(
+            self.listener.context,
+            event.window,
+            requested_fullscreen,
+        );
+    }
+    const maximized = window.maximized_horz and window.maximized_vert;
+    const requested_maximized = requested_maximized_horz and requested_maximized_vert;
+    if (requested_maximized != maximized) {
+        self.listener.maximize_requested(
+            self.listener.context,
+            event.window,
+            requested_maximized,
+        );
     }
 }
 
@@ -1152,6 +1258,7 @@ fn info(window_id: WindowId, window: Window) WindowInfo {
         .max_size = window.max_size,
         .can_close = window.delete_window,
         .fullscreen = window.fullscreen,
+        .maximized = window.maximized_horz and window.maximized_vert,
     };
 }
 

@@ -622,6 +622,7 @@ pub fn create(
             .resize = riverResizeXwaylandWindow,
             .move = riverMoveXwaylandWindow,
             .set_fullscreen = riverSetXwaylandWindowFullscreen,
+            .set_maximized = riverSetXwaylandWindowMaximized,
             .close = riverCloseXwaylandWindow,
             .refresh_scene = riverRefreshXwaylandScene,
         },
@@ -643,6 +644,7 @@ pub fn create(
             .window_info = riverXwaylandWindowInfo,
             .close = riverCloseXwaylandWindow,
             .request_fullscreen = riverRequestXwaylandWindowFullscreen,
+            .request_maximized = riverRequestXwaylandWindowMaximized,
         },
         &self.outputs,
     );
@@ -3242,6 +3244,7 @@ fn xwaylandReady(
         .configured = xwmWindowConfigured,
         .metadata_changed = xwmWindowMetadataChanged,
         .fullscreen_requested = xwmWindowFullscreenRequested,
+        .maximize_requested = xwmWindowMaximizeRequested,
         .serial = xwmWindowSerial,
         .associated = xwmWindowAssociated,
         .dissociated = xwmWindowDissociated,
@@ -3350,6 +3353,19 @@ fn xwmWindowFullscreenRequested(context: *anyopaque, window_id: Xwm.WindowId, fu
     }
     if (self.window_manager_initialized) {
         self.window_manager.xwaylandWindowFullscreenRequested(window_id, fullscreen, null);
+    }
+}
+
+fn xwmWindowMaximizeRequested(context: *anyopaque, window_id: Xwm.WindowId, maximized: bool) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    if (self.foreign_toplevel_list_initialized) {
+        const info = self.xwm.windowInfo(window_id) orelse return;
+        if (info.maximized == maximized) {
+            self.foreign_toplevel_list.xwaylandWindowStateChanged(window_id);
+        }
+    }
+    if (self.window_manager_initialized) {
+        self.window_manager.xwaylandWindowMaximizeRequested(window_id, maximized);
     }
 }
 
@@ -3491,6 +3507,22 @@ fn riverSetXwaylandWindowFullscreen(
     }
 }
 
+fn riverSetXwaylandWindowMaximized(
+    context: *anyopaque,
+    window_id: Xwm.WindowId,
+    maximized: bool,
+) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    if (!self.xwm_initialized) return;
+    const changed = self.xwm.setMaximized(window_id, maximized) catch |err| {
+        log.warn("failed to set X11 window {d} maximized state: {t}", .{ window_id, err });
+        return;
+    };
+    if (changed and self.foreign_toplevel_list_initialized) {
+        self.foreign_toplevel_list.xwaylandWindowStateChanged(window_id);
+    }
+}
+
 fn riverRequestXwaylandWindowFullscreen(
     context: *anyopaque,
     window_id: Xwm.WindowId,
@@ -3504,6 +3536,17 @@ fn riverRequestXwaylandWindowFullscreen(
             fullscreen,
             preferred_output,
         );
+    }
+}
+
+fn riverRequestXwaylandWindowMaximized(
+    context: *anyopaque,
+    window_id: Xwm.WindowId,
+    maximized: bool,
+) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    if (self.window_manager_initialized) {
+        self.window_manager.xwaylandWindowMaximizeRequested(window_id, maximized);
     }
 }
 
