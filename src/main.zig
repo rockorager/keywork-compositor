@@ -116,6 +116,7 @@ test {
     _ = @import("river/input_manager.zig");
     _ = @import("river/libinput_config.zig");
     _ = @import("river/xkb_config.zig");
+    _ = @import("river/xkb_bindings.zig");
     _ = @import("river/window_manager.zig");
     _ = @import("server.zig");
 }

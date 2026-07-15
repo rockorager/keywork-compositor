@@ -521,6 +521,31 @@ pub fn pointerMoved(self: *Self, root: ?Surface.Id) void {
     if (changed) self.requestManage();
 }
 
+pub fn bindingSession(self: *Self, resource: *river.SeatV1) ?u64 {
+    const data = resource.getUserData() orelse return null;
+    const seat_resource: *SeatResource = @ptrCast(@alignCast(data));
+    if (seat_resource.manager != self or self.seat_resource != resource or self.active == null) return null;
+    if (seat_resource.owner_generation != self.session_generation or
+        resource.getClient() != self.active.?.getClient()) return null;
+    return self.session_generation;
+}
+
+pub fn bindingSessionActive(self: *Self, generation: u64, client: *wl.Client) bool {
+    return self.active != null and self.session_generation == generation and
+        self.active.?.getClient() == client;
+}
+
+pub fn requireBindingManage(self: *Self, generation: u64, client: *wl.Client) bool {
+    if (!self.bindingSessionActive(generation, client)) return false;
+    if (self.sequence.state == .manage) return true;
+    self.active.?.postError(.sequence_order, "binding request outside a manage sequence");
+    return false;
+}
+
+pub fn requestBindingManage(self: *Self, generation: u64, client: *wl.Client) void {
+    if (self.bindingSessionActive(generation, client)) self.requestManage();
+}
+
 fn updateDesiredHover(self: *Self, root: ?Surface.Id) bool {
     const next = self.windowForSurface(root);
     if (std.meta.eql(self.desired_hovered, next)) return false;

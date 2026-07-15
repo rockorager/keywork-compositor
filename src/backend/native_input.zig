@@ -142,6 +142,7 @@ pub const KeyboardEvent = struct {
     device_id: DeviceId,
     key_code: u32,
     state: wl.Keyboard.KeyState,
+    seat_level: bool,
     modifiers: u32,
     keysyms: []const u32,
     is_modifier: bool,
@@ -992,13 +993,14 @@ fn keyboardKey(self: *Self, event: *c.struct_libinput_event_keyboard) void {
     if (forward and self.active_keyboard != device.info.id) {
         self.activateKeyboard(device) catch |err| return self.fail(err);
     }
-    const binding_event = keyboardEvent(device, keyboard, key, pressed);
-    const native_captured = forward and self.handleNativeShortcut(key, pressed);
-    const binding_captured = forward and !native_captured and if (self.keyboard_event_listener) |listener|
+    const binding_event = keyboardEvent(device, keyboard, key, pressed, forward);
+    const emergency_captured = forward and self.handleEmergencyShortcut(key, pressed);
+    const binding_captured = !emergency_captured and if (self.keyboard_event_listener) |listener|
         listener.key(listener.context, binding_event)
     else
         false;
-    const old_modifiers = effectiveKeyboardModifiers(keyboard);
+    const launcher_captured = forward and !emergency_captured and !binding_captured and
+        self.handleLauncherShortcut(key, pressed);
     const old_state = stateSnapshot(keyboard);
     _ = c.xkb_state_update_key(
         keyboard.state,
@@ -1009,7 +1011,7 @@ fn keyboardKey(self: *Self, event: *c.struct_libinput_event_keyboard) void {
     if (!keyboardStatesEqual(old_state, new_state)) self.notifyKeyboardState(device);
     if (!forward) return;
     log.debug("key {d} {s}", .{ key, if (pressed) "pressed" else "released" });
-    if (!native_captured and !binding_captured) {
+    if (!emergency_captured and !binding_captured and !launcher_captured) {
         self.listener.keyboard_key(
             self.listener.context,
             c.libinput_event_keyboard_get_time(event),
@@ -1018,13 +1020,9 @@ fn keyboardKey(self: *Self, event: *c.struct_libinput_event_keyboard) void {
         );
     }
     self.sendKeyboardModifiers(keyboard, false);
-    const new_modifiers = effectiveKeyboardModifiers(keyboard);
-    if (old_modifiers != new_modifiers) if (self.keyboard_event_listener) |listener| {
-        listener.modifiers(listener.context, old_modifiers, new_modifiers);
-    };
 }
 
-fn handleNativeShortcut(self: *Self, key: u32, pressed: bool) bool {
+fn handleEmergencyShortcut(self: *Self, key: u32, pressed: bool) bool {
     if (key == c.KEY_LEFTMETA) self.left_meta_pressed = pressed;
     if (key == c.KEY_RIGHTMETA) self.right_meta_pressed = pressed;
     if (key == c.KEY_LEFTCTRL) self.left_ctrl_pressed = pressed;
@@ -1052,6 +1050,10 @@ fn handleNativeShortcut(self: *Self, key: u32, pressed: bool) bool {
             return true;
         }
     }
+    return false;
+}
+
+fn handleLauncherShortcut(self: *Self, key: u32, pressed: bool) bool {
     if (key == c.KEY_ENTER) {
         if (pressed and (self.left_meta_pressed or self.right_meta_pressed)) {
             self.launcher_enter_pressed = true;
@@ -1081,6 +1083,7 @@ fn sendKeyboardModifiers(self: *Self, keyboard: *const Keyboard, force: bool) vo
         .group = c.xkb_state_serialize_layout(keyboard.state, c.XKB_STATE_LAYOUT_EFFECTIVE),
     };
     if (!force and std.meta.eql(self.modifiers, modifiers)) return;
+    const old_effective = effectiveModifiers(self.modifiers);
     self.modifiers = modifiers;
     self.listener.keyboard_modifiers(
         self.listener.context,
@@ -1089,6 +1092,10 @@ fn sendKeyboardModifiers(self: *Self, keyboard: *const Keyboard, force: bool) vo
         modifiers.locked,
         modifiers.group,
     );
+    const new_effective = effectiveModifiers(modifiers);
+    if (old_effective != new_effective) if (self.keyboard_event_listener) |listener| {
+        listener.modifiers(listener.context, old_effective, new_effective);
+    };
 }
 
 fn keyboardEvent(
@@ -1096,6 +1103,7 @@ fn keyboardEvent(
     keyboard: *const Keyboard,
     key_code: u32,
     pressed: bool,
+    seat_level: bool,
 ) KeyboardEvent {
     var symbols: [*c]const c.xkb_keysym_t = null;
     const count = c.xkb_state_key_get_syms(keyboard.state, key_code + 8, &symbols);
@@ -1107,6 +1115,7 @@ fn keyboardEvent(
         .device_id = device.info.id,
         .key_code = key_code,
         .state = if (pressed) .pressed else .released,
+        .seat_level = seat_level,
         .modifiers = effectiveKeyboardModifiers(keyboard),
         .keysyms = keysyms,
         .is_modifier = isModifierKeysyms(keysyms),
@@ -1114,8 +1123,14 @@ fn keyboardEvent(
 }
 
 fn effectiveKeyboardModifiers(keyboard: *const Keyboard) u32 {
-    return (c.xkb_state_serialize_mods(keyboard.state, c.XKB_STATE_MODS_DEPRESSED) |
-        c.xkb_state_serialize_mods(keyboard.state, c.XKB_STATE_MODS_LATCHED)) & 0xed;
+    return effectiveModifiers(.{
+        .depressed = c.xkb_state_serialize_mods(keyboard.state, c.XKB_STATE_MODS_DEPRESSED),
+        .latched = c.xkb_state_serialize_mods(keyboard.state, c.XKB_STATE_MODS_LATCHED),
+    });
+}
+
+fn effectiveModifiers(modifiers: Modifiers) u32 {
+    return (modifiers.depressed | modifiers.latched) & 0xed;
 }
 
 fn isModifierKeysyms(keysyms: []const u32) bool {
@@ -1145,6 +1160,7 @@ fn isModifierKeysyms(keysyms: []const u32) bool {
 }
 
 fn resetKeyboardState(self: *Self) void {
+    const old_effective = effectiveModifiers(self.modifiers);
     self.active_keyboard = null;
     self.modifiers = .{};
     self.left_meta_pressed = false;
@@ -1156,6 +1172,9 @@ fn resetKeyboardState(self: *Self) void {
     self.launcher_enter_pressed = false;
     self.session_switch_key = null;
     self.listener.keyboard_modifiers(self.listener.context, 0, 0, 0, 0);
+    if (old_effective != 0) if (self.keyboard_event_listener) |listener| {
+        listener.modifiers(listener.context, old_effective, 0);
+    };
 }
 
 fn configuredKeyboardStateChanged(self: *Self, device: *InputDevice) void {
