@@ -12,6 +12,7 @@ const Seat = @import("../wayland/seat.zig");
 const slot_map = @import("../slot_map.zig");
 const Surface = @import("../wayland/surface.zig");
 const XdgShell = @import("../wayland/xdg_shell.zig");
+const Xwm = @import("../xwayland/xwm.zig");
 const LayerShell = @import("../wayland/layer_shell.zig");
 
 const wl = wayland.server.wl;
@@ -109,7 +110,9 @@ const ManagedNodeId = union(enum) {
 };
 
 const ManagedWindow = struct {
-    xdg_id: XdgShell.WindowId,
+    backend: Backend,
+    scene_id: Scene.Id,
+    surface_id: Surface.Id,
     identifier: u64,
     resource: ?*river.WindowV1 = null,
     node_resource: ?*river.NodeV1 = null,
@@ -134,6 +137,18 @@ const ManagedWindow = struct {
     borders: ?Scene.Borders = null,
     clip_box: ?Scene.ClipBox = null,
     content_clip_box: ?Scene.ClipBox = null,
+
+    const Backend = union(enum) {
+        xdg: XdgShell.WindowId,
+        xwayland: Xwm.WindowId,
+    };
+
+    fn xdgId(self: *const ManagedWindow) ?XdgShell.WindowId {
+        return switch (self.backend) {
+            .xdg => |id| id,
+            .xwayland => null,
+        };
+    }
 };
 
 const ManagedDecoration = struct {
@@ -565,7 +580,7 @@ pub fn focusedSurfaceForSeat(self: *Self, seat: *Seat) ?Surface.Id {
     }
     const id = state.focused orelse return null;
     const window = self.windows.get(id) orelse return null;
-    return self.xdg_shell.windowSurface(window.xdg_id);
+    return window.surface_id;
 }
 
 pub fn pointerGrabbed(self: *const Self) bool {
@@ -592,7 +607,7 @@ fn reroutePointer(self: *Self, state: *SeatState) bool {
 
 fn windowForSurface(self: *Self, root: ?Surface.Id) ?WindowId {
     const surface_id = root orelse return null;
-    if (self.xdg_shell.surfaceRootWindow(surface_id)) |xdg_id| return self.findWindow(xdg_id);
+    if (self.xdg_shell.surfaceRootWindow(surface_id)) |xdg_id| return self.findXdgWindow(xdg_id);
     var decorations = self.decorations.iterator();
     while (decorations.next()) |entry| if (entry.value.adapter.surface) |surface| {
         if (std.meta.eql(surface.handle(), surface_id)) return entry.value.window_id;
@@ -816,19 +831,24 @@ fn handleDestroy(resource: *river.WindowManagerV1, self: *Self) void {
 }
 
 fn ensureWindow(self: *Self, xdg_id: XdgShell.WindowId) error{OutOfMemory}!WindowId {
-    if (self.findWindow(xdg_id)) |id| return id;
+    if (self.findXdgWindow(xdg_id)) |id| return id;
+    const info = self.xdg_shell.windowInfo(xdg_id) orelse unreachable;
+    const surface_id = self.xdg_shell.windowSurface(xdg_id) orelse unreachable;
     const identifier = self.next_window_identifier;
     self.next_window_identifier = std.math.add(u64, identifier, 1) catch unreachable;
     return self.windows.insert(self.allocator, .{
-        .xdg_id = xdg_id,
+        .backend = .{ .xdg = xdg_id },
+        .scene_id = info.scene_id,
+        .surface_id = surface_id,
         .identifier = identifier,
     });
 }
 
-fn findWindow(self: *Self, xdg_id: XdgShell.WindowId) ?WindowId {
+fn findXdgWindow(self: *Self, xdg_id: XdgShell.WindowId) ?WindowId {
     var iterator = self.windows.iterator();
     while (iterator.next()) |entry| {
-        if (std.meta.eql(entry.value.xdg_id, xdg_id)) return entry.id;
+        const candidate = entry.value.xdgId() orelse continue;
+        if (std.meta.eql(candidate, xdg_id)) return entry.id;
     }
     return null;
 }
@@ -870,7 +890,8 @@ fn sendPendingState(self: *Self, manager: *river.WindowManagerV1) !void {
         const window = entry.value;
         if (!window.metadata_dirty) continue;
         const resource = window.resource orelse continue;
-        const info = self.xdg_shell.windowInfo(window.xdg_id) orelse continue;
+        const xdg_id = window.xdgId() orelse continue;
+        const info = self.xdg_shell.windowInfo(xdg_id) orelse continue;
         resource.sendDimensionsHint(
             info.min_size.width,
             info.min_size.height,
@@ -880,7 +901,7 @@ fn sendPendingState(self: *Self, manager: *river.WindowManagerV1) !void {
         resource.sendAppId(if (info.app_id) |app_id| app_id.ptr else null);
         resource.sendTitle(if (info.title) |title| title.ptr else null);
         const parent_resource = if (info.parent) |parent_id| parent: {
-            const managed_parent_id = self.findWindow(parent_id) orelse break :parent null;
+            const managed_parent_id = self.findXdgWindow(parent_id) orelse break :parent null;
             const managed_parent = self.windows.get(managed_parent_id) orelse break :parent null;
             break :parent managed_parent.resource;
         } else null;
@@ -995,7 +1016,8 @@ fn createWindowResource(
     window.resource = resource;
     manager.sendWindow(resource);
     if (resource.getVersion() >= river.WindowV1.unreliable_pid_since_version) {
-        const info = self.xdg_shell.windowInfo(window.xdg_id) orelse unreachable;
+        const xdg_id = window.xdgId() orelse unreachable;
+        const info = self.xdg_shell.windowInfo(xdg_id) orelse unreachable;
         resource.sendUnreliablePid(info.unreliable_pid);
     }
     if (resource.getVersion() >= river.WindowV1.identifier_since_version) {
@@ -1024,11 +1046,12 @@ fn finishManage(self: *Self, manager: *river.WindowManagerV1) void {
     var configure_count: u32 = 0;
     var iterator = self.windows.iterator();
     while (iterator.next()) |entry| {
+        const xdg_id = entry.value.xdgId() orelse continue;
         const activated = self.windowFocusedByAnySeat(entry.id);
         entry.value.requested_configuration.activated = activated;
         const report_dimensions = entry.value.proposed_dimensions != null or
             entry.value.fullscreen_dimensions_pending;
-        const info = self.xdg_shell.windowInfo(entry.value.xdg_id) orelse continue;
+        const info = self.xdg_shell.windowInfo(xdg_id) orelse continue;
         if (info.decoration_preference == .only_csd) {
             entry.value.requested_configuration.decoration_mode = .client_side;
         }
@@ -1047,7 +1070,7 @@ fn finishManage(self: *Self, manager: *river.WindowManagerV1) void {
             };
         } else proposed_dimensions orelse info.dimensions orelse entry.value.requested_dimensions;
         const serial = self.xdg_shell.configureWindowState(
-            entry.value.xdg_id,
+            xdg_id,
             dimensions,
             entry.value.requested_configuration,
         ) catch |err| {
@@ -1144,7 +1167,8 @@ fn startRender(self: *Self, manager: *river.WindowManagerV1) void {
             }
         }
         if (!entry.value.dimensions_pending) continue;
-        const dimensions = (self.xdg_shell.windowInfo(entry.value.xdg_id) orelse continue).dimensions orelse
+        const xdg_id = entry.value.xdgId() orelse continue;
+        const dimensions = (self.xdg_shell.windowInfo(xdg_id) orelse continue).dimensions orelse
             continue;
         if (dimensions.width <= 0 or dimensions.height <= 0) continue;
         if (entry.value.resource) |resource| {
@@ -1172,24 +1196,25 @@ fn finishRender(self: *Self, manager: *river.WindowManagerV1) void {
 
     var iterator = self.windows.iterator();
     while (iterator.next()) |entry| {
+        const xdg_id = entry.value.xdgId() orelse continue;
         if (entry.value.pending_position) |position| {
             if (entry.value.fullscreen_output == null) {
-                self.xdg_shell.setWindowPosition(entry.value.xdg_id, position);
+                self.xdg_shell.setWindowPosition(xdg_id, position);
             }
             entry.value.pending_position = null;
         }
         if (self.fullscreenOutput(entry.value)) |output| {
             const position = output.logicalPosition();
-            self.xdg_shell.setWindowPosition(entry.value.xdg_id, .{
+            self.xdg_shell.setWindowPosition(xdg_id, .{
                 .x = position.x,
                 .y = position.y,
             });
         }
         self.xdg_shell.setWindowFocused(
-            entry.value.xdg_id,
+            xdg_id,
             self.windowFocusedByAnySeat(entry.id),
         );
-        self.xdg_shell.setWindowFullscreen(entry.value.xdg_id, entry.value.fullscreen_output != null);
+        self.xdg_shell.setWindowFullscreen(xdg_id, entry.value.fullscreen_output != null);
         switch (entry.value.pending_borders) {
             .unchanged => {},
             .set => |borders| {
@@ -1213,24 +1238,24 @@ fn finishRender(self: *Self, manager: *river.WindowManagerV1) void {
         }
         if (self.fullscreenOutput(entry.value)) |output| {
             const size = output.logicalSize();
-            self.xdg_shell.setWindowBorders(entry.value.xdg_id, null);
-            self.xdg_shell.setWindowClipBox(entry.value.xdg_id, .{
+            self.xdg_shell.setWindowBorders(xdg_id, null);
+            self.xdg_shell.setWindowClipBox(xdg_id, .{
                 .x = 0,
                 .y = 0,
                 .width = size.width,
                 .height = size.height,
             });
-            self.xdg_shell.setWindowContentClipBox(entry.value.xdg_id, null);
+            self.xdg_shell.setWindowContentClipBox(xdg_id, null);
         } else {
-            self.xdg_shell.setWindowBorders(entry.value.xdg_id, entry.value.borders);
-            self.xdg_shell.setWindowClipBox(entry.value.xdg_id, entry.value.clip_box);
+            self.xdg_shell.setWindowBorders(xdg_id, entry.value.borders);
+            self.xdg_shell.setWindowClipBox(xdg_id, entry.value.clip_box);
             self.xdg_shell.setWindowContentClipBox(
-                entry.value.xdg_id,
+                xdg_id,
                 entry.value.content_clip_box,
             );
         }
         self.xdg_shell.setWindowVisible(
-            entry.value.xdg_id,
+            xdg_id,
             entry.value.display_ready and entry.value.requested_visible,
         );
     }
@@ -1341,8 +1366,7 @@ fn sceneNodeId(self: *Self, id: ManagedNodeId) ?Scene.NodeId {
     return switch (id) {
         .window => |window_id| {
             const window = self.windows.get(window_id) orelse return null;
-            const info = self.xdg_shell.windowInfo(window.xdg_id) orelse return null;
-            return .{ .window = info.scene_id };
+            return .{ .window = window.scene_id };
         },
         .shell_surface => |shell_id| {
             const shell_surface = self.shell_surfaces.get(shell_id) orelse return null;
@@ -1596,20 +1620,22 @@ fn releaseWindows(self: *Self) void {
     var iterator = self.windows.iterator();
     while (iterator.next()) |entry| {
         self.detachDecorations(entry.id);
-        self.xdg_shell.setWindowFocused(entry.value.xdg_id, false);
-        self.xdg_shell.setWindowFullscreen(entry.value.xdg_id, false);
-        self.xdg_shell.setWindowBorders(entry.value.xdg_id, null);
-        self.xdg_shell.setWindowClipBox(entry.value.xdg_id, null);
-        self.xdg_shell.setWindowContentClipBox(entry.value.xdg_id, null);
-        self.xdg_shell.restoreStandaloneWindow(
-            entry.value.xdg_id,
-            entry.value.sent_configuration.activated or
-                entry.value.sent_configuration.decoration_mode == .server_side or
-                entry.value.sent_configuration.suspended or
-                entry.value.sent_configuration.bounds.width != 0 or
-                entry.value.sent_configuration.bounds.height != 0,
-            entry.value.requested_dimensions,
-        );
+        if (entry.value.xdgId()) |xdg_id| {
+            self.xdg_shell.setWindowFocused(xdg_id, false);
+            self.xdg_shell.setWindowFullscreen(xdg_id, false);
+            self.xdg_shell.setWindowBorders(xdg_id, null);
+            self.xdg_shell.setWindowClipBox(xdg_id, null);
+            self.xdg_shell.setWindowContentClipBox(xdg_id, null);
+            self.xdg_shell.restoreStandaloneWindow(
+                xdg_id,
+                entry.value.sent_configuration.activated or
+                    entry.value.sent_configuration.decoration_mode == .server_side or
+                    entry.value.sent_configuration.suspended or
+                    entry.value.sent_configuration.bounds.width != 0 or
+                    entry.value.sent_configuration.bounds.height != 0,
+                entry.value.requested_dimensions,
+            );
+        }
         _ = self.windows.remove(entry.id);
     }
 }
@@ -1659,7 +1685,7 @@ fn windowCommitted(
 ) bool {
     const self: *Self = @ptrCast(@alignCast(context));
     const manager = self.active orelse return false;
-    const id = self.findWindow(xdg_id) orelse return false;
+    const id = self.findXdgWindow(xdg_id) orelse return false;
     const window = self.windows.get(id) orelse return false;
     const serial = configure_serial orelse {
         const dimensions = (self.xdg_shell.windowInfo(xdg_id) orelse return true).dimensions orelse
@@ -1710,7 +1736,7 @@ fn windowDestroyed(context: *anyopaque, xdg_id: XdgShell.WindowId) void {
 fn windowMetadataChanged(context: *anyopaque, xdg_id: XdgShell.WindowId) bool {
     const self: *Self = @ptrCast(@alignCast(context));
     if (self.active == null) return false;
-    const id = self.findWindow(xdg_id) orelse return false;
+    const id = self.findXdgWindow(xdg_id) orelse return false;
     const window = self.windows.get(id) orelse return false;
     window.metadata_dirty = true;
     self.requestManage();
@@ -1778,7 +1804,7 @@ fn windowRequest(
 }
 
 fn removeWindow(self: *Self, xdg_id: XdgShell.WindowId) void {
-    const id = self.findWindow(xdg_id) orelse return;
+    const id = self.findXdgWindow(xdg_id) orelse return;
     const window = self.windows.get(id) orelse return;
     if (window.resource) |resource| resource.sendClosed();
     for (self.seat_states.items) |state| {
@@ -1803,11 +1829,13 @@ fn removeWindow(self: *Self, xdg_id: XdgShell.WindowId) void {
         else => false,
     };
     self.detachDecorations(id);
-    self.xdg_shell.setWindowFocused(window.xdg_id, false);
-    self.xdg_shell.setWindowFullscreen(window.xdg_id, false);
-    self.xdg_shell.setWindowBorders(window.xdg_id, null);
-    self.xdg_shell.setWindowClipBox(window.xdg_id, null);
-    self.xdg_shell.setWindowContentClipBox(window.xdg_id, null);
+    if (window.xdgId()) |xdg_window_id| {
+        self.xdg_shell.setWindowFocused(xdg_window_id, false);
+        self.xdg_shell.setWindowFullscreen(xdg_window_id, false);
+        self.xdg_shell.setWindowBorders(xdg_window_id, null);
+        self.xdg_shell.setWindowClipBox(xdg_window_id, null);
+        self.xdg_shell.setWindowContentClipBox(xdg_window_id, null);
+    }
     _ = self.windows.remove(id);
     if (finish_configure and self.sequence.configureFinished()) {
         if (self.active) |manager| self.startRender(manager);
@@ -1832,12 +1860,13 @@ const WindowResource = struct {
         }
         const manager_resource = self.activeManager() orelse return;
         const window = self.manager.windows.get(self.id) orelse return;
+        const xdg_id = window.xdgId() orelse return;
 
         switch (request) {
             .destroy => unreachable,
             .close => {
                 if (!self.requireManage(manager_resource)) return;
-                self.manager.xdg_shell.closeWindow(window.xdg_id);
+                self.manager.xdg_shell.closeWindow(xdg_id);
             },
             .propose_dimensions => |dimensions| {
                 if (!self.requireManage(manager_resource)) return;
@@ -1868,7 +1897,7 @@ const WindowResource = struct {
             },
             .use_ssd => {
                 if (!self.requireManage(manager_resource)) return;
-                const info = self.manager.xdg_shell.windowInfo(window.xdg_id) orelse return;
+                const info = self.manager.xdg_shell.windowInfo(xdg_id) orelse return;
                 if (info.decoration_preference != .only_csd) {
                     window.requested_configuration.decoration_mode = .server_side;
                 }
@@ -2132,7 +2161,7 @@ const DecorationResource = struct {
         errdefer surface.releaseRole(self);
 
         const scene_id = manager.xdg_shell.addWindowDecoration(
-            window.xdg_id,
+            window.xdgId() orelse return error.ResourceCreateFailed,
             surface.handle(),
             layer,
         ) catch |err| switch (err) {
