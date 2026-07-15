@@ -862,16 +862,17 @@
       "interfaces": [
         {
           "name": "ext_foreign_toplevel_list_v1",
-          "current_version": null,
+          "current_version": 1,
           "target_version": 1
         }
       ],
-      "status": "not_started",
+      "status": "done",
       "privileged": true,
       "blocked_by": [
         "security-context",
         "xdg-shell"
-      ]
+      ],
+      "status_detail": "Version 1 advertises every mapped xdg-toplevel with a never-reused opaque identifier, initial and updated title/app-id metadata, atomic done events, unmap/remap and close lifecycles, stopped-list handling, and sandboxed-client global filtering."
     },
     {
       "id": "wlr-foreign-toplevel-management",

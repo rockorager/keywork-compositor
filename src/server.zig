@@ -27,6 +27,7 @@ const Seat = @import("wayland/seat.zig");
 const DataDevice = @import("wayland/data_device.zig");
 const PrimarySelection = @import("wayland/primary_selection.zig");
 const DataControl = @import("wayland/data_control.zig");
+const ForeignToplevelList = @import("wayland/foreign_toplevel_list.zig");
 const TextInput = @import("wayland/text_input.zig");
 const InputMethod = @import("wayland/input_method.zig");
 const VirtualKeyboard = @import("wayland/virtual_keyboard.zig");
@@ -113,6 +114,7 @@ next_touch_id: u31,
 data_device: DataDevice,
 primary_selection: PrimarySelection,
 data_control: DataControl,
+foreign_toplevel_list: ForeignToplevelList,
 text_input: TextInput,
 input_method: InputMethod,
 virtual_keyboard: VirtualKeyboard,
@@ -275,6 +277,7 @@ pub fn create(
         .data_device = undefined,
         .primary_selection = undefined,
         .data_control = undefined,
+        .foreign_toplevel_list = undefined,
         .text_input = undefined,
         .input_method = undefined,
         .virtual_keyboard = undefined,
@@ -564,6 +567,13 @@ pub fn create(
         self.window_manager.deinit();
         self.window_manager_initialized = false;
     }
+    try self.foreign_toplevel_list.init(
+        allocator,
+        display,
+        &self.security_context,
+        &self.xdg_shell,
+    );
+    errdefer self.foreign_toplevel_list.deinit();
     self.subcompositor.setRepaintListener(.{
         .context = self,
         .request = requestRepaint,
@@ -714,6 +724,7 @@ pub fn destroy(self: *Self) void {
         self.output_management.deinit();
         self.output_management_initialized = false;
     }
+    self.foreign_toplevel_list.deinit();
     self.window_manager.deinit();
     self.window_manager_initialized = false;
     self.virtual_keyboard.deinit();

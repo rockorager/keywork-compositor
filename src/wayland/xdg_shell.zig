@@ -30,6 +30,7 @@ windows: WindowStore,
 popups: PopupStore,
 next_popup_order: u64,
 window_listener: ?WindowListener,
+window_observers: std.ArrayList(WindowObserver),
 
 const BindingStore = slot_map.SlotMap(BindingState, enum { xdg_binding });
 const BindingId = BindingStore.Id;
@@ -281,6 +282,14 @@ pub const WindowListener = struct {
     request: *const fn (*anyopaque, WindowId, WindowRequest) void,
 };
 
+pub const WindowObserver = struct {
+    context: *anyopaque,
+    committed: *const fn (*anyopaque, WindowId) void,
+    unmapped: *const fn (*anyopaque, WindowId) void,
+    destroyed: *const fn (*anyopaque, WindowId) void,
+    metadata_changed: *const fn (*anyopaque, WindowId) void,
+};
+
 pub const WindowIterator = struct {
     inner: WindowStore.Iterator,
 
@@ -325,11 +334,13 @@ pub fn init(
         .popups = .{},
         .next_popup_order = 0,
         .window_listener = null,
+        .window_observers = .empty,
     };
     errdefer self.bindings.deinit(allocator);
     errdefer self.xdg_surfaces.deinit(allocator);
     errdefer self.windows.deinit(allocator);
     errdefer self.popups.deinit(allocator);
+    errdefer self.window_observers.deinit(allocator);
     self.global = try wl.Global.create(display, xdg.WmBase, 7, *Self, self, bind);
     errdefer self.global.destroy();
     self.decoration_global = try wl.Global.create(
@@ -344,12 +355,14 @@ pub fn init(
 
 pub fn deinit(self: *Self) void {
     std.debug.assert(self.window_listener == null);
+    std.debug.assert(self.window_observers.items.len == 0);
     self.decoration_global.destroy();
     self.global.destroy();
     self.bindings.deinit(self.allocator);
     self.xdg_surfaces.deinit(self.allocator);
     self.windows.deinit(self.allocator);
     self.popups.deinit(self.allocator);
+    self.window_observers.deinit(self.allocator);
     self.* = undefined;
 }
 
@@ -366,6 +379,22 @@ pub fn setWindowListener(self: *Self, listener: WindowListener) void {
 pub fn clearWindowListener(self: *Self) void {
     std.debug.assert(self.window_listener != null);
     self.window_listener = null;
+}
+
+pub fn addWindowObserver(self: *Self, observer: WindowObserver) error{OutOfMemory}!void {
+    for (self.window_observers.items) |existing| {
+        std.debug.assert(existing.context != observer.context);
+    }
+    try self.window_observers.append(self.allocator, observer);
+}
+
+pub fn removeWindowObserver(self: *Self, context: *anyopaque) void {
+    for (self.window_observers.items, 0..) |observer, index| {
+        if (observer.context != context) continue;
+        _ = self.window_observers.orderedRemove(index);
+        return;
+    }
+    unreachable;
 }
 
 pub fn windowIterator(self: *Self) WindowIterator {
@@ -875,7 +904,7 @@ pub fn setForeignParent(
     }
     child.parent = applied_parent;
     child.parent_owner = if (applied_parent != null) owner else null;
-    self.notifyWindowMetadataChanged(child_id);
+    _ = self.notifyWindowMetadataChanged(child_id);
 }
 
 pub fn clearForeignParents(self: *Self, owner: *anyopaque) void {
@@ -884,7 +913,7 @@ pub fn clearForeignParents(self: *Self, owner: *anyopaque) void {
         if (entry.value.parent_owner != owner) continue;
         entry.value.parent = null;
         entry.value.parent_owner = null;
-        self.notifyWindowMetadataChanged(entry.id);
+        _ = self.notifyWindowMetadataChanged(entry.id);
     }
 }
 
@@ -895,15 +924,41 @@ fn clearParentReferences(self: *Self, parent_id: WindowId) void {
             if (!std.meta.eql(candidate, parent_id)) continue;
             entry.value.parent = null;
             entry.value.parent_owner = null;
-            self.notifyWindowMetadataChanged(entry.id);
+            _ = self.notifyWindowMetadataChanged(entry.id);
         }
     }
 }
 
-fn notifyWindowMetadataChanged(self: *Self, window_id: WindowId) void {
-    if (self.window_listener) |listener| {
-        _ = listener.metadata_changed(listener.context, window_id);
+fn notifyWindowMetadataChanged(self: *Self, window_id: WindowId) bool {
+    const externally_managed = if (self.window_listener) |listener|
+        listener.metadata_changed(listener.context, window_id)
+    else
+        false;
+    for (self.window_observers.items) |observer| {
+        observer.metadata_changed(observer.context, window_id);
     }
+    return externally_managed;
+}
+
+fn notifyWindowCommitted(self: *Self, window_id: WindowId, configure_serial: ?u32) bool {
+    const externally_managed = if (self.window_listener) |listener|
+        listener.committed(listener.context, window_id, configure_serial)
+    else
+        false;
+    for (self.window_observers.items) |observer| {
+        observer.committed(observer.context, window_id);
+    }
+    return externally_managed;
+}
+
+fn notifyWindowUnmapped(self: *Self, window_id: WindowId) void {
+    if (self.window_listener) |listener| listener.unmapped(listener.context, window_id);
+    for (self.window_observers.items) |observer| observer.unmapped(observer.context, window_id);
+}
+
+fn notifyWindowDestroyed(self: *Self, window_id: WindowId) void {
+    if (self.window_listener) |listener| listener.destroyed(listener.context, window_id);
+    for (self.window_observers.items) |observer| observer.destroyed(observer.context, window_id);
 }
 
 fn isTopmostPopup(self: *Self, id: PopupId) bool {
@@ -1481,9 +1536,7 @@ const XdgSurfaceResource = struct {
             .toplevel => |window_id| {
                 self.shell.clearParentReferences(window_id);
                 if (self.shell.windows.remove(window_id)) |window_value| {
-                    if (self.shell.window_listener) |listener| {
-                        listener.destroyed(listener.context, window_id);
-                    }
+                    self.shell.notifyWindowDestroyed(window_id);
                     var window = window_value;
                     self.shell.scene.removeWindow(window.scene_id);
                     window.deinit(self.allocator);
@@ -1584,16 +1637,12 @@ const XdgSurfaceResource = struct {
     ) void {
         const window = self.shell.windows.get(window_id) orelse return;
         if (window.commit()) {
-            if (self.shell.window_listener) |listener| {
-                _ = listener.metadata_changed(listener.context, window_id);
-            }
+            _ = self.shell.notifyWindowMetadataChanged(window_id);
         }
 
         if (info.had_buffer and !info.has_buffer) {
             self.shell.dismissPopupsForParent(self.id);
-            if (self.shell.window_listener) |listener| {
-                listener.unmapped(listener.context, window_id);
-            }
+            self.shell.notifyWindowUnmapped(window_id);
             state.mapped = false;
             state.configured = false;
             state.initial_configure_sent = false;
@@ -1624,10 +1673,10 @@ const XdgSurfaceResource = struct {
             }
             state.mapped = state.configured;
             window.mapped = state.mapped;
-            const externally_managed = if (self.shell.window_listener) |listener|
-                listener.committed(listener.context, window_id, configure_serial)
-            else
-                false;
+            const externally_managed = self.shell.notifyWindowCommitted(
+                window_id,
+                configure_serial,
+            );
             if (!externally_managed) self.shell.scene.setMapped(window.scene_id, state.mapped);
             if (was_mapped and state.mapped) {
                 self.shell.scene.surfaceCommitted(window.scene_id);
@@ -1729,9 +1778,7 @@ const XdgSurfaceResource = struct {
             .toplevel => |window_id| {
                 if (self.shell.windows.get(window_id)) |window| {
                     if (window.ready) {
-                        if (self.shell.window_listener) |listener| {
-                            listener.unmapped(listener.context, window_id);
-                        }
+                        self.shell.notifyWindowUnmapped(window_id);
                     }
                     window.mapped = false;
                     window.ready = false;
@@ -2079,10 +2126,7 @@ const ToplevelDecorationResource = struct {
 
     fn notifyMetadataChanged(self: *ToplevelDecorationResource) bool {
         const toplevel = self.toplevel orelse return false;
-        if (self.shell.window_listener) |listener| {
-            return listener.metadata_changed(listener.context, toplevel.id);
-        }
-        return false;
+        return self.shell.notifyWindowMetadataChanged(toplevel.id);
     }
 
     fn configureStandalone(self: *ToplevelDecorationResource) void {
@@ -2263,9 +2307,7 @@ const ToplevelResource = struct {
         }
         if (self.shell.windows.remove(self.id)) |window_value| {
             self.shell.clearParentReferences(self.id);
-            if (self.shell.window_listener) |listener| {
-                listener.destroyed(listener.context, self.id);
-            }
+            self.shell.notifyWindowDestroyed(self.id);
             var window = window_value;
             self.shell.scene.removeWindow(window.scene_id);
             window.deinit(self.allocator);
@@ -2290,9 +2332,7 @@ const ToplevelResource = struct {
         };
         if (destination.*) |old| self.allocator.free(old);
         destination.* = copy;
-        if (self.shell.window_listener) |listener| {
-            _ = listener.metadata_changed(listener.context, self.id);
-        }
+        _ = self.shell.notifyWindowMetadataChanged(self.id);
     }
 
     fn setParent(
@@ -2319,7 +2359,7 @@ const ToplevelResource = struct {
         }
         window.parent = parent_id;
         window.parent_owner = null;
-        self.shell.notifyWindowMetadataChanged(self.id);
+        _ = self.shell.notifyWindowMetadataChanged(self.id);
     }
 
     fn validMaxSize(maximum: SizeHint, minimum: SizeHint) bool {
