@@ -95,6 +95,7 @@ pub const WindowInfo = struct {
     fullscreen: bool,
     maximized: bool,
     minimized: bool,
+    skip_taskbar: bool,
 
     pub fn participatesInWindowManagement(self: WindowInfo) bool {
         return self.mapped and !self.override_redirect and
@@ -102,7 +103,7 @@ pub const WindowInfo = struct {
     }
 
     pub fn appearsInForeignToplevelList(self: WindowInfo) bool {
-        return self.participatesInWindowManagement();
+        return self.participatesInWindowManagement() and !self.skip_taskbar;
     }
 };
 
@@ -127,6 +128,7 @@ const Window = struct {
     maximized_horz: bool = false,
     maximized_vert: bool = false,
     minimized: bool = false,
+    skip_taskbar: bool = false,
 
     fn deinit(self: *Window, allocator: std.mem.Allocator) void {
         if (self.title) |value| allocator.free(value);
@@ -150,6 +152,7 @@ const Atom = enum {
     net_wm_state_maximized_horz,
     net_wm_state_maximized_vert,
     net_wm_state_hidden,
+    net_wm_state_skip_taskbar,
     net_wm_window_type,
     net_wm_window_type_desktop,
     net_wm_window_type_dock,
@@ -207,6 +210,7 @@ const atom_names: [atom_count][]const u8 = .{
     "_NET_WM_STATE_MAXIMIZED_HORZ",
     "_NET_WM_STATE_MAXIMIZED_VERT",
     "_NET_WM_STATE_HIDDEN",
+    "_NET_WM_STATE_SKIP_TASKBAR",
     "_NET_WM_WINDOW_TYPE",
     "_NET_WM_WINDOW_TYPE_DESKTOP",
     "_NET_WM_WINDOW_TYPE_DOCK",
@@ -841,6 +845,7 @@ fn publishWmIdentity(self: *Self) !void {
         self.atomValue(.net_wm_state_maximized_horz),
         self.atomValue(.net_wm_state_maximized_vert),
         self.atomValue(.net_wm_state_hidden),
+        self.atomValue(.net_wm_state_skip_taskbar),
         self.atomValue(.net_wm_window_type),
         self.atomValue(.net_wm_window_type_desktop),
         self.atomValue(.net_wm_window_type_dock),
@@ -922,6 +927,7 @@ const NetWmStateChanges = struct {
     fullscreen: bool = false,
     maximized: bool = false,
     minimized: bool = false,
+    skip_taskbar: bool = false,
 };
 
 fn refreshNetWmState(self: *Self, window_id: WindowId, window: *Window) !NetWmStateChanges {
@@ -933,6 +939,7 @@ fn refreshNetWmState(self: *Self, window_id: WindowId, window: *Window) !NetWmSt
     const previous_fullscreen = window.fullscreen;
     const previous_maximized = window.maximized_horz and window.maximized_vert;
     const previous_minimized = window.minimized;
+    const previous_skip_taskbar = window.skip_taskbar;
     self.allocator.free(window.net_wm_state);
     window.net_wm_state = replacement;
     window.fullscreen = std.mem.indexOfScalar(
@@ -955,10 +962,16 @@ fn refreshNetWmState(self: *Self, window_id: WindowId, window: *Window) !NetWmSt
         replacement,
         self.atomValue(.net_wm_state_hidden),
     ) != null;
+    window.skip_taskbar = std.mem.indexOfScalar(
+        c.xcb_atom_t,
+        replacement,
+        self.atomValue(.net_wm_state_skip_taskbar),
+    ) != null;
     return .{
         .fullscreen = previous_fullscreen != window.fullscreen,
         .maximized = previous_maximized != (window.maximized_horz and window.maximized_vert),
         .minimized = previous_minimized != window.minimized,
+        .skip_taskbar = previous_skip_taskbar != window.skip_taskbar,
     };
 }
 
@@ -1534,6 +1547,9 @@ fn handlePropertyNotify(self: *Self, event: *const c.xcb_property_notify_event_t
                     window.minimized,
                 );
             }
+            if (changed.skip_taskbar) {
+                self.listener.metadata_changed(self.listener.context, event.window);
+            }
         }
     }
 }
@@ -1631,7 +1647,7 @@ fn handleClientMessage(
         return;
     }
     if (event.type == self.atomValue(.net_wm_state)) {
-        self.handleNetWmStateMessage(event);
+        try self.handleNetWmStateMessage(event);
         return;
     }
     if (event.type == self.atomValue(.net_active_window)) {
@@ -1654,13 +1670,14 @@ fn handleClientMessage(
     self.listener.serial(self.listener.context, event.window, serial);
 }
 
-fn handleNetWmStateMessage(self: *Self, event: *const c.xcb_client_message_event_t) void {
-    const window = self.windows.get(event.window) orelse return;
+fn handleNetWmStateMessage(self: *Self, event: *const c.xcb_client_message_event_t) !void {
+    const window = self.windows.getPtr(event.window) orelse return;
     if (!window.mapped or window.override_redirect) return;
     var requested_fullscreen = window.fullscreen;
     var requested_maximized_horz = window.maximized_horz;
     var requested_maximized_vert = window.maximized_vert;
     var requested_minimized = window.minimized;
+    var requested_skip_taskbar = window.skip_taskbar;
     const atoms = [_]c.xcb_atom_t{ event.data.data32[1], event.data.data32[2] };
     for (atoms) |atom| {
         if (atom == self.atomValue(.net_wm_state_fullscreen)) {
@@ -1681,6 +1698,11 @@ fn handleNetWmStateMessage(self: *Self, event: *const c.xcb_client_message_event
         } else if (atom == self.atomValue(.net_wm_state_hidden)) {
             requested_minimized = applyStateAction(
                 requested_minimized,
+                event.data.data32[0],
+            ) orelse return;
+        } else if (atom == self.atomValue(.net_wm_state_skip_taskbar)) {
+            requested_skip_taskbar = applyStateAction(
+                requested_skip_taskbar,
                 event.data.data32[0],
             ) orelse return;
         }
@@ -1707,6 +1729,17 @@ fn handleNetWmStateMessage(self: *Self, event: *const c.xcb_client_message_event
             event.window,
             requested_minimized,
         );
+    }
+    if (requested_skip_taskbar != window.skip_taskbar) {
+        const atom = self.atomValue(.net_wm_state_skip_taskbar);
+        try self.replaceNetWmStateAtoms(
+            event.window,
+            window,
+            &.{atom},
+            if (requested_skip_taskbar) &.{atom} else &.{},
+        );
+        window.skip_taskbar = requested_skip_taskbar;
+        self.listener.metadata_changed(self.listener.context, event.window);
     }
 }
 
@@ -1748,6 +1781,7 @@ fn info(self: *const Self, window_id: WindowId, window: Window) WindowInfo {
         .fullscreen = window.fullscreen,
         .maximized = window.maximized_horz and window.maximized_vert,
         .minimized = window.minimized,
+        .skip_taskbar = window.skip_taskbar,
     };
 }
 
