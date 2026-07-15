@@ -94,6 +94,7 @@ pub const WindowInfo = struct {
     min_size: Size,
     max_size: Size,
     can_close: bool,
+    modal: bool,
     fullscreen: bool,
     maximized: bool,
     minimized: bool,
@@ -127,6 +128,7 @@ const Window = struct {
     take_focus: bool = false,
     delete_window: bool = false,
     net_wm_state: []c.xcb_atom_t = &.{},
+    modal: bool = false,
     fullscreen: bool = false,
     maximized_horz: bool = false,
     maximized_vert: bool = false,
@@ -154,6 +156,7 @@ const Atom = enum {
     net_active_window,
     net_close_window,
     net_wm_state,
+    net_wm_state_modal,
     net_wm_state_fullscreen,
     net_wm_state_maximized_horz,
     net_wm_state_maximized_vert,
@@ -215,6 +218,7 @@ const atom_names: [atom_count][]const u8 = .{
     "_NET_ACTIVE_WINDOW",
     "_NET_CLOSE_WINDOW",
     "_NET_WM_STATE",
+    "_NET_WM_STATE_MODAL",
     "_NET_WM_STATE_FULLSCREEN",
     "_NET_WM_STATE_MAXIMIZED_HORZ",
     "_NET_WM_STATE_MAXIMIZED_VERT",
@@ -879,6 +883,7 @@ fn publishWmIdentity(self: *Self) !void {
         self.atomValue(.net_active_window),
         self.atomValue(.net_close_window),
         self.atomValue(.net_wm_state),
+        self.atomValue(.net_wm_state_modal),
         self.atomValue(.net_wm_state_fullscreen),
         self.atomValue(.net_wm_state_maximized_horz),
         self.atomValue(.net_wm_state_maximized_vert),
@@ -1014,6 +1019,7 @@ fn refreshProtocols(self: *Self, window_id: WindowId, window: *Window) void {
 }
 
 const NetWmStateChanges = struct {
+    modal: bool = false,
     fullscreen: bool = false,
     maximized: bool = false,
     minimized: bool = false,
@@ -1026,12 +1032,18 @@ fn refreshNetWmState(self: *Self, window_id: WindowId, window: *Window) !NetWmSt
         self.allocator.free(replacement);
         return .{};
     }
+    const previous_modal = window.modal;
     const previous_fullscreen = window.fullscreen;
     const previous_maximized = window.maximized_horz and window.maximized_vert;
     const previous_minimized = window.minimized;
     const previous_skip_taskbar = window.skip_taskbar;
     self.allocator.free(window.net_wm_state);
     window.net_wm_state = replacement;
+    window.modal = std.mem.indexOfScalar(
+        c.xcb_atom_t,
+        replacement,
+        self.atomValue(.net_wm_state_modal),
+    ) != null;
     window.fullscreen = std.mem.indexOfScalar(
         c.xcb_atom_t,
         replacement,
@@ -1058,6 +1070,7 @@ fn refreshNetWmState(self: *Self, window_id: WindowId, window: *Window) !NetWmSt
         self.atomValue(.net_wm_state_skip_taskbar),
     ) != null;
     return .{
+        .modal = previous_modal != window.modal,
         .fullscreen = previous_fullscreen != window.fullscreen,
         .maximized = previous_maximized != (window.maximized_horz and window.maximized_vert),
         .minimized = previous_minimized != window.minimized,
@@ -1676,7 +1689,7 @@ fn handlePropertyNotify(self: *Self, event: *const c.xcb_property_notify_event_t
                     window.minimized,
                 );
             }
-            if (changed.skip_taskbar) {
+            if (changed.skip_taskbar or changed.modal) {
                 self.listener.metadata_changed(self.listener.context, event.window);
             }
         }
@@ -1810,9 +1823,15 @@ fn handleNetWmStateMessage(self: *Self, event: *const c.xcb_client_message_event
     var requested_maximized_vert = window.maximized_vert;
     var requested_minimized = window.minimized;
     var requested_skip_taskbar = window.skip_taskbar;
+    var requested_modal = window.modal;
     const atoms = [_]c.xcb_atom_t{ event.data.data32[1], event.data.data32[2] };
     for (atoms) |atom| {
-        if (atom == self.atomValue(.net_wm_state_fullscreen)) {
+        if (atom == self.atomValue(.net_wm_state_modal)) {
+            requested_modal = applyStateAction(
+                requested_modal,
+                event.data.data32[0],
+            ) orelse return;
+        } else if (atom == self.atomValue(.net_wm_state_fullscreen)) {
             requested_fullscreen = applyStateAction(
                 requested_fullscreen,
                 event.data.data32[0],
@@ -1862,6 +1881,8 @@ fn handleNetWmStateMessage(self: *Self, event: *const c.xcb_client_message_event
             requested_minimized,
         );
     }
+    const metadata_changed = requested_skip_taskbar != window.skip_taskbar or
+        requested_modal != window.modal;
     if (requested_skip_taskbar != window.skip_taskbar) {
         const atom = self.atomValue(.net_wm_state_skip_taskbar);
         try self.replaceNetWmStateAtoms(
@@ -1871,6 +1892,18 @@ fn handleNetWmStateMessage(self: *Self, event: *const c.xcb_client_message_event
             if (requested_skip_taskbar) &.{atom} else &.{},
         );
         window.skip_taskbar = requested_skip_taskbar;
+    }
+    if (requested_modal != window.modal) {
+        const atom = self.atomValue(.net_wm_state_modal);
+        try self.replaceNetWmStateAtoms(
+            event.window,
+            window,
+            &.{atom},
+            if (requested_modal) &.{atom} else &.{},
+        );
+        window.modal = requested_modal;
+    }
+    if (metadata_changed) {
         self.listener.metadata_changed(self.listener.context, event.window);
     }
 }
@@ -1910,6 +1943,7 @@ fn info(self: *const Self, window_id: WindowId, window: Window) WindowInfo {
         .min_size = window.min_size,
         .max_size = window.max_size,
         .can_close = window.delete_window,
+        .modal = window.modal,
         .fullscreen = window.fullscreen,
         .maximized = window.maximized_horz and window.maximized_vert,
         .minimized = window.minimized,
