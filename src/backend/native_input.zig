@@ -5,7 +5,6 @@ const Self = @This();
 const std = @import("std");
 const wayland = @import("wayland");
 const Session = @import("session.zig");
-const NestedOutput = @import("nested_wayland.zig");
 const render = @import("../render/types.zig");
 
 const c = @cImport({
@@ -57,10 +56,35 @@ suspended: bool,
 initialized: bool,
 failed: bool,
 
-pub const Listener = NestedOutput.Listener;
-
 pub const DeviceId = u64;
 pub const PhysicalDeviceId = u64;
+
+pub const Listener = struct {
+    context: *anyopaque,
+    close: *const fn (*anyopaque) void,
+    keyboard_available: *const fn (*anyopaque, bool) void,
+    keyboard_keymap: *const fn (*anyopaque, ?DeviceId, wl.Keyboard.KeymapFormat, std.posix.fd_t, u32) void,
+    keyboard_enter: *const fn (*anyopaque, []const u32) void,
+    keyboard_key: *const fn (*anyopaque, DeviceId, u32, u32, wl.Keyboard.KeyState) void,
+    keyboard_modifiers: *const fn (*anyopaque, ?DeviceId, u32, u32, u32, u32) void,
+    keyboard_repeat_info: *const fn (*anyopaque, ?DeviceId, i32, i32) void,
+    pointer_available: *const fn (*anyopaque, bool) void,
+    pointer_motion: *const fn (*anyopaque, DeviceId, u32, f64, f64) void,
+    pointer_relative_motion: *const fn (*anyopaque, DeviceId, u64, f64, f64, f64, f64) void,
+    pointer_button: *const fn (*anyopaque, DeviceId, u32, u32, wl.Pointer.ButtonState) void,
+    pointer_axis: *const fn (*anyopaque, DeviceId, u32, wl.Pointer.Axis, wl.Fixed) void,
+    pointer_frame: *const fn (*anyopaque, DeviceId) void,
+    pointer_axis_source: *const fn (*anyopaque, DeviceId, wl.Pointer.AxisSource) void,
+    pointer_axis_stop: *const fn (*anyopaque, DeviceId, u32, wl.Pointer.Axis) void,
+    pointer_axis_discrete: *const fn (*anyopaque, DeviceId, wl.Pointer.Axis, i32) void,
+    pointer_axis_value120: *const fn (*anyopaque, DeviceId, wl.Pointer.Axis, i32) void,
+    touch_available: *const fn (*anyopaque, bool) void,
+    touch_down: *const fn (*anyopaque, DeviceId, u32, i32, f64, f64) void,
+    touch_up: *const fn (*anyopaque, DeviceId, u32, i32) void,
+    touch_motion: *const fn (*anyopaque, DeviceId, u32, i32, f64, f64) void,
+    touch_frame: *const fn (*anyopaque, DeviceId) void,
+    touch_cancel: *const fn (*anyopaque, DeviceId) void,
+};
 
 pub const Status = enum { success, unsupported, invalid };
 pub const Toggle = enum(u1) { disabled, enabled };
@@ -247,7 +271,7 @@ pub const DeviceMap = struct {
     height: u32,
 };
 
-const RepeatInfo = struct {
+pub const RepeatInfo = struct {
     rate: i32 = 25,
     delay: i32 = 600,
 };
@@ -342,8 +366,8 @@ pub fn init(
     ) orelse return error.XkbKeymapFailed;
     self.default_keymap = try self.wrapKeymap(default_native_keymap);
     errdefer self.default_keymap.unref();
-    try self.installKeymap(self.default_keymap);
-    listener.keyboard_repeat_info(listener.context, 25, 600);
+    try self.installKeymap(null, self.default_keymap);
+    listener.keyboard_repeat_info(listener.context, null, 25, 600);
 
     const udev = c.udev_new() orelse return error.UdevContextFailed;
     defer _ = c.udev_unref(udev);
@@ -458,12 +482,26 @@ pub fn keyboardState(self: *Self, id: DeviceId) ?KeyboardState {
     return stateSnapshot(keyboard);
 }
 
+/// Returns a close-on-exec duplicate of the device's cached keymap fd.
+/// The caller owns the returned fd and must close it.
+pub fn duplicateKeyboardKeymapFd(self: *Self, id: DeviceId) !?std.posix.fd_t {
+    const device = self.findInputDeviceById(id) orelse return null;
+    const keyboard = device.keyboard orelse return null;
+    return try duplicateKeymapFd(keyboard.keymap);
+}
+
+pub fn deviceRepeatInfo(self: *Self, id: DeviceId) ?RepeatInfo {
+    const device = self.findInputDeviceById(id) orelse return null;
+    if (device.info.device_type != .keyboard) return null;
+    return device.repeat_info;
+}
+
 pub fn setKeyboardKeymap(self: *Self, id: DeviceId, keymap: *Keymap) !bool {
     const device = self.findInputDeviceById(id) orelse return false;
     const keyboard = if (device.keyboard) |*value| value else return false;
     const state = c.xkb_state_new(keymap.native) orelse return error.XkbStateFailed;
     errdefer c.xkb_state_unref(state);
-    if (self.active_keyboard == id) try self.installKeymap(keymap);
+    if (self.active_keyboard == id) try self.installKeymap(id, keymap);
     const old_keymap = keyboard.keymap;
     const old_state = keyboard.state;
     keyboard.* = .{ .keymap = keymap.ref(), .state = state };
@@ -742,15 +780,21 @@ fn wrapKeymap(self: *Self, native: *c.struct_xkb_keymap) !*Keymap {
     return keymap;
 }
 
-fn installKeymap(self: *Self, keymap: *const Keymap) !void {
+fn duplicateKeymapFd(keymap: *const Keymap) !std.posix.fd_t {
     const duplicate = std.c.fcntl(
         keymap.file.handle,
         std.os.linux.F.DUPFD_CLOEXEC,
         @as(c_int, 0),
     );
     if (duplicate < 0) return error.DuplicateKeymapFailed;
+    return duplicate;
+}
+
+fn installKeymap(self: *Self, source: ?DeviceId, keymap: *const Keymap) !void {
+    const duplicate = try duplicateKeymapFd(keymap);
     self.listener.keyboard_keymap(
         self.listener.context,
+        source,
         .xkb_v1,
         duplicate,
         keymap.size,
@@ -797,8 +841,8 @@ fn processEvent(self: *Self, event: *c.struct_libinput_event) void {
         c.LIBINPUT_EVENT_TOUCH_DOWN => self.touchDown(c.libinput_event_get_touch_event(event).?),
         c.LIBINPUT_EVENT_TOUCH_UP => self.touchUp(c.libinput_event_get_touch_event(event).?),
         c.LIBINPUT_EVENT_TOUCH_MOTION => self.touchMotion(c.libinput_event_get_touch_event(event).?),
-        c.LIBINPUT_EVENT_TOUCH_CANCEL => self.listener.touch_cancel(self.listener.context),
-        c.LIBINPUT_EVENT_TOUCH_FRAME => self.listener.touch_frame(self.listener.context),
+        c.LIBINPUT_EVENT_TOUCH_CANCEL => self.touchCancelOrFrame(event, true),
+        c.LIBINPUT_EVENT_TOUCH_FRAME => self.touchCancelOrFrame(event, false),
         else => {},
     }
 }
@@ -966,7 +1010,7 @@ fn promoteKeyboard(self: *Self) void {
     if (self.active_keyboard != null) return;
     for (self.input_devices.items) |*device| {
         const keyboard = if (device.keyboard) |*value| value else continue;
-        self.installKeymap(keyboard.keymap) catch |err| return self.fail(err);
+        self.installKeymap(device.info.id, keyboard.keymap) catch |err| return self.fail(err);
         self.active_keyboard = device.info.id;
         self.sendKeyboardModifiers(keyboard, true);
         return;
@@ -982,6 +1026,7 @@ fn keyboardKey(self: *Self, event: *c.struct_libinput_event_keyboard) void {
         self.active_repeat_info = device.repeat_info;
         self.listener.keyboard_repeat_info(
             self.listener.context,
+            device.info.id,
             device.repeat_info.rate,
             device.repeat_info.delay,
         );
@@ -1014,6 +1059,7 @@ fn keyboardKey(self: *Self, event: *c.struct_libinput_event_keyboard) void {
     if (!emergency_captured and !binding_captured and !launcher_captured) {
         self.listener.keyboard_key(
             self.listener.context,
+            device.info.id,
             c.libinput_event_keyboard_get_time(event),
             key,
             if (pressed) .pressed else .released,
@@ -1070,7 +1116,7 @@ fn handleLauncherShortcut(self: *Self, key: u32, pressed: bool) bool {
 
 fn activateKeyboard(self: *Self, device: *InputDevice) !void {
     const keyboard = if (device.keyboard) |*value| value else unreachable;
-    try self.installKeymap(keyboard.keymap);
+    try self.installKeymap(device.info.id, keyboard.keymap);
     self.active_keyboard = device.info.id;
     self.sendKeyboardModifiers(keyboard, true);
 }
@@ -1087,6 +1133,7 @@ fn sendKeyboardModifiers(self: *Self, keyboard: *const Keyboard, force: bool) vo
     self.modifiers = modifiers;
     self.listener.keyboard_modifiers(
         self.listener.context,
+        self.active_keyboard,
         modifiers.depressed,
         modifiers.latched,
         modifiers.locked,
@@ -1171,7 +1218,7 @@ fn resetKeyboardState(self: *Self) void {
     self.right_alt_pressed = false;
     self.launcher_enter_pressed = false;
     self.session_switch_key = null;
-    self.listener.keyboard_modifiers(self.listener.context, 0, 0, 0, 0);
+    self.listener.keyboard_modifiers(self.listener.context, null, 0, 0, 0, 0);
     if (old_effective != 0) if (self.keyboard_event_listener) |listener| {
         listener.modifiers(listener.context, old_effective, 0);
     };
@@ -1255,8 +1302,10 @@ fn launchMonstar(self: *Self) void {
 }
 
 fn pointerMotion(self: *Self, event: *c.struct_libinput_event_pointer) void {
+    const device = self.eventInputDevice(c.libinput_event_pointer_get_base_event(event).?, .pointer) orelse return;
     self.listener.pointer_relative_motion(
         self.listener.context,
+        device.info.id,
         c.libinput_event_pointer_get_time_usec(event),
         c.libinput_event_pointer_get_dx(event),
         c.libinput_event_pointer_get_dy(event),
@@ -1273,15 +1322,17 @@ fn pointerMotion(self: *Self, event: *c.struct_libinput_event_pointer) void {
     );
     self.listener.pointer_motion(
         self.listener.context,
+        device.info.id,
         c.libinput_event_pointer_get_time(event),
         self.pointer_x,
         self.pointer_y,
     );
-    self.listener.pointer_frame(self.listener.context);
+    self.listener.pointer_frame(self.listener.context, device.info.id);
 }
 
 fn pointerMotionAbsolute(self: *Self, event: *c.struct_libinput_event_pointer) void {
-    const map = self.eventDeviceMap(c.libinput_event_pointer_get_base_event(event).?, .pointer) orelse
+    const device = self.eventInputDevice(c.libinput_event_pointer_get_base_event(event).?, .pointer) orelse return;
+    const map = device.map orelse
         DeviceMap{ .x = 0, .y = 0, .width = self.size.width, .height = self.size.height };
     self.pointer_x = @as(f64, @floatFromInt(map.x)) +
         c.libinput_event_pointer_get_absolute_x_transformed(event, map.width);
@@ -1289,25 +1340,28 @@ fn pointerMotionAbsolute(self: *Self, event: *c.struct_libinput_event_pointer) v
         c.libinput_event_pointer_get_absolute_y_transformed(event, map.height);
     self.listener.pointer_motion(
         self.listener.context,
+        device.info.id,
         c.libinput_event_pointer_get_time(event),
         self.pointer_x,
         self.pointer_y,
     );
-    self.listener.pointer_frame(self.listener.context);
+    self.listener.pointer_frame(self.listener.context, device.info.id);
 }
 
 fn pointerButton(self: *Self, event: *c.struct_libinput_event_pointer) void {
+    const device = self.eventInputDevice(c.libinput_event_pointer_get_base_event(event).?, .pointer) orelse return;
     const pressed = c.libinput_event_pointer_get_button_state(event) ==
         c.LIBINPUT_BUTTON_STATE_PRESSED;
     const seat_button_count = c.libinput_event_pointer_get_seat_button_count(event);
     if ((pressed and seat_button_count != 1) or (!pressed and seat_button_count != 0)) return;
     self.listener.pointer_button(
         self.listener.context,
+        device.info.id,
         c.libinput_event_pointer_get_time(event),
         c.libinput_event_pointer_get_button(event),
         if (pressed) .pressed else .released,
     );
-    self.listener.pointer_frame(self.listener.context);
+    self.listener.pointer_frame(self.listener.context, device.info.id);
 }
 
 fn pointerScroll(
@@ -1315,14 +1369,16 @@ fn pointerScroll(
     event: *c.struct_libinput_event_pointer,
     source: wl.Pointer.AxisSource,
 ) void {
-    self.listener.pointer_axis_source(self.listener.context, source);
-    self.pointerScrollAxis(event, source, c.LIBINPUT_POINTER_AXIS_SCROLL_VERTICAL, .vertical_scroll);
-    self.pointerScrollAxis(event, source, c.LIBINPUT_POINTER_AXIS_SCROLL_HORIZONTAL, .horizontal_scroll);
-    self.listener.pointer_frame(self.listener.context);
+    const device = self.eventInputDevice(c.libinput_event_pointer_get_base_event(event).?, .pointer) orelse return;
+    self.listener.pointer_axis_source(self.listener.context, device.info.id, source);
+    self.pointerScrollAxis(device, event, source, c.LIBINPUT_POINTER_AXIS_SCROLL_VERTICAL, .vertical_scroll);
+    self.pointerScrollAxis(device, event, source, c.LIBINPUT_POINTER_AXIS_SCROLL_HORIZONTAL, .horizontal_scroll);
+    self.listener.pointer_frame(self.listener.context, device.info.id);
 }
 
 fn pointerScrollAxis(
     self: *Self,
+    device: *const InputDevice,
     event: *c.struct_libinput_event_pointer,
     source: wl.Pointer.AxisSource,
     libinput_axis: c.enum_libinput_pointer_axis,
@@ -1330,18 +1386,15 @@ fn pointerScrollAxis(
 ) void {
     if (c.libinput_event_pointer_has_axis(event, libinput_axis) == 0) return;
     const time = c.libinput_event_pointer_get_time(event);
-    const base_event = c.libinput_event_pointer_get_base_event(event);
-    const factor = if (self.findInputDevice(c.libinput_event_get_device(base_event).?, .pointer)) |device|
-        device.scroll_factor
-    else
-        1;
+    const factor = device.scroll_factor;
     const value = c.libinput_event_pointer_get_scroll_value(event, libinput_axis) * factor;
     if (value == 0 and source != .wheel) {
-        self.listener.pointer_axis_stop(self.listener.context, time, axis);
+        self.listener.pointer_axis_stop(self.listener.context, device.info.id, time, axis);
         return;
     }
     self.listener.pointer_axis(
         self.listener.context,
+        device.info.id,
         time,
         axis,
         wl.Fixed.fromDouble(value),
@@ -1351,20 +1404,23 @@ fn pointerScrollAxis(
         const discrete: i32 = @intFromFloat(@round(value_120 / 120));
         self.listener.pointer_axis_value120(
             self.listener.context,
+            device.info.id,
             axis,
             @intFromFloat(@round(value_120)),
         );
         if (discrete != 0) {
-            self.listener.pointer_axis_discrete(self.listener.context, axis, discrete);
+            self.listener.pointer_axis_discrete(self.listener.context, device.info.id, axis, discrete);
         }
     }
 }
 
 fn touchDown(self: *Self, event: *c.struct_libinput_event_touch) void {
-    const map = self.eventDeviceMap(c.libinput_event_touch_get_base_event(event).?, .touch) orelse
+    const device = self.eventInputDevice(c.libinput_event_touch_get_base_event(event).?, .touch) orelse return;
+    const map = device.map orelse
         DeviceMap{ .x = 0, .y = 0, .width = self.size.width, .height = self.size.height };
     self.listener.touch_down(
         self.listener.context,
+        device.info.id,
         c.libinput_event_touch_get_time(event),
         c.libinput_event_touch_get_seat_slot(event),
         @as(f64, @floatFromInt(map.x)) + c.libinput_event_touch_get_x_transformed(event, map.width),
@@ -1373,23 +1429,36 @@ fn touchDown(self: *Self, event: *c.struct_libinput_event_touch) void {
 }
 
 fn touchUp(self: *Self, event: *c.struct_libinput_event_touch) void {
+    const device = self.eventInputDevice(c.libinput_event_touch_get_base_event(event).?, .touch) orelse return;
     self.listener.touch_up(
         self.listener.context,
+        device.info.id,
         c.libinput_event_touch_get_time(event),
         c.libinput_event_touch_get_seat_slot(event),
     );
 }
 
 fn touchMotion(self: *Self, event: *c.struct_libinput_event_touch) void {
-    const map = self.eventDeviceMap(c.libinput_event_touch_get_base_event(event).?, .touch) orelse
+    const device = self.eventInputDevice(c.libinput_event_touch_get_base_event(event).?, .touch) orelse return;
+    const map = device.map orelse
         DeviceMap{ .x = 0, .y = 0, .width = self.size.width, .height = self.size.height };
     self.listener.touch_motion(
         self.listener.context,
+        device.info.id,
         c.libinput_event_touch_get_time(event),
         c.libinput_event_touch_get_seat_slot(event),
         @as(f64, @floatFromInt(map.x)) + c.libinput_event_touch_get_x_transformed(event, map.width),
         @as(f64, @floatFromInt(map.y)) + c.libinput_event_touch_get_y_transformed(event, map.height),
     );
+}
+
+fn touchCancelOrFrame(self: *Self, event: *c.struct_libinput_event, cancel: bool) void {
+    const device = self.eventInputDevice(event, .touch) orelse return;
+    if (cancel) {
+        self.listener.touch_cancel(self.listener.context, device.info.id);
+    } else {
+        self.listener.touch_frame(self.listener.context, device.info.id);
+    }
 }
 
 fn findInputDeviceById(self: *Self, id: DeviceId) ?*InputDevice {
@@ -1410,13 +1479,12 @@ fn findInputDevice(
     return null;
 }
 
-fn eventDeviceMap(
+fn eventInputDevice(
     self: *Self,
     event: *c.struct_libinput_event,
     device_type: DeviceType,
-) ?DeviceMap {
-    const device = self.findInputDevice(c.libinput_event_get_device(event).?, device_type) orelse return null;
-    return device.map;
+) ?*InputDevice {
+    return self.findInputDevice(c.libinput_event_get_device(event).?, device_type);
 }
 
 fn clearCapabilities(self: *Self) void {

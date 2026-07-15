@@ -458,7 +458,7 @@ pub fn create(
             display.getEventLoop(),
             &self.session,
             render_output.backend.size(),
-            backendListener(render_output),
+            nativeInputListener(render_output),
         );
         self.native_input_initialized = true;
         errdefer {
@@ -705,6 +705,35 @@ fn backendListener(render_output: *RenderOutput) OutputBackend.Listener {
     };
 }
 
+fn nativeInputListener(render_output: *RenderOutput) NativeInput.Listener {
+    return .{
+        .context = render_output,
+        .close = closeOutput,
+        .keyboard_available = keyboardAvailable,
+        .keyboard_keymap = nativeKeyboardKeymap,
+        .keyboard_enter = keyboardEnter,
+        .keyboard_key = nativeKeyboardKey,
+        .keyboard_modifiers = nativeKeyboardModifiers,
+        .keyboard_repeat_info = nativeKeyboardRepeatInfo,
+        .pointer_available = pointerAvailable,
+        .pointer_motion = nativePointerMotion,
+        .pointer_relative_motion = nativePointerRelativeMotion,
+        .pointer_button = nativePointerButton,
+        .pointer_axis = nativePointerAxis,
+        .pointer_frame = nativePointerFrame,
+        .pointer_axis_source = nativePointerAxisSource,
+        .pointer_axis_stop = nativePointerAxisStop,
+        .pointer_axis_discrete = nativePointerAxisDiscrete,
+        .pointer_axis_value120 = nativePointerAxisValue120,
+        .touch_available = touchAvailable,
+        .touch_down = nativeTouchDown,
+        .touch_up = nativeTouchUp,
+        .touch_motion = nativeTouchMotion,
+        .touch_frame = nativeTouchFrame,
+        .touch_cancel = nativeTouchCancel,
+    };
+}
+
 fn removeRenderOutput(self: *Self, id: RenderOutputId) bool {
     const render_output = self.render_outputs.remove(id) orelse return false;
     stopRenderOutput(render_output);
@@ -819,7 +848,7 @@ fn setDrmOutputConfiguration(
     {
         self.native_input.retarget(
             render_output.output.backend.size(),
-            backendListener(render_output.output),
+            nativeInputListener(render_output.output),
         );
     }
     if (position_changed or dimensions_changed) {
@@ -871,7 +900,7 @@ fn replacePrimaryRenderOutput(self: *Self, removed_id: RenderOutputId) void {
         self.xdg_shell.setDefaultOutput(replacement.protocol_id);
         self.layer_shell.setDefaultOutput(replacement.protocol_id);
         self.window_manager.setDefaultOutput(replacement.protocol_id);
-        self.native_input.retarget(replacement.backend.size(), backendListener(replacement));
+        self.native_input.retarget(replacement.backend.size(), nativeInputListener(replacement));
         if (self.input_manager_initialized) {
             self.input_manager.targetOutputChanged(replacement.protocol_id);
         }
@@ -1126,6 +1155,61 @@ fn closeOutput(context: *anyopaque) void {
 fn serverForOutput(context: *anyopaque) *Self {
     const output: *RenderOutput = @ptrCast(@alignCast(context));
     return output.server;
+}
+
+fn nativeKeyboardKeymap(context: *anyopaque, _: ?NativeInput.DeviceId, format: wl.Keyboard.KeymapFormat, fd: std.posix.fd_t, size: u32) void {
+    keyboardKeymap(context, format, fd, size);
+}
+fn nativeKeyboardKey(context: *anyopaque, _: NativeInput.DeviceId, time: u32, key: u32, state: wl.Keyboard.KeyState) void {
+    keyboardKey(context, time, key, state);
+}
+fn nativeKeyboardModifiers(context: *anyopaque, _: ?NativeInput.DeviceId, depressed: u32, latched: u32, locked: u32, group: u32) void {
+    keyboardModifiers(context, depressed, latched, locked, group);
+}
+fn nativeKeyboardRepeatInfo(context: *anyopaque, _: ?NativeInput.DeviceId, rate: i32, delay: i32) void {
+    keyboardRepeatInfo(context, rate, delay);
+}
+fn nativePointerMotion(context: *anyopaque, _: NativeInput.DeviceId, time: u32, x: f64, y: f64) void {
+    pointerMotion(context, time, x, y);
+}
+fn nativePointerRelativeMotion(context: *anyopaque, _: NativeInput.DeviceId, time: u64, dx: f64, dy: f64, dx_unaccelerated: f64, dy_unaccelerated: f64) void {
+    pointerRelativeMotion(context, time, dx, dy, dx_unaccelerated, dy_unaccelerated);
+}
+fn nativePointerButton(context: *anyopaque, _: NativeInput.DeviceId, time: u32, button: u32, state: wl.Pointer.ButtonState) void {
+    pointerButton(context, time, button, state);
+}
+fn nativePointerAxis(context: *anyopaque, _: NativeInput.DeviceId, time: u32, axis: wl.Pointer.Axis, value: wl.Fixed) void {
+    pointerAxis(context, time, axis, value);
+}
+fn nativePointerFrame(context: *anyopaque, _: NativeInput.DeviceId) void {
+    pointerFrame(context);
+}
+fn nativePointerAxisSource(context: *anyopaque, _: NativeInput.DeviceId, source: wl.Pointer.AxisSource) void {
+    pointerAxisSource(context, source);
+}
+fn nativePointerAxisStop(context: *anyopaque, _: NativeInput.DeviceId, time: u32, axis: wl.Pointer.Axis) void {
+    pointerAxisStop(context, time, axis);
+}
+fn nativePointerAxisDiscrete(context: *anyopaque, _: NativeInput.DeviceId, axis: wl.Pointer.Axis, discrete: i32) void {
+    pointerAxisDiscrete(context, axis, discrete);
+}
+fn nativePointerAxisValue120(context: *anyopaque, _: NativeInput.DeviceId, axis: wl.Pointer.Axis, value: i32) void {
+    pointerAxisValue120(context, axis, value);
+}
+fn nativeTouchDown(context: *anyopaque, _: NativeInput.DeviceId, time: u32, id: i32, x: f64, y: f64) void {
+    touchDown(context, time, id, x, y);
+}
+fn nativeTouchUp(context: *anyopaque, _: NativeInput.DeviceId, time: u32, id: i32) void {
+    touchUp(context, time, id);
+}
+fn nativeTouchMotion(context: *anyopaque, _: NativeInput.DeviceId, time: u32, id: i32, x: f64, y: f64) void {
+    touchMotion(context, time, id, x, y);
+}
+fn nativeTouchFrame(context: *anyopaque, _: NativeInput.DeviceId) void {
+    touchFrame(context);
+}
+fn nativeTouchCancel(context: *anyopaque, _: NativeInput.DeviceId) void {
+    touchCancel(context);
 }
 
 fn keyboardAvailable(context: *anyopaque, available: bool) void {
