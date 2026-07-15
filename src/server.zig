@@ -26,6 +26,7 @@ const IdleNotify = @import("wayland/idle_notify.zig");
 const Seat = @import("wayland/seat.zig");
 const DataDevice = @import("wayland/data_device.zig");
 const PrimarySelection = @import("wayland/primary_selection.zig");
+const DataControl = @import("wayland/data_control.zig");
 const TextInput = @import("wayland/text_input.zig");
 const InputMethod = @import("wayland/input_method.zig");
 const VirtualKeyboard = @import("wayland/virtual_keyboard.zig");
@@ -111,6 +112,7 @@ routed_touches: std.ArrayList(RoutedTouch),
 next_touch_id: u31,
 data_device: DataDevice,
 primary_selection: PrimarySelection,
+data_control: DataControl,
 text_input: TextInput,
 input_method: InputMethod,
 virtual_keyboard: VirtualKeyboard,
@@ -272,6 +274,7 @@ pub fn create(
         .next_touch_id = 0,
         .data_device = undefined,
         .primary_selection = undefined,
+        .data_control = undefined,
         .text_input = undefined,
         .input_method = undefined,
         .virtual_keyboard = undefined,
@@ -505,6 +508,15 @@ pub fn create(
     errdefer self.data_device.deinit();
     try self.primary_selection.init(allocator, display, &self.seat);
     errdefer self.primary_selection.deinit();
+    try self.data_control.init(
+        allocator,
+        display,
+        &self.security_context,
+        &self.seat,
+        &self.data_device,
+        &self.primary_selection,
+    );
+    errdefer self.data_control.deinit();
     try self.text_input.init(
         allocator,
         display,
@@ -707,6 +719,7 @@ pub fn destroy(self: *Self) void {
     self.virtual_keyboard.deinit();
     self.input_method.deinit();
     self.text_input.deinit();
+    self.data_control.deinit();
     self.primary_selection.deinit();
     self.data_device.deinit();
     self.xdg_activation.deinit();
@@ -927,6 +940,8 @@ fn inputSeatCreated(context: *anyopaque, name: [:0]const u8) error{OutOfMemory}!
     errdefer entry.seat.clearRepaintListener();
     try self.window_manager.seatAdded(&entry.seat);
     errdefer self.window_manager.seatRemoved(&entry.seat);
+    try self.data_control.addSeat(&entry.seat);
+    errdefer self.data_control.removeSeat(&entry.seat);
     try self.dynamic_seats.append(self.allocator, entry);
     self.refreshSeatCapabilities(&entry.seat, name_copy);
     requestRepaint(self);
@@ -942,6 +957,7 @@ fn inputSeatDestroyed(context: *anyopaque, name: [:0]const u8) void {
         entry.seat.setTouchAvailable(false);
         entry.seat.parentKeyboardLeave();
         self.window_manager.seatRemoved(&entry.seat);
+        self.data_control.removeSeat(&entry.seat);
         entry.seat.clearRepaintListener();
         entry.seat.removeGlobal();
         entry.removed = true;

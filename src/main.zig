@@ -93,6 +93,8 @@ test {
     _ = @import("wayland/output_power.zig");
     _ = @import("wayland/data_device.zig");
     _ = @import("wayland/primary_selection.zig");
+    _ = @import("wayland/selection_source.zig");
+    _ = @import("wayland/data_control.zig");
     _ = @import("wayland/text_input.zig");
     _ = @import("wayland/input_method.zig");
     _ = @import("wayland/virtual_keyboard.zig");

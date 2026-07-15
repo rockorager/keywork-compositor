@@ -5,6 +5,7 @@ const Self = @This();
 const std = @import("std");
 const wayland = @import("wayland");
 const Seat = @import("seat.zig");
+const SelectionSource = @import("selection_source.zig").Source;
 const Surface = @import("surface.zig");
 const slot_map = @import("../slot_map.zig");
 
@@ -22,8 +23,10 @@ devices: DeviceStore,
 device_adapters: std.AutoHashMapUnmanaged(DeviceId, *DeviceResource),
 offers: OfferStore,
 offer_adapters: std.AutoHashMapUnmanaged(OfferId, *OfferResource),
-selection: ?SourceId,
+selection: ?Selection,
 selection_serial: u32,
+selection_generation: u64,
+selection_listener: ?SelectionListener,
 focused_client: ?*wl.Client,
 drag: ?DragState,
 next_drag_generation: u64,
@@ -36,6 +39,12 @@ pub const Listener = struct {
     repaint: *const fn (*anyopaque) void,
 };
 
+pub const SelectionListener = struct {
+    context: *anyopaque,
+    changed: *const fn (*anyopaque) void,
+    offered: *const fn (*anyopaque, [*:0]const u8) void,
+};
+
 pub const IconInfo = struct {
     surface_id: Surface.Id,
     x: i32,
@@ -44,6 +53,10 @@ pub const IconInfo = struct {
 
 const SourceStore = slot_map.SlotMap(SourceState, enum { data_source });
 const SourceId = SourceStore.Id;
+const Selection = union(enum) {
+    local: SourceId,
+    external: *const SelectionSource,
+};
 const SourceState = struct {
     resource: *wl.DataSource,
     mime_types: std.ArrayList([:0]u8) = .empty,
@@ -70,6 +83,7 @@ const OfferState = struct {
     resource: *wl.DataOffer,
     device: DeviceId,
     source: ?SourceId,
+    external_source: ?*const SelectionSource = null,
     kind: Kind,
     drag_generation: u64 = 0,
     enter_serial: u32 = 0,
@@ -178,6 +192,8 @@ pub fn init(
         .offer_adapters = .empty,
         .selection = null,
         .selection_serial = 0,
+        .selection_generation = 0,
+        .selection_listener = null,
         .focused_client = null,
         .drag = null,
         .next_drag_generation = 0,
@@ -199,6 +215,7 @@ pub fn init(
 
 pub fn deinit(self: *Self) void {
     self.cancelDrag(false);
+    std.debug.assert(self.selection_listener == null);
     self.seat.removeKeyboardFocusListener(self);
     self.global.destroy();
     std.debug.assert(self.sources.len() == 0);
@@ -357,6 +374,14 @@ const SourceResource = struct {
                 if (std.meta.eql(source_id, self.id)) entry.value.resource.sendOffer(copy.ptr);
             }
         }
+        if (self.manager.selection) |selection| switch (selection) {
+            .local => |source_id| if (std.meta.eql(source_id, self.id)) {
+                if (self.manager.selection_listener) |listener| {
+                    listener.offered(listener.context, copy.ptr);
+                }
+            },
+            .external => {},
+        };
     }
 
     fn handleDestroy(_: *wl.DataSource, self: *SourceResource) void {
@@ -682,6 +707,7 @@ fn sendCurrentDragToDevice(
             device.resource.getVersion(),
             device_id,
             source_id,
+            null,
             .drag,
             drag.generation,
             target.enter_serial,
@@ -777,7 +803,8 @@ const OfferResource = struct {
         client: *wl.Client,
         version: u32,
         device_id: DeviceId,
-        source_id: SourceId,
+        source_id: ?SourceId,
+        external_source: ?*const SelectionSource,
         kind: OfferState.Kind,
         drag_generation: u64,
         enter_serial: u32,
@@ -790,6 +817,7 @@ const OfferResource = struct {
             .resource = resource,
             .device = device_id,
             .source = source_id,
+            .external_source = external_source,
             .kind = kind,
             .drag_generation = drag_generation,
             .enter_serial = enter_serial,
@@ -833,10 +861,14 @@ const OfferResource = struct {
                     .flags = .{ .nonblocking = false },
                 }).close(self.manager.seat.io);
                 const offer = self.manager.offers.get(self.id) orelse return;
-                const source_id = offer.source orelse return;
-                const source = self.manager.sources.get(source_id) orelse return;
-                if (!sourceHasMime(source, receive.mime_type)) return;
-                source.resource.sendSend(receive.mime_type, receive.fd);
+                if (offer.source) |source_id| {
+                    const source = self.manager.sources.get(source_id) orelse return;
+                    if (!sourceHasMime(source, receive.mime_type)) return;
+                    source.resource.sendSend(receive.mime_type, receive.fd);
+                } else if (offer.external_source) |source| {
+                    if (!source.hasMime(receive.mime_type)) return;
+                    source.send(source.context, receive.mime_type, receive.fd);
+                }
             },
             .destroy => resource.destroy(),
             .finish => self.manager.finishOffer(self.id),
@@ -1016,18 +1048,32 @@ fn keyboardFocusChanged(context: *anyopaque, client: ?*wl.Client) void {
 
 fn setSelection(self: *Self, source_id: ?SourceId, serial: u32) void {
     if (self.selection != null and Seat.serialIsOlder(serial, self.selection_serial)) return;
-    const old_source = self.selection;
-    if (std.meta.eql(old_source, source_id)) {
+    const selection: ?Selection = if (source_id) |id| .{ .local = id } else null;
+    if (std.meta.eql(self.selection, selection)) {
         self.selection_serial = serial;
         return;
     }
-    self.selection = source_id;
+    self.replaceSelection(selection, serial, true);
+}
+
+fn replaceSelection(
+    self: *Self,
+    selection: ?Selection,
+    serial: u32,
+    cancel_old: bool,
+) void {
+    const old_source = self.selection;
+    std.debug.assert(!std.meta.eql(old_source, selection));
+    self.selection = selection;
     self.selection_serial = serial;
+    self.selection_generation +%= 1;
     self.invalidateOffers();
-    if (old_source) |id| {
-        if (self.sources.get(id)) |source| source.resource.sendCancelled();
-    }
     if (self.focused_client) |client| self.sendSelectionToClient(client);
+    if (self.selection_listener) |listener| listener.changed(listener.context);
+    if (cancel_old) if (old_source) |old| switch (old) {
+        .local => |id| if (self.sources.get(id)) |source| source.resource.sendCancelled(),
+        .external => |source| source.cancel(source.context),
+    };
 }
 
 fn sourceDestroyed(self: *Self, id: SourceId) void {
@@ -1043,9 +1089,12 @@ fn sourceDestroyed(self: *Self, id: SourceId) void {
         }
     }
     if (self.selection) |selection| {
-        if (!std.meta.eql(selection, id)) return;
-        self.selection = null;
-        if (self.focused_client) |client| self.sendSelectionToClient(client);
+        switch (selection) {
+            .local => |selection_id| if (std.meta.eql(selection_id, id)) {
+                self.replaceSelection(null, self.display.nextSerial(), false);
+            },
+            .external => {},
+        }
     }
 }
 
@@ -1057,7 +1106,10 @@ fn deviceDestroyed(self: *Self, id: DeviceId) void {
 fn invalidateOffers(self: *Self) void {
     var iterator = self.offers.iterator();
     while (iterator.next()) |entry| {
-        if (entry.value.kind == .selection) entry.value.source = null;
+        if (entry.value.kind == .selection) {
+            entry.value.source = null;
+            entry.value.external_source = null;
+        }
     }
 }
 
@@ -1074,14 +1126,13 @@ fn sendSelectionToDevice(
     device_id: DeviceId,
 ) error{ OutOfMemory, ResourceCreateFailed }!void {
     const device = self.devices.get(device_id) orelse return;
-    const source_id = self.selection orelse {
+    const selection = self.selection orelse {
         device.resource.sendSelection(null);
         return;
     };
-    const source = self.sources.get(source_id) orelse {
-        self.selection = null;
-        device.resource.sendSelection(null);
-        return;
+    const source_id: ?SourceId, const external_source: ?*const SelectionSource = switch (selection) {
+        .local => |source_id| .{ source_id, null },
+        .external => |source| .{ null, source },
     };
     const offer = try OfferResource.create(
         self,
@@ -1089,13 +1140,72 @@ fn sendSelectionToDevice(
         device.resource.getVersion(),
         device_id,
         source_id,
+        external_source,
         .selection,
         0,
         0,
     );
     device.resource.sendDataOffer(offer);
-    for (source.mime_types.items) |mime_type| offer.sendOffer(mime_type.ptr);
+    for (self.selectionMimeTypes()) |mime_type| offer.sendOffer(mime_type.ptr);
     device.resource.sendSelection(offer);
+}
+
+pub fn setSelectionListener(self: *Self, listener: SelectionListener) void {
+    std.debug.assert(self.selection_listener == null);
+    self.selection_listener = listener;
+}
+
+pub fn clearSelectionListener(self: *Self, context: *anyopaque) void {
+    std.debug.assert(self.selection_listener.?.context == context);
+    self.selection_listener = null;
+}
+
+pub fn selectionGeneration(self: *const Self) u64 {
+    return self.selection_generation;
+}
+
+pub fn hasSelection(self: *const Self) bool {
+    return self.selection != null;
+}
+
+pub fn selectionMimeTypes(self: *Self) []const [:0]const u8 {
+    const selection = self.selection orelse return &.{};
+    return switch (selection) {
+        .local => |id| if (self.sources.get(id)) |source|
+            @ptrCast(source.mime_types.items)
+        else
+            &.{},
+        .external => |source| source.mime_types(source.context),
+    };
+}
+
+pub fn sendSelection(self: *Self, mime_type: [*:0]const u8, fd: std.posix.fd_t) void {
+    const selection = self.selection orelse return;
+    switch (selection) {
+        .local => |id| {
+            const source = self.sources.get(id) orelse return;
+            if (sourceHasMime(source, mime_type)) source.resource.sendSend(mime_type, fd);
+        },
+        .external => |source| {
+            if (source.hasMime(mime_type)) source.send(source.context, mime_type, fd);
+        },
+    }
+}
+
+pub fn setExternalSelection(self: *Self, source: ?*const SelectionSource) void {
+    const selection: ?Selection = if (source) |value| .{ .external = value } else null;
+    if (std.meta.eql(self.selection, selection)) return;
+    self.replaceSelection(selection, self.display.nextSerial(), true);
+}
+
+pub fn externalSourceDestroyed(self: *Self, source: *const SelectionSource) void {
+    const selection = self.selection orelse return;
+    switch (selection) {
+        .local => {},
+        .external => |current| if (current == source) {
+            self.replaceSelection(null, self.display.nextSerial(), false);
+        },
+    }
 }
 
 const DndActionKind = enum {

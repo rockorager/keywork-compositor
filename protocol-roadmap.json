@@ -821,16 +821,17 @@
       "interfaces": [
         {
           "name": "ext_data_control_manager_v1",
-          "current_version": null,
+          "current_version": 1,
           "target_version": 1
         }
       ],
-      "status": "not_started",
+      "status": "done",
       "privileged": true,
       "blocked_by": [
         "security-context",
         "wl-data-device-manager"
-      ]
+      ],
+      "status_detail": "Version 1 provides privileged per-seat clipboard and primary-selection monitoring and replacement, MIME-validated transfers, source-use errors, stale-offer invalidation, cancellation, dynamic-seat teardown, and sandboxed-client global filtering."
     },
     {
       "id": "wlr-data-control",
