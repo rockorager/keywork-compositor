@@ -514,7 +514,7 @@ pub fn seatAdded(self: *Self, seat: *Seat) error{OutOfMemory}!void {
     try self.seat_states.append(self.allocator, state);
     errdefer _ = self.seat_states.pop();
     if (self.active) |manager| {
-        try self.createSeat(manager, state);
+        self.createSeat(manager, state) catch return error.OutOfMemory;
         if (manager.getVersion() >= 4) seat.setUnfocusedCursorController(manager.getClient());
         self.requestManage();
     }

@@ -13,6 +13,7 @@ allocator: std.mem.Allocator,
 io: std.Io,
 display: *wl.Server,
 global: *wl.Global,
+global_removed: bool,
 name_value: [:0]const u8,
 surface_store: *Surface.Store,
 seat_resources: std.ArrayList(*wl.Seat),
@@ -208,6 +209,7 @@ pub fn init(
         .io = io,
         .display = display,
         .global = undefined,
+        .global_removed = false,
         .name_value = seat_name,
         .surface_store = surface_store,
         .seat_resources = .empty,
@@ -274,7 +276,7 @@ pub fn deinit(self: *Self) void {
     std.debug.assert(self.keyboard_grab == null);
     std.debug.assert(self.repaint_listener == null);
     std.debug.assert(self.keyboard_focus_listeners.items.len == 0);
-    self.global.destroy();
+    if (!self.global_removed) self.global.destroy();
     if (self.keymap) |keymap| keymap.file.close(self.io);
     self.keyboard_focus_listeners.deinit(self.allocator);
     self.grabbed_keys.deinit(self.allocator);
@@ -290,7 +292,15 @@ pub fn deinit(self: *Self) void {
 }
 
 pub fn globalName(self: *const Self, client: *const wl.Client) u32 {
+    std.debug.assert(!self.global_removed);
     return self.global.getName(client);
+}
+
+/// Stop advertising this seat while keeping existing client resources alive.
+pub fn removeGlobal(self: *Self) void {
+    std.debug.assert(!self.global_removed);
+    self.global.destroy();
+    self.global_removed = true;
 }
 
 pub fn name(self: *const Self) [:0]const u8 {

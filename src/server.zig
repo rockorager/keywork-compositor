@@ -92,6 +92,8 @@ xdg_shell: XdgShell,
 xdg_foreign: XdgForeign,
 layer_shell: LayerShell,
 seat: Seat,
+dynamic_seats: std.ArrayList(*SeatEntry),
+input_device_listener: InputManager.DeviceListener,
 data_device: DataDevice,
 primary_selection: PrimarySelection,
 text_input: TextInput,
@@ -127,6 +129,12 @@ const RenderOutput = struct {
             .y = y + @as(f64, @floatFromInt(position.y)),
         };
     }
+};
+
+const SeatEntry = struct {
+    name: [:0]u8,
+    seat: Seat,
+    removed: bool,
 };
 
 const RenderOutputStore = slot_map.SlotMap(*RenderOutput, enum { render_output });
@@ -203,6 +211,12 @@ pub fn create(
         .xdg_foreign = undefined,
         .layer_shell = undefined,
         .seat = undefined,
+        .dynamic_seats = .empty,
+        .input_device_listener = .{
+            .context = self,
+            .added = inputDeviceAdded,
+            .removed = inputDeviceRemoved,
+        },
         .data_device = undefined,
         .primary_selection = undefined,
         .text_input = undefined,
@@ -220,6 +234,7 @@ pub fn create(
         .socket_buffer = undefined,
         .listening = false,
     };
+    errdefer self.dynamic_seats.deinit(allocator);
     errdefer self.render_outputs.deinit(allocator);
     errdefer self.renderer.deinit();
     if (output_kind == .drm) {
@@ -479,6 +494,15 @@ pub fn create(
             self.input_manager.deinit();
             self.input_manager_initialized = false;
         }
+        self.input_manager.setSeatListener(.{
+            .context = self,
+            .created = inputSeatCreated,
+            .device_changed = inputDeviceSeatChanged,
+            .destroyed = inputSeatDestroyed,
+        });
+        errdefer self.input_manager.clearSeatListener();
+        try self.input_manager.addDeviceListener(&self.input_device_listener);
+        errdefer self.input_manager.removeDeviceListener(&self.input_device_listener);
         try self.libinput_config.init(
             allocator,
             display,
@@ -536,10 +560,17 @@ pub fn destroy(self: *Self) void {
     self.data_device.cancel();
     if (self.xkb_bindings_initialized) self.xkb_bindings.detachNativeInput();
     if (self.xkb_config_initialized) self.xkb_config.detachNativeInput();
-    if (self.input_manager_initialized) self.input_manager.detachNativeInput();
+    if (self.input_manager_initialized) {
+        self.input_manager.detachNativeInput();
+        self.input_manager.removeDeviceListener(&self.input_device_listener);
+        self.input_manager.clearSeatListener();
+    }
     if (self.native_input_initialized) self.native_input.deinit();
     self.layer_shell.clearRepaintListener();
     self.seat.clearRepaintListener();
+    for (self.dynamic_seats.items) |entry| {
+        if (!entry.removed) entry.seat.clearRepaintListener();
+    }
     self.scene.clearRepaintListener();
     self.subcompositor.clearRepaintListener();
     var render_outputs = self.render_outputs.iterator();
@@ -600,6 +631,12 @@ pub fn destroy(self: *Self) void {
     }
     self.outputs.deinit();
     self.render_outputs.deinit(allocator);
+    for (self.dynamic_seats.items) |entry| {
+        entry.seat.deinit();
+        allocator.free(entry.name);
+        allocator.destroy(entry);
+    }
+    self.dynamic_seats.deinit(allocator);
     self.seat.deinit();
     self.compositor.deinit();
     if (self.drm_device_initialized) self.drm_device.deinit();
@@ -732,6 +769,145 @@ fn nativeInputListener(render_output: *RenderOutput) NativeInput.Listener {
         .touch_frame = nativeTouchFrame,
         .touch_cancel = nativeTouchCancel,
     };
+}
+
+fn inputSeatCreated(context: *anyopaque, name: [:0]const u8) error{OutOfMemory}!void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    std.debug.assert(self.seatForName(name) == null);
+
+    const name_copy = try self.allocator.dupeSentinel(u8, name, 0);
+    errdefer self.allocator.free(name_copy);
+    const entry = try self.allocator.create(SeatEntry);
+    errdefer self.allocator.destroy(entry);
+    entry.* = .{ .name = name_copy, .seat = undefined, .removed = false };
+    entry.seat.init(
+        self.allocator,
+        self.native_input.io,
+        self.display,
+        name_copy,
+        self.compositor.surfaceStore(),
+    ) catch |err| {
+        log.err("failed to create input seat {s}: {t}", .{ name, err });
+        self.terminate();
+        return error.OutOfMemory;
+    };
+    errdefer entry.seat.deinit();
+    try entry.seat.parentKeyboardEnter(&.{});
+    entry.seat.setRepaintListener(.{ .context = self, .request = requestRepaint });
+    errdefer entry.seat.clearRepaintListener();
+    try self.window_manager.seatAdded(&entry.seat);
+    errdefer self.window_manager.seatRemoved(&entry.seat);
+    try self.dynamic_seats.append(self.allocator, entry);
+    self.refreshSeatCapabilities(&entry.seat, name_copy);
+    requestRepaint(self);
+}
+
+fn inputSeatDestroyed(context: *anyopaque, name: [:0]const u8) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    for (self.dynamic_seats.items) |entry| {
+        if (entry.removed or !std.mem.eql(u8, entry.name, name)) continue;
+        entry.seat.setKeyboardAvailable(false);
+        entry.seat.setPointerAvailable(false);
+        entry.seat.setTouchAvailable(false);
+        entry.seat.parentKeyboardLeave();
+        self.window_manager.seatRemoved(&entry.seat);
+        entry.seat.clearRepaintListener();
+        entry.seat.removeGlobal();
+        entry.removed = true;
+        requestRepaint(self);
+        return;
+    }
+    unreachable;
+}
+
+fn inputDeviceAdded(context: *anyopaque, device: *InputManager.Device) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const seat = self.seatForName(device.seat_name) orelse return;
+    self.refreshSeatCapabilities(seat, device.seat_name);
+    if (device.device_type == .keyboard) self.prepareSeatKeyboard(seat, device.id);
+}
+
+fn inputDeviceRemoved(context: *anyopaque, device: *InputManager.Device) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const seat = self.seatForName(device.seat_name) orelse return;
+    self.refreshSeatCapabilities(seat, device.seat_name);
+    if (device.device_type == .keyboard) self.prepareAnySeatKeyboard(seat, device.seat_name);
+}
+
+fn inputDeviceSeatChanged(
+    context: *anyopaque,
+    device: *InputManager.Device,
+    previous_name: [:0]const u8,
+) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    if (self.seatForName(previous_name)) |previous| {
+        self.refreshSeatCapabilities(previous, previous_name);
+        if (device.device_type == .keyboard) self.prepareAnySeatKeyboard(previous, previous_name);
+    }
+    const next = self.seatForName(device.seat_name) orelse return;
+    self.refreshSeatCapabilities(next, device.seat_name);
+    if (device.device_type == .keyboard) {
+        next.parentKeyboardEnter(&.{}) catch return self.terminate();
+        self.prepareSeatKeyboard(next, device.id);
+    }
+}
+
+fn seatForName(self: *Self, name: []const u8) ?*Seat {
+    if (std.mem.eql(u8, name, "default")) return &self.seat;
+    for (self.dynamic_seats.items) |entry| {
+        if (!entry.removed and std.mem.eql(u8, entry.name, name)) return &entry.seat;
+    }
+    return null;
+}
+
+fn seatForDevice(self: *Self, id: NativeInput.DeviceId) *Seat {
+    if (!self.input_manager_initialized) return &self.seat;
+    const device = self.input_manager.findDevice(id) orelse return &self.seat;
+    return self.seatForName(device.seat_name) orelse &self.seat;
+}
+
+fn refreshSeatCapabilities(self: *Self, seat: *Seat, name: []const u8) void {
+    var keyboard = false;
+    var pointer = false;
+    var touch = false;
+    var devices = self.input_manager.deviceIterator();
+    while (devices.next()) |device| {
+        if (!std.mem.eql(u8, device.seat_name, name)) continue;
+        switch (device.device_type) {
+            .keyboard => keyboard = true,
+            .pointer => pointer = true,
+            .touch => touch = true,
+            .tablet => {},
+        }
+    }
+    if (seat == &self.seat and !pointer) {
+        self.pointer_constraints.deactivateAll();
+        self.data_device.cancel();
+    }
+    seat.setKeyboardAvailable(keyboard);
+    seat.setPointerAvailable(pointer);
+    seat.setTouchAvailable(touch);
+}
+
+fn prepareAnySeatKeyboard(self: *Self, seat: *Seat, name: []const u8) void {
+    var devices = self.input_manager.deviceIterator();
+    while (devices.next()) |device| {
+        if (device.device_type != .keyboard or !std.mem.eql(u8, device.seat_name, name)) continue;
+        self.prepareSeatKeyboard(seat, device.id);
+        return;
+    }
+}
+
+fn prepareSeatKeyboard(self: *Self, seat: *Seat, id: NativeInput.DeviceId) void {
+    const state = self.native_input.keyboardState(id) orelse return;
+    const fd = self.native_input.duplicateKeyboardKeymapFd(id) catch {
+        log.err("failed to duplicate keymap for input seat", .{});
+        return self.terminate();
+    } orelse return;
+    seat.setKeymap(.xkb_v1, fd, state.keymap.size);
+    if (self.native_input.deviceRepeatInfo(id)) |repeat| {
+        seat.setRepeatInfo(repeat.rate, repeat.delay);
+    }
 }
 
 fn removeRenderOutput(self: *Self, id: RenderOutputId) bool {
