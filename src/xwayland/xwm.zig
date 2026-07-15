@@ -5,6 +5,7 @@ const Self = @This();
 const std = @import("std");
 const wayland = @import("wayland");
 const DataDevice = @import("../wayland/data_device.zig");
+const PrimarySelection = @import("../wayland/primary_selection.zig");
 const Surface = @import("../wayland/surface.zig");
 const XSelection = @import("selection.zig");
 
@@ -23,6 +24,7 @@ serial_windows: std.AutoHashMapUnmanaged(u64, WindowId),
 focused_window: ?WindowId,
 xfixes_event_base: u8,
 clipboard_selection: XSelection,
+primary_selection: XSelection,
 listener: Listener,
 
 pub const WindowId = u32;
@@ -167,6 +169,7 @@ pub fn init(
     event_loop: *wl.EventLoop,
     fd: std.posix.fd_t,
     data_device: *DataDevice,
+    primary_selection: *PrimarySelection,
     listener: Listener,
 ) !void {
     const connection = c.xcb_connect_to_fd(fd, null) orelse {
@@ -194,6 +197,7 @@ pub fn init(
         .focused_window = null,
         .xfixes_event_base = 0,
         .clipboard_selection = undefined,
+        .primary_selection = undefined,
         .listener = listener,
     };
 
@@ -251,6 +255,22 @@ pub fn init(
         .{ .clipboard = data_device },
     );
     errdefer self.clipboard_selection.deinit();
+    try self.primary_selection.init(
+        allocator,
+        event_loop,
+        connection,
+        screen,
+        .{
+            .selection = c.XCB_ATOM_PRIMARY,
+            .targets = self.atomValue(.targets),
+            .selection_data = self.atomValue(.selection_data),
+            .incr = self.atomValue(.incr),
+            .utf8_string = self.atomValue(.utf8_string),
+            .text = self.atomValue(.text),
+        },
+        .{ .primary = primary_selection },
+    );
+    errdefer self.primary_selection.deinit();
     if (c.xcb_flush(connection) <= 0) return error.XcbFlushFailed;
 
     const event_fd = c.xcb_get_file_descriptor(connection);
@@ -267,6 +287,7 @@ pub fn init(
 
 pub fn deinit(self: *Self) void {
     self.event_source.remove();
+    self.primary_selection.deinit();
     self.clipboard_selection.deinit();
     while (self.windows.count() > 0) {
         var iterator = self.windows.iterator();
@@ -1076,6 +1097,7 @@ fn dispatchEvent(self: *Self, event: [*c]c.xcb_generic_event_t) !void {
     const response_type = event.*.response_type & 0x7f;
     if (response_type == self.xfixes_event_base + c.XCB_XFIXES_SELECTION_NOTIFY) {
         self.clipboard_selection.handleXfixesNotify(@ptrCast(event));
+        self.primary_selection.handleXfixesNotify(@ptrCast(event));
         return;
     }
     switch (response_type) {
@@ -1089,7 +1111,10 @@ fn dispatchEvent(self: *Self, event: [*c]c.xcb_generic_event_t) !void {
         c.XCB_PROPERTY_NOTIFY => try self.handlePropertyNotify(@ptrCast(event)),
         c.XCB_CLIENT_MESSAGE => try self.handleClientMessage(@ptrCast(event)),
         c.XCB_SELECTION_REQUEST => self.handleSelectionRequest(@ptrCast(event)),
-        c.XCB_SELECTION_NOTIFY => self.clipboard_selection.handleNotify(@ptrCast(event)),
+        c.XCB_SELECTION_NOTIFY => {
+            self.clipboard_selection.handleNotify(@ptrCast(event));
+            self.primary_selection.handleNotify(@ptrCast(event));
+        },
         else => {},
     }
 }
@@ -1097,6 +1122,7 @@ fn dispatchEvent(self: *Self, event: [*c]c.xcb_generic_event_t) !void {
 fn handleCreate(self: *Self, event: *const c.xcb_create_notify_event_t) !void {
     if (event.window == self.wm_window or
         self.clipboard_selection.ownsWindow(event.window) or
+        self.primary_selection.ownsWindow(event.window) or
         self.windows.contains(event.window)) return;
     const window: Window = .{
         .geometry = .{
@@ -1121,12 +1147,15 @@ fn handleCreate(self: *Self, event: *const c.xcb_create_notify_event_t) !void {
 
 fn handleDestroy(self: *Self, event: *const c.xcb_destroy_notify_event_t) void {
     self.clipboard_selection.handleRequestorDestroyed(event.window);
+    self.primary_selection.handleRequestorDestroyed(event.window);
     self.removeWindow(event.window);
 }
 
 fn handleSelectionRequest(self: *Self, event: *const c.xcb_selection_request_event_t) void {
     if (self.clipboard_selection.handlesSelection(event.selection)) {
         self.clipboard_selection.handleRequest(event);
+    } else if (self.primary_selection.handlesSelection(event.selection)) {
+        self.primary_selection.handleRequest(event);
     }
 }
 
@@ -1211,6 +1240,7 @@ fn handleUnmapNotify(self: *Self, event: *const c.xcb_unmap_notify_event_t) void
 
 fn handlePropertyNotify(self: *Self, event: *const c.xcb_property_notify_event_t) !void {
     if (self.clipboard_selection.handlePropertyNotify(event)) return;
+    if (self.primary_selection.handlePropertyNotify(event)) return;
     const window = self.windows.getPtr(event.window) orelse return;
     if (event.atom == self.atomValue(.net_wm_name) or
         event.atom == c.XCB_ATOM_WM_NAME or

@@ -3238,23 +3238,30 @@ fn xwaylandReady(
 ) bool {
     const self: *Self = @ptrCast(@alignCast(context));
     std.debug.assert(!self.xwm_initialized);
-    self.xwm.init(self.allocator, self.display.getEventLoop(), wm_fd, &self.data_device, .{
-        .context = self,
-        .failed = xwmFailed,
-        .created = xwmWindowCreated,
-        .destroyed = xwmWindowDestroyed,
-        .mapped = xwmWindowMapped,
-        .configured = xwmWindowConfigured,
-        .metadata_changed = xwmWindowMetadataChanged,
-        .fullscreen_requested = xwmWindowFullscreenRequested,
-        .maximize_requested = xwmWindowMaximizeRequested,
-        .minimize_requested = xwmWindowMinimizeRequested,
-        .activation_requested = xwmWindowActivationRequested,
-        .activation_changed = xwmWindowActivationChanged,
-        .serial = xwmWindowSerial,
-        .associated = xwmWindowAssociated,
-        .dissociated = xwmWindowDissociated,
-    }) catch |err| {
+    self.xwm.init(
+        self.allocator,
+        self.display.getEventLoop(),
+        wm_fd,
+        &self.data_device,
+        &self.primary_selection,
+        .{
+            .context = self,
+            .failed = xwmFailed,
+            .created = xwmWindowCreated,
+            .destroyed = xwmWindowDestroyed,
+            .mapped = xwmWindowMapped,
+            .configured = xwmWindowConfigured,
+            .metadata_changed = xwmWindowMetadataChanged,
+            .fullscreen_requested = xwmWindowFullscreenRequested,
+            .maximize_requested = xwmWindowMaximizeRequested,
+            .minimize_requested = xwmWindowMinimizeRequested,
+            .activation_requested = xwmWindowActivationRequested,
+            .activation_changed = xwmWindowActivationChanged,
+            .serial = xwmWindowSerial,
+            .associated = xwmWindowAssociated,
+            .dissociated = xwmWindowDissociated,
+        },
+    ) catch |err| {
         log.err("failed to initialize XWM: {t}", .{err});
         return false;
     };
