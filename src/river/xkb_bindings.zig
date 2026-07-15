@@ -4,6 +4,7 @@ const Self = @This();
 const std = @import("std");
 const wayland = @import("wayland");
 const NativeInput = @import("../backend/native_input.zig");
+const KeyboardShortcutsInhibit = @import("../wayland/keyboard_shortcuts_inhibit.zig");
 const SecurityContext = @import("../wayland/security_context.zig");
 const Seat = @import("../wayland/seat.zig");
 const InputManager = @import("input_manager.zig");
@@ -16,6 +17,7 @@ global: *wl.Global,
 security_context: *SecurityContext,
 window_manager: *WindowManager,
 input_manager: *InputManager,
+keyboard_shortcuts_inhibit: *KeyboardShortcutsInhibit,
 native_input: ?*NativeInput,
 device_listener: InputManager.DeviceListener,
 bindings: std.ArrayList(*Binding),
@@ -63,7 +65,14 @@ const HeldKey = struct {
     key_code: u32,
     binding: ?*Binding,
     captured: bool,
+    shortcuts_inhibited: bool = false,
     stop_repeat_sent: bool = false,
+
+    fn disposition(self: HeldKey) NativeInput.KeyboardEventDisposition {
+        if (self.captured) return .captured;
+        if (self.shortcuts_inhibited) return .shortcuts_inhibited;
+        return .forwarded;
+    }
 };
 
 const EventSession = struct {
@@ -78,6 +87,7 @@ pub fn init(
     security_context: *SecurityContext,
     window_manager: *WindowManager,
     input_manager: *InputManager,
+    keyboard_shortcuts_inhibit: *KeyboardShortcutsInhibit,
     native_input: *NativeInput,
 ) !void {
     self.* = .{
@@ -86,6 +96,7 @@ pub fn init(
         .security_context = security_context,
         .window_manager = window_manager,
         .input_manager = input_manager,
+        .keyboard_shortcuts_inhibit = keyboard_shortcuts_inhibit,
         .native_input = native_input,
         .device_listener = .{
             .context = self,
@@ -273,20 +284,25 @@ fn seatDestroyed(_: *river.XkbBindingsSeatV1, seat: *BindingsSeat) void {
     unreachable;
 }
 
-fn keyboardKey(context: *anyopaque, event: NativeInput.KeyboardEvent) bool {
+fn keyboardKey(
+    context: *anyopaque,
+    event: NativeInput.KeyboardEvent,
+) NativeInput.KeyboardEventDisposition {
     const self: *Self = @ptrCast(@alignCast(context));
     return switch (event.state) {
         .pressed => self.keyPressed(event),
         .released => self.keyReleased(event),
-        else => false,
+        else => .forwarded,
     };
 }
 
-fn keyPressed(self: *Self, event: NativeInput.KeyboardEvent) bool {
+fn keyPressed(self: *Self, event: NativeInput.KeyboardEvent) NativeInput.KeyboardEventDisposition {
     for (self.held_keys.items) |held| {
-        if (held.device_id == event.device_id and held.key_code == event.key_code) return held.captured;
+        if (held.device_id == event.device_id and held.key_code == event.key_code) {
+            return held.disposition();
+        }
     }
-    const event_device = self.input_manager.findDevice(event.device_id) orelse return false;
+    const event_device = self.input_manager.findDevice(event.device_id) orelse return .forwarded;
     if (!event.seat_level) {
         for (self.held_keys.items) |held| {
             if (held.key_code != event.key_code) continue;
@@ -297,8 +313,9 @@ fn keyPressed(self: *Self, event: NativeInput.KeyboardEvent) bool {
                 .key_code = event.key_code,
                 .binding = null,
                 .captured = held.captured,
-            }) catch return true;
-            return held.captured;
+                .shortcuts_inhibited = held.shortcuts_inhibited,
+            }) catch return .captured;
+            return held.disposition();
         }
     }
 
@@ -310,6 +327,18 @@ fn keyPressed(self: *Self, event: NativeInput.KeyboardEvent) bool {
         binding.resource.sendStopRepeat();
         held.stop_repeat_sent = true;
         session = bindingSession(binding);
+    }
+
+    if (self.keyboard_shortcuts_inhibit.inhibitsSeatNamed(event_device.seat_name)) {
+        self.held_keys.append(self.allocator, .{
+            .device_id = event.device_id,
+            .key_code = event.key_code,
+            .binding = null,
+            .captured = false,
+            .shortcuts_inhibited = true,
+        }) catch return .shortcuts_inhibited;
+        if (session) |event_session| self.requestManage(event_session);
+        return .shortcuts_inhibited;
     }
 
     var matched: ?*Binding = null;
@@ -348,7 +377,7 @@ fn keyPressed(self: *Self, event: NativeInput.KeyboardEvent) bool {
         .captured = captured,
     }) catch {
         if (matched) |binding| binding.resource.postNoMemory() else if (eaten_by) |seat| seat.resource.postNoMemory();
-        return true;
+        return .captured;
     };
     if (matched) |binding| {
         binding.resource.sendPressed();
@@ -358,10 +387,10 @@ fn keyPressed(self: *Self, event: NativeInput.KeyboardEvent) bool {
         session = seatSession(seat);
     }
     if (session) |event_session| self.requestManage(event_session);
-    return captured;
+    return if (captured) .captured else .forwarded;
 }
 
-fn keyReleased(self: *Self, event: NativeInput.KeyboardEvent) bool {
+fn keyReleased(self: *Self, event: NativeInput.KeyboardEvent) NativeInput.KeyboardEventDisposition {
     for (self.held_keys.items, 0..) |held, index| {
         if (held.device_id != event.device_id or held.key_code != event.key_code) continue;
         _ = self.held_keys.orderedRemove(index);
@@ -369,9 +398,9 @@ fn keyReleased(self: *Self, event: NativeInput.KeyboardEvent) bool {
             binding.resource.sendReleased();
             self.requestManage(bindingSession(binding));
         };
-        return held.captured;
+        return held.disposition();
     }
-    return false;
+    return .forwarded;
 }
 
 fn deviceAdded(_: *anyopaque, _: *InputManager.Device) void {}

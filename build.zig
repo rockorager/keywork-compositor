@@ -37,6 +37,7 @@ pub fn build(b: *std.Build) void {
     scanner.addSystemProtocol("unstable/relative-pointer/relative-pointer-unstable-v1.xml");
     scanner.addSystemProtocol("unstable/pointer-constraints/pointer-constraints-unstable-v1.xml");
     scanner.addSystemProtocol("unstable/idle-inhibit/idle-inhibit-unstable-v1.xml");
+    scanner.addSystemProtocol("unstable/keyboard-shortcuts-inhibit/keyboard-shortcuts-inhibit-unstable-v1.xml");
     scanner.addSystemProtocol("unstable/xdg-foreign/xdg-foreign-unstable-v2.xml");
     scanner.addSystemProtocol("unstable/xdg-output/xdg-output-unstable-v1.xml");
     scanner.addCustomProtocol(b.path("protocol/input-method-unstable-v2.xml"));
@@ -88,6 +89,7 @@ pub fn build(b: *std.Build) void {
     scanner.generate("zwp_relative_pointer_manager_v1", 1);
     scanner.generate("zwp_pointer_constraints_v1", 1);
     scanner.generate("zwp_idle_inhibit_manager_v1", 1);
+    scanner.generate("zwp_keyboard_shortcuts_inhibit_manager_v1", 1);
     scanner.generate("zxdg_exporter_v2", 1);
     scanner.generate("zxdg_importer_v2", 1);
     scanner.generate("zxdg_output_manager_v1", 3);

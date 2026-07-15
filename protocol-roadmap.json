@@ -761,15 +761,16 @@
       "interfaces": [
         {
           "name": "zwp_keyboard_shortcuts_inhibit_manager_v1",
-          "current_version": null,
+          "current_version": 1,
           "target_version": 1
         }
       ],
-      "status": "not_started",
+      "status": "done",
       "privileged": false,
       "blocked_by": [
         "wl-seat"
-      ]
+      ],
+      "status_detail": "Version 1 enforces one inhibitor per surface and seat, activates inhibition only while that exact surface has keyboard focus on the requested seat, and follows focus, grab, keyboard-capability, surface-destruction, and protocol-resource lifetimes. Active inhibitors bypass River xkb bindings and the temporary compositor launcher while preserving press-time key ownership across focus changes; emergency compositor exit and virtual-terminal switching shortcuts remain available as the protocol permits."
     },
     {
       "id": "pointer-gestures",

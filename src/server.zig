@@ -22,6 +22,7 @@ const RelativePointer = @import("wayland/relative_pointer.zig");
 const PointerGestures = @import("wayland/pointer_gestures.zig");
 const PointerConstraints = @import("wayland/pointer_constraints.zig");
 const IdleInhibit = @import("wayland/idle_inhibit.zig");
+const KeyboardShortcutsInhibit = @import("wayland/keyboard_shortcuts_inhibit.zig");
 const IdleNotify = @import("wayland/idle_notify.zig");
 const Seat = @import("wayland/seat.zig");
 const DataDevice = @import("wayland/data_device.zig");
@@ -104,6 +105,7 @@ relative_pointer: RelativePointer,
 pointer_gestures: PointerGestures,
 pointer_constraints: PointerConstraints,
 idle_inhibit: IdleInhibit,
+keyboard_shortcuts_inhibit: KeyboardShortcutsInhibit,
 idle_notify: IdleNotify,
 idle_notify_initialized: bool,
 compositor: Compositor,
@@ -294,6 +296,7 @@ pub fn create(
         .pointer_gestures = undefined,
         .pointer_constraints = undefined,
         .idle_inhibit = undefined,
+        .keyboard_shortcuts_inhibit = undefined,
         .idle_notify = undefined,
         .idle_notify_initialized = false,
         .compositor = undefined,
@@ -500,6 +503,8 @@ pub fn create(
         .changed = idleInhibitorsChanged,
     });
     errdefer self.idle_inhibit.deinit();
+    try self.keyboard_shortcuts_inhibit.init(allocator, display);
+    errdefer self.keyboard_shortcuts_inhibit.deinit();
     try self.presentation_protocol.init(
         allocator,
         display,
@@ -839,6 +844,7 @@ pub fn create(
             &self.security_context,
             &self.window_manager,
             &self.input_manager,
+            &self.keyboard_shortcuts_inhibit,
             &self.native_input,
         );
         self.xkb_bindings_initialized = true;
@@ -945,6 +951,7 @@ pub fn destroy(self: *Self) void {
     self.fractional_scale.deinit();
     self.viewporter.deinit();
     self.presentation_protocol.deinit();
+    self.keyboard_shortcuts_inhibit.deinit();
     self.idle_inhibit.deinit();
     self.pointer_constraints.deinit();
     self.pointer_gestures.deinit();

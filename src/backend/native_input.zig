@@ -191,9 +191,15 @@ pub const KeyboardEvent = struct {
     is_modifier: bool,
 };
 
+pub const KeyboardEventDisposition = enum {
+    forwarded,
+    captured,
+    shortcuts_inhibited,
+};
+
 pub const KeyboardEventListener = struct {
     context: *anyopaque,
-    key: *const fn (*anyopaque, KeyboardEvent) bool,
+    key: *const fn (*anyopaque, KeyboardEvent) KeyboardEventDisposition,
     modifiers: *const fn (*anyopaque, ?DeviceId, u32, u32) void,
 };
 
@@ -1388,12 +1394,18 @@ fn keyboardKey(self: *Self, event: *c.struct_libinput_event_keyboard) void {
     }
     const binding_event = keyboardEvent(device, keyboard, key, pressed, forward);
     const emergency_captured = forward and self.handleEmergencyShortcut(key, pressed);
-    const binding_captured = !emergency_captured and if (self.keyboard_event_listener) |listener|
-        listener.key(listener.context, binding_event)
+    const binding_disposition: KeyboardEventDisposition = if (!emergency_captured and
+        self.keyboard_event_listener != null)
+        self.keyboard_event_listener.?.key(
+            self.keyboard_event_listener.?.context,
+            binding_event,
+        )
     else
-        false;
+        .forwarded;
+    const binding_captured = binding_disposition == .captured;
+    const shortcuts_inhibited = binding_disposition == .shortcuts_inhibited;
     const launcher_captured = forward and !emergency_captured and !binding_captured and
-        self.handleLauncherShortcut(key, pressed);
+        !shortcuts_inhibited and self.handleLauncherShortcut(key, pressed);
     const old_state = stateSnapshot(keyboard);
     _ = c.xkb_state_update_key(
         keyboard.state,
