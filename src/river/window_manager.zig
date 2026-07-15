@@ -935,6 +935,8 @@ pub fn xwaylandWindowAssociated(
     const info = self.xwayland.window_info(self.xwayland.context, xwayland_id) orelse return;
     if (!info.mapped or info.override_redirect) return;
     _ = try self.ensureXwaylandWindow(xwayland_id);
+    var windows = self.windows.iterator();
+    while (windows.next()) |entry| entry.value.metadata_dirty = true;
     self.xwayland.refresh_scene(self.xwayland.context, xwayland_id);
     self.requestManage();
 }
@@ -957,6 +959,8 @@ pub fn xwaylandWindowMapped(self: *Self, xwayland_id: Xwm.WindowId, mapped: bool
         manager.postNoMemory();
         return;
     };
+    var windows = self.windows.iterator();
+    while (windows.next()) |entry| entry.value.metadata_dirty = true;
     self.xwayland.refresh_scene(self.xwayland.context, xwayland_id);
     self.requestManage();
 }
@@ -1067,10 +1071,20 @@ fn sendPendingState(self: *Self, manager: *river.WindowManagerV1) !void {
                     self.xwayland.context,
                     xwayland_id,
                 ) orelse continue;
-                resource.sendDimensionsHint(0, 0, 0, 0);
+                resource.sendDimensionsHint(
+                    info.min_size.width,
+                    info.min_size.height,
+                    info.max_size.width,
+                    info.max_size.height,
+                );
                 resource.sendAppId(if (info.app_id) |app_id| app_id.ptr else null);
                 resource.sendTitle(if (info.title) |title| title.ptr else null);
-                resource.sendParent(null);
+                const parent_resource = if (info.parent) |parent_id| parent: {
+                    const managed_parent_id = self.findXwaylandWindow(parent_id) orelse break :parent null;
+                    const managed_parent = self.windows.get(managed_parent_id) orelse break :parent null;
+                    break :parent managed_parent.resource;
+                } else null;
+                resource.sendParent(parent_resource);
                 resource.sendDecorationHint(.no_preference);
             },
         }

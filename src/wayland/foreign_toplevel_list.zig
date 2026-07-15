@@ -346,10 +346,9 @@ const WlrHandle = struct {
         self.resource.sendState(&array);
     }
 
-    fn sendParent(self: *WlrHandle, parent_id: ?XdgShell.WindowId) void {
+    fn sendParent(self: *WlrHandle, parent_mapping: ?*Mapping) void {
         if (self.resource.getVersion() < 3) return;
-        if (parent_id) |id| {
-            const mapping = self.owner.mappingForXdg(id) orelse return;
+        if (parent_mapping) |mapping| {
             const parent = self.owner.wlrHandleFor(self.binding_generation, mapping) orelse return;
             self.resource.sendParent(parent.resource);
         } else {
@@ -517,7 +516,7 @@ fn addMapping(self: *Self, backend: Mapping.Backend, surface_id: Surface.Id) !vo
         if (handle.mapping != mapping or handle.initialized) continue;
         handle.sendInitialDetails() catch handle.resource.postNoMemory();
     }
-    if (mapping.xdgId()) |window_id| self.syncWlrChildParents(window_id);
+    self.syncWlrChildParents(mapping);
 }
 
 fn removeMapping(self: *Self, target: *Mapping) void {
@@ -529,7 +528,7 @@ fn removeMapping(self: *Self, target: *Mapping) void {
         for (self.wlr_handles.items) |handle| {
             if (handle.mapping == mapping) handle.close();
         }
-        if (mapping.xdgId()) |window_id| self.clearWlrChildParents(window_id);
+        self.clearWlrChildParents(mapping);
         _ = self.mappings.swapRemove(index);
         self.destroyMapping(mapping);
         return;
@@ -582,10 +581,18 @@ fn mappingConfiguration(self: *Self, mapping: *const Mapping) XdgShell.ToplevelC
     return info.configuration;
 }
 
-fn mappingParent(self: *Self, mapping: *const Mapping) ?XdgShell.WindowId {
-    const window_id = mapping.xdgId() orelse return null;
-    const info = self.xdg_shell.windowInfo(window_id) orelse return null;
-    return info.parent;
+fn mappingParent(self: *Self, mapping: *const Mapping) ?*Mapping {
+    return switch (mapping.backend) {
+        .xdg => |window_id| parent: {
+            const info = self.xdg_shell.windowInfo(window_id) orelse return null;
+            break :parent self.mappingForXdg(info.parent orelse return null);
+        },
+        .xwayland => |window_id| parent: {
+            const info = self.xwayland.window_info(self.xwayland.context, window_id) orelse
+                return null;
+            break :parent self.mappingForXwayland(info.parent orelse return null);
+        },
+    };
 }
 
 fn handleFor(self: *Self, list: *List, mapping: *Mapping) ?*Handle {
@@ -651,25 +658,21 @@ pub fn windowForExtHandle(
     return null;
 }
 
-fn syncWlrChildParents(self: *Self, parent_id: XdgShell.WindowId) void {
+fn syncWlrChildParents(self: *Self, parent_mapping: *Mapping) void {
     for (self.wlr_handles.items) |handle| {
         if (!handle.initialized or handle.closed) continue;
         const mapping = handle.mapping orelse continue;
-        const window_id = mapping.xdgId() orelse continue;
-        const info = self.xdg_shell.windowInfo(window_id) orelse continue;
-        if (info.parent == null or !std.meta.eql(info.parent.?, parent_id)) continue;
-        handle.sendParent(info.parent);
+        if (self.mappingParent(mapping) != parent_mapping) continue;
+        handle.sendParent(parent_mapping);
         handle.resource.sendDone();
     }
 }
 
-fn clearWlrChildParents(self: *Self, parent_id: XdgShell.WindowId) void {
+fn clearWlrChildParents(self: *Self, parent_mapping: *Mapping) void {
     for (self.wlr_handles.items) |handle| {
         if (!handle.initialized or handle.closed or handle.resource.getVersion() < 3) continue;
         const mapping = handle.mapping orelse continue;
-        const window_id = mapping.xdgId() orelse continue;
-        const info = self.xdg_shell.windowInfo(window_id) orelse continue;
-        if (info.parent == null or !std.meta.eql(info.parent.?, parent_id)) continue;
+        if (self.mappingParent(mapping) != parent_mapping) continue;
         handle.resource.sendParent(null);
         handle.resource.sendDone();
     }

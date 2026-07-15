@@ -35,6 +35,11 @@ pub const Geometry = struct {
     height: u16,
 };
 
+pub const Size = struct {
+    width: i32 = 0,
+    height: i32 = 0,
+};
+
 pub const WindowInfo = struct {
     id: WindowId,
     geometry: Geometry,
@@ -44,6 +49,9 @@ pub const WindowInfo = struct {
     title: ?[:0]const u8,
     app_id: ?[:0]const u8,
     instance: ?[:0]const u8,
+    parent: ?WindowId,
+    min_size: Size,
+    max_size: Size,
     can_close: bool,
 };
 
@@ -56,6 +64,9 @@ const Window = struct {
     title: ?[:0]u8 = null,
     app_id: ?[:0]u8 = null,
     instance: ?[:0]u8 = null,
+    parent: ?WindowId = null,
+    min_size: Size = .{},
+    max_size: Size = .{},
     accepts_input: bool = true,
     take_focus: bool = false,
     delete_window: bool = false,
@@ -506,7 +517,78 @@ fn refreshMetadata(self: *Self, window_id: WindowId, window: *Window) !bool {
         try self.readTitle(window_id),
     );
     const class_changed = try self.refreshClass(window_id, window);
-    return title_changed or class_changed;
+    const parent_changed = self.refreshTransientFor(window_id, window);
+    const size_hints_changed = self.refreshNormalHints(window_id, window);
+    return title_changed or class_changed or parent_changed or size_hints_changed;
+}
+
+fn refreshTransientFor(self: *Self, window_id: WindowId, window: *Window) bool {
+    var requested_parent: c.xcb_window_t = 0;
+    const found = c.xcb_icccm_get_wm_transient_for_reply(
+        self.connection,
+        c.xcb_icccm_get_wm_transient_for(self.connection, window_id),
+        &requested_parent,
+        null,
+    ) != 0;
+    const parent: ?WindowId = if (!found or
+        requested_parent == 0 or
+        requested_parent == self.screen.root or
+        requested_parent == window_id or
+        self.wouldCreateParentLoop(window_id, requested_parent))
+        null
+    else
+        requested_parent;
+    if (window.parent == parent) return false;
+    window.parent = parent;
+    return true;
+}
+
+fn wouldCreateParentLoop(self: *const Self, window_id: WindowId, requested_parent: WindowId) bool {
+    var ancestor = requested_parent;
+    var remaining = self.windows.count() + 1;
+    while (remaining > 0) : (remaining -= 1) {
+        if (ancestor == window_id) return true;
+        const parent = (self.windows.get(ancestor) orelse return false).parent orelse return false;
+        ancestor = parent;
+    }
+    return true;
+}
+
+fn refreshNormalHints(self: *Self, window_id: WindowId, window: *Window) bool {
+    var hints = std.mem.zeroes(c.xcb_size_hints_t);
+    const found = c.xcb_icccm_get_wm_normal_hints_reply(
+        self.connection,
+        c.xcb_icccm_get_wm_normal_hints(self.connection, window_id),
+        &hints,
+        null,
+    ) != 0;
+    var min_size: Size = .{};
+    var max_size: Size = .{};
+    if (found and hints.flags & c.XCB_ICCCM_SIZE_HINT_P_MIN_SIZE != 0) {
+        min_size = validSizeHint(hints.min_width, hints.min_height);
+    }
+    if (found and hints.flags & c.XCB_ICCCM_SIZE_HINT_P_MAX_SIZE != 0) {
+        max_size = validSizeHint(hints.max_width, hints.max_height);
+    }
+    if (max_size.width > 0 and min_size.width > max_size.width) {
+        max_size.width = min_size.width;
+    }
+    if (max_size.height > 0 and min_size.height > max_size.height) {
+        max_size.height = min_size.height;
+    }
+    if (std.meta.eql(window.min_size, min_size) and std.meta.eql(window.max_size, max_size)) {
+        return false;
+    }
+    window.min_size = min_size;
+    window.max_size = max_size;
+    return true;
+}
+
+fn validSizeHint(width: i32, height: i32) Size {
+    return .{
+        .width = if (width > 0) width else 0,
+        .height = if (height > 0) height else 0,
+    };
 }
 
 fn readTitle(self: *Self, window_id: WindowId) !?[:0]u8 {
@@ -741,6 +823,12 @@ fn removeWindow(self: *Self, window_id: WindowId) void {
     if (removed.value.surface_id) |surface_id|
         self.listener.dissociated(self.listener.context, window_id, surface_id);
     self.listener.destroyed(self.listener.context, window_id);
+    var children = self.windows.iterator();
+    while (children.next()) |entry| {
+        if (entry.value_ptr.parent != window_id) continue;
+        entry.value_ptr.parent = null;
+        self.listener.metadata_changed(self.listener.context, entry.key_ptr.*);
+    }
     var window = removed.value;
     window.deinit(self.allocator);
 }
@@ -800,7 +888,10 @@ fn handleUnmapNotify(self: *Self, event: *const c.xcb_unmap_notify_event_t) void
 fn handlePropertyNotify(self: *Self, event: *const c.xcb_property_notify_event_t) !void {
     const window = self.windows.getPtr(event.window) orelse return;
     if (event.atom == self.atomValue(.net_wm_name) or
-        event.atom == c.XCB_ATOM_WM_NAME or event.atom == c.XCB_ATOM_WM_CLASS)
+        event.atom == c.XCB_ATOM_WM_NAME or
+        event.atom == c.XCB_ATOM_WM_CLASS or
+        event.atom == c.XCB_ATOM_WM_TRANSIENT_FOR or
+        event.atom == c.XCB_ATOM_WM_NORMAL_HINTS)
     {
         if (try self.refreshMetadata(event.window, window)) {
             self.listener.metadata_changed(self.listener.context, event.window);
@@ -916,6 +1007,9 @@ fn info(window_id: WindowId, window: Window) WindowInfo {
         .title = window.title,
         .app_id = window.app_id,
         .instance = window.instance,
+        .parent = window.parent,
+        .min_size = window.min_size,
+        .max_size = window.max_size,
         .can_close = window.delete_window,
     };
 }
