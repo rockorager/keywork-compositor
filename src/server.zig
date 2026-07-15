@@ -17,6 +17,7 @@ const ContentType = @import("wayland/content_type.zig");
 const SecurityContext = @import("wayland/security_context.zig");
 const SessionLock = @import("wayland/session_lock.zig");
 const CursorShape = @import("wayland/cursor_shape.zig");
+const Tablet = @import("wayland/tablet.zig");
 const RelativePointer = @import("wayland/relative_pointer.zig");
 const PointerGestures = @import("wayland/pointer_gestures.zig");
 const PointerConstraints = @import("wayland/pointer_constraints.zig");
@@ -87,6 +88,7 @@ security_context: SecurityContext,
 session_lock: SessionLock,
 session_lock_initialized: bool,
 cursor_shape: CursorShape,
+tablet: Tablet,
 relative_pointer: RelativePointer,
 pointer_gestures: PointerGestures,
 pointer_constraints: PointerConstraints,
@@ -243,6 +245,7 @@ pub fn create(
         .session_lock = undefined,
         .session_lock_initialized = false,
         .cursor_shape = undefined,
+        .tablet = undefined,
         .relative_pointer = undefined,
         .pointer_gestures = undefined,
         .pointer_constraints = undefined,
@@ -399,6 +402,16 @@ pub fn create(
     }
     try self.cursor_shape.init(allocator, display, &self.seat);
     errdefer self.cursor_shape.deinit();
+    try self.tablet.init(
+        allocator,
+        display,
+        self.compositor.surfaceStore(),
+        .{
+            .context = self,
+            .surface_coordinates = tabletSurfaceCoordinates,
+        },
+    );
+    errdefer self.tablet.deinit();
     try self.relative_pointer.init(allocator, display, &self.seat);
     errdefer self.relative_pointer.deinit();
     try self.pointer_gestures.init(allocator, display);
@@ -709,6 +722,7 @@ pub fn destroy(self: *Self) void {
     self.pointer_constraints.deinit();
     self.pointer_gestures.deinit();
     self.relative_pointer.deinit();
+    self.tablet.deinit();
     self.cursor_shape.deinit();
     self.session_lock.deinit();
     self.session_lock_initialized = false;
@@ -866,6 +880,10 @@ fn nativeInputListener(render_output: *RenderOutput) NativeInput.Listener {
         .pinch_end = nativePinchEnd,
         .hold_begin = nativeHoldBegin,
         .hold_end = nativeHoldEnd,
+        .tablet_tool_proximity = nativeTabletToolProximity,
+        .tablet_tool_axis = nativeTabletToolAxis,
+        .tablet_tool_tip = nativeTabletToolTip,
+        .tablet_tool_button = nativeTabletToolButton,
         .touch_available = touchAvailable,
         .touch_down = nativeTouchDown,
         .touch_up = nativeTouchUp,
@@ -928,6 +946,10 @@ fn inputSeatDestroyed(context: *anyopaque, name: [:0]const u8) void {
 fn inputDeviceAdded(context: *anyopaque, device: *InputManager.Device) void {
     const self: *Self = @ptrCast(@alignCast(context));
     const seat = self.seatForName(device.seat_name) orelse return;
+    if (device.device_type == .tablet) {
+        const info = self.native_input.tabletInfo(device.id) orelse return;
+        self.tablet.addTablet(device.id, seat, device.name, info) catch return self.terminate();
+    }
     self.refreshSeatCapabilities(seat, device.seat_name);
     if (device.device_type == .keyboard) self.prepareSeatKeyboard(seat, device.id);
 }
@@ -940,6 +962,7 @@ fn inputDeviceRemoved(context: *anyopaque, device: *InputManager.Device) void {
         self.releaseDeviceButtons(device.id);
         self.cancelDeviceGestures(device.id);
     }
+    if (device.device_type == .tablet) self.tablet.removeTablet(device.id);
     if (device.device_type == .touch) self.cancelDeviceTouches(device.id);
     self.refreshSeatCapabilities(seat, device.seat_name);
     if (device.device_type == .keyboard) self.prepareAnySeatKeyboard(seat, device.seat_name);
@@ -962,6 +985,9 @@ fn inputDeviceSeatChanged(
         if (device.device_type == .keyboard) self.prepareAnySeatKeyboard(previous, previous_name);
     }
     const next = self.seatForName(device.seat_name) orelse return;
+    if (device.device_type == .tablet) {
+        self.tablet.moveTablet(device.id, next) catch return self.terminate();
+    }
     self.refreshSeatCapabilities(next, device.seat_name);
     if (device.device_type == .keyboard) {
         next.ensureParentKeyboardEnter();
@@ -1635,6 +1661,118 @@ fn nativeHoldBegin(context: *anyopaque, id: NativeInput.DeviceId, time: u32, fin
 }
 fn nativeHoldEnd(context: *anyopaque, id: NativeInput.DeviceId, time: u32, cancelled: bool) void {
     serverForOutput(context).endGesture(id, time, .hold, cancelled);
+}
+fn nativeTabletToolProximity(
+    context: *anyopaque,
+    device_id: NativeInput.DeviceId,
+    tool_id: NativeInput.TabletToolId,
+    time: u32,
+    x: f64,
+    y: f64,
+    in_proximity: bool,
+    axes: NativeInput.TabletToolAxes,
+) void {
+    const output: *RenderOutput = @ptrCast(@alignCast(context));
+    const self = output.server;
+    const info = self.native_input.tabletToolInfo(tool_id) orelse return;
+    const target = if (in_proximity) tabletFocus(output, x, y) else null;
+    const routed_axes = tabletAxesRoute(output, axes).axes;
+    self.idle_notify.notifyActivity(self.seatForDevice(device_id));
+    self.tablet.proximity(
+        device_id,
+        info,
+        time,
+        target,
+        in_proximity,
+        routed_axes,
+    ) catch self.terminate();
+}
+fn nativeTabletToolAxis(
+    context: *anyopaque,
+    device_id: NativeInput.DeviceId,
+    tool_id: NativeInput.TabletToolId,
+    time: u32,
+    axes: NativeInput.TabletToolAxes,
+) void {
+    const output: *RenderOutput = @ptrCast(@alignCast(context));
+    const self = output.server;
+    const route = tabletAxesRoute(output, axes);
+    self.idle_notify.notifyActivity(self.seatForDevice(device_id));
+    self.tablet.axis(device_id, tool_id, time, route.focus, route.axes);
+}
+fn nativeTabletToolTip(
+    context: *anyopaque,
+    device_id: NativeInput.DeviceId,
+    tool_id: NativeInput.TabletToolId,
+    time: u32,
+    axes: NativeInput.TabletToolAxes,
+    down: bool,
+) void {
+    const output: *RenderOutput = @ptrCast(@alignCast(context));
+    const self = output.server;
+    const route = tabletAxesRoute(output, axes);
+    self.idle_notify.notifyActivity(self.seatForDevice(device_id));
+    self.tablet.tip(device_id, tool_id, time, route.focus, route.axes, down);
+}
+fn nativeTabletToolButton(
+    context: *anyopaque,
+    device_id: NativeInput.DeviceId,
+    tool_id: NativeInput.TabletToolId,
+    time: u32,
+    axes: NativeInput.TabletToolAxes,
+    button: u32,
+    pressed: bool,
+) void {
+    const output: *RenderOutput = @ptrCast(@alignCast(context));
+    const self = output.server;
+    const route = tabletAxesRoute(output, axes);
+    self.idle_notify.notifyActivity(self.seatForDevice(device_id));
+    self.tablet.button(
+        device_id,
+        tool_id,
+        time,
+        route.focus,
+        route.axes,
+        button,
+        pressed,
+    ) catch self.terminate();
+}
+
+const TabletAxisRoute = struct {
+    axes: NativeInput.TabletToolAxes,
+    focus: ?Seat.PointerFocus,
+};
+
+fn tabletAxesRoute(output: *RenderOutput, axes: NativeInput.TabletToolAxes) TabletAxisRoute {
+    var routed = axes;
+    const position = axes.position orelse return .{ .axes = routed, .focus = null };
+    const point = output.globalPoint(position.x, position.y);
+    routed.position = .{ .x = point.x, .y = point.y };
+    return .{
+        .axes = routed,
+        .focus = output.server.pointerFocus(point.x, point.y),
+    };
+}
+
+fn tabletFocus(output: *RenderOutput, x: f64, y: f64) ?Seat.PointerFocus {
+    const point = output.globalPoint(x, y);
+    return output.server.pointerFocus(point.x, point.y);
+}
+
+fn tabletSurfaceCoordinates(
+    context: *anyopaque,
+    surface_id: Surface.Id,
+    x: f64,
+    y: f64,
+) ?Tablet.Point {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const root = self.subcompositor.rootSurface(surface_id);
+    const root_position = self.scene.surfacePosition(root) orelse return null;
+    const offset = self.subcompositor.surfaceOffset(surface_id);
+    return .{
+        .x = x - @as(f64, @floatFromInt(root_position.x +| offset.x)),
+        .y = y - @as(f64, @floatFromInt(root_position.y +| offset.y)),
+    };
 }
 fn nativeTouchDown(context: *anyopaque, device_id: NativeInput.DeviceId, time: u32, id: i32, x: f64, y: f64) void {
     const output: *RenderOutput = @ptrCast(@alignCast(context));

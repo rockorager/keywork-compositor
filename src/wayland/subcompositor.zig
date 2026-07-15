@@ -178,6 +178,18 @@ pub fn rootSurface(self: *Self, surface_id: Surface.Id) Surface.Id {
     return root;
 }
 
+pub fn surfaceOffset(self: *Self, surface_id: Surface.Id) Point {
+    var offset: Point = .{};
+    var current = surface_id;
+    while (self.by_surface.get(current)) |id| {
+        const state = self.subsurfaces.get(id) orelse break;
+        offset.x +|= state.current_position.x;
+        offset.y +|= state.current_position.y;
+        current = state.parent_id;
+    }
+    return offset;
+}
+
 fn requestRepaint(self: *Self) void {
     if (self.repaint_listener) |listener| listener.request(listener.context);
 }

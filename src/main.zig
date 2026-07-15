@@ -105,6 +105,7 @@ test {
     _ = @import("wayland/security_context.zig");
     _ = @import("wayland/session_lock.zig");
     _ = @import("wayland/cursor_shape.zig");
+    _ = @import("wayland/tablet.zig");
     _ = @import("wayland/pointer_gestures.zig");
     _ = @import("wayland/relative_pointer.zig");
     _ = @import("wayland/pointer_constraints.zig");

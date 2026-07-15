@@ -29,6 +29,8 @@ listener: Listener,
 devices: std.AutoHashMapUnmanaged(std.posix.fd_t, Session.Device),
 input_devices: std.ArrayList(InputDevice),
 next_input_device_id: DeviceId,
+tablet_tools: std.ArrayList(TabletTool),
+next_tablet_tool_id: TabletToolId,
 device_listener: ?DeviceListener,
 environ_map: ?*const std.process.Environ.Map,
 xkb_context: *c.struct_xkb_context,
@@ -58,6 +60,7 @@ failed: bool,
 
 pub const DeviceId = u64;
 pub const PhysicalDeviceId = u64;
+pub const TabletToolId = u64;
 
 pub const Listener = struct {
     context: *anyopaque,
@@ -86,6 +89,10 @@ pub const Listener = struct {
     pinch_end: *const fn (*anyopaque, DeviceId, u32, bool) void,
     hold_begin: *const fn (*anyopaque, DeviceId, u32, u32) void,
     hold_end: *const fn (*anyopaque, DeviceId, u32, bool) void,
+    tablet_tool_proximity: *const fn (*anyopaque, DeviceId, TabletToolId, u32, f64, f64, bool, TabletToolAxes) void,
+    tablet_tool_axis: *const fn (*anyopaque, DeviceId, TabletToolId, u32, TabletToolAxes) void,
+    tablet_tool_tip: *const fn (*anyopaque, DeviceId, TabletToolId, u32, TabletToolAxes, bool) void,
+    tablet_tool_button: *const fn (*anyopaque, DeviceId, TabletToolId, u32, TabletToolAxes, u32, bool) void,
     touch_available: *const fn (*anyopaque, bool) void,
     touch_down: *const fn (*anyopaque, DeviceId, u32, i32, f64, f64) void,
     touch_up: *const fn (*anyopaque, DeviceId, u32, i32) void,
@@ -252,6 +259,57 @@ pub const DeviceInfo = struct {
     name: [:0]const u8,
 };
 
+pub const TabletInfo = struct {
+    vendor: u32,
+    product: u32,
+    bustype: u32,
+    path: ?[:0]const u8,
+};
+
+pub const TabletToolType = enum {
+    pen,
+    eraser,
+    brush,
+    pencil,
+    airbrush,
+    mouse,
+    lens,
+};
+
+pub const TabletToolCapabilities = packed struct {
+    pressure: bool = false,
+    distance: bool = false,
+    tilt: bool = false,
+    rotation: bool = false,
+    slider: bool = false,
+    wheel: bool = false,
+    _padding: u2 = 0,
+};
+
+pub const TabletToolInfo = struct {
+    id: TabletToolId,
+    tool_type: TabletToolType,
+    serial: ?u64,
+    hardware_id: ?u64,
+    capabilities: TabletToolCapabilities,
+};
+
+pub const TabletToolAxes = struct {
+    position: ?struct { x: f64, y: f64 } = null,
+    pressure: ?f64 = null,
+    distance: ?f64 = null,
+    tilt: ?struct { x: f64, y: f64 } = null,
+    rotation: ?f64 = null,
+    slider: ?f64 = null,
+    wheel: ?struct { degrees: f64, clicks: i32 } = null,
+
+    pub fn hasChanges(self: TabletToolAxes) bool {
+        return self.position != null or self.pressure != null or self.distance != null or
+            self.tilt != null or self.rotation != null or self.slider != null or
+            self.wheel != null;
+    }
+};
+
 pub const DeviceListener = struct {
     context: *anyopaque,
     added: *const fn (*anyopaque, DeviceInfo) void,
@@ -265,6 +323,13 @@ const InputDevice = struct {
     repeat_info: RepeatInfo = .{},
     scroll_factor: f64 = 1,
     map: ?DeviceMap = null,
+    tablet_info: ?TabletInfo = null,
+};
+
+const TabletTool = struct {
+    info: TabletToolInfo,
+    device_id: DeviceId,
+    native: *c.struct_libinput_tablet_tool,
 };
 
 const Keyboard = struct {
@@ -333,6 +398,8 @@ pub fn init(
         .devices = .empty,
         .input_devices = .empty,
         .next_input_device_id = 1,
+        .tablet_tools = .empty,
+        .next_tablet_tool_id = 1,
         .device_listener = null,
         .environ_map = null,
         .xkb_context = undefined,
@@ -362,6 +429,7 @@ pub fn init(
     };
     errdefer self.devices.deinit(allocator);
     errdefer self.input_devices.deinit(allocator);
+    errdefer self.tablet_tools.deinit(allocator);
 
     self.xkb_context = c.xkb_context_new(c.XKB_CONTEXT_NO_FLAGS) orelse
         return error.XkbContextFailed;
@@ -425,6 +493,8 @@ pub fn deinit(self: *Self) void {
     self.devices.deinit(self.allocator);
     std.debug.assert(self.input_devices.items.len == 0);
     self.input_devices.deinit(self.allocator);
+    std.debug.assert(self.tablet_tools.items.len == 0);
+    self.tablet_tools.deinit(self.allocator);
     std.debug.assert(self.default_keymap.references == 1);
     self.default_keymap.unref();
     c.xkb_context_unref(self.xkb_context);
@@ -470,6 +540,18 @@ pub fn clearKeyboardEventListener(self: *Self) void {
 
 pub fn deviceIterator(self: *const Self) DeviceIterator {
     return .{ .devices = self.input_devices.items };
+}
+
+pub fn tabletInfo(self: *Self, id: DeviceId) ?TabletInfo {
+    const device = self.findInputDeviceById(id) orelse return null;
+    return device.tablet_info;
+}
+
+pub fn tabletToolInfo(self: *const Self, id: TabletToolId) ?TabletToolInfo {
+    for (self.tablet_tools.items) |tool| {
+        if (tool.info.id == id) return tool.info;
+    }
+    return null;
 }
 
 pub fn compileKeymap(self: *Self, format: KeymapFormat, text: []const u8) !?*Keymap {
@@ -887,6 +969,18 @@ fn processEvent(self: *Self, event: *c.struct_libinput_event) void {
         c.LIBINPUT_EVENT_GESTURE_HOLD_END => self.holdEnd(
             c.libinput_event_get_gesture_event(event).?,
         ),
+        c.LIBINPUT_EVENT_TABLET_TOOL_AXIS => self.tabletToolAxis(
+            c.libinput_event_get_tablet_tool_event(event).?,
+        ),
+        c.LIBINPUT_EVENT_TABLET_TOOL_PROXIMITY => self.tabletToolProximity(
+            c.libinput_event_get_tablet_tool_event(event).?,
+        ),
+        c.LIBINPUT_EVENT_TABLET_TOOL_TIP => self.tabletToolTip(
+            c.libinput_event_get_tablet_tool_event(event).?,
+        ),
+        c.LIBINPUT_EVENT_TABLET_TOOL_BUTTON => self.tabletToolButton(
+            c.libinput_event_get_tablet_tool_event(event).?,
+        ),
         c.LIBINPUT_EVENT_TOUCH_DOWN => self.touchDown(c.libinput_event_get_touch_event(event).?),
         c.LIBINPUT_EVENT_TOUCH_UP => self.touchUp(c.libinput_event_get_touch_event(event).?),
         c.LIBINPUT_EVENT_TOUCH_MOTION => self.touchMotion(c.libinput_event_get_touch_event(event).?),
@@ -998,6 +1092,23 @@ fn addInputDevice(
         };
     }
     errdefer if (keyboard) |value| c.xkb_state_unref(value.state);
+    var tablet_info: ?TabletInfo = null;
+    if (device_type == .tablet) {
+        var path: ?[:0]u8 = null;
+        if (c.libinput_device_get_udev_device(libinput_device)) |udev_device| {
+            defer _ = c.udev_device_unref(udev_device);
+            if (c.udev_device_get_devnode(udev_device)) |devnode| {
+                path = try self.allocator.dupeSentinel(u8, std.mem.span(devnode), 0);
+            }
+        }
+        tablet_info = .{
+            .vendor = c.libinput_device_get_id_vendor(libinput_device),
+            .product = c.libinput_device_get_id_product(libinput_device),
+            .bustype = c.libinput_device_get_id_bustype(libinput_device),
+            .path = path,
+        };
+    }
+    errdefer if (tablet_info) |info| if (info.path) |path| self.allocator.free(path);
     try self.input_devices.append(self.allocator, .{
         .info = .{
             .id = id,
@@ -1007,6 +1118,7 @@ fn addInputDevice(
         },
         .libinput_device = libinput_device,
         .keyboard = keyboard,
+        .tablet_info = tablet_info,
     });
     if (device_type == .keyboard and self.active_keyboard == null) self.active_keyboard = id;
     if (self.device_listener) |listener| {
@@ -1048,10 +1160,12 @@ fn removeAllInputDevices(self: *Self) void {
 }
 
 fn deinitInputDevice(self: *Self, device: *InputDevice) void {
+    self.removeTabletTools(device.info.id);
     if (device.keyboard) |*keyboard| {
         c.xkb_state_unref(keyboard.state);
         keyboard.keymap.unref();
     }
+    if (device.tablet_info) |info| if (info.path) |path| self.allocator.free(path);
     self.allocator.free(device.info.name);
 }
 
@@ -1559,6 +1673,198 @@ fn gestureInputDevice(
 fn gestureFingerCount(event: *c.struct_libinput_event_gesture) ?u32 {
     const fingers = c.libinput_event_gesture_get_finger_count(event);
     return if (fingers > 0) @intCast(fingers) else null;
+}
+
+fn tabletToolProximity(self: *Self, event: *c.struct_libinput_event_tablet_tool) void {
+    const device = self.tabletInputDevice(event) orelse return;
+    const tool = self.ensureTabletTool(device, event) catch |err| {
+        self.fail(err);
+        return;
+    } orelse return;
+    const map = device.map orelse
+        DeviceMap{ .x = 0, .y = 0, .width = self.size.width, .height = self.size.height };
+    const x = @as(f64, @floatFromInt(map.x)) +
+        c.libinput_event_tablet_tool_get_x_transformed(event, map.width);
+    const y = @as(f64, @floatFromInt(map.y)) +
+        c.libinput_event_tablet_tool_get_y_transformed(event, map.height);
+    const in_proximity = c.libinput_event_tablet_tool_get_proximity_state(event) ==
+        c.LIBINPUT_TABLET_TOOL_PROXIMITY_STATE_IN;
+    const axes: TabletToolAxes = if (in_proximity) self.tabletToolAxes(device, event) else .{};
+    self.listener.tablet_tool_proximity(
+        self.listener.context,
+        device.info.id,
+        tool.info.id,
+        c.libinput_event_tablet_tool_get_time(event),
+        x,
+        y,
+        in_proximity,
+        axes,
+    );
+}
+
+fn tabletToolAxis(self: *Self, event: *c.struct_libinput_event_tablet_tool) void {
+    const device = self.tabletInputDevice(event) orelse return;
+    const tool = self.ensureTabletTool(device, event) catch |err| {
+        self.fail(err);
+        return;
+    } orelse return;
+    const axes = self.tabletToolAxes(device, event);
+    if (!axes.hasChanges()) return;
+    self.listener.tablet_tool_axis(
+        self.listener.context,
+        device.info.id,
+        tool.info.id,
+        c.libinput_event_tablet_tool_get_time(event),
+        axes,
+    );
+}
+
+fn tabletToolTip(self: *Self, event: *c.struct_libinput_event_tablet_tool) void {
+    const device = self.tabletInputDevice(event) orelse return;
+    const tool = self.ensureTabletTool(device, event) catch |err| {
+        self.fail(err);
+        return;
+    } orelse return;
+    self.listener.tablet_tool_tip(
+        self.listener.context,
+        device.info.id,
+        tool.info.id,
+        c.libinput_event_tablet_tool_get_time(event),
+        self.tabletToolAxes(device, event),
+        c.libinput_event_tablet_tool_get_tip_state(event) == c.LIBINPUT_TABLET_TOOL_TIP_DOWN,
+    );
+}
+
+fn tabletToolButton(self: *Self, event: *c.struct_libinput_event_tablet_tool) void {
+    const device = self.tabletInputDevice(event) orelse return;
+    const tool = self.ensureTabletTool(device, event) catch |err| {
+        self.fail(err);
+        return;
+    } orelse return;
+    self.listener.tablet_tool_button(
+        self.listener.context,
+        device.info.id,
+        tool.info.id,
+        c.libinput_event_tablet_tool_get_time(event),
+        self.tabletToolAxes(device, event),
+        c.libinput_event_tablet_tool_get_button(event),
+        c.libinput_event_tablet_tool_get_button_state(event) == c.LIBINPUT_BUTTON_STATE_PRESSED,
+    );
+}
+
+fn tabletToolAxes(
+    self: *const Self,
+    device: *const InputDevice,
+    event: *c.struct_libinput_event_tablet_tool,
+) TabletToolAxes {
+    var axes: TabletToolAxes = .{};
+    if (c.libinput_event_tablet_tool_x_has_changed(event) != 0 or
+        c.libinput_event_tablet_tool_y_has_changed(event) != 0)
+    {
+        const map = device.map orelse
+            DeviceMap{ .x = 0, .y = 0, .width = self.size.width, .height = self.size.height };
+        axes.position = .{
+            .x = @as(f64, @floatFromInt(map.x)) +
+                c.libinput_event_tablet_tool_get_x_transformed(event, map.width),
+            .y = @as(f64, @floatFromInt(map.y)) +
+                c.libinput_event_tablet_tool_get_y_transformed(event, map.height),
+        };
+    }
+    if (c.libinput_event_tablet_tool_pressure_has_changed(event) != 0) {
+        axes.pressure = c.libinput_event_tablet_tool_get_pressure(event);
+    }
+    if (c.libinput_event_tablet_tool_distance_has_changed(event) != 0) {
+        axes.distance = c.libinput_event_tablet_tool_get_distance(event);
+    }
+    if (c.libinput_event_tablet_tool_tilt_x_has_changed(event) != 0 or
+        c.libinput_event_tablet_tool_tilt_y_has_changed(event) != 0)
+    {
+        axes.tilt = .{
+            .x = c.libinput_event_tablet_tool_get_tilt_x(event),
+            .y = c.libinput_event_tablet_tool_get_tilt_y(event),
+        };
+    }
+    if (c.libinput_event_tablet_tool_rotation_has_changed(event) != 0) {
+        axes.rotation = c.libinput_event_tablet_tool_get_rotation(event);
+    }
+    if (c.libinput_event_tablet_tool_slider_has_changed(event) != 0) {
+        axes.slider = c.libinput_event_tablet_tool_get_slider_position(event);
+    }
+    if (c.libinput_event_tablet_tool_wheel_has_changed(event) != 0) {
+        axes.wheel = .{
+            .degrees = c.libinput_event_tablet_tool_get_wheel_delta(event),
+            .clicks = c.libinput_event_tablet_tool_get_wheel_delta_discrete(event),
+        };
+    }
+    return axes;
+}
+
+fn tabletInputDevice(
+    self: *Self,
+    event: *c.struct_libinput_event_tablet_tool,
+) ?*InputDevice {
+    const base = c.libinput_event_tablet_tool_get_base_event(event) orelse return null;
+    return self.eventInputDevice(base, .tablet);
+}
+
+fn ensureTabletTool(
+    self: *Self,
+    device: *const InputDevice,
+    event: *c.struct_libinput_event_tablet_tool,
+) !?*TabletTool {
+    const native = c.libinput_event_tablet_tool_get_tool(event) orelse return null;
+    for (self.tablet_tools.items) |*tool| {
+        if (tool.device_id == device.info.id and tool.native == native) return tool;
+    }
+    const tool_type: TabletToolType = switch (c.libinput_tablet_tool_get_type(native)) {
+        c.LIBINPUT_TABLET_TOOL_TYPE_PEN => .pen,
+        c.LIBINPUT_TABLET_TOOL_TYPE_ERASER => .eraser,
+        c.LIBINPUT_TABLET_TOOL_TYPE_BRUSH => .brush,
+        c.LIBINPUT_TABLET_TOOL_TYPE_PENCIL => .pencil,
+        c.LIBINPUT_TABLET_TOOL_TYPE_AIRBRUSH => .airbrush,
+        c.LIBINPUT_TABLET_TOOL_TYPE_MOUSE => .mouse,
+        c.LIBINPUT_TABLET_TOOL_TYPE_LENS => .lens,
+        else => return null,
+    };
+    const id = self.next_tablet_tool_id;
+    self.next_tablet_tool_id = std.math.add(TabletToolId, id, 1) catch return error.OutOfMemory;
+    _ = c.libinput_tablet_tool_ref(native);
+    errdefer _ = c.libinput_tablet_tool_unref(native);
+    const serial = c.libinput_tablet_tool_get_serial(native);
+    const hardware_id = c.libinput_tablet_tool_get_tool_id(native);
+    try self.tablet_tools.append(self.allocator, .{
+        .info = .{
+            .id = id,
+            .tool_type = tool_type,
+            .serial = if (c.libinput_tablet_tool_is_unique(native) != 0 and serial != 0)
+                serial
+            else
+                null,
+            .hardware_id = if (hardware_id != 0) hardware_id else null,
+            .capabilities = .{
+                .pressure = c.libinput_tablet_tool_has_pressure(native) != 0,
+                .distance = c.libinput_tablet_tool_has_distance(native) != 0,
+                .tilt = c.libinput_tablet_tool_has_tilt(native) != 0,
+                .rotation = c.libinput_tablet_tool_has_rotation(native) != 0,
+                .slider = c.libinput_tablet_tool_has_slider(native) != 0,
+                .wheel = c.libinput_tablet_tool_has_wheel(native) != 0,
+            },
+        },
+        .device_id = device.info.id,
+        .native = native,
+    });
+    return &self.tablet_tools.items[self.tablet_tools.items.len - 1];
+}
+
+fn removeTabletTools(self: *Self, device_id: DeviceId) void {
+    var index = self.tablet_tools.items.len;
+    while (index > 0) {
+        index -= 1;
+        const tool = self.tablet_tools.items[index];
+        if (tool.device_id != device_id) continue;
+        _ = self.tablet_tools.orderedRemove(index);
+        _ = c.libinput_tablet_tool_unref(tool.native);
+    }
 }
 
 fn touchDown(self: *Self, event: *c.struct_libinput_event_touch) void {

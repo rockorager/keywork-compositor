@@ -1,0 +1,762 @@
+//! Graphics tablet devices and tool input.
+
+const Self = @This();
+
+const std = @import("std");
+const wayland = @import("wayland");
+const NativeInput = @import("../backend/native_input.zig");
+const Seat = @import("seat.zig");
+const Surface = @import("surface.zig");
+
+const wl = wayland.server.wl;
+const zwp = wayland.server.zwp;
+
+allocator: std.mem.Allocator,
+display: *wl.Server,
+surface_store: *Surface.Store,
+global: *wl.Global,
+listener: Listener,
+seat_bindings: std.ArrayList(*SeatBinding),
+devices: std.ArrayList(*Device),
+tools: std.ArrayList(*Tool),
+tablet_resources: std.ArrayList(*TabletResource),
+tool_resources: std.ArrayList(*ToolResource),
+
+pub fn init(
+    self: *Self,
+    allocator: std.mem.Allocator,
+    display: *wl.Server,
+    surface_store: *Surface.Store,
+    listener: Listener,
+) !void {
+    self.* = .{
+        .allocator = allocator,
+        .display = display,
+        .surface_store = surface_store,
+        .global = try wl.Global.create(display, zwp.TabletManagerV2, 2, *Self, self, bind),
+        .listener = listener,
+        .seat_bindings = .empty,
+        .devices = .empty,
+        .tools = .empty,
+        .tablet_resources = .empty,
+        .tool_resources = .empty,
+    };
+}
+
+pub fn deinit(self: *Self) void {
+    std.debug.assert(self.seat_bindings.items.len == 0);
+    std.debug.assert(self.tablet_resources.items.len == 0);
+    std.debug.assert(self.tool_resources.items.len == 0);
+    while (self.tools.pop()) |tool| self.destroyTool(tool);
+    while (self.devices.pop()) |device| self.destroyDevice(device);
+    self.global.destroy();
+    self.tool_resources.deinit(self.allocator);
+    self.tablet_resources.deinit(self.allocator);
+    self.tools.deinit(self.allocator);
+    self.devices.deinit(self.allocator);
+    self.seat_bindings.deinit(self.allocator);
+    self.* = undefined;
+}
+
+pub fn addTablet(
+    self: *Self,
+    id: NativeInput.DeviceId,
+    seat: *Seat,
+    name: [:0]const u8,
+    info: NativeInput.TabletInfo,
+) !void {
+    std.debug.assert(self.findDevice(id) == null);
+    const device = try self.allocator.create(Device);
+    errdefer self.allocator.destroy(device);
+    const name_copy = try self.allocator.dupeSentinel(u8, name, 0);
+    errdefer self.allocator.free(name_copy);
+    const path_copy = if (info.path) |path|
+        try self.allocator.dupeSentinel(u8, path, 0)
+    else
+        null;
+    errdefer if (path_copy) |path| self.allocator.free(path);
+    device.* = .{
+        .manager = self,
+        .id = id,
+        .seat = seat,
+        .name = name_copy,
+        .vendor = info.vendor,
+        .product = info.product,
+        .bustype = info.bustype,
+        .path = path_copy,
+    };
+    try self.devices.append(self.allocator, device);
+    for (self.seat_bindings.items) |binding| {
+        if (binding.resource != null and binding.seat == seat) {
+            self.createTabletResource(binding, device) catch binding.resource.?.postNoMemory();
+        }
+    }
+}
+
+pub fn removeTablet(self: *Self, id: NativeInput.DeviceId) void {
+    const device = self.findDevice(id) orelse return;
+    self.unadvertiseDevice(device, true);
+    for (self.devices.items, 0..) |candidate, index| {
+        if (candidate != device) continue;
+        _ = self.devices.orderedRemove(index);
+        self.destroyDevice(device);
+        return;
+    }
+    unreachable;
+}
+
+pub fn moveTablet(self: *Self, id: NativeInput.DeviceId, seat: *Seat) !void {
+    const device = self.findDevice(id) orelse return;
+    if (device.seat == seat) return;
+    self.unadvertiseDevice(device, false);
+    device.seat = seat;
+    for (self.seat_bindings.items) |binding| {
+        if (binding.resource == null or binding.seat != seat) continue;
+        self.createTabletResource(binding, device) catch binding.resource.?.postNoMemory();
+        for (self.tools.items) |tool| {
+            if (tool.device == device) {
+                self.createToolResource(binding, tool) catch binding.resource.?.postNoMemory();
+            }
+        }
+    }
+}
+
+pub fn proximity(
+    self: *Self,
+    device_id: NativeInput.DeviceId,
+    info: NativeInput.TabletToolInfo,
+    time: u32,
+    target: ?Seat.PointerFocus,
+    in_proximity: bool,
+    axes: NativeInput.TabletToolAxes,
+) !void {
+    const device = self.findDevice(device_id) orelse return;
+    const tool = try self.ensureTool(device, info);
+    if (!in_proximity) {
+        tool.in_proximity = false;
+        self.leaveFocus(tool, time, true);
+        return;
+    }
+    tool.in_proximity = true;
+    self.updateFocus(tool, target, time);
+    self.sendAxes(tool, target, axes);
+    self.sendFrame(tool, time);
+}
+
+pub fn axis(
+    self: *Self,
+    device_id: NativeInput.DeviceId,
+    tool_id: NativeInput.TabletToolId,
+    time: u32,
+    target: ?Seat.PointerFocus,
+    axes: NativeInput.TabletToolAxes,
+) void {
+    const tool = self.findTool(device_id, tool_id) orelse return;
+    if (!tool.in_proximity) return;
+    if (axes.position != null) self.updateFocus(tool, target, time);
+    self.sendAxes(tool, target, axes);
+    self.sendFrame(tool, time);
+}
+
+pub fn tip(
+    self: *Self,
+    device_id: NativeInput.DeviceId,
+    tool_id: NativeInput.TabletToolId,
+    time: u32,
+    target: ?Seat.PointerFocus,
+    axes: NativeInput.TabletToolAxes,
+    down: bool,
+) void {
+    const tool = self.findTool(device_id, tool_id) orelse return;
+    if (!tool.in_proximity) return;
+    if (axes.position != null) self.updateFocus(tool, target, time);
+    self.sendAxes(tool, target, axes);
+    if (tool.tip_down != down) {
+        tool.tip_down = down;
+        const serial = if (down) self.display.nextSerial() else 0;
+        for (self.tool_resources.items) |adapter| {
+            if (adapter.tool != tool or !adapter.active) continue;
+            if (down) {
+                adapter.resource.sendDown(serial);
+            } else {
+                adapter.resource.sendUp();
+            }
+        }
+    }
+    self.sendFrame(tool, time);
+}
+
+pub fn button(
+    self: *Self,
+    device_id: NativeInput.DeviceId,
+    tool_id: NativeInput.TabletToolId,
+    time: u32,
+    target: ?Seat.PointerFocus,
+    axes: NativeInput.TabletToolAxes,
+    button_code: u32,
+    pressed: bool,
+) !void {
+    const tool = self.findTool(device_id, tool_id) orelse return;
+    if (!tool.in_proximity) return;
+    const had_focus = tool.focus != null;
+    var state_changed = false;
+    var release_index: ?usize = null;
+    if (pressed) {
+        for (tool.pressed_buttons.items) |pressed_button| {
+            if (pressed_button == button_code) break;
+        } else {
+            try tool.pressed_buttons.append(self.allocator, button_code);
+            state_changed = true;
+        }
+    } else {
+        for (tool.pressed_buttons.items, 0..) |pressed_button, index| {
+            if (pressed_button != button_code) continue;
+            state_changed = true;
+            release_index = index;
+            break;
+        }
+    }
+    if (axes.position != null) self.updateFocus(tool, target, time);
+    self.sendAxes(tool, target, axes);
+    if (state_changed and had_focus) {
+        const serial = self.display.nextSerial();
+        for (self.tool_resources.items) |adapter| {
+            if (adapter.tool == tool and adapter.active) {
+                adapter.resource.sendButton(
+                    serial,
+                    button_code,
+                    if (pressed) .pressed else .released,
+                );
+            }
+        }
+    }
+    if (release_index) |index| _ = tool.pressed_buttons.orderedRemove(index);
+    self.sendFrame(tool, time);
+}
+
+const Device = struct {
+    manager: *Self,
+    id: NativeInput.DeviceId,
+    seat: *Seat,
+    name: [:0]u8,
+    vendor: u32,
+    product: u32,
+    bustype: u32,
+    path: ?[:0]u8,
+};
+
+pub const Point = struct { x: f64, y: f64 };
+
+pub const Listener = struct {
+    context: *anyopaque,
+    surface_coordinates: *const fn (*anyopaque, Surface.Id, f64, f64) ?Point,
+};
+
+const Tool = struct {
+    manager: *Self,
+    info: NativeInput.TabletToolInfo,
+    device: *Device,
+    in_proximity: bool,
+    focus: ?Surface.Id,
+    focus_resource: ?*wl.Surface,
+    focus_destroy_listener: wl.Listener(*wl.Resource),
+    tip_down: bool,
+    pressed_buttons: std.ArrayList(u32),
+};
+
+const SeatBinding = struct {
+    manager: *Self,
+    resource: ?*zwp.TabletSeatV2,
+    client: *wl.Client,
+    seat: *Seat,
+    references: usize,
+};
+
+const TabletResource = struct {
+    binding: *SeatBinding,
+    resource: *zwp.TabletV2,
+    device: ?*Device,
+};
+
+const ToolResource = struct {
+    binding: *SeatBinding,
+    resource: *zwp.TabletToolV2,
+    tool: ?*Tool,
+    active: bool,
+};
+
+fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
+    const resource = zwp.TabletManagerV2.create(client, version, id) catch {
+        client.postNoMemory();
+        return;
+    };
+    resource.setHandler(*Self, handleManagerRequest, null, self);
+}
+
+fn handleManagerRequest(
+    resource: *zwp.TabletManagerV2,
+    request: zwp.TabletManagerV2.Request,
+    self: *Self,
+) void {
+    switch (request) {
+        .destroy => resource.destroy(),
+        .get_tablet_seat => |get| self.createSeatBinding(
+            resource,
+            get.tablet_seat,
+            Seat.fromResource(get.seat),
+        ) catch resource.postNoMemory(),
+    }
+}
+
+fn createSeatBinding(
+    self: *Self,
+    manager_resource: *zwp.TabletManagerV2,
+    id: u32,
+    seat: *Seat,
+) !void {
+    const resource = try zwp.TabletSeatV2.create(
+        manager_resource.getClient(),
+        manager_resource.getVersion(),
+        id,
+    );
+    errdefer resource.destroy();
+    const binding = try self.allocator.create(SeatBinding);
+    errdefer self.allocator.destroy(binding);
+    binding.* = .{
+        .manager = self,
+        .resource = resource,
+        .client = manager_resource.getClient(),
+        .seat = seat,
+        .references = 1,
+    };
+    try self.seat_bindings.append(self.allocator, binding);
+    resource.setHandler(*SeatBinding, handleSeatRequest, handleSeatDestroy, binding);
+    for (self.devices.items) |device| {
+        if (device.seat == seat) self.createTabletResource(binding, device) catch
+            resource.postNoMemory();
+    }
+    for (self.tools.items) |tool| {
+        if (tool.device.seat == seat) self.createToolResource(binding, tool) catch
+            resource.postNoMemory();
+    }
+}
+
+fn handleSeatRequest(
+    resource: *zwp.TabletSeatV2,
+    request: zwp.TabletSeatV2.Request,
+    _: *SeatBinding,
+) void {
+    switch (request) {
+        .destroy => resource.destroy(),
+    }
+}
+
+fn handleSeatDestroy(_: *zwp.TabletSeatV2, binding: *SeatBinding) void {
+    binding.resource = null;
+    releaseBinding(binding);
+}
+
+fn createTabletResource(self: *Self, binding: *SeatBinding, device: *Device) !void {
+    const seat_resource = binding.resource orelse return;
+    const resource = try zwp.TabletV2.create(
+        binding.client,
+        seat_resource.getVersion(),
+        0,
+    );
+    errdefer resource.destroy();
+    const adapter = try self.allocator.create(TabletResource);
+    errdefer self.allocator.destroy(adapter);
+    adapter.* = .{ .binding = binding, .resource = resource, .device = device };
+    try self.tablet_resources.append(self.allocator, adapter);
+    retainBinding(binding);
+    resource.setHandler(*TabletResource, handleTabletRequest, handleTabletDestroy, adapter);
+    seat_resource.sendTabletAdded(resource);
+    resource.sendName(device.name);
+    if (device.vendor != 0 or device.product != 0) {
+        resource.sendId(device.vendor, device.product);
+    }
+    if (device.path) |path| resource.sendPath(path);
+    if (resource.getVersion() >= zwp.TabletV2.bustype_since_version) {
+        if (protocolBustype(device.bustype)) |bustype| resource.sendBustype(bustype);
+    }
+    resource.sendDone();
+}
+
+fn handleTabletRequest(
+    resource: *zwp.TabletV2,
+    request: zwp.TabletV2.Request,
+    _: *TabletResource,
+) void {
+    switch (request) {
+        .destroy => resource.destroy(),
+    }
+}
+
+fn handleTabletDestroy(_: *zwp.TabletV2, adapter: *TabletResource) void {
+    const manager = adapter.binding.manager;
+    const binding = adapter.binding;
+    removeAdapter(TabletResource, manager.allocator, &manager.tablet_resources, adapter);
+    releaseBinding(binding);
+}
+
+fn createToolResource(self: *Self, binding: *SeatBinding, tool: *Tool) !void {
+    const seat_resource = binding.resource orelse return;
+    const resource = try zwp.TabletToolV2.create(
+        binding.client,
+        seat_resource.getVersion(),
+        0,
+    );
+    errdefer resource.destroy();
+    const adapter = try self.allocator.create(ToolResource);
+    errdefer self.allocator.destroy(adapter);
+    adapter.* = .{
+        .binding = binding,
+        .resource = resource,
+        .tool = tool,
+        .active = false,
+    };
+    try self.tool_resources.append(self.allocator, adapter);
+    retainBinding(binding);
+    resource.setHandler(*ToolResource, handleToolRequest, handleToolDestroy, adapter);
+    seat_resource.sendToolAdded(resource);
+    resource.sendType(switch (tool.info.tool_type) {
+        .pen => .pen,
+        .eraser => .eraser,
+        .brush => .brush,
+        .pencil => .pencil,
+        .airbrush => .airbrush,
+        .mouse => .mouse,
+        .lens => .lens,
+    });
+    if (tool.info.serial) |serial| {
+        resource.sendHardwareSerial(high(serial), low(serial));
+    }
+    if (tool.info.hardware_id) |hardware_id| {
+        resource.sendHardwareIdWacom(high(hardware_id), low(hardware_id));
+    }
+    const capabilities = tool.info.capabilities;
+    if (capabilities.tilt) resource.sendCapability(.tilt);
+    if (capabilities.pressure) resource.sendCapability(.pressure);
+    if (capabilities.distance) resource.sendCapability(.distance);
+    if (capabilities.rotation) resource.sendCapability(.rotation);
+    if (capabilities.slider) resource.sendCapability(.slider);
+    if (capabilities.wheel) resource.sendCapability(.wheel);
+    resource.sendDone();
+    const surface = tool.focus_resource orelse return;
+    if (!tool.in_proximity or binding.client != surface.getClient()) return;
+    const tablet = self.tabletResource(binding, tool.device) orelse return;
+    const serial = self.display.nextSerial();
+    adapter.active = true;
+    resource.sendProximityIn(serial, tablet.resource, surface);
+    for (tool.pressed_buttons.items) |button_code| {
+        resource.sendButton(serial, button_code, .pressed);
+    }
+    if (tool.tip_down) resource.sendDown(serial);
+    resource.sendFrame(0);
+}
+
+fn handleToolRequest(
+    resource: *zwp.TabletToolV2,
+    request: zwp.TabletToolV2.Request,
+    _: *ToolResource,
+) void {
+    switch (request) {
+        .destroy => resource.destroy(),
+        .set_cursor => {},
+    }
+}
+
+fn handleToolDestroy(_: *zwp.TabletToolV2, adapter: *ToolResource) void {
+    const manager = adapter.binding.manager;
+    const binding = adapter.binding;
+    removeAdapter(ToolResource, manager.allocator, &manager.tool_resources, adapter);
+    releaseBinding(binding);
+}
+
+fn ensureTool(
+    self: *Self,
+    device: *Device,
+    info: NativeInput.TabletToolInfo,
+) !*Tool {
+    if (self.findTool(device.id, info.id)) |tool| return tool;
+    const tool = try self.allocator.create(Tool);
+    errdefer self.allocator.destroy(tool);
+    tool.* = .{
+        .manager = self,
+        .info = info,
+        .device = device,
+        .in_proximity = false,
+        .focus = null,
+        .focus_resource = null,
+        .focus_destroy_listener = wl.Listener(*wl.Resource).init(handleFocusDestroyed),
+        .tip_down = false,
+        .pressed_buttons = .empty,
+    };
+    errdefer tool.pressed_buttons.deinit(self.allocator);
+    try self.tools.append(self.allocator, tool);
+    for (self.seat_bindings.items) |binding| {
+        if (binding.resource != null and binding.seat == device.seat) {
+            self.createToolResource(binding, tool) catch binding.resource.?.postNoMemory();
+        }
+    }
+    return tool;
+}
+
+fn updateFocus(self: *Self, tool: *Tool, target: ?Seat.PointerFocus, time: u32) void {
+    const next = if (target) |focus| focus.surface_id else null;
+    if (tool.focus) |current| {
+        if (next != null and std.meta.eql(current, next.?)) return;
+        if (tool.tip_down or tool.pressed_buttons.items.len != 0) return;
+        self.leaveFocus(tool, time, false);
+    } else if (next == null) return;
+    const focus = target orelse return;
+    const surface = Surface.resourceFor(self.surface_store, focus.surface_id) orelse return;
+    tool.focus = focus.surface_id;
+    tool.focus_resource = surface;
+    @as(*wl.Resource, @ptrCast(surface)).addDestroyListener(&tool.focus_destroy_listener);
+    const serial = self.display.nextSerial();
+    for (self.tool_resources.items) |adapter| {
+        if (adapter.tool != tool or adapter.binding.client != surface.getClient()) continue;
+        const tablet = self.tabletResource(adapter.binding, tool.device) orelse continue;
+        adapter.active = true;
+        adapter.resource.sendProximityIn(serial, tablet.resource, surface);
+        for (tool.pressed_buttons.items) |button_code| {
+            adapter.resource.sendButton(serial, button_code, .pressed);
+        }
+        if (tool.tip_down) adapter.resource.sendDown(serial);
+    }
+}
+
+fn leaveFocus(self: *Self, tool: *Tool, time: u32, release_state: bool) void {
+    if (tool.focus == null) {
+        if (release_state) self.clearToolState(tool);
+        return;
+    }
+    if (release_state) {
+        const serial = self.display.nextSerial();
+        for (self.tool_resources.items) |adapter| {
+            if (adapter.tool != tool or !adapter.active) continue;
+            for (tool.pressed_buttons.items) |button_code| {
+                adapter.resource.sendButton(serial, button_code, .released);
+            }
+            if (tool.tip_down) adapter.resource.sendUp();
+        }
+    }
+    for (self.tool_resources.items) |adapter| {
+        if (adapter.tool != tool or !adapter.active) continue;
+        adapter.resource.sendProximityOut();
+        adapter.resource.sendFrame(time);
+        adapter.active = false;
+    }
+    tool.focus_destroy_listener.link.remove();
+    tool.focus = null;
+    tool.focus_resource = null;
+    if (release_state) self.clearToolState(tool);
+}
+
+fn clearToolState(self: *Self, tool: *Tool) void {
+    tool.tip_down = false;
+    tool.pressed_buttons.clearRetainingCapacity();
+    _ = self;
+}
+
+fn sendAxes(
+    self: *Self,
+    tool: *Tool,
+    target: ?Seat.PointerFocus,
+    axes: NativeInput.TabletToolAxes,
+) void {
+    const motion = if (axes.position) |position| blk: {
+        const focus = tool.focus orelse break :blk null;
+        if (target) |candidate| {
+            if (std.meta.eql(candidate.surface_id, focus)) {
+                break :blk Point{ .x = candidate.x, .y = candidate.y };
+            }
+        }
+        break :blk self.listener.surface_coordinates(
+            self.listener.context,
+            focus,
+            position.x,
+            position.y,
+        );
+    } else null;
+    for (self.tool_resources.items) |adapter| {
+        if (adapter.tool != tool or !adapter.active) continue;
+        if (motion) |position| {
+            adapter.resource.sendMotion(fixed(position.x), fixed(position.y));
+        }
+        if (axes.pressure) |value| adapter.resource.sendPressure(normalizedUnsigned(value));
+        if (axes.distance) |value| adapter.resource.sendDistance(normalizedUnsigned(value));
+        if (axes.tilt) |value| adapter.resource.sendTilt(fixed(value.x), fixed(value.y));
+        if (axes.rotation) |value| adapter.resource.sendRotation(fixed(value));
+        if (axes.slider) |value| adapter.resource.sendSlider(normalizedSigned(value));
+        if (axes.wheel) |value| adapter.resource.sendWheel(fixed(value.degrees), value.clicks);
+    }
+}
+
+fn sendFrame(self: *Self, tool: *Tool, time: u32) void {
+    for (self.tool_resources.items) |adapter| {
+        if (adapter.tool == tool and adapter.active) adapter.resource.sendFrame(time);
+    }
+}
+
+fn unadvertiseDevice(self: *Self, device: *Device, destroy_tools: bool) void {
+    var tool_index = self.tools.items.len;
+    while (tool_index > 0) {
+        tool_index -= 1;
+        const tool = self.tools.items[tool_index];
+        if (tool.device != device) continue;
+        self.unadvertiseTool(tool, destroy_tools);
+        if (destroy_tools) {
+            _ = self.tools.orderedRemove(tool_index);
+            self.destroyTool(tool);
+        }
+    }
+    for (self.tablet_resources.items) |adapter| {
+        if (adapter.device != device) continue;
+        adapter.resource.sendRemoved();
+        adapter.device = null;
+    }
+}
+
+fn unadvertiseTool(self: *Self, tool: *Tool, removed: bool) void {
+    if (removed) tool.in_proximity = false;
+    self.leaveFocus(tool, 0, true);
+    for (self.tool_resources.items) |adapter| {
+        if (adapter.tool != tool) continue;
+        adapter.resource.sendRemoved();
+        adapter.tool = null;
+        adapter.active = false;
+    }
+}
+
+fn handleFocusDestroyed(listener: *wl.Listener(*wl.Resource), _: *wl.Resource) void {
+    const tool: *Tool = @fieldParentPtr("focus_destroy_listener", listener);
+    listener.link.remove();
+    tool.focus = null;
+    tool.focus_resource = null;
+    const serial = tool.manager.display.nextSerial();
+    for (tool.manager.tool_resources.items) |adapter| {
+        if (adapter.tool != tool or !adapter.active) continue;
+        for (tool.pressed_buttons.items) |button_code| {
+            adapter.resource.sendButton(serial, button_code, .released);
+        }
+        if (tool.tip_down) adapter.resource.sendUp();
+        adapter.resource.sendProximityOut();
+        adapter.resource.sendFrame(0);
+        adapter.active = false;
+    }
+    tool.manager.clearToolState(tool);
+}
+
+fn tabletResource(self: *Self, binding: *SeatBinding, device: *Device) ?*TabletResource {
+    for (self.tablet_resources.items) |adapter| {
+        if (adapter.binding == binding and adapter.device == device) return adapter;
+    }
+    return null;
+}
+
+fn findDevice(self: *Self, id: NativeInput.DeviceId) ?*Device {
+    for (self.devices.items) |device| if (device.id == id) return device;
+    return null;
+}
+
+fn findTool(
+    self: *const Self,
+    device_id: NativeInput.DeviceId,
+    tool_id: NativeInput.TabletToolId,
+) ?*Tool {
+    for (self.tools.items) |tool| {
+        if (tool.device.id == device_id and tool.info.id == tool_id) return tool;
+    }
+    return null;
+}
+
+fn destroyTool(self: *Self, tool: *Tool) void {
+    if (tool.focus_resource != null) tool.focus_destroy_listener.link.remove();
+    tool.pressed_buttons.deinit(self.allocator);
+    self.allocator.destroy(tool);
+}
+
+fn destroyDevice(self: *Self, device: *Device) void {
+    if (device.path) |path| self.allocator.free(path);
+    self.allocator.free(device.name);
+    self.allocator.destroy(device);
+}
+
+fn retainBinding(binding: *SeatBinding) void {
+    binding.references = std.math.add(usize, binding.references, 1) catch unreachable;
+}
+
+fn releaseBinding(binding: *SeatBinding) void {
+    std.debug.assert(binding.references > 0);
+    binding.references -= 1;
+    if (binding.references != 0) return;
+    const manager = binding.manager;
+    std.debug.assert(binding.resource == null);
+    for (manager.seat_bindings.items, 0..) |candidate, index| {
+        if (candidate != binding) continue;
+        _ = manager.seat_bindings.orderedRemove(index);
+        manager.allocator.destroy(binding);
+        return;
+    }
+    unreachable;
+}
+
+fn removeAdapter(
+    comptime Adapter: type,
+    allocator: std.mem.Allocator,
+    adapters: *std.ArrayList(*Adapter),
+    adapter: *Adapter,
+) void {
+    for (adapters.items, 0..) |candidate, index| {
+        if (candidate != adapter) continue;
+        _ = adapters.orderedRemove(index);
+        allocator.destroy(adapter);
+        return;
+    }
+    unreachable;
+}
+
+fn high(value: u64) u32 {
+    return @truncate(value >> 32);
+}
+
+fn low(value: u64) u32 {
+    return @truncate(value);
+}
+
+fn normalizedUnsigned(value: f64) u32 {
+    if (!std.math.isFinite(value)) return 0;
+    return @intFromFloat(@round(std.math.clamp(value, 0, 1) * 65535));
+}
+
+fn normalizedSigned(value: f64) i32 {
+    if (!std.math.isFinite(value)) return 0;
+    return @intFromFloat(@round(std.math.clamp(value, -1, 1) * 65535));
+}
+
+fn protocolBustype(value: u32) ?zwp.TabletV2.Bustype {
+    return switch (value) {
+        3 => .usb,
+        5 => .bluetooth,
+        6 => .virtual,
+        17 => .serial,
+        24 => .i2c,
+        else => null,
+    };
+}
+
+fn fixed(value: f64) wl.Fixed {
+    if (!std.math.isFinite(value)) return wl.Fixed.fromInt(0);
+    const minimum = @as(f64, @floatFromInt(std.math.minInt(i32))) / 256.0;
+    const maximum = @as(f64, @floatFromInt(std.math.maxInt(i32))) / 256.0;
+    return wl.Fixed.fromDouble(std.math.clamp(value, minimum, maximum));
+}
+
+test "tablet axes normalize protocol values" {
+    try std.testing.expectEqual(0, normalizedUnsigned(-1));
+    try std.testing.expectEqual(65535, normalizedUnsigned(2));
+    try std.testing.expectEqual(-65535, normalizedSigned(-2));
+    try std.testing.expectEqual(65535, normalizedSigned(2));
+}

@@ -800,16 +800,17 @@
       "interfaces": [
         {
           "name": "zwp_tablet_manager_v2",
-          "current_version": null,
+          "current_version": 2,
           "target_version": 2
         }
       ],
-      "status": "not_started",
+      "status": "in_progress",
       "privileged": false,
       "blocked_by": [
         "cursor-shape",
         "wl-seat"
-      ]
+      ],
+      "status_detail": "Stable version 2 advertises seat-scoped tablet and tool objects and forwards libinput proximity, motion, pressure, distance, tilt, rotation, slider, wheel, tip, and button events to the focused surface. Device hotplug, dynamic seat reassignment, surface destruction, implicit tool grabs, framing, and tablet metadata are implemented; tablet pads and tool cursor requests remain."
     },
     {
       "id": "ext-data-control",
