@@ -44,6 +44,23 @@ pub const Size = struct {
     height: i32 = 0,
 };
 
+pub const WindowType = enum {
+    desktop,
+    dock,
+    toolbar,
+    menu,
+    utility,
+    splash,
+    dialog,
+    dropdown_menu,
+    popup_menu,
+    tooltip,
+    notification,
+    combo,
+    dnd,
+    normal,
+};
+
 pub const WindowInfo = struct {
     id: WindowId,
     geometry: Geometry,
@@ -55,6 +72,7 @@ pub const WindowInfo = struct {
     app_id: ?[:0]const u8,
     instance: ?[:0]const u8,
     parent: ?WindowId,
+    window_type: WindowType,
     min_size: Size,
     max_size: Size,
     can_close: bool,
@@ -73,6 +91,7 @@ const Window = struct {
     app_id: ?[:0]u8 = null,
     instance: ?[:0]u8 = null,
     parent: ?WindowId = null,
+    window_type: WindowType = .normal,
     min_size: Size = .{},
     max_size: Size = .{},
     accepts_input: bool = true,
@@ -106,6 +125,21 @@ const Atom = enum {
     net_wm_state_maximized_horz,
     net_wm_state_maximized_vert,
     net_wm_state_hidden,
+    net_wm_window_type,
+    net_wm_window_type_desktop,
+    net_wm_window_type_dock,
+    net_wm_window_type_toolbar,
+    net_wm_window_type_menu,
+    net_wm_window_type_utility,
+    net_wm_window_type_splash,
+    net_wm_window_type_dialog,
+    net_wm_window_type_dropdown_menu,
+    net_wm_window_type_popup_menu,
+    net_wm_window_type_tooltip,
+    net_wm_window_type_notification,
+    net_wm_window_type_combo,
+    net_wm_window_type_dnd,
+    net_wm_window_type_normal,
     utf8_string,
     wm_protocols,
     wm_take_focus,
@@ -148,6 +182,21 @@ const atom_names: [atom_count][]const u8 = .{
     "_NET_WM_STATE_MAXIMIZED_HORZ",
     "_NET_WM_STATE_MAXIMIZED_VERT",
     "_NET_WM_STATE_HIDDEN",
+    "_NET_WM_WINDOW_TYPE",
+    "_NET_WM_WINDOW_TYPE_DESKTOP",
+    "_NET_WM_WINDOW_TYPE_DOCK",
+    "_NET_WM_WINDOW_TYPE_TOOLBAR",
+    "_NET_WM_WINDOW_TYPE_MENU",
+    "_NET_WM_WINDOW_TYPE_UTILITY",
+    "_NET_WM_WINDOW_TYPE_SPLASH",
+    "_NET_WM_WINDOW_TYPE_DIALOG",
+    "_NET_WM_WINDOW_TYPE_DROPDOWN_MENU",
+    "_NET_WM_WINDOW_TYPE_POPUP_MENU",
+    "_NET_WM_WINDOW_TYPE_TOOLTIP",
+    "_NET_WM_WINDOW_TYPE_NOTIFICATION",
+    "_NET_WM_WINDOW_TYPE_COMBO",
+    "_NET_WM_WINDOW_TYPE_DND",
+    "_NET_WM_WINDOW_TYPE_NORMAL",
     "UTF8_STRING",
     "WM_PROTOCOLS",
     "WM_TAKE_FOCUS",
@@ -767,6 +816,21 @@ fn publishWmIdentity(self: *Self) !void {
         self.atomValue(.net_wm_state_maximized_horz),
         self.atomValue(.net_wm_state_maximized_vert),
         self.atomValue(.net_wm_state_hidden),
+        self.atomValue(.net_wm_window_type),
+        self.atomValue(.net_wm_window_type_desktop),
+        self.atomValue(.net_wm_window_type_dock),
+        self.atomValue(.net_wm_window_type_toolbar),
+        self.atomValue(.net_wm_window_type_menu),
+        self.atomValue(.net_wm_window_type_utility),
+        self.atomValue(.net_wm_window_type_splash),
+        self.atomValue(.net_wm_window_type_dialog),
+        self.atomValue(.net_wm_window_type_dropdown_menu),
+        self.atomValue(.net_wm_window_type_popup_menu),
+        self.atomValue(.net_wm_window_type_tooltip),
+        self.atomValue(.net_wm_window_type_notification),
+        self.atomValue(.net_wm_window_type_combo),
+        self.atomValue(.net_wm_window_type_dnd),
+        self.atomValue(.net_wm_window_type_normal),
     };
     try checkRequest(self.connection, c.xcb_change_property_checked(
         self.connection,
@@ -939,8 +1003,10 @@ fn refreshMetadata(self: *Self, window_id: WindowId, window: *Window) !bool {
     );
     const class_changed = try self.refreshClass(window_id, window);
     const parent_changed = self.refreshTransientFor(window_id, window);
+    const window_type_changed = try self.refreshWindowType(window_id, window);
     const size_hints_changed = self.refreshNormalHints(window_id, window);
-    return title_changed or class_changed or parent_changed or size_hints_changed;
+    return title_changed or class_changed or parent_changed or window_type_changed or
+        size_hints_changed;
 }
 
 fn refreshTransientFor(self: *Self, window_id: WindowId, window: *Window) bool {
@@ -973,6 +1039,43 @@ fn wouldCreateParentLoop(self: *const Self, window_id: WindowId, requested_paren
         ancestor = parent;
     }
     return true;
+}
+
+fn refreshWindowType(self: *Self, window_id: WindowId, window: *Window) !bool {
+    const type_atoms = (try self.readAtomList(window_id, .net_wm_window_type)) orelse return false;
+    defer self.allocator.free(type_atoms);
+    const window_type = for (type_atoms) |type_atom| {
+        if (self.windowTypeForAtom(type_atom)) |value| break value;
+    } else defaultWindowType(window.override_redirect, window.parent != null);
+    if (window.window_type == window_type) return false;
+    window.window_type = window_type;
+    return true;
+}
+
+fn windowTypeForAtom(self: *const Self, atom: c.xcb_atom_t) ?WindowType {
+    inline for (.{
+        .{ Atom.net_wm_window_type_desktop, WindowType.desktop },
+        .{ Atom.net_wm_window_type_dock, WindowType.dock },
+        .{ Atom.net_wm_window_type_toolbar, WindowType.toolbar },
+        .{ Atom.net_wm_window_type_menu, WindowType.menu },
+        .{ Atom.net_wm_window_type_utility, WindowType.utility },
+        .{ Atom.net_wm_window_type_splash, WindowType.splash },
+        .{ Atom.net_wm_window_type_dialog, WindowType.dialog },
+        .{ Atom.net_wm_window_type_dropdown_menu, WindowType.dropdown_menu },
+        .{ Atom.net_wm_window_type_popup_menu, WindowType.popup_menu },
+        .{ Atom.net_wm_window_type_tooltip, WindowType.tooltip },
+        .{ Atom.net_wm_window_type_notification, WindowType.notification },
+        .{ Atom.net_wm_window_type_combo, WindowType.combo },
+        .{ Atom.net_wm_window_type_dnd, WindowType.dnd },
+        .{ Atom.net_wm_window_type_normal, WindowType.normal },
+    }) |entry| {
+        if (atom == self.atomValue(entry[0])) return entry[1];
+    }
+    return null;
+}
+
+fn defaultWindowType(override_redirect: bool, transient: bool) WindowType {
+    return if (!override_redirect and transient) .dialog else .normal;
 }
 
 fn refreshNormalHints(self: *Self, window_id: WindowId, window: *Window) bool {
@@ -1210,10 +1313,10 @@ fn dispatchEvent(self: *Self, event: [*c]c.xcb_generic_event_t) !void {
         c.XCB_CREATE_NOTIFY => try self.handleCreate(@ptrCast(event)),
         c.XCB_DESTROY_NOTIFY => self.handleDestroy(@ptrCast(event)),
         c.XCB_MAP_REQUEST => try self.handleMapRequest(@ptrCast(event)),
-        c.XCB_MAP_NOTIFY => self.handleMapNotify(@ptrCast(event)),
+        c.XCB_MAP_NOTIFY => try self.handleMapNotify(@ptrCast(event)),
         c.XCB_UNMAP_NOTIFY => self.handleUnmapNotify(@ptrCast(event)),
         c.XCB_CONFIGURE_REQUEST => self.handleConfigureRequest(@ptrCast(event)),
-        c.XCB_CONFIGURE_NOTIFY => self.handleConfigureNotify(@ptrCast(event)),
+        c.XCB_CONFIGURE_NOTIFY => try self.handleConfigureNotify(@ptrCast(event)),
         c.XCB_PROPERTY_NOTIFY => try self.handlePropertyNotify(@ptrCast(event)),
         c.XCB_CLIENT_MESSAGE => try self.handleClientMessage(@ptrCast(event)),
         c.XCB_SELECTION_REQUEST => self.handleSelectionRequest(@ptrCast(event)),
@@ -1311,7 +1414,7 @@ fn handleMapRequest(self: *Self, event: *const c.xcb_map_request_event_t) !void 
     _ = c.xcb_map_window(self.connection, event.window);
 }
 
-fn handleMapNotify(self: *Self, event: *const c.xcb_map_notify_event_t) void {
+fn handleMapNotify(self: *Self, event: *const c.xcb_map_notify_event_t) !void {
     const window = self.windows.getPtr(event.window) orelse return;
     const override_redirect = event.override_redirect != 0;
     if (window.override_redirect != override_redirect) {
@@ -1325,8 +1428,14 @@ fn handleMapNotify(self: *Self, event: *const c.xcb_map_notify_event_t) void {
             window.geometry,
             override_redirect,
         );
+        if (try self.refreshWindowType(event.window, window)) {
+            self.listener.metadata_changed(self.listener.context, event.window);
+        }
     }
     if (window.mapped) return;
+    if (override_redirect and try self.refreshMetadata(event.window, window)) {
+        self.listener.metadata_changed(self.listener.context, event.window);
+    }
     window.mapped = true;
     self.listener.mapped(self.listener.context, event.window, true);
 }
@@ -1359,7 +1468,8 @@ fn handlePropertyNotify(self: *Self, event: *const c.xcb_property_notify_event_t
         event.atom == c.XCB_ATOM_WM_NAME or
         event.atom == c.XCB_ATOM_WM_CLASS or
         event.atom == c.XCB_ATOM_WM_TRANSIENT_FOR or
-        event.atom == c.XCB_ATOM_WM_NORMAL_HINTS)
+        event.atom == c.XCB_ATOM_WM_NORMAL_HINTS or
+        event.atom == self.atomValue(.net_wm_window_type))
     {
         if (try self.refreshMetadata(event.window, window)) {
             self.listener.metadata_changed(self.listener.context, event.window);
@@ -1437,7 +1547,7 @@ fn handleConfigureRequest(
 fn handleConfigureNotify(
     self: *Self,
     event: *const c.xcb_configure_notify_event_t,
-) void {
+) !void {
     const window = self.windows.getPtr(event.window) orelse return;
     const geometry: Geometry = .{
         .x = event.x,
@@ -1449,6 +1559,7 @@ fn handleConfigureNotify(
     if (std.meta.eql(window.geometry, geometry) and
         window.override_redirect == override_redirect) return;
     window.geometry = geometry;
+    const override_redirect_changed = window.override_redirect != override_redirect;
     window.override_redirect = override_redirect;
     if (override_redirect and self.focused_window == event.window) {
         self.focusWindow(null) catch log.err("failed to clear X11 input focus", .{});
@@ -1459,6 +1570,9 @@ fn handleConfigureNotify(
         geometry,
         override_redirect,
     );
+    if (override_redirect_changed and try self.refreshWindowType(event.window, window)) {
+        self.listener.metadata_changed(self.listener.context, event.window);
+    }
 }
 
 fn sendConfigureNotify(self: *Self, window_id: WindowId, window: Window) void {
@@ -1602,6 +1716,7 @@ fn info(self: *const Self, window_id: WindowId, window: Window) WindowInfo {
         .app_id = window.app_id,
         .instance = window.instance,
         .parent = window.parent,
+        .window_type = window.window_type,
         .min_size = window.min_size,
         .max_size = window.max_size,
         .can_close = window.delete_window,
@@ -1652,4 +1767,11 @@ test "EWMH state actions apply remove add and toggle" {
     try std.testing.expectEqual(false, applyStateAction(true, 2).?);
     try std.testing.expectEqual(true, applyStateAction(false, 2).?);
     try std.testing.expectEqual(null, applyStateAction(false, 3));
+}
+
+test "EWMH window type fallback follows transient and override-redirect rules" {
+    try std.testing.expectEqual(WindowType.normal, defaultWindowType(false, false));
+    try std.testing.expectEqual(WindowType.dialog, defaultWindowType(false, true));
+    try std.testing.expectEqual(WindowType.normal, defaultWindowType(true, false));
+    try std.testing.expectEqual(WindowType.normal, defaultWindowType(true, true));
 }
