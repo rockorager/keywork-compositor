@@ -2366,7 +2366,8 @@ fn keyboardRepeatInfo(context: *anyopaque, rate: i32, delay: i32) void {
 
 fn pointerAvailable(context: *anyopaque, available: bool) void {
     const self = serverForOutput(context);
-    if (!available) {
+    // The nested backend can report its initial state before later input protocols exist.
+    if (!available and self.window_manager_initialized) {
         self.pointer_constraints.deactivateAll();
         self.data_device.cancel();
     }
