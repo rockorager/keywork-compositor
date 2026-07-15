@@ -992,16 +992,17 @@
       "interfaces": [
         {
           "name": "ext_image_copy_capture_manager_v1",
-          "current_version": null,
+          "current_version": 1,
           "target_version": 1
         }
       ],
-      "status": "not_started",
+      "status": "in_progress",
       "privileged": true,
       "blocked_by": [
         "image-capture-source",
         "linux-dmabuf"
-      ]
+      ],
+      "status_detail": "Version 1 base sessions synchronously capture complete output scenes or mapped toplevel surface trees into ARGB8888/XRGB8888 wl_shm buffers. Output sessions honor paint-cursors, captures preserve session/frame lifetime rules, constraints are refreshed on size changes, source invalidation stops sessions, and frame metadata includes full conservative damage plus monotonic timestamps. The privileged global is security-context filtered. DMA-BUF destinations and dedicated cursor-image sessions remain to complete the target."
     },
     {
       "id": "wlr-screencopy",

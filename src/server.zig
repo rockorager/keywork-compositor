@@ -29,6 +29,7 @@ const PrimarySelection = @import("wayland/primary_selection.zig");
 const DataControl = @import("wayland/data_control.zig");
 const ForeignToplevelList = @import("wayland/foreign_toplevel_list.zig");
 const ImageCaptureSource = @import("wayland/image_capture_source.zig");
+const ImageCopyCapture = @import("wayland/image_copy_capture.zig");
 const Workspace = @import("wayland/workspace.zig");
 const TextInput = @import("wayland/text_input.zig");
 const InputMethod = @import("wayland/input_method.zig");
@@ -62,6 +63,7 @@ const wl = wayland.server.wl;
 const log = std.log.scoped(.server);
 
 allocator: std.mem.Allocator,
+io: std.Io,
 display: *wl.Server,
 session: Session,
 session_initialized: bool,
@@ -120,6 +122,8 @@ foreign_toplevel_list: ForeignToplevelList,
 foreign_toplevel_list_initialized: bool,
 image_capture_source: ImageCaptureSource,
 image_capture_source_initialized: bool,
+image_copy_capture: ImageCopyCapture,
+image_copy_capture_initialized: bool,
 workspace: Workspace,
 workspace_initialized: bool,
 text_input: TextInput,
@@ -208,6 +212,11 @@ const OutputFrame = struct {
     render_output: *RenderOutput,
     output: *Output,
     target: renderer_types.Target,
+    size: render.Size,
+    scale: render.Scale,
+    origin: render.Position,
+    visible_rect: render.Rect,
+    track_visibility: bool,
 };
 
 pub fn create(
@@ -226,6 +235,7 @@ pub fn create(
 
     self.* = .{
         .allocator = allocator,
+        .io = io,
         .display = display,
         .session = undefined,
         .session_initialized = false,
@@ -288,6 +298,8 @@ pub fn create(
         .foreign_toplevel_list_initialized = false,
         .image_capture_source = undefined,
         .image_capture_source_initialized = false,
+        .image_copy_capture = undefined,
+        .image_copy_capture_initialized = false,
         .workspace = undefined,
         .workspace_initialized = false,
         .text_input = undefined,
@@ -604,6 +616,22 @@ pub fn create(
         self.image_capture_source.deinit();
         self.image_capture_source_initialized = false;
     }
+    try self.image_copy_capture.init(
+        allocator,
+        display,
+        &self.security_context,
+        &self.image_capture_source,
+        .{
+            .context = self,
+            .constraints = captureConstraints,
+            .capture = captureImage,
+        },
+    );
+    self.image_copy_capture_initialized = true;
+    errdefer {
+        self.image_copy_capture.deinit();
+        self.image_copy_capture_initialized = false;
+    }
     try self.workspace.init(allocator, display, &self.security_context, &self.outputs);
     self.workspace_initialized = true;
     errdefer {
@@ -762,6 +790,8 @@ pub fn destroy(self: *Self) void {
     }
     self.workspace.deinit();
     self.workspace_initialized = false;
+    self.image_copy_capture.deinit();
+    self.image_copy_capture_initialized = false;
     self.image_capture_source.deinit();
     self.image_capture_source_initialized = false;
     self.foreign_toplevel_list.deinit();
@@ -2992,6 +3022,212 @@ fn pointInRoundedRect(x: f64, y: f64, rect: render.Rect, requested_radius: u32) 
     return distance_x * distance_x + distance_y * distance_y <= radius * radius;
 }
 
+fn captureConstraints(
+    context: *anyopaque,
+    target: ImageCaptureSource.Target,
+) ?ImageCopyCapture.Constraints {
+    const self: *Self = @ptrCast(@alignCast(context));
+    return switch (target) {
+        .output => |output_id| output: {
+            const render_output = self.renderOutputForProtocol(output_id) orelse return null;
+            break :output .{ .size = render_output.backend.size() };
+        },
+        .toplevel => |window_id| toplevel: {
+            const bounds = self.toplevelCaptureBounds(window_id) orelse return null;
+            break :toplevel .{ .size = .{ .width = bounds.width, .height = bounds.height } };
+        },
+    };
+}
+
+fn captureImage(
+    context: *anyopaque,
+    target: ImageCaptureSource.Target,
+    paint_cursors: bool,
+    pixel_buffer: render.PixelBuffer,
+) ImageCopyCapture.CaptureError!presentation.Timestamp {
+    const self: *Self = @ptrCast(@alignCast(context));
+    switch (target) {
+        .output => |output_id| self.captureOutput(
+            output_id,
+            paint_cursors,
+            pixel_buffer,
+        ) catch return error.Failed,
+        .toplevel => |window_id| {
+            if (self.session_lock.isLocked()) return error.Failed;
+            self.captureToplevel(window_id, pixel_buffer) catch |err| switch (err) {
+                error.Stopped => return error.Stopped,
+                else => return error.Failed,
+            };
+        },
+    }
+    return presentation.Info.now(self.io).timestamp;
+}
+
+fn captureOutput(
+    self: *Self,
+    output_id: OutputLayout.Id,
+    paint_cursors: bool,
+    pixel_buffer: render.PixelBuffer,
+) renderer_types.Renderer.Error!void {
+    const render_output = self.renderOutputForProtocol(output_id) orelse
+        return error.InvalidTarget;
+    const output = self.outputs.get(output_id) orelse return error.InvalidTarget;
+    if (!std.meta.eql(pixel_buffer.size, render_output.backend.size())) {
+        return error.InvalidTarget;
+    }
+    const position = output.logicalPosition();
+    const frame: OutputFrame = .{
+        .render_output = render_output,
+        .output = output,
+        .target = self.renderer.makeTarget(pixel_buffer),
+        .size = pixel_buffer.size,
+        .scale = render_output.backend.renderScale(),
+        .origin = .{ .x = position.x, .y = position.y },
+        .visible_rect = output.logicalRect(),
+        .track_visibility = false,
+    };
+    const clear_command = [_]render.Command{.{ .clear = if (self.session_lock.isLocked())
+        render.Color.rgba(0, 0, 0, 255)
+    else
+        render.Color.rgba(24, 24, 27, 255) }};
+    try self.renderCommands(&frame, &clear_command);
+    if (self.session_lock.isLocked()) {
+        try self.renderSessionLockContents(&frame, paint_cursors);
+    } else {
+        _ = try self.renderDesktopContents(&frame, paint_cursors);
+    }
+}
+
+const ToplevelCaptureError = renderer_types.Renderer.Error || error{Stopped};
+
+fn captureToplevel(
+    self: *Self,
+    window_id: XdgShell.WindowId,
+    pixel_buffer: render.PixelBuffer,
+) ToplevelCaptureError!void {
+    const info = self.xdg_shell.windowInfo(window_id) orelse return error.Stopped;
+    if (!info.mapped) return error.Stopped;
+    const surface_id = self.xdg_shell.windowSurface(window_id) orelse return error.Stopped;
+    const position = self.scene.surfacePosition(surface_id) orelse return error.Stopped;
+    const bounds = self.toplevelCaptureBounds(window_id) orelse return error.Stopped;
+    if (!std.meta.eql(pixel_buffer.size, render.Size{
+        .width = bounds.width,
+        .height = bounds.height,
+    })) return error.InvalidTarget;
+    const render_output = self.firstRenderOutput() orelse return error.InvalidTarget;
+    const output = self.outputs.get(render_output.protocol_id) orelse return error.InvalidTarget;
+    const frame: OutputFrame = .{
+        .render_output = render_output,
+        .output = output,
+        .target = self.renderer.makeTarget(pixel_buffer),
+        .size = pixel_buffer.size,
+        .scale = .{},
+        .origin = .{ .x = bounds.x, .y = bounds.y },
+        .visible_rect = bounds,
+        .track_visibility = false,
+    };
+    const clear_command = [_]render.Command{.{ .clear = render.Color.rgba(0, 0, 0, 0) }};
+    try self.renderCommands(&frame, &clear_command);
+    try self.renderSurfaceTree(
+        &frame,
+        surface_id,
+        position.x,
+        position.y,
+        null,
+        null,
+    );
+}
+
+fn renderOutputForProtocol(self: *Self, output_id: OutputLayout.Id) ?*RenderOutput {
+    var outputs = self.render_outputs.iterator();
+    while (outputs.next()) |entry| {
+        const render_output = entry.value.*;
+        if (std.meta.eql(render_output.protocol_id, output_id)) return render_output;
+    }
+    return null;
+}
+
+fn firstRenderOutput(self: *Self) ?*RenderOutput {
+    var outputs = self.render_outputs.iterator();
+    const entry = outputs.next() orelse return null;
+    return entry.value.*;
+}
+
+fn toplevelCaptureBounds(self: *Self, window_id: XdgShell.WindowId) ?render.Rect {
+    const info = self.xdg_shell.windowInfo(window_id) orelse return null;
+    if (!info.mapped) return null;
+    const surface_id = self.xdg_shell.windowSurface(window_id) orelse return null;
+    const position = self.scene.surfacePosition(surface_id) orelse return null;
+    var bounds: ?render.Rect = null;
+    self.addSurfaceTreeBounds(surface_id, position.x, position.y, &bounds) catch return null;
+    return bounds;
+}
+
+fn addSurfaceTreeBounds(
+    self: *Self,
+    surface_id: Surface.Id,
+    x: i32,
+    y: i32,
+    bounds: *?render.Rect,
+) error{Overflow}!void {
+    if (Surface.currentBuffer(self.compositor.surfaceStore(), surface_id) == null) return;
+    var stack = self.subcompositor.stackIterator(surface_id);
+    while (stack.next()) |entry| switch (entry) {
+        .parent => {
+            const buffer = Surface.currentBuffer(
+                self.compositor.surfaceStore(),
+                surface_id,
+            ) orelse continue;
+            const rect: render.Rect = .{
+                .x = x,
+                .y = y,
+                .width = buffer.logical_size.width,
+                .height = buffer.logical_size.height,
+            };
+            bounds.* = if (bounds.*) |current| try unionCaptureBounds(current, rect) else rect;
+        },
+        .child => |child| try self.addSurfaceTreeBounds(
+            child.surface_id,
+            x +| child.position.x,
+            y +| child.position.y,
+            bounds,
+        ),
+    };
+}
+
+fn unionCaptureBounds(a: render.Rect, b: render.Rect) error{Overflow}!render.Rect {
+    const left = @min(a.x, b.x);
+    const top = @min(a.y, b.y);
+    const right = @max(
+        @as(i64, a.x) + a.width,
+        @as(i64, b.x) + b.width,
+    );
+    const bottom = @max(
+        @as(i64, a.y) + a.height,
+        @as(i64, b.y) + b.height,
+    );
+    const width = right - left;
+    const height = bottom - top;
+    if (width <= 0 or height <= 0 or
+        width > std.math.maxInt(u32) or height > std.math.maxInt(u32)) return error.Overflow;
+    return .{
+        .x = left,
+        .y = top,
+        .width = @intCast(width),
+        .height = @intCast(height),
+    };
+}
+
+test "capture bounds include negative child offsets" {
+    try std.testing.expectEqual(
+        render.Rect{ .x = -20, .y = 5, .width = 120, .height = 70 },
+        try unionCaptureBounds(
+            .{ .x = 0, .y = 10, .width = 100, .height = 50 },
+            .{ .x = -20, .y = 5, .width = 30, .height = 70 },
+        ),
+    );
+}
+
 fn handleRenderTimer(output_context: *RenderOutput) c_int {
     const self = output_context.server;
     output_context.render_scheduled = false;
@@ -3014,10 +3250,16 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
     const output = self.outputs.get(render_output.protocol_id).?;
     output.beginFrame();
     errdefer output.cancelFrame();
+    const position = output.logicalPosition();
     const frame: OutputFrame = .{
         .render_output = render_output,
         .output = output,
         .target = self.renderer.makeTarget(pixel_target),
+        .size = render_output.backend.size(),
+        .scale = render_output.backend.renderScale(),
+        .origin = .{ .x = position.x, .y = position.y },
+        .visible_rect = output.logicalRect(),
+        .track_visibility = true,
     };
     const clear_command = [_]render.Command{.{ .clear = if (self.session_lock.isLocked())
         render.Color.rgba(0, 0, 0, 255)
@@ -3026,67 +3268,7 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
     try self.renderCommands(&frame, &clear_command);
     if (self.session_lock.isLocked()) return self.renderSessionLockFrame(&frame);
 
-    try self.renderLayerSurfaces(&frame, .background);
-    try self.renderLayerSurfaces(&frame, .bottom);
-    const top_fullscreen = self.topFullscreenForOutput(output.logicalRect());
-    if (top_fullscreen != null) try self.renderLayerSurfaces(&frame, .top);
-    var fullscreen_reached = top_fullscreen == null;
-    var nodes = self.scene.nodeIterator();
-    while (nodes.next()) |entry| switch (entry) {
-        .window => |window_entry| {
-            if (!window_entry.window.mapped) continue;
-            if (top_fullscreen) |id| {
-                if (!std.meta.eql(window_entry.id, id)) continue;
-                fullscreen_reached = true;
-            }
-            try self.renderWindow(&frame, window_entry.id, window_entry.window);
-        },
-        .shell_surface => |shell_entry| {
-            if (!fullscreen_reached or !shell_entry.shell_surface.mapped) continue;
-            try self.renderSurfaceTree(
-                &frame,
-                shell_entry.shell_surface.surface_id,
-                shell_entry.shell_surface.position.x,
-                shell_entry.shell_surface.position.y,
-                null,
-                null,
-            );
-        },
-    };
-    if (top_fullscreen == null) try self.renderLayerSurfaces(&frame, .top);
-    try self.renderLayerSurfaces(&frame, .overlay);
-    try self.renderLayerPopups(&frame);
-
-    self.input_method.refreshPopups();
-    var input_popups = self.input_method.popupIterator();
-    while (input_popups.next()) |popup| {
-        try self.renderSurfaceTree(
-            &frame,
-            popup.surface_id,
-            popup.position.x,
-            popup.position.y,
-            null,
-            null,
-        );
-    }
-
-    const drag_icon = self.data_device.iconInfo();
-    if (drag_icon) |info| {
-        try self.renderSurfaceTree(
-            &frame,
-            info.surface_id,
-            info.x,
-            info.y,
-            null,
-            null,
-        );
-    }
-
-    try self.renderSeatCursor(&frame, &self.seat, false);
-    for (self.dynamic_seats.items) |entry| {
-        if (!entry.removed) try self.renderSeatCursor(&frame, &entry.seat, false);
-    }
-    try self.renderTabletCursors(&frame, false);
+    const top_fullscreen = try self.renderDesktopContents(&frame, true);
 
     const presented = render_output.backend.present() catch return error.InvalidTarget;
     output.endFrame();
@@ -3095,8 +3277,8 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
     self.submitLayerSurfaces(output, .background);
     self.submitLayerSurfaces(output, .bottom);
     if (top_fullscreen != null) self.submitLayerSurfaces(output, .top);
-    fullscreen_reached = top_fullscreen == null;
-    nodes = self.scene.nodeIterator();
+    var fullscreen_reached = top_fullscreen == null;
+    var nodes = self.scene.nodeIterator();
     while (nodes.next()) |entry| switch (entry) {
         .window => |window_entry| {
             if (!window_entry.window.mapped) continue;
@@ -3117,8 +3299,9 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
     if (top_fullscreen == null) self.submitLayerSurfaces(output, .top);
     self.submitLayerSurfaces(output, .overlay);
     self.submitLayerPopups(output);
-    input_popups = self.input_method.popupIterator();
+    var input_popups = self.input_method.popupIterator();
     while (input_popups.next()) |popup| self.submitSurfaceTree(output, popup.surface_id);
+    const drag_icon = self.data_device.iconInfo();
     if (drag_icon) |info| self.submitSurfaceTree(output, info.surface_id);
     self.submitSeatCursor(output, &self.seat, false);
     for (self.dynamic_seats.items) |entry| {
@@ -3130,28 +3313,84 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
     self.refreshKeyboardFocus();
 }
 
-fn renderSessionLockFrame(
+fn renderDesktopContents(
     self: *Self,
     frame: *const OutputFrame,
-) renderer_types.Renderer.Error!void {
-    const lock_surface = self.session_lock.surfaceForOutput(frame.render_output.protocol_id);
-    if (lock_surface) |info| {
+    paint_cursors: bool,
+) renderer_types.Renderer.Error!?Scene.Id {
+    try self.renderLayerSurfaces(frame, .background);
+    try self.renderLayerSurfaces(frame, .bottom);
+    const top_fullscreen = self.topFullscreenForOutput(frame.visible_rect);
+    if (top_fullscreen != null) try self.renderLayerSurfaces(frame, .top);
+    var fullscreen_reached = top_fullscreen == null;
+    var nodes = self.scene.nodeIterator();
+    while (nodes.next()) |entry| switch (entry) {
+        .window => |window_entry| {
+            if (!window_entry.window.mapped) continue;
+            if (top_fullscreen) |id| {
+                if (!std.meta.eql(window_entry.id, id)) continue;
+                fullscreen_reached = true;
+            }
+            try self.renderWindow(frame, window_entry.id, window_entry.window);
+        },
+        .shell_surface => |shell_entry| {
+            if (!fullscreen_reached or !shell_entry.shell_surface.mapped) continue;
+            try self.renderSurfaceTree(
+                frame,
+                shell_entry.shell_surface.surface_id,
+                shell_entry.shell_surface.position.x,
+                shell_entry.shell_surface.position.y,
+                null,
+                null,
+            );
+        },
+    };
+    if (top_fullscreen == null) try self.renderLayerSurfaces(frame, .top);
+    try self.renderLayerSurfaces(frame, .overlay);
+    try self.renderLayerPopups(frame);
+
+    self.input_method.refreshPopups();
+    var input_popups = self.input_method.popupIterator();
+    while (input_popups.next()) |popup| {
         try self.renderSurfaceTree(
             frame,
-            info.surface_id,
-            info.position.x,
-            info.position.y,
+            popup.surface_id,
+            popup.position.x,
+            popup.position.y,
             null,
             null,
         );
     }
 
-    try self.renderSeatCursor(frame, &self.seat, true);
-    for (self.dynamic_seats.items) |entry| {
-        if (!entry.removed) try self.renderSeatCursor(frame, &entry.seat, true);
+    const drag_icon = self.data_device.iconInfo();
+    if (drag_icon) |info| {
+        try self.renderSurfaceTree(
+            frame,
+            info.surface_id,
+            info.x,
+            info.y,
+            null,
+            null,
+        );
     }
-    try self.renderTabletCursors(frame, true);
 
+    if (paint_cursors) {
+        try self.renderSeatCursor(frame, &self.seat, false);
+        for (self.dynamic_seats.items) |entry| {
+            if (!entry.removed) try self.renderSeatCursor(frame, &entry.seat, false);
+        }
+        try self.renderTabletCursors(frame, false);
+    }
+    return top_fullscreen;
+}
+
+fn renderSessionLockFrame(
+    self: *Self,
+    frame: *const OutputFrame,
+) renderer_types.Renderer.Error!void {
+    try self.renderSessionLockContents(frame, true);
+
+    const lock_surface = self.session_lock.surfaceForOutput(frame.render_output.protocol_id);
     const presented = frame.render_output.backend.present() catch return error.InvalidTarget;
     frame.render_output.lock_frame_pending = true;
     frame.output.endFrame();
@@ -3165,6 +3404,32 @@ fn renderSessionLockFrame(
     self.finishRepaintIfIdle();
     if (presented) |info| outputPresented(frame.render_output, info);
     self.refreshKeyboardFocus();
+}
+
+fn renderSessionLockContents(
+    self: *Self,
+    frame: *const OutputFrame,
+    paint_cursors: bool,
+) renderer_types.Renderer.Error!void {
+    const lock_surface = self.session_lock.surfaceForOutput(frame.render_output.protocol_id);
+    if (lock_surface) |info| {
+        try self.renderSurfaceTree(
+            frame,
+            info.surface_id,
+            info.position.x,
+            info.position.y,
+            null,
+            null,
+        );
+    }
+
+    if (paint_cursors) {
+        try self.renderSeatCursor(frame, &self.seat, true);
+        for (self.dynamic_seats.items) |entry| {
+            if (!entry.removed) try self.renderSeatCursor(frame, &entry.seat, true);
+        }
+        try self.renderTabletCursors(frame, true);
+    }
 }
 
 fn refreshKeyboardFocus(self: *Self) void {
@@ -3389,12 +3654,11 @@ fn renderCommands(
     frame: *const OutputFrame,
     commands: []const render.Command,
 ) renderer_types.Renderer.Error!void {
-    const position = frame.output.logicalPosition();
     try self.renderer.render(.{
-        .size = frame.render_output.backend.size(),
+        .size = frame.size,
         .commands = commands,
-        .scale = frame.render_output.backend.renderScale(),
-        .origin = .{ .x = position.x, .y = position.y },
+        .scale = frame.scale,
+        .origin = frame.origin,
     }, frame.target);
 }
 
@@ -3528,11 +3792,11 @@ fn renderSurfaceTree(
                 .width = buffer.logical_size.width,
                 .height = buffer.logical_size.height,
             };
-            const visible_rect = surface_rect.intersection(frame.output.logicalRect()) orelse continue;
+            const visible_rect = surface_rect.intersection(frame.visible_rect) orelse continue;
             if (clip) |clip_rect| {
                 if (visible_rect.intersection(clip_rect) == null) continue;
             }
-            try frame.output.markSurfaceVisible(surface_id);
+            if (frame.track_visibility) try frame.output.markSurfaceVisible(surface_id);
             if (buffer.transform != .normal) continue;
             const image_command = [_]render.Command{
                 .{ .image = .{
