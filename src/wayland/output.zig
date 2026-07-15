@@ -28,6 +28,7 @@ resources: std.ArrayList(*wl.Output),
 surfaces: *Surface.Store,
 memberships: std.ArrayList(Membership),
 frame_active: bool,
+bind_listener: ?BindListener,
 
 pub const Position = struct {
     x: i32 = 0,
@@ -47,6 +48,11 @@ pub const Config = struct {
     description: []const u8,
     make: []const u8 = "keywork",
     model: []const u8,
+};
+
+pub const BindListener = struct {
+    context: *anyopaque,
+    bound: *const fn (*anyopaque, *Self, *wl.Output) void,
 };
 
 const Membership = struct {
@@ -109,11 +115,13 @@ pub fn init(
         .surfaces = surfaces,
         .memberships = .empty,
         .frame_active = false,
+        .bind_listener = null,
     };
 }
 
 pub fn deinit(self: *Self) void {
     std.debug.assert(!self.frame_active);
+    std.debug.assert(self.bind_listener == null);
     while (self.resources.items.len > 0) self.resources.items[0].destroy();
     self.global.destroy();
     self.resources.deinit(self.allocator);
@@ -127,6 +135,7 @@ pub fn deinit(self: *Self) void {
 
 pub fn retire(self: *Self) void {
     std.debug.assert(!self.frame_active);
+    std.debug.assert(self.bind_listener == null);
     self.global.remove();
     for (self.memberships.items) |membership| {
         const surface = Surface.resourceFor(self.surfaces, membership.surface_id) orelse continue;
@@ -237,6 +246,16 @@ pub fn boundResources(self: *const Self) []const *wl.Output {
     return self.resources.items;
 }
 
+pub fn setBindListener(self: *Self, listener: BindListener) void {
+    std.debug.assert(self.bind_listener == null);
+    self.bind_listener = listener;
+}
+
+pub fn clearBindListener(self: *Self) void {
+    std.debug.assert(self.bind_listener != null);
+    self.bind_listener = null;
+}
+
 pub fn setRefresh(self: *Self, info: presentation.Info) void {
     const refresh_millihertz: i32 = @intCast(@min(
         info.refreshMillihertz(),
@@ -327,6 +346,7 @@ fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
         const surface = Surface.resourceFor(self.surfaces, membership.surface_id) orelse continue;
         if (surface.getClient() == client) surface.sendEnter(resource);
     }
+    if (self.bind_listener) |listener| listener.bound(listener.context, self, resource);
 }
 
 fn sendGeometry(self: *const Self, resource: *wl.Output) void {

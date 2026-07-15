@@ -28,6 +28,7 @@ const DataDevice = @import("wayland/data_device.zig");
 const PrimarySelection = @import("wayland/primary_selection.zig");
 const DataControl = @import("wayland/data_control.zig");
 const ForeignToplevelList = @import("wayland/foreign_toplevel_list.zig");
+const Workspace = @import("wayland/workspace.zig");
 const TextInput = @import("wayland/text_input.zig");
 const InputMethod = @import("wayland/input_method.zig");
 const VirtualKeyboard = @import("wayland/virtual_keyboard.zig");
@@ -116,6 +117,8 @@ primary_selection: PrimarySelection,
 data_control: DataControl,
 foreign_toplevel_list: ForeignToplevelList,
 foreign_toplevel_list_initialized: bool,
+workspace: Workspace,
+workspace_initialized: bool,
 text_input: TextInput,
 input_method: InputMethod,
 virtual_keyboard: VirtualKeyboard,
@@ -280,6 +283,8 @@ pub fn create(
         .data_control = undefined,
         .foreign_toplevel_list = undefined,
         .foreign_toplevel_list_initialized = false,
+        .workspace = undefined,
+        .workspace_initialized = false,
         .text_input = undefined,
         .input_method = undefined,
         .virtual_keyboard = undefined,
@@ -581,6 +586,12 @@ pub fn create(
         self.foreign_toplevel_list.deinit();
         self.foreign_toplevel_list_initialized = false;
     }
+    try self.workspace.init(allocator, display, &self.security_context, &self.outputs);
+    self.workspace_initialized = true;
+    errdefer {
+        self.workspace.deinit();
+        self.workspace_initialized = false;
+    }
     self.subcompositor.setRepaintListener(.{
         .context = self,
         .request = requestRepaint,
@@ -731,6 +742,8 @@ pub fn destroy(self: *Self) void {
         self.output_management.deinit();
         self.output_management_initialized = false;
     }
+    self.workspace.deinit();
+    self.workspace_initialized = false;
     self.foreign_toplevel_list.deinit();
     self.foreign_toplevel_list_initialized = false;
     self.window_manager.deinit();
@@ -841,6 +854,10 @@ fn addRenderOutput(
     errdefer stopRenderOutput(render_output);
     const id = try self.render_outputs.insert(self.allocator, render_output);
     errdefer std.debug.assert(self.render_outputs.remove(id) != null);
+    if (self.workspace_initialized) {
+        self.workspace.addOutput(render_output.protocol_id);
+        errdefer self.workspace.removeOutput(render_output.protocol_id);
+    }
     if (self.window_manager_initialized) {
         try self.window_manager.outputAdded(render_output.protocol_id);
     }
@@ -1123,6 +1140,7 @@ fn removeRenderOutput(self: *Self, id: RenderOutputId) bool {
     const render_output = self.render_outputs.remove(id) orelse return false;
     stopRenderOutput(render_output);
     const protocol_output = self.outputs.get(render_output.protocol_id).?;
+    if (self.workspace_initialized) self.workspace.removeOutput(render_output.protocol_id);
     if (self.foreign_toplevel_list_initialized) {
         self.foreign_toplevel_list.removeOutput(render_output.protocol_id);
     }

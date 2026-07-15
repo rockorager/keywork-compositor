@@ -903,16 +903,17 @@
       "interfaces": [
         {
           "name": "ext_workspace_manager_v1",
-          "current_version": null,
+          "current_version": 1,
           "target_version": 1
         }
       ],
-      "status": "not_started",
+      "status": "done",
       "privileged": true,
       "blocked_by": [
         "ext-foreign-toplevel-list",
         "river-window-management"
-      ]
+      ],
+      "status_detail": "Version 1 advertises the compositor's single permanent active workspace in one group spanning all outputs, including late wl_output bindings, output hotplug, atomic done events, inert stopped-manager handles, zero mutation capabilities, and sandboxed-client global filtering."
     },
     {
       "id": "wlr-output-management",
