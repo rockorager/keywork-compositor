@@ -1119,6 +1119,29 @@ fn appendXwaylandMinimizeRequest(self: *Self, id: WindowId) error{OutOfMemory}!v
     try self.window_requests.append(self.allocator, .{ .id = id, .request = .minimize });
 }
 
+pub fn xwaylandWindowActivationRequested(
+    self: *Self,
+    xwayland_id: Xwm.WindowId,
+    seat: *Seat,
+) void {
+    const manager = self.active orelse return;
+    const info = self.xwayland.window_info(self.xwayland.context, xwayland_id) orelse return;
+    if (!info.mapped or info.override_redirect or
+        !self.known_xwayland_windows.contains(xwayland_id)) return;
+    const id = self.ensureXwaylandWindow(xwayland_id) catch {
+        manager.postNoMemory();
+        return;
+    };
+    const seat_state = self.seatState(seat) orelse return;
+    if (self.layer_focus == .exclusive or self.layer_focus_sent == .exclusive) return;
+    const window = self.windows.get(id) orelse return;
+    _ = self.layer_shell.relinquishNonExclusiveFocus();
+    seat_state.pending_focus = .{ .window = id };
+    window.requested_visible = true;
+    window.requested_configuration.suspended = false;
+    self.requestManage();
+}
+
 pub fn xwaylandWindowDisplayed(self: *Self, xwayland_id: Xwm.WindowId) bool {
     const id = self.findXwaylandWindow(xwayland_id) orelse return true;
     const window = self.windows.get(id) orelse return true;

@@ -53,6 +53,7 @@ pub const XwaylandController = struct {
     context: *anyopaque,
     window_info: *const fn (*anyopaque, Xwm.WindowId) ?Xwm.WindowInfo,
     close: *const fn (*anyopaque, Xwm.WindowId) void,
+    request_activation: *const fn (*anyopaque, Xwm.WindowId, *Seat) void,
     request_fullscreen: *const fn (*anyopaque, Xwm.WindowId, bool, ?OutputLayout.Id) void,
     request_maximized: *const fn (*anyopaque, Xwm.WindowId, bool) void,
     request_minimized: *const fn (*anyopaque, Xwm.WindowId, bool) void,
@@ -299,8 +300,11 @@ const WlrHandle = struct {
                 .destroy => unreachable,
                 .close => self.owner.xwayland.close(self.owner.xwayland.context, window_id),
                 .set_rectangle => |rectangle| validateRectangle(resource, rectangle.width, rectangle.height),
-                .activate,
-                => {},
+                .activate => |activate| self.owner.xwayland.request_activation(
+                    self.owner.xwayland.context,
+                    window_id,
+                    Seat.fromResource(activate.seat),
+                ),
                 .set_maximized => self.owner.xwayland.request_maximized(
                     self.owner.xwayland.context,
                     window_id,
@@ -622,6 +626,7 @@ fn mappingConfiguration(self: *Self, mapping: *const Mapping) XdgShell.ToplevelC
                 .fullscreen = info.fullscreen,
                 .maximized = info.maximized,
                 .suspended = info.minimized,
+                .activated = info.activated,
             };
         },
     };

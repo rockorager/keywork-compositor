@@ -45,6 +45,7 @@ pub const WindowInfo = struct {
     geometry: Geometry,
     override_redirect: bool,
     mapped: bool,
+    activated: bool,
     surface_id: ?Surface.Id,
     title: ?[:0]const u8,
     app_id: ?[:0]const u8,
@@ -95,6 +96,7 @@ const Atom = enum {
     net_supporting_wm_check,
     net_wm_name,
     net_active_window,
+    net_close_window,
     net_wm_state,
     net_wm_state_fullscreen,
     net_wm_state_maximized_horz,
@@ -117,6 +119,7 @@ const atom_names: [atom_count][]const u8 = .{
     "_NET_SUPPORTING_WM_CHECK",
     "_NET_WM_NAME",
     "_NET_ACTIVE_WINDOW",
+    "_NET_CLOSE_WINDOW",
     "_NET_WM_STATE",
     "_NET_WM_STATE_FULLSCREEN",
     "_NET_WM_STATE_MAXIMIZED_HORZ",
@@ -142,6 +145,8 @@ pub const Listener = struct {
     fullscreen_requested: *const fn (*anyopaque, WindowId, bool) void,
     maximize_requested: *const fn (*anyopaque, WindowId, bool) void,
     minimize_requested: *const fn (*anyopaque, WindowId, bool) void,
+    activation_requested: *const fn (*anyopaque, WindowId) void,
+    activation_changed: *const fn (*anyopaque, WindowId) void,
     serial: *const fn (*anyopaque, WindowId, u64) void,
     associated: *const fn (*anyopaque, WindowId, Surface.Id) void,
     dissociated: *const fn (*anyopaque, WindowId, Surface.Id) void,
@@ -277,7 +282,7 @@ pub fn removeSurfaceAssociation(
 
 pub fn windowInfo(self: *const Self, window_id: WindowId) ?WindowInfo {
     const window = self.windows.get(window_id) orelse return null;
-    return info(window_id, window);
+    return self.info(window_id, window);
 }
 
 pub fn windowForSerial(self: *const Self, serial: u64) ?WindowId {
@@ -290,7 +295,8 @@ pub fn focusWindow(self: *Self, requested_window: ?WindowId) error{XcbFlushFaile
         if (!window.mapped or window.override_redirect) break :focus null;
         break :focus id;
     } else null;
-    if (self.focused_window == window_id) return;
+    const previous_window = self.focused_window;
+    if (previous_window == window_id) return;
 
     self.focused_window = window_id;
     const active_window = window_id orelse c.XCB_WINDOW_NONE;
@@ -325,6 +331,8 @@ pub fn focusWindow(self: *Self, requested_window: ?WindowId) error{XcbFlushFaile
         );
     }
     if (c.xcb_flush(self.connection) <= 0) return error.XcbFlushFailed;
+    if (previous_window) |id| self.listener.activation_changed(self.listener.context, id);
+    if (window_id) |id| self.listener.activation_changed(self.listener.context, id);
 }
 
 pub fn closeWindow(self: *Self, window_id: WindowId) void {
@@ -564,6 +572,7 @@ fn publishWmIdentity(self: *Self) !void {
         self.atomValue(.net_supporting_wm_check),
         self.atomValue(.net_wm_name),
         self.atomValue(.net_active_window),
+        self.atomValue(.net_close_window),
         self.atomValue(.net_wm_state),
         self.atomValue(.net_wm_state_fullscreen),
         self.atomValue(.net_wm_state_maximized_horz),
@@ -1034,7 +1043,7 @@ fn handleCreate(self: *Self, event: *const c.xcb_create_notify_event_t) !void {
         c.XCB_CW_EVENT_MASK,
         &event_mask,
     );
-    self.listener.created(self.listener.context, info(event.window, window));
+    self.listener.created(self.listener.context, self.info(event.window, window));
 }
 
 fn handleDestroy(self: *Self, event: *const c.xcb_destroy_notify_event_t) void {
@@ -1261,6 +1270,14 @@ fn handleClientMessage(
         self.handleNetWmStateMessage(event);
         return;
     }
+    if (event.type == self.atomValue(.net_active_window)) {
+        self.handleNetActiveWindowMessage(event);
+        return;
+    }
+    if (event.type == self.atomValue(.net_close_window)) {
+        self.handleNetCloseWindowMessage(event);
+        return;
+    }
     if (event.type != self.atomValue(.wl_surface_serial)) return;
     const window = self.windows.getPtr(event.window) orelse return;
     const serial = @as(u64, event.data.data32[1]) << 32 | event.data.data32[0];
@@ -1336,12 +1353,25 @@ fn handleWmChangeStateMessage(self: *Self, event: *const c.xcb_client_message_ev
     self.listener.minimize_requested(self.listener.context, event.window, true);
 }
 
-fn info(window_id: WindowId, window: Window) WindowInfo {
+fn handleNetActiveWindowMessage(self: *Self, event: *const c.xcb_client_message_event_t) void {
+    const window = self.windows.get(event.window) orelse return;
+    if (!window.mapped or window.override_redirect or self.focused_window == event.window) return;
+    self.listener.activation_requested(self.listener.context, event.window);
+}
+
+fn handleNetCloseWindowMessage(self: *Self, event: *const c.xcb_client_message_event_t) void {
+    const window = self.windows.get(event.window) orelse return;
+    if (!window.mapped or window.override_redirect) return;
+    self.closeWindow(event.window);
+}
+
+fn info(self: *const Self, window_id: WindowId, window: Window) WindowInfo {
     return .{
         .id = window_id,
         .geometry = window.geometry,
         .override_redirect = window.override_redirect,
         .mapped = window.mapped,
+        .activated = self.focused_window == window_id,
         .surface_id = window.surface_id,
         .title = window.title,
         .app_id = window.app_id,

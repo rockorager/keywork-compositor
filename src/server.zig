@@ -644,6 +644,7 @@ pub fn create(
             .context = self,
             .window_info = riverXwaylandWindowInfo,
             .close = riverCloseXwaylandWindow,
+            .request_activation = riverRequestXwaylandWindowActivation,
             .request_fullscreen = riverRequestXwaylandWindowFullscreen,
             .request_maximized = riverRequestXwaylandWindowMaximized,
             .request_minimized = riverRequestXwaylandWindowMinimized,
@@ -3248,6 +3249,8 @@ fn xwaylandReady(
         .fullscreen_requested = xwmWindowFullscreenRequested,
         .maximize_requested = xwmWindowMaximizeRequested,
         .minimize_requested = xwmWindowMinimizeRequested,
+        .activation_requested = xwmWindowActivationRequested,
+        .activation_changed = xwmWindowActivationChanged,
         .serial = xwmWindowSerial,
         .associated = xwmWindowAssociated,
         .dissociated = xwmWindowDissociated,
@@ -3382,6 +3385,20 @@ fn xwmWindowMinimizeRequested(context: *anyopaque, window_id: Xwm.WindowId, mini
     }
     if (self.window_manager_initialized) {
         self.window_manager.xwaylandWindowMinimizeRequested(window_id, minimized);
+    }
+}
+
+fn xwmWindowActivationRequested(context: *anyopaque, window_id: Xwm.WindowId) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    if (self.window_manager_initialized) {
+        self.window_manager.xwaylandWindowActivationRequested(window_id, &self.seat);
+    }
+}
+
+fn xwmWindowActivationChanged(context: *anyopaque, window_id: Xwm.WindowId) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    if (self.foreign_toplevel_list_initialized) {
+        self.foreign_toplevel_list.xwaylandWindowStateChanged(window_id);
     }
 }
 
@@ -3568,6 +3585,17 @@ fn riverRequestXwaylandWindowFullscreen(
             fullscreen,
             preferred_output,
         );
+    }
+}
+
+fn riverRequestXwaylandWindowActivation(
+    context: *anyopaque,
+    window_id: Xwm.WindowId,
+    seat: *Seat,
+) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    if (self.window_manager_initialized) {
+        self.window_manager.xwaylandWindowActivationRequested(window_id, seat);
     }
 }
 
