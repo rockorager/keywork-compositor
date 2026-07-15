@@ -23,6 +23,7 @@ devices: std.ArrayList(*Device),
 device_resources: std.ArrayList(*DeviceResource),
 device_listeners: std.ArrayList(*DeviceListener),
 resource_listeners: std.ArrayList(*ResourceListener),
+seat_listener: ?SeatListener,
 seats: std.ArrayList([:0]u8),
 
 const ManagerResource = struct {
@@ -55,6 +56,13 @@ pub const ResourceListener = struct {
     created: *const fn (*anyopaque, *Device, *river.InputDeviceV1) void,
 };
 
+pub const SeatListener = struct {
+    context: *anyopaque,
+    created: *const fn (*anyopaque, [:0]const u8) error{OutOfMemory}!void,
+    device_changed: *const fn (*anyopaque, *Device, [:0]const u8) void,
+    destroyed: *const fn (*anyopaque, [:0]const u8) void,
+};
+
 const DeviceResource = struct {
     device: *Device,
     resource: ?*river.InputDeviceV1,
@@ -85,6 +93,7 @@ pub fn init(
         .device_resources = .empty,
         .device_listeners = .empty,
         .resource_listeners = .empty,
+        .seat_listener = null,
         .seats = .empty,
     };
     errdefer self.deinitStorage();
@@ -103,6 +112,7 @@ pub fn deinit(self: *Self) void {
     std.debug.assert(self.native_input == null);
     std.debug.assert(self.device_listeners.items.len == 0);
     std.debug.assert(self.resource_listeners.items.len == 0);
+    std.debug.assert(self.seat_listener == null);
     for (self.managers.items) |manager| std.debug.assert(manager.resource == null);
     for (self.device_resources.items) |resource| std.debug.assert(resource.resource == null);
     self.security_context.unrestrictGlobal(self.global);
@@ -202,6 +212,17 @@ pub fn removeResourceListener(self: *Self, listener: *ResourceListener) void {
     unreachable;
 }
 
+pub fn setSeatListener(self: *Self, listener: SeatListener) void {
+    std.debug.assert(self.seat_listener == null);
+    std.debug.assert(self.seats.items.len == 0);
+    self.seat_listener = listener;
+}
+
+pub fn clearSeatListener(self: *Self) void {
+    std.debug.assert(self.seat_listener != null);
+    self.seat_listener = null;
+}
+
 pub fn retainDevice(device: *Device) void {
     device.references = std.math.add(usize, device.references, 1) catch unreachable;
 }
@@ -283,12 +304,17 @@ fn managerDestroyed(_: *river.InputManagerV1, adapter: *ManagerResource) void {
 
 fn createSeat(self: *Self, resource: *river.InputManagerV1, name: []const u8) void {
     if (std.mem.eql(u8, name, default_seat) or self.hasSeat(name)) return;
-    log.warn("tracking seat {s}, but multi-seat input routing is not implemented yet", .{name});
     const copy = self.allocator.dupeSentinel(u8, name, 0) catch {
         resource.postNoMemory();
         return;
     };
     self.seats.append(self.allocator, copy) catch {
+        self.allocator.free(copy);
+        resource.postNoMemory();
+        return;
+    };
+    if (self.seat_listener) |listener| listener.created(listener.context, copy) catch {
+        _ = self.seats.pop();
         self.allocator.free(copy);
         resource.postNoMemory();
     };
@@ -299,8 +325,14 @@ fn destroySeat(self: *Self, name: []const u8) void {
     for (self.seats.items, 0..) |seat_name, index| {
         if (!std.mem.eql(u8, seat_name, name)) continue;
         for (self.devices.items) |device| {
-            if (std.mem.eql(u8, device.seat_name, seat_name)) device.seat_name = default_seat;
+            if (!std.mem.eql(u8, device.seat_name, seat_name)) continue;
+            const previous = device.seat_name;
+            device.seat_name = default_seat;
+            if (self.seat_listener) |listener| {
+                listener.device_changed(listener.context, device, previous);
+            }
         }
+        if (self.seat_listener) |listener| listener.destroyed(listener.context, seat_name);
         const removed = self.seats.orderedRemove(index);
         self.allocator.free(removed);
         return;
@@ -355,10 +387,12 @@ fn deviceRequest(
         .destroy => unreachable,
         .assign_to_seat => |assign| {
             const name = std.mem.span(assign.name);
-            if (!self.hasSeat(name)) return;
-            device.seat_name = self.seatName(name).?;
-            if (!std.mem.eql(u8, name, default_seat)) {
-                log.warn("device {d} remains routed through the default seat", .{device.id});
+            const next = self.seatName(name) orelse return;
+            if (std.mem.eql(u8, device.seat_name, next)) return;
+            const previous = device.seat_name;
+            device.seat_name = next;
+            if (self.seat_listener) |listener| {
+                listener.device_changed(listener.context, device, previous);
             }
         },
         .set_repeat_info => |repeat| {
