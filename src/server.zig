@@ -32,6 +32,7 @@ const ImageCaptureSource = @import("wayland/image_capture_source.zig");
 const ImageCopyCapture = @import("wayland/image_copy_capture.zig");
 const Screencopy = @import("wayland/screencopy.zig");
 const XwaylandShell = @import("wayland/xwayland_shell.zig");
+const XwaylandServer = @import("xwayland/server.zig");
 const Workspace = @import("wayland/workspace.zig");
 const TextInput = @import("wayland/text_input.zig");
 const InputMethod = @import("wayland/input_method.zig");
@@ -130,6 +131,8 @@ screencopy: Screencopy,
 screencopy_initialized: bool,
 xwayland_shell: XwaylandShell,
 xwayland_shell_initialized: bool,
+xwayland_server: XwaylandServer,
+xwayland_server_initialized: bool,
 workspace: Workspace,
 workspace_initialized: bool,
 text_input: TextInput,
@@ -310,6 +313,8 @@ pub fn create(
         .screencopy_initialized = false,
         .xwayland_shell = undefined,
         .xwayland_shell_initialized = false,
+        .xwayland_server = undefined,
+        .xwayland_server_initialized = false,
         .workspace = undefined,
         .workspace_initialized = false,
         .text_input = undefined,
@@ -676,6 +681,21 @@ pub fn create(
         self.xwayland_shell.deinit();
         self.xwayland_shell_initialized = false;
     }
+    self.xwayland_server.init(
+        allocator,
+        display,
+        &self.xwayland_shell,
+        .{
+            .context = self,
+            .ready = xwaylandReady,
+            .stopped = xwaylandStopped,
+        },
+    );
+    self.xwayland_server_initialized = true;
+    errdefer {
+        self.xwayland_server.deinit();
+        self.xwayland_server_initialized = false;
+    }
     try self.workspace.init(allocator, display, &self.security_context, &self.outputs);
     self.workspace_initialized = true;
     errdefer {
@@ -834,6 +854,8 @@ pub fn destroy(self: *Self) void {
     }
     self.workspace.deinit();
     self.workspace_initialized = false;
+    self.xwayland_server.deinit();
+    self.xwayland_server_initialized = false;
     self.xwayland_shell.deinit();
     self.xwayland_shell_initialized = false;
     self.screencopy.deinit();
@@ -1584,6 +1606,15 @@ pub fn setLauncherEnvironment(
     environ_map: *const std.process.Environ.Map,
 ) void {
     if (self.native_input_initialized) self.native_input.setEnvironMap(environ_map);
+}
+
+pub fn startXwayland(
+    self: *Self,
+    environ_map: *std.process.Environ.Map,
+) void {
+    self.xwayland_server.start(environ_map) catch |err| {
+        log.warn("Xwayland is unavailable: {t}", .{err});
+    };
 }
 
 pub fn eventLoop(self: *Self) *wl.EventLoop {
@@ -3120,6 +3151,14 @@ fn screencopyConstraints(context: *anyopaque, target: Screencopy.Target) ?render
 fn xwaylandSurfaceAssociated(_: *anyopaque, _: u64, _: Surface.Id) void {}
 
 fn xwaylandSurfaceRemoved(_: *anyopaque, _: u64, _: Surface.Id) void {}
+
+fn xwaylandReady(_: *anyopaque, display_name: []const u8) void {
+    log.info("X11 clients may use DISPLAY={s}", .{display_name});
+}
+
+fn xwaylandStopped(_: *anyopaque) void {
+    log.warn("Xwayland stopped", .{});
+}
 
 fn captureImage(
     context: *anyopaque,

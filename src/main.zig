@@ -52,6 +52,7 @@ pub fn main(init: std.process.Init) !void {
     var writer = std.Io.File.stdout().writer(init.io, &buffer);
     try writer.interface.print("WAYLAND_DISPLAY={s}\n", .{socket_name});
     try writer.interface.flush();
+    server.startXwayland(init.environ_map);
 
     server.run();
 }
@@ -62,6 +63,7 @@ fn terminate(_: c_int, server: *Server) c_int {
 }
 
 fn reapChildren(_: c_int, _: *Server) c_int {
+    // Detached launchers and Xwayland deliberately transfer wait ownership here.
     while (std.c.waitpid(-1, null, std.os.linux.W.NOHANG) > 0) {}
     return 0;
 }
@@ -100,6 +102,7 @@ test {
     _ = @import("wayland/image_copy_capture.zig");
     _ = @import("wayland/screencopy.zig");
     _ = @import("wayland/xwayland_shell.zig");
+    _ = @import("xwayland/server.zig");
     _ = @import("wayland/workspace.zig");
     _ = @import("wayland/text_input.zig");
     _ = @import("wayland/input_method.zig");

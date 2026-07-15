@@ -1043,7 +1043,7 @@
         "security-context",
         "wl-compositor"
       ],
-      "status_detail": "Version 1 private-global filtering, the xwayland_surface role, double-buffered non-zero unique serial association, commit-time publication, and destruction-safe serial lookup are implemented. The global remains hidden until a compositor-created Xwayland client is explicitly authorized. Process/socket launch, XWM pairing, and scene integration remain before Xwayland is usable."
+      "status_detail": "Version 1 private-global filtering, the xwayland_surface role, double-buffered non-zero unique serial association, commit-time publication, and destruction-safe serial lookup are implemented. Keywork now reserves an X display, launches a rootless compositor-owned Xwayland process with inherited X11, Wayland, XWM, and readiness descriptors, and authorizes only its exact Wayland client. XWM pairing and scene integration remain before X11 windows are usable."
     },
     {
       "id": "xwayland-keyboard-grab",
