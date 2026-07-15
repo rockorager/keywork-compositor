@@ -2329,10 +2329,13 @@ fn routeTouchDown(
         }
     } else if (seat == &self.seat) {
         if (focus) |target| {
-            self.layer_shell.pointerPressed(self.subcompositor.rootSurface(target.surface_id));
+            const root = self.subcompositor.rootSurface(target.surface_id);
+            self.focusXwaylandSurface(root);
+            self.layer_shell.pointerPressed(root);
             requestRepaint(self);
-        } else if (self.xdg_shell.hasPopupGrab()) {
-            self.xdg_shell.dismissPopupGrab();
+        } else {
+            self.focusXwaylandSurface(null);
+            if (self.xdg_shell.hasPopupGrab()) self.xdg_shell.dismissPopupGrab();
         }
     }
     seat.touchDown(time, protocol_id, point.x, point.y, focus) catch {
@@ -2636,6 +2639,7 @@ fn pointerButtonForSeat(
             self.subcompositor.rootSurface(surface_id)
         else
             null;
+        if (seat == &self.seat) self.focusXwaylandSurface(root);
         if (seat == &self.seat) self.layer_shell.pointerPressed(focused);
         requestRepaint(self);
     }
@@ -2736,10 +2740,13 @@ fn touchDown(context: *anyopaque, time: u32, id: i32, x: f64, y: f64) void {
         return;
     }
     if (focus) |target| {
-        self.layer_shell.pointerPressed(self.subcompositor.rootSurface(target.surface_id));
+        const root = self.subcompositor.rootSurface(target.surface_id);
+        self.focusXwaylandSurface(root);
+        self.layer_shell.pointerPressed(root);
         requestRepaint(self);
-    } else if (self.xdg_shell.hasPopupGrab()) {
-        self.xdg_shell.dismissPopupGrab();
+    } else {
+        self.focusXwaylandSurface(null);
+        if (self.xdg_shell.hasPopupGrab()) self.xdg_shell.dismissPopupGrab();
     }
     self.seat.touchDown(time, id, point.x, point.y, focus) catch {
         log.err("failed to store touch point", .{});
@@ -3311,6 +3318,43 @@ fn configureXwaylandSceneWindow(
 fn removeXwaylandWindow(self: *Self, window_id: Xwm.WindowId) void {
     const removed = self.xwayland_windows.fetchRemove(window_id) orelse return;
     self.scene.removeWindow(removed.value.scene_id);
+}
+
+fn focusXwaylandSurface(self: *Self, root: ?Surface.Id) void {
+    var target: ?Xwm.WindowId = null;
+    if (root) |surface_id| {
+        var windows = self.xwayland_windows.iterator();
+        while (windows.next()) |entry| {
+            if (!std.meta.eql(entry.value_ptr.surface_id, surface_id)) continue;
+            const info = self.xwm.windowInfo(entry.key_ptr.*) orelse break;
+            if (info.override_redirect) return;
+            target = entry.key_ptr.*;
+            break;
+        }
+    }
+
+    var windows = self.xwayland_windows.iterator();
+    while (windows.next()) |entry| {
+        const focused = target != null and entry.key_ptr.* == target.?;
+        self.scene.setFocused(entry.value_ptr.scene_id, focused);
+        if (focused) self.scene.placeTop(entry.value_ptr.scene_id);
+    }
+    self.refreshKeyboardFocus();
+}
+
+fn syncXwaylandFocus(self: *Self, surface_id: ?Surface.Id) void {
+    if (!self.xwm_initialized) return;
+    const target: ?Xwm.WindowId = if (surface_id) |surface| target: {
+        var windows = self.xwayland_windows.iterator();
+        while (windows.next()) |entry| {
+            if (std.meta.eql(entry.value_ptr.surface_id, surface)) break :target entry.key_ptr.*;
+        }
+        break :target null;
+    } else null;
+    self.xwm.focusWindow(target) catch {
+        log.err("failed to update X11 input focus", .{});
+        self.terminate();
+    };
 }
 
 fn captureImage(
@@ -3952,6 +3996,7 @@ fn refreshKeyboardFocus(self: *Self) void {
     if (self.session_lock.isLocked()) {
         const focus = self.session_lock.keyboardFocus();
         self.seat.setKeyboardFocus(focus);
+        self.syncXwaylandFocus(null);
         for (self.dynamic_seats.items) |entry| {
             if (!entry.removed) entry.seat.setKeyboardFocus(focus);
         }
@@ -3965,6 +4010,7 @@ fn refreshKeyboardFocus(self: *Self) void {
     else
         null;
     self.seat.setKeyboardFocus(default_focus);
+    self.syncXwaylandFocus(default_focus);
     for (self.dynamic_seats.items) |entry| {
         if (entry.removed) continue;
         const focus = self.window_manager.focusedSurfaceForSeat(&entry.seat) orelse if (!self.window_manager.hasActiveManager())

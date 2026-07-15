@@ -10,6 +10,7 @@ const c = @cImport({
     @cInclude("stdlib.h");
     @cInclude("xcb/xcb.h");
     @cInclude("xcb/composite.h");
+    @cInclude("xcb/xcb_icccm.h");
 });
 const wl = wayland.server.wl;
 const log = std.log.scoped(.xwm);
@@ -22,6 +23,7 @@ wm_window: c.xcb_window_t,
 atoms: [atom_count]c.xcb_atom_t,
 windows: std.AutoHashMapUnmanaged(WindowId, Window),
 serial_windows: std.AutoHashMapUnmanaged(u64, WindowId),
+focused_window: ?WindowId,
 listener: Listener,
 
 pub const WindowId = u32;
@@ -55,7 +57,10 @@ const Atom = enum {
     net_supported,
     net_supporting_wm_check,
     net_wm_name,
+    net_active_window,
     utf8_string,
+    wm_protocols,
+    wm_take_focus,
     wl_surface_serial,
 };
 
@@ -66,7 +71,10 @@ const atom_names: [atom_count][]const u8 = .{
     "_NET_SUPPORTED",
     "_NET_SUPPORTING_WM_CHECK",
     "_NET_WM_NAME",
+    "_NET_ACTIVE_WINDOW",
     "UTF8_STRING",
+    "WM_PROTOCOLS",
+    "WM_TAKE_FOCUS",
     "WL_SURFACE_SERIAL",
 };
 
@@ -111,6 +119,7 @@ pub fn init(
         .atoms = undefined,
         .windows = .empty,
         .serial_windows = .empty,
+        .focused_window = null,
         .listener = listener,
     };
 
@@ -198,6 +207,9 @@ pub fn removeSurfaceAssociation(
     const window = self.windows.getPtr(window_id) orelse return;
     if (window.surface_id) |current| {
         if (!std.meta.eql(current, surface_id)) return;
+        if (self.focused_window == window_id) {
+            self.focusWindow(null) catch log.err("failed to clear X11 input focus", .{});
+        }
         self.listener.dissociated(self.listener.context, window_id, current);
     }
     std.debug.assert(self.serial_windows.remove(serial));
@@ -213,6 +225,49 @@ pub fn windowInfo(self: *const Self, window_id: WindowId) ?WindowInfo {
 
 pub fn windowForSerial(self: *const Self, serial: u64) ?WindowId {
     return self.serial_windows.get(serial);
+}
+
+pub fn focusWindow(self: *Self, requested_window: ?WindowId) error{XcbFlushFailed}!void {
+    const window_id = if (requested_window) |id| focus: {
+        const window = self.windows.get(id) orelse break :focus null;
+        if (!window.mapped or window.override_redirect) break :focus null;
+        break :focus id;
+    } else null;
+    if (self.focused_window == window_id) return;
+
+    self.focused_window = window_id;
+    const active_window = window_id orelse c.XCB_WINDOW_NONE;
+    _ = c.xcb_change_property(
+        self.connection,
+        c.XCB_PROP_MODE_REPLACE,
+        self.screen.root,
+        self.atomValue(.net_active_window),
+        c.XCB_ATOM_WINDOW,
+        32,
+        1,
+        &active_window,
+    );
+
+    if (window_id) |id| {
+        const model = self.readInputModel(id);
+        if (model.take_focus) self.sendTakeFocus(id);
+        if (model.accepts_input) {
+            _ = c.xcb_set_input_focus(
+                self.connection,
+                c.XCB_INPUT_FOCUS_POINTER_ROOT,
+                id,
+                c.XCB_CURRENT_TIME,
+            );
+        }
+    } else {
+        _ = c.xcb_set_input_focus(
+            self.connection,
+            c.XCB_INPUT_FOCUS_POINTER_ROOT,
+            c.XCB_NONE,
+            c.XCB_CURRENT_TIME,
+        );
+    }
+    if (c.xcb_flush(self.connection) <= 0) return error.XcbFlushFailed;
 }
 
 fn resolveAtoms(self: *Self) !void {
@@ -295,6 +350,7 @@ fn publishWmIdentity(self: *Self) !void {
     const supported = [_]c.xcb_atom_t{
         self.atomValue(.net_supporting_wm_check),
         self.atomValue(.net_wm_name),
+        self.atomValue(.net_active_window),
     };
     try checkRequest(self.connection, c.xcb_change_property_checked(
         self.connection,
@@ -306,6 +362,73 @@ fn publishWmIdentity(self: *Self) !void {
         supported.len,
         &supported,
     ));
+    const active_window = c.XCB_WINDOW_NONE;
+    try checkRequest(self.connection, c.xcb_change_property_checked(
+        self.connection,
+        c.XCB_PROP_MODE_REPLACE,
+        self.screen.root,
+        self.atomValue(.net_active_window),
+        c.XCB_ATOM_WINDOW,
+        32,
+        1,
+        &active_window,
+    ));
+}
+
+const InputModel = struct {
+    accepts_input: bool = true,
+    take_focus: bool = false,
+};
+
+fn readInputModel(self: *Self, window_id: WindowId) InputModel {
+    var model: InputModel = .{};
+    var hints = std.mem.zeroes(c.xcb_icccm_wm_hints_t);
+    if (c.xcb_icccm_get_wm_hints_reply(
+        self.connection,
+        c.xcb_icccm_get_wm_hints(self.connection, window_id),
+        &hints,
+        null,
+    ) != 0 and hints.flags & c.XCB_ICCCM_WM_HINT_INPUT != 0) {
+        model.accepts_input = hints.input != 0;
+    }
+
+    var protocols = std.mem.zeroes(c.xcb_icccm_get_wm_protocols_reply_t);
+    if (c.xcb_icccm_get_wm_protocols_reply(
+        self.connection,
+        c.xcb_icccm_get_wm_protocols(
+            self.connection,
+            window_id,
+            self.atomValue(.wm_protocols),
+        ),
+        &protocols,
+        null,
+    ) != 0) {
+        defer c.xcb_icccm_get_wm_protocols_reply_wipe(&protocols);
+        for (protocols.atoms[0..protocols.atoms_len]) |protocol| {
+            if (protocol == self.atomValue(.wm_take_focus)) {
+                model.take_focus = true;
+                break;
+            }
+        }
+    }
+    return model;
+}
+
+fn sendTakeFocus(self: *Self, window_id: WindowId) void {
+    var event = std.mem.zeroes(c.xcb_client_message_event_t);
+    event.response_type = c.XCB_CLIENT_MESSAGE;
+    event.format = 32;
+    event.window = window_id;
+    event.type = self.atomValue(.wm_protocols);
+    event.data.data32[0] = self.atomValue(.wm_take_focus);
+    event.data.data32[1] = c.XCB_CURRENT_TIME;
+    _ = c.xcb_send_event(
+        self.connection,
+        0,
+        window_id,
+        c.XCB_EVENT_MASK_NO_EVENT,
+        @ptrCast(&event),
+    );
 }
 
 fn setWindowProperty(
@@ -374,20 +497,22 @@ fn handleEvents(_: std.posix.fd_t, mask: wl.EventMask, self: *Self) c_int {
         self.listener.failed(self.listener.context);
         return 0;
     }
-    if (mask.readable) {
-        while (c.xcb_poll_for_event(self.connection)) |event| {
-            if (event.*.response_type & 0x7f == 0) {
-                logX11Error("event", @ptrCast(event));
-            } else {
-                self.dispatchEvent(event) catch |err| {
-                    log.err("failed to process X11 event: {t}", .{err});
-                    std.c.free(event);
-                    self.listener.failed(self.listener.context);
-                    return 0;
-                };
-            }
-            std.c.free(event);
+    var processed = false;
+    while (c.xcb_poll_for_event(self.connection)) |event| {
+        processed = true;
+        if (event.*.response_type & 0x7f == 0) {
+            logX11Error("event", @ptrCast(event));
+        } else {
+            self.dispatchEvent(event) catch |err| {
+                log.err("failed to process X11 event: {t}", .{err});
+                std.c.free(event);
+                self.listener.failed(self.listener.context);
+                return 0;
+            };
         }
+        std.c.free(event);
+    }
+    if (processed) {
         if (c.xcb_flush(self.connection) <= 0) {
             self.listener.failed(self.listener.context);
             return 0;
@@ -397,7 +522,7 @@ fn handleEvents(_: std.posix.fd_t, mask: wl.EventMask, self: *Self) c_int {
         self.listener.failed(self.listener.context);
         return 0;
     }
-    return 0;
+    return @intFromBool(processed);
 }
 
 fn dispatchEvent(self: *Self, event: [*c]c.xcb_generic_event_t) !void {
@@ -434,6 +559,9 @@ fn handleDestroy(self: *Self, event: *const c.xcb_destroy_notify_event_t) void {
 }
 
 fn removeWindow(self: *Self, window_id: WindowId) void {
+    if (self.focused_window == window_id) {
+        self.focusWindow(null) catch log.err("failed to clear X11 input focus", .{});
+    }
     const removed = self.windows.fetchRemove(window_id) orelse return;
     if (removed.value.serial) |serial|
         std.debug.assert(self.serial_windows.remove(serial));
@@ -452,6 +580,9 @@ fn handleMapNotify(self: *Self, event: *const c.xcb_map_notify_event_t) void {
     const override_redirect = event.override_redirect != 0;
     if (window.override_redirect != override_redirect) {
         window.override_redirect = override_redirect;
+        if (override_redirect and self.focused_window == event.window) {
+            self.focusWindow(null) catch log.err("failed to clear X11 input focus", .{});
+        }
         self.listener.configured(
             self.listener.context,
             event.window,
@@ -466,6 +597,9 @@ fn handleMapNotify(self: *Self, event: *const c.xcb_map_notify_event_t) void {
 
 fn handleUnmapNotify(self: *Self, event: *const c.xcb_unmap_notify_event_t) void {
     const window = self.windows.getPtr(event.window) orelse return;
+    if (self.focused_window == event.window) {
+        self.focusWindow(null) catch log.err("failed to clear X11 input focus", .{});
+    }
     if (window.surface_id) |surface_id|
         self.listener.dissociated(self.listener.context, event.window, surface_id);
     if (window.serial) |serial|
@@ -524,6 +658,9 @@ fn handleConfigureNotify(
         window.override_redirect == override_redirect) return;
     window.geometry = geometry;
     window.override_redirect = override_redirect;
+    if (override_redirect and self.focused_window == event.window) {
+        self.focusWindow(null) catch log.err("failed to clear X11 input focus", .{});
+    }
     self.listener.configured(
         self.listener.context,
         event.window,

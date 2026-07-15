@@ -130,6 +130,7 @@ pub fn build(b: *std.Build) void {
     root_module.linkSystemLibrary("xkbcommon", .{});
     root_module.linkSystemLibrary("xcb", .{});
     root_module.linkSystemLibrary("xcb-composite", .{});
+    root_module.linkSystemLibrary("xcb-icccm", .{});
 
     const exe = b.addExecutable(.{
         .name = "keywork_compositor",
