@@ -34,6 +34,7 @@ pub fn build(b: *std.Build) void {
     scanner.addSystemProtocol("unstable/xdg-foreign/xdg-foreign-unstable-v2.xml");
     scanner.addSystemProtocol("unstable/xdg-output/xdg-output-unstable-v1.xml");
     scanner.addCustomProtocol(b.path("protocol/input-method-unstable-v2.xml"));
+    scanner.addCustomProtocol(b.path("protocol/wlr-data-control-unstable-v1.xml"));
     scanner.addCustomProtocol(b.path("protocol/wlr-output-management-unstable-v1.xml"));
     scanner.addCustomProtocol(river.path("protocol/upstream/virtual-keyboard-unstable-v1.xml"));
     scanner.addCustomProtocol(river.path("protocol/upstream/wlr-layer-shell-unstable-v1.xml"));
@@ -77,6 +78,7 @@ pub fn build(b: *std.Build) void {
     scanner.generate("zxdg_output_manager_v1", 3);
     scanner.generate("zwp_input_method_manager_v2", 1);
     scanner.generate("zwp_virtual_keyboard_manager_v1", 1);
+    scanner.generate("zwlr_data_control_manager_v1", 2);
     scanner.generate("zwlr_output_manager_v1", 4);
     scanner.generate("zwlr_layer_shell_v1", 5);
     scanner.generate("zwlr_output_power_manager_v1", 1);

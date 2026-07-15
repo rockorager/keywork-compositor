@@ -12,9 +12,11 @@ const SelectionSource = @import("selection_source.zig").Source;
 
 const wl = wayland.server.wl;
 const ext = wayland.server.ext;
+const zwlr = wayland.server.zwlr;
 
 allocator: std.mem.Allocator,
-global: *wl.Global,
+ext_global: *wl.Global,
+wlr_global: *wl.Global,
 security_context: *SecurityContext,
 seats: std.ArrayList(*SeatState),
 sources: std.ArrayList(*Source),
@@ -63,7 +65,7 @@ const SeatState = struct {
     }
 
     fn broadcast(self: *SeatState, kind: Kind) void {
-        for (self.devices.items) |device| device.sendSelection(kind) catch device.resource.postNoMemory();
+        for (self.devices.items) |device| device.sendSelection(kind) catch device.postNoMemory();
     }
 
     fn hasSelection(self: *SeatState, kind: Kind) bool {
@@ -110,7 +112,7 @@ const SeatState = struct {
         for (self.devices.items) |device| {
             for (device.offers.items) |offer| {
                 if (offer.kind == kind and offer.generation == current_generation) {
-                    offer.resource.sendOffer(mime_type);
+                    offer.sendOffer(mime_type);
                 }
             }
         }
@@ -119,15 +121,32 @@ const SeatState = struct {
 
 const Source = struct {
     manager: *Self,
-    resource: *ext.DataControlSourceV1,
+    resource: Resource,
     mime_types: std.ArrayList([:0]u8) = .empty,
     used: bool = false,
     cancelled: bool = false,
     callbacks: SelectionSource,
 
-    fn create(manager: *Self, client: *wl.Client, version: u32, id: u32) !void {
+    const Resource = union(enum) {
+        ext: *ext.DataControlSourceV1,
+        wlr: *zwlr.DataControlSourceV1,
+    };
+
+    fn createExt(manager: *Self, client: *wl.Client, version: u32, id: u32) !void {
         const resource = try ext.DataControlSourceV1.create(client, version, id);
         errdefer resource.destroy();
+        const self = try create(manager, .{ .ext = resource });
+        resource.setHandler(*Source, handleExtRequest, handleExtDestroy, self);
+    }
+
+    fn createWlr(manager: *Self, client: *wl.Client, version: u32, id: u32) !void {
+        const resource = try zwlr.DataControlSourceV1.create(client, @min(version, 1), id);
+        errdefer resource.destroy();
+        const self = try create(manager, .{ .wlr = resource });
+        resource.setHandler(*Source, handleWlrRequest, handleWlrDestroy, self);
+    }
+
+    fn create(manager: *Self, resource: Resource) !*Source {
         const self = try manager.allocator.create(Source);
         errdefer manager.allocator.destroy(self);
         self.* = .{
@@ -136,7 +155,7 @@ const Source = struct {
             .callbacks = .{ .context = self, .mime_types = callbackMimes, .send = callbackSend, .cancel = callbackCancel },
         };
         try manager.sources.append(manager.allocator, self);
-        resource.setHandler(*Source, handleRequest, handleDestroy, self);
+        return self;
     }
 
     fn callbackMimes(context: *anyopaque) []const [:0]const u8 {
@@ -146,36 +165,86 @@ const Source = struct {
 
     fn callbackSend(context: *anyopaque, mime_type: [*:0]const u8, fd: std.posix.fd_t) void {
         const self: *Source = @ptrCast(@alignCast(context));
-        self.resource.sendSend(mime_type, fd);
+        switch (self.resource) {
+            .ext => |resource| resource.sendSend(mime_type, fd),
+            .wlr => |resource| resource.sendSend(mime_type, fd),
+        }
     }
 
     fn callbackCancel(context: *anyopaque) void {
         const self: *Source = @ptrCast(@alignCast(context));
         if (self.cancelled) return;
         self.cancelled = true;
-        self.resource.sendCancelled();
+        switch (self.resource) {
+            .ext => |resource| resource.sendCancelled(),
+            .wlr => |resource| resource.sendCancelled(),
+        }
     }
 
-    fn handleRequest(resource: *ext.DataControlSourceV1, request: ext.DataControlSourceV1.Request, self: *Source) void {
+    fn handleExtRequest(
+        resource: *ext.DataControlSourceV1,
+        request: ext.DataControlSourceV1.Request,
+        self: *Source,
+    ) void {
         switch (request) {
-            .offer => |offer| {
-                if (self.used) {
-                    resource.postError(.invalid_offer, "cannot add a MIME type after using the source");
-                    return;
-                }
-                const value = std.mem.span(offer.mime_type);
-                for (self.mime_types.items) |existing| if (std.mem.eql(u8, existing, value)) return;
-                const copy = self.manager.allocator.dupeZ(u8, value) catch return resource.postNoMemory();
-                self.mime_types.append(self.manager.allocator, copy) catch {
-                    self.manager.allocator.free(copy);
-                    resource.postNoMemory();
-                };
-            },
+            .offer => |request_offer| self.offer(request_offer.mime_type),
             .destroy => resource.destroy(),
         }
     }
 
-    fn handleDestroy(_: *ext.DataControlSourceV1, self: *Source) void {
+    fn handleWlrRequest(
+        resource: *zwlr.DataControlSourceV1,
+        request: zwlr.DataControlSourceV1.Request,
+        self: *Source,
+    ) void {
+        switch (request) {
+            .offer => |request_offer| self.offer(request_offer.mime_type),
+            .destroy => resource.destroy(),
+        }
+    }
+
+    fn offer(self: *Source, mime_type: [*:0]const u8) void {
+        if (self.used) {
+            switch (self.resource) {
+                .ext => |resource| resource.postError(
+                    .invalid_offer,
+                    "cannot add a MIME type after using the source",
+                ),
+                .wlr => |resource| resource.postError(
+                    .invalid_offer,
+                    "cannot add a MIME type after using the source",
+                ),
+            }
+            return;
+        }
+        const value = std.mem.span(mime_type);
+        for (self.mime_types.items) |existing| if (std.mem.eql(u8, existing, value)) return;
+        const copy = self.manager.allocator.dupeZ(u8, value) catch {
+            self.postNoMemory();
+            return;
+        };
+        self.mime_types.append(self.manager.allocator, copy) catch {
+            self.manager.allocator.free(copy);
+            self.postNoMemory();
+        };
+    }
+
+    fn postNoMemory(self: *Source) void {
+        switch (self.resource) {
+            .ext => |resource| resource.postNoMemory(),
+            .wlr => |resource| resource.postNoMemory(),
+        }
+    }
+
+    fn handleExtDestroy(_: *ext.DataControlSourceV1, self: *Source) void {
+        self.destroy();
+    }
+
+    fn handleWlrDestroy(_: *zwlr.DataControlSourceV1, self: *Source) void {
+        self.destroy();
+    }
+
+    fn destroy(self: *Source) void {
         for (self.manager.seats.items) |seat| {
             if (seat.data_device) |data_device| {
                 data_device.externalSourceDestroyed(&self.callbacks);
@@ -197,67 +266,177 @@ const Source = struct {
 
 const Device = struct {
     state: *SeatState,
-    resource: *ext.DataControlDeviceV1,
+    resource: Resource,
     offers: std.ArrayList(*Offer) = .empty,
 
-    fn create(state: *SeatState, client: *wl.Client, version: u32, id: u32) !void {
-        const resource = try ext.DataControlDeviceV1.create(client, version, id);
+    const Resource = union(enum) {
+        ext: *ext.DataControlDeviceV1,
+        wlr: *zwlr.DataControlDeviceV1,
+    };
+
+    fn createExt(state: *SeatState, wayland_client: *wl.Client, bound_version: u32, id: u32) !void {
+        const resource = try ext.DataControlDeviceV1.create(wayland_client, bound_version, id);
         errdefer resource.destroy();
+        const self = try create(state, .{ .ext = resource });
+        resource.setHandler(*Device, handleExtRequest, handleExtDestroy, self);
+        self.sendInitial();
+    }
+
+    fn createWlr(state: *SeatState, wayland_client: *wl.Client, bound_version: u32, id: u32) !void {
+        const resource = try zwlr.DataControlDeviceV1.create(wayland_client, bound_version, id);
+        errdefer resource.destroy();
+        const self = try create(state, .{ .wlr = resource });
+        resource.setHandler(*Device, handleWlrRequest, handleWlrDestroy, self);
+        self.sendInitial();
+    }
+
+    fn create(state: *SeatState, resource: Resource) !*Device {
         const self = try state.manager.allocator.create(Device);
         errdefer state.manager.allocator.destroy(self);
         self.* = .{ .state = state, .resource = resource };
         try state.devices.append(state.manager.allocator, self);
-        resource.setHandler(*Device, handleRequest, handleDestroy, self);
-        self.sendSelection(.regular) catch {
-            resource.postNoMemory();
-            return;
-        };
-        self.sendSelection(.primary) catch resource.postNoMemory();
+        return self;
     }
 
-    fn set(self: *Device, resource: *ext.DataControlDeviceV1, kind: Kind, source_resource: ?*ext.DataControlSourceV1) void {
+    fn sendInitial(self: *Device) void {
+        self.sendSelection(.regular) catch {
+            self.postNoMemory();
+            return;
+        };
+        if (self.supportsPrimary()) self.sendSelection(.primary) catch self.postNoMemory();
+    }
+
+    fn set(self: *Device, kind: Kind, source: ?*Source) void {
         if (self.state.removed) return;
-        const source = if (source_resource) |candidate| blk: {
-            var found: ?*Source = null;
-            for (self.state.manager.sources.items) |item| if (item.resource == candidate) {
-                found = item;
-                break;
-            };
-            break :blk found orelse return;
-        } else null;
         if (source) |value| {
-            if (value.used) return resource.postError(.used_source, "data-control source was already used");
+            if (value.used) {
+                self.postUsedSource();
+                return;
+            }
             value.used = true;
         }
         self.state.replace(kind, source, true);
     }
 
-    fn handleRequest(resource: *ext.DataControlDeviceV1, request: ext.DataControlDeviceV1.Request, self: *Device) void {
+    fn handleExtRequest(
+        resource: *ext.DataControlDeviceV1,
+        request: ext.DataControlDeviceV1.Request,
+        self: *Device,
+    ) void {
         switch (request) {
-            .set_selection => |request_set| self.set(resource, .regular, request_set.source),
-            .set_primary_selection => |request_set| self.set(resource, .primary, request_set.source),
+            .set_selection => |request_set| self.set(.regular, extSource(request_set.source)),
+            .set_primary_selection => |request_set| self.set(
+                .primary,
+                extSource(request_set.source),
+            ),
+            .destroy => resource.destroy(),
+        }
+    }
+
+    fn handleWlrRequest(
+        resource: *zwlr.DataControlDeviceV1,
+        request: zwlr.DataControlDeviceV1.Request,
+        self: *Device,
+    ) void {
+        switch (request) {
+            .set_selection => |request_set| self.set(.regular, wlrSource(request_set.source)),
+            .set_primary_selection => |request_set| self.set(
+                .primary,
+                wlrSource(request_set.source),
+            ),
             .destroy => resource.destroy(),
         }
     }
 
     fn sendSelection(self: *Device, kind: Kind) !void {
+        if (kind == .primary and !self.supportsPrimary()) return;
         if (!self.state.hasSelection(kind)) {
-            switch (kind) {
-                .regular => self.resource.sendSelection(null),
-                .primary => self.resource.sendPrimarySelection(null),
-            }
+            self.sendSelectionEvent(kind, null);
             return;
         }
         const offer = try Offer.create(self, kind, self.state.generation(kind));
-        self.resource.sendDataOffer(offer.resource);
-        for (self.state.mimeTypes(kind)) |mime_type| offer.resource.sendOffer(mime_type.ptr);
-        switch (kind) {
-            .regular => self.resource.sendSelection(offer.resource),
-            .primary => self.resource.sendPrimarySelection(offer.resource),
+        self.sendDataOffer(offer);
+        for (self.state.mimeTypes(kind)) |mime_type| offer.sendOffer(mime_type.ptr);
+        self.sendSelectionEvent(kind, offer);
+    }
+
+    fn supportsPrimary(self: *const Device) bool {
+        return switch (self.resource) {
+            .ext => true,
+            .wlr => |resource| resource.getVersion() >= 2,
+        };
+    }
+
+    fn postNoMemory(self: *Device) void {
+        switch (self.resource) {
+            .ext => |resource| resource.postNoMemory(),
+            .wlr => |resource| resource.postNoMemory(),
         }
     }
 
-    fn handleDestroy(_: *ext.DataControlDeviceV1, self: *Device) void {
+    fn postUsedSource(self: *Device) void {
+        switch (self.resource) {
+            .ext => |resource| resource.postError(
+                .used_source,
+                "data-control source was already used",
+            ),
+            .wlr => |resource| resource.postError(
+                .used_source,
+                "data-control source was already used",
+            ),
+        }
+    }
+
+    fn sendDataOffer(self: *Device, offer: *Offer) void {
+        switch (self.resource) {
+            .ext => |resource| resource.sendDataOffer(offer.resource.ext),
+            .wlr => |resource| resource.sendDataOffer(offer.resource.wlr),
+        }
+    }
+
+    fn sendSelectionEvent(self: *Device, kind: Kind, offer: ?*Offer) void {
+        switch (self.resource) {
+            .ext => |resource| switch (kind) {
+                .regular => resource.sendSelection(if (offer) |value| value.resource.ext else null),
+                .primary => resource.sendPrimarySelection(if (offer) |value| value.resource.ext else null),
+            },
+            .wlr => |resource| switch (kind) {
+                .regular => resource.sendSelection(if (offer) |value| value.resource.wlr else null),
+                .primary => resource.sendPrimarySelection(if (offer) |value| value.resource.wlr else null),
+            },
+        }
+    }
+
+    fn sendFinished(self: *Device) void {
+        switch (self.resource) {
+            .ext => |resource| resource.sendFinished(),
+            .wlr => |resource| resource.sendFinished(),
+        }
+    }
+
+    fn client(self: *const Device) *wl.Client {
+        return switch (self.resource) {
+            .ext => |resource| resource.getClient(),
+            .wlr => |resource| resource.getClient(),
+        };
+    }
+
+    fn version(self: *const Device) u32 {
+        return switch (self.resource) {
+            .ext => |resource| resource.getVersion(),
+            .wlr => |resource| resource.getVersion(),
+        };
+    }
+
+    fn handleExtDestroy(_: *ext.DataControlDeviceV1, self: *Device) void {
+        self.destroy();
+    }
+
+    fn handleWlrDestroy(_: *zwlr.DataControlDeviceV1, self: *Device) void {
+        self.destroy();
+    }
+
+    fn destroy(self: *Device) void {
         for (self.state.devices.items, 0..) |device, index| if (device == self) {
             _ = self.state.devices.swapRemove(index);
             break;
@@ -266,19 +445,50 @@ const Device = struct {
         self.offers.deinit(self.state.manager.allocator);
         self.state.manager.allocator.destroy(self);
     }
+
+    fn extSource(resource: ?*ext.DataControlSourceV1) ?*Source {
+        const source_resource = resource orelse return null;
+        const data = source_resource.getUserData() orelse return null;
+        const source: *Source = @ptrCast(@alignCast(data));
+        return switch (source.resource) {
+            .ext => |candidate| if (candidate == source_resource) source else null,
+            .wlr => null,
+        };
+    }
+
+    fn wlrSource(resource: ?*zwlr.DataControlSourceV1) ?*Source {
+        const source_resource = resource orelse return null;
+        const data = source_resource.getUserData() orelse return null;
+        const source: *Source = @ptrCast(@alignCast(data));
+        return switch (source.resource) {
+            .ext => null,
+            .wlr => |candidate| if (candidate == source_resource) source else null,
+        };
+    }
 };
 
 const Offer = struct {
     manager: *Self,
     device: ?*Device,
     io: std.Io,
-    resource: *ext.DataControlOfferV1,
+    resource: Resource,
     kind: Kind,
     generation: u64,
 
+    const Resource = union(enum) {
+        ext: *ext.DataControlOfferV1,
+        wlr: *zwlr.DataControlOfferV1,
+    };
+
     fn create(device: *Device, kind: Kind, generation: u64) !*Offer {
-        const resource = try ext.DataControlOfferV1.create(device.resource.getClient(), device.resource.getVersion(), 0);
-        errdefer resource.destroy();
+        const resource: Resource = switch (device.resource) {
+            .ext => .{ .ext = try ext.DataControlOfferV1.create(device.client(), device.version(), 0) },
+            .wlr => .{ .wlr = try zwlr.DataControlOfferV1.create(device.client(), 1, 0) },
+        };
+        errdefer switch (resource) {
+            .ext => |value| value.destroy(),
+            .wlr => |value| value.destroy(),
+        };
         const self = try device.state.manager.allocator.create(Offer);
         errdefer device.state.manager.allocator.destroy(self);
         self.* = .{
@@ -290,27 +500,62 @@ const Offer = struct {
             .generation = generation,
         };
         try device.offers.append(device.state.manager.allocator, self);
-        resource.setHandler(*Offer, handleRequest, handleDestroy, self);
+        switch (resource) {
+            .ext => |value| value.setHandler(*Offer, handleExtRequest, handleExtDestroy, self),
+            .wlr => |value| value.setHandler(*Offer, handleWlrRequest, handleWlrDestroy, self),
+        }
         return self;
     }
 
-    fn handleRequest(resource: *ext.DataControlOfferV1, request: ext.DataControlOfferV1.Request, self: *Offer) void {
+    fn handleExtRequest(
+        resource: *ext.DataControlOfferV1,
+        request: ext.DataControlOfferV1.Request,
+        self: *Offer,
+    ) void {
         switch (request) {
-            .receive => |receive| {
-                defer (std.Io.File{
-                    .handle = receive.fd,
-                    .flags = .{ .nonblocking = false },
-                }).close(self.io);
-                const device = self.device orelse return;
-                if (device.state.removed or device.state.generation(self.kind) != self.generation) return;
-                if (!hasMime(device.state.mimeTypes(self.kind), receive.mime_type)) return;
-                device.state.send(self.kind, receive.mime_type, receive.fd);
-            },
+            .receive => |request_receive| self.receive(request_receive.mime_type, request_receive.fd),
             .destroy => resource.destroy(),
         }
     }
 
-    fn handleDestroy(_: *ext.DataControlOfferV1, self: *Offer) void {
+    fn handleWlrRequest(
+        resource: *zwlr.DataControlOfferV1,
+        request: zwlr.DataControlOfferV1.Request,
+        self: *Offer,
+    ) void {
+        switch (request) {
+            .receive => |request_receive| self.receive(request_receive.mime_type, request_receive.fd),
+            .destroy => resource.destroy(),
+        }
+    }
+
+    fn receive(self: *Offer, mime_type: [*:0]const u8, fd: std.posix.fd_t) void {
+        defer (std.Io.File{
+            .handle = fd,
+            .flags = .{ .nonblocking = false },
+        }).close(self.io);
+        const device = self.device orelse return;
+        if (device.state.removed or device.state.generation(self.kind) != self.generation) return;
+        if (!hasMime(device.state.mimeTypes(self.kind), mime_type)) return;
+        device.state.send(self.kind, mime_type, fd);
+    }
+
+    fn sendOffer(self: *Offer, mime_type: [*:0]const u8) void {
+        switch (self.resource) {
+            .ext => |resource| resource.sendOffer(mime_type),
+            .wlr => |resource| resource.sendOffer(mime_type),
+        }
+    }
+
+    fn handleExtDestroy(_: *ext.DataControlOfferV1, self: *Offer) void {
+        self.destroy();
+    }
+
+    fn handleWlrDestroy(_: *zwlr.DataControlOfferV1, self: *Offer) void {
+        self.destroy();
+    }
+
+    fn destroy(self: *Offer) void {
         if (self.device) |device| for (device.offers.items, 0..) |offer, index| if (offer == self) {
             _ = device.offers.swapRemove(index);
             break;
@@ -328,13 +573,31 @@ pub fn init(
     data_device: *DataDevice,
     primary_selection: *PrimarySelection,
 ) !void {
-    self.* = .{ .allocator = allocator, .global = undefined, .security_context = security_context, .seats = .empty, .sources = .empty };
+    self.* = .{
+        .allocator = allocator,
+        .ext_global = undefined,
+        .wlr_global = undefined,
+        .security_context = security_context,
+        .seats = .empty,
+        .sources = .empty,
+    };
     errdefer self.seats.deinit(allocator);
     errdefer self.sources.deinit(allocator);
-    self.global = try wl.Global.create(display, ext.DataControlManagerV1, 1, *Self, self, bind);
-    errdefer self.global.destroy();
-    try security_context.restrictGlobal(self.global);
-    errdefer security_context.unrestrictGlobal(self.global);
+    self.ext_global = try wl.Global.create(display, ext.DataControlManagerV1, 1, *Self, self, bindExt);
+    errdefer self.ext_global.destroy();
+    try security_context.restrictGlobal(self.ext_global);
+    errdefer security_context.unrestrictGlobal(self.ext_global);
+    self.wlr_global = try wl.Global.create(
+        display,
+        zwlr.DataControlManagerV1,
+        2,
+        *Self,
+        self,
+        bindWlr,
+    );
+    errdefer self.wlr_global.destroy();
+    try security_context.restrictGlobal(self.wlr_global);
+    errdefer security_context.unrestrictGlobal(self.wlr_global);
     const state = try self.addSeatState(default_seat);
     state.data_device = data_device;
     state.primary_selection = primary_selection;
@@ -357,8 +620,10 @@ pub fn deinit(self: *Self) void {
             state.primary_selection.?.clearSelectionListener(state);
         }
     }
-    self.security_context.unrestrictGlobal(self.global);
-    self.global.destroy();
+    self.security_context.unrestrictGlobal(self.wlr_global);
+    self.wlr_global.destroy();
+    self.security_context.unrestrictGlobal(self.ext_global);
+    self.ext_global.destroy();
     std.debug.assert(self.sources.items.len == 0);
     for (self.seats.items) |state| {
         std.debug.assert(state.devices.items.len == 0);
@@ -387,33 +652,99 @@ pub fn removeSeat(self: *Self, seat: *Seat) void {
         state.removed = true;
         state.replace(.regular, null, true);
         state.replace(.primary, null, true);
-        for (state.devices.items) |device| device.resource.sendFinished();
+        for (state.devices.items) |device| device.sendFinished();
         return;
     };
 }
 
-fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
+fn bindExt(client: *wl.Client, self: *Self, version: u32, id: u32) void {
     const resource = ext.DataControlManagerV1.create(client, version, id) catch return client.postNoMemory();
-    resource.setHandler(*Self, handleManagerRequest, null, self);
+    resource.setHandler(*Self, handleExtManagerRequest, null, self);
 }
 
-fn handleManagerRequest(resource: *ext.DataControlManagerV1, request: ext.DataControlManagerV1.Request, self: *Self) void {
+fn handleExtManagerRequest(
+    resource: *ext.DataControlManagerV1,
+    request: ext.DataControlManagerV1.Request,
+    self: *Self,
+) void {
     switch (request) {
-        .create_data_source => |create| Source.create(self, resource.getClient(), resource.getVersion(), create.id) catch resource.postNoMemory(),
+        .create_data_source => |create| Source.createExt(
+            self,
+            resource.getClient(),
+            resource.getVersion(),
+            create.id,
+        ) catch resource.postNoMemory(),
         .get_data_device => |get| {
             for (self.seats.items) |state| if (!state.removed and state.seat.ownsResource(get.seat)) {
-                Device.create(state, resource.getClient(), resource.getVersion(), get.id) catch resource.postNoMemory();
+                Device.createExt(
+                    state,
+                    resource.getClient(),
+                    resource.getVersion(),
+                    get.id,
+                ) catch resource.postNoMemory();
                 return;
             };
             const inert = ext.DataControlDeviceV1.create(resource.getClient(), resource.getVersion(), get.id) catch return resource.postNoMemory();
             inert.sendFinished();
-            inert.setHandler(?*anyopaque, inertRequest, null, null);
+            inert.setHandler(?*anyopaque, inertExtRequest, null, null);
         },
         .destroy => resource.destroy(),
     }
 }
 
-fn inertRequest(resource: *ext.DataControlDeviceV1, request: ext.DataControlDeviceV1.Request, _: ?*anyopaque) void {
+fn bindWlr(client: *wl.Client, self: *Self, version: u32, id: u32) void {
+    const resource = zwlr.DataControlManagerV1.create(client, version, id) catch
+        return client.postNoMemory();
+    resource.setHandler(*Self, handleWlrManagerRequest, null, self);
+}
+
+fn handleWlrManagerRequest(
+    resource: *zwlr.DataControlManagerV1,
+    request: zwlr.DataControlManagerV1.Request,
+    self: *Self,
+) void {
+    switch (request) {
+        .create_data_source => |create| Source.createWlr(
+            self,
+            resource.getClient(),
+            resource.getVersion(),
+            create.id,
+        ) catch resource.postNoMemory(),
+        .get_data_device => |get| {
+            for (self.seats.items) |state| if (!state.removed and state.seat.ownsResource(get.seat)) {
+                Device.createWlr(
+                    state,
+                    resource.getClient(),
+                    resource.getVersion(),
+                    get.id,
+                ) catch resource.postNoMemory();
+                return;
+            };
+            const inert = zwlr.DataControlDeviceV1.create(
+                resource.getClient(),
+                resource.getVersion(),
+                get.id,
+            ) catch return resource.postNoMemory();
+            inert.sendFinished();
+            inert.setHandler(?*anyopaque, inertWlrRequest, null, null);
+        },
+        .destroy => resource.destroy(),
+    }
+}
+
+fn inertExtRequest(
+    resource: *ext.DataControlDeviceV1,
+    request: ext.DataControlDeviceV1.Request,
+    _: ?*anyopaque,
+) void {
+    if (request == .destroy) resource.destroy();
+}
+
+fn inertWlrRequest(
+    resource: *zwlr.DataControlDeviceV1,
+    request: zwlr.DataControlDeviceV1.Request,
+    _: ?*anyopaque,
+) void {
     if (request == .destroy) resource.destroy();
 }
 
