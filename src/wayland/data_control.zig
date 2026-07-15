@@ -601,23 +601,25 @@ pub fn init(
     const state = try self.addSeatState(default_seat);
     state.data_device = data_device;
     state.primary_selection = primary_selection;
-    data_device.setSelectionListener(.{
+    try data_device.addSelectionListener(.{
         .context = state,
         .changed = regularSelectionChanged,
         .offered = regularMimeOffered,
     });
-    primary_selection.setSelectionListener(.{
+    errdefer data_device.removeSelectionListener(state);
+    try primary_selection.addSelectionListener(.{
         .context = state,
         .changed = primarySelectionChanged,
         .offered = primaryMimeOffered,
     });
+    errdefer primary_selection.removeSelectionListener(state);
 }
 
 pub fn deinit(self: *Self) void {
     for (self.seats.items) |state| {
         if (state.data_device) |data_device| {
-            data_device.clearSelectionListener(state);
-            state.primary_selection.?.clearSelectionListener(state);
+            data_device.removeSelectionListener(state);
+            state.primary_selection.?.removeSelectionListener(state);
         }
     }
     self.security_context.unrestrictGlobal(self.wlr_global);

@@ -21,7 +21,7 @@ offers: OfferStore,
 selection: ?Selection,
 selection_serial: u32,
 selection_generation: u64,
-selection_listener: ?SelectionListener,
+selection_listeners: std.ArrayList(SelectionListener),
 focused_client: ?*wl.Client,
 
 pub const SelectionListener = struct {
@@ -80,12 +80,13 @@ pub fn init(
         .selection = null,
         .selection_serial = 0,
         .selection_generation = 0,
-        .selection_listener = null,
+        .selection_listeners = .empty,
         .focused_client = null,
     };
     errdefer self.sources.deinit(allocator);
     errdefer self.devices.deinit(allocator);
     errdefer self.offers.deinit(allocator);
+    errdefer self.selection_listeners.deinit(allocator);
     self.global = try wl.Global.create(
         display,
         zwp.PrimarySelectionDeviceManagerV1,
@@ -102,7 +103,7 @@ pub fn init(
 }
 
 pub fn deinit(self: *Self) void {
-    std.debug.assert(self.selection_listener == null);
+    std.debug.assert(self.selection_listeners.items.len == 0);
     self.seat.removeKeyboardFocusListener(self);
     self.global.destroy();
     std.debug.assert(self.sources.len() == 0);
@@ -111,6 +112,7 @@ pub fn deinit(self: *Self) void {
     self.offers.deinit(self.allocator);
     self.devices.deinit(self.allocator);
     self.sources.deinit(self.allocator);
+    self.selection_listeners.deinit(self.allocator);
     self.* = undefined;
 }
 
@@ -244,7 +246,7 @@ const SourceResource = struct {
         }
         if (self.manager.selection) |selection| switch (selection) {
             .local => |source_id| if (std.meta.eql(source_id, self.id)) {
-                if (self.manager.selection_listener) |listener| {
+                for (self.manager.selection_listeners.items) |listener| {
                     listener.offered(listener.context, copy.ptr);
                 }
             },
@@ -439,7 +441,7 @@ fn replaceSelection(
     self.selection_generation +%= 1;
     self.invalidateOffers();
     if (self.focused_client) |client| self.sendSelectionToClient(client);
-    if (self.selection_listener) |listener| listener.changed(listener.context);
+    for (self.selection_listeners.items) |listener| listener.changed(listener.context);
     if (cancel_old) if (old_source) |old| switch (old) {
         .local => |id| if (self.sources.get(id)) |source| {
             source.cancelled = true;
@@ -525,14 +527,20 @@ fn sendSelectionToDevice(
     device.resource.sendSelection(offer);
 }
 
-pub fn setSelectionListener(self: *Self, listener: SelectionListener) void {
-    std.debug.assert(self.selection_listener == null);
-    self.selection_listener = listener;
+pub fn addSelectionListener(self: *Self, listener: SelectionListener) error{OutOfMemory}!void {
+    for (self.selection_listeners.items) |existing| {
+        std.debug.assert(existing.context != listener.context);
+    }
+    try self.selection_listeners.append(self.allocator, listener);
 }
 
-pub fn clearSelectionListener(self: *Self, context: *anyopaque) void {
-    std.debug.assert(self.selection_listener.?.context == context);
-    self.selection_listener = null;
+pub fn removeSelectionListener(self: *Self, context: *anyopaque) void {
+    for (self.selection_listeners.items, 0..) |listener, index| {
+        if (listener.context != context) continue;
+        _ = self.selection_listeners.orderedRemove(index);
+        return;
+    }
+    unreachable;
 }
 
 pub fn selectionGeneration(self: *const Self) u64 {
