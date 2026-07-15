@@ -8,7 +8,9 @@ const Output = @import("output.zig");
 const OutputLayout = @import("output_layout.zig");
 const SecurityContext = @import("security_context.zig");
 const Seat = @import("seat.zig");
+const Surface = @import("surface.zig");
 const XdgShell = @import("xdg_shell.zig");
+const Xwm = @import("../xwayland/xwm.zig");
 
 const wl = wayland.server.wl;
 const ext = wayland.server.ext;
@@ -19,6 +21,7 @@ ext_global: *wl.Global,
 wlr_global: *wl.Global,
 security_context: *SecurityContext,
 xdg_shell: *XdgShell,
+xwayland: XwaylandController,
 outputs: *OutputLayout,
 lists: std.ArrayList(*List),
 mappings: std.ArrayList(*Mapping),
@@ -29,8 +32,27 @@ next_identifier: u64,
 next_wlr_manager_generation: u64,
 
 const Mapping = struct {
-    window_id: XdgShell.WindowId,
+    backend: Backend,
+    surface_id: Surface.Id,
     identifier: [:0]u8,
+
+    const Backend = union(enum) {
+        xdg: XdgShell.WindowId,
+        xwayland: Xwm.WindowId,
+    };
+
+    fn xdgId(self: *const Mapping) ?XdgShell.WindowId {
+        return switch (self.backend) {
+            .xdg => |id| id,
+            .xwayland => null,
+        };
+    }
+};
+
+pub const XwaylandController = struct {
+    context: *anyopaque,
+    window_info: *const fn (*anyopaque, Xwm.WindowId) ?Xwm.WindowInfo,
+    close: *const fn (*anyopaque, Xwm.WindowId) void,
 };
 
 const List = struct {
@@ -110,9 +132,9 @@ const Handle = struct {
         resource.setHandler(*Handle, handleRequest, handleDestroy, self);
         list.resource.sendToplevel(resource);
         resource.sendIdentifier(mapping.identifier.ptr);
-        if (list.manager.xdg_shell.windowInfo(mapping.window_id)) |info| {
-            if (info.title) |title| resource.sendTitle(title.ptr);
-            if (info.app_id) |app_id| resource.sendAppId(app_id.ptr);
+        if (list.manager.mappingMetadata(mapping)) |metadata| {
+            if (metadata.title) |title| resource.sendTitle(title.ptr);
+            if (metadata.app_id) |app_id| resource.sendAppId(app_id.ptr);
         }
         resource.sendDone();
     }
@@ -226,18 +248,17 @@ const WlrHandle = struct {
     fn sendInitialDetails(self: *WlrHandle) !void {
         std.debug.assert(!self.initialized and !self.closed);
         const mapping = self.mapping orelse return;
-        const info = self.owner.xdg_shell.windowInfo(mapping.window_id) orelse return;
-        if (info.title) |title| self.resource.sendTitle(title.ptr);
-        if (info.app_id) |app_id| self.resource.sendAppId(app_id.ptr);
+        const metadata = self.owner.mappingMetadata(mapping) orelse return;
+        if (metadata.title) |title| self.resource.sendTitle(title.ptr);
+        if (metadata.app_id) |app_id| self.resource.sendAppId(app_id.ptr);
         var outputs = self.owner.outputs.iterator();
         while (outputs.next()) |entry| {
-            const surface_id = self.owner.xdg_shell.windowSurface(mapping.window_id) orelse break;
-            if (!entry.output.containsSurface(surface_id)) continue;
+            if (!entry.output.containsSurface(mapping.surface_id)) continue;
             try self.outputs.append(self.owner.allocator, entry.id);
             self.sendOutput(entry.output, true);
         }
-        self.sendState(info.configuration);
-        self.sendParent(info.parent);
+        self.sendState(self.owner.mappingConfiguration(mapping));
+        self.sendParent(self.owner.mappingParent(mapping));
         self.resource.sendDone();
         self.initialized = true;
     }
@@ -252,29 +273,38 @@ const WlrHandle = struct {
             return;
         }
         const mapping = self.mapping orelse return;
-        const window_id = mapping.window_id;
-        switch (request) {
-            .destroy => unreachable,
-            .set_maximized => self.owner.xdg_shell.requestWindow(window_id, .maximize),
-            .unset_maximized => self.owner.xdg_shell.requestWindow(window_id, .unmaximize),
-            .set_minimized => self.owner.xdg_shell.requestWindow(window_id, .minimize),
-            .unset_minimized => self.owner.xdg_shell.requestWindow(window_id, .unminimize),
-            .activate => |activate| self.owner.xdg_shell.requestWindow(
-                window_id,
-                .{ .activate = Seat.fromResource(activate.seat) },
-            ),
-            .close => self.owner.xdg_shell.closeWindow(window_id),
-            .set_rectangle => |rectangle| {
-                if (rectangle.width < 0 or rectangle.height < 0) {
-                    resource.postError(.invalid_rectangle, "rectangle dimensions must not be negative");
-                    return;
-                }
+        switch (mapping.backend) {
+            .xdg => |window_id| switch (request) {
+                .destroy => unreachable,
+                .set_maximized => self.owner.xdg_shell.requestWindow(window_id, .maximize),
+                .unset_maximized => self.owner.xdg_shell.requestWindow(window_id, .unmaximize),
+                .set_minimized => self.owner.xdg_shell.requestWindow(window_id, .minimize),
+                .unset_minimized => self.owner.xdg_shell.requestWindow(window_id, .unminimize),
+                .activate => |activate| self.owner.xdg_shell.requestWindow(
+                    window_id,
+                    .{ .activate = Seat.fromResource(activate.seat) },
+                ),
+                .close => self.owner.xdg_shell.closeWindow(window_id),
+                .set_rectangle => |rectangle| validateRectangle(resource, rectangle.width, rectangle.height),
+                .set_fullscreen => |fullscreen| self.owner.xdg_shell.requestWindow(
+                    window_id,
+                    .{ .fullscreen = fullscreen.output },
+                ),
+                .unset_fullscreen => self.owner.xdg_shell.requestWindow(window_id, .exit_fullscreen),
             },
-            .set_fullscreen => |fullscreen| self.owner.xdg_shell.requestWindow(
-                window_id,
-                .{ .fullscreen = fullscreen.output },
-            ),
-            .unset_fullscreen => self.owner.xdg_shell.requestWindow(window_id, .exit_fullscreen),
+            .xwayland => |window_id| switch (request) {
+                .destroy => unreachable,
+                .close => self.owner.xwayland.close(self.owner.xwayland.context, window_id),
+                .set_rectangle => |rectangle| validateRectangle(resource, rectangle.width, rectangle.height),
+                .set_maximized,
+                .unset_maximized,
+                .set_minimized,
+                .unset_minimized,
+                .activate,
+                .set_fullscreen,
+                .unset_fullscreen,
+                => {},
+            },
         }
     }
 
@@ -319,7 +349,7 @@ const WlrHandle = struct {
     fn sendParent(self: *WlrHandle, parent_id: ?XdgShell.WindowId) void {
         if (self.resource.getVersion() < 3) return;
         if (parent_id) |id| {
-            const mapping = self.owner.mappingFor(id) orelse return;
+            const mapping = self.owner.mappingForXdg(id) orelse return;
             const parent = self.owner.wlrHandleFor(self.binding_generation, mapping) orelse return;
             self.resource.sendParent(parent.resource);
         } else {
@@ -352,12 +382,23 @@ fn appendWlrState(
     count.* += 1;
 }
 
+fn validateRectangle(
+    resource: *zwlr.ForeignToplevelHandleV1,
+    width: i32,
+    height: i32,
+) void {
+    if (width < 0 or height < 0) {
+        resource.postError(.invalid_rectangle, "rectangle dimensions must not be negative");
+    }
+}
+
 pub fn init(
     self: *Self,
     allocator: std.mem.Allocator,
     display: *wl.Server,
     security_context: *SecurityContext,
     xdg_shell: *XdgShell,
+    xwayland: XwaylandController,
     outputs: *OutputLayout,
 ) !void {
     self.* = .{
@@ -366,6 +407,7 @@ pub fn init(
         .wlr_global = undefined,
         .security_context = security_context,
         .xdg_shell = xdg_shell,
+        .xwayland = xwayland,
         .outputs = outputs,
         .lists = .empty,
         .mappings = .empty,
@@ -445,20 +487,24 @@ fn syncMappedWindows(self: *Self) void {
     var windows = self.xdg_shell.windowIterator();
     while (windows.next()) |window_id| {
         const info = self.xdg_shell.windowInfo(window_id) orelse continue;
-        if (!info.mapped or self.mappingFor(window_id) != null) continue;
-        self.addMapping(window_id) catch self.postNoMemory();
+        if (!info.mapped or self.mappingForXdg(window_id) != null) continue;
+        const surface_id = self.xdg_shell.windowSurface(window_id) orelse continue;
+        self.addMapping(.{ .xdg = window_id }, surface_id) catch self.postNoMemory();
     }
 }
 
-fn addMapping(self: *Self, window_id: XdgShell.WindowId) !void {
-    std.debug.assert(self.mappingFor(window_id) == null);
+fn addMapping(self: *Self, backend: Mapping.Backend, surface_id: Surface.Id) !void {
     self.next_identifier = std.math.add(u64, self.next_identifier, 1) catch
         return error.OutOfMemory;
     const identifier = try identifierFor(self.allocator, self.next_identifier);
     errdefer self.allocator.free(identifier);
     const mapping = try self.allocator.create(Mapping);
     errdefer self.allocator.destroy(mapping);
-    mapping.* = .{ .window_id = window_id, .identifier = identifier };
+    mapping.* = .{
+        .backend = backend,
+        .surface_id = surface_id,
+        .identifier = identifier,
+    };
     try self.mappings.append(self.allocator, mapping);
     for (self.lists.items) |list| {
         if (list.stopped) continue;
@@ -471,19 +517,19 @@ fn addMapping(self: *Self, window_id: XdgShell.WindowId) !void {
         if (handle.mapping != mapping or handle.initialized) continue;
         handle.sendInitialDetails() catch handle.resource.postNoMemory();
     }
-    self.syncWlrChildParents(window_id);
+    if (mapping.xdgId()) |window_id| self.syncWlrChildParents(window_id);
 }
 
-fn removeMapping(self: *Self, window_id: XdgShell.WindowId) void {
+fn removeMapping(self: *Self, target: *Mapping) void {
     for (self.mappings.items, 0..) |mapping, index| {
-        if (!std.meta.eql(mapping.window_id, window_id)) continue;
+        if (mapping != target) continue;
         for (self.handles.items) |handle| {
             if (handle.mapping == mapping) handle.close();
         }
         for (self.wlr_handles.items) |handle| {
             if (handle.mapping == mapping) handle.close();
         }
-        self.clearWlrChildParents(window_id);
+        if (mapping.xdgId()) |window_id| self.clearWlrChildParents(window_id);
         _ = self.mappings.swapRemove(index);
         self.destroyMapping(mapping);
         return;
@@ -495,11 +541,51 @@ fn destroyMapping(self: *Self, mapping: *Mapping) void {
     self.allocator.destroy(mapping);
 }
 
-fn mappingFor(self: *Self, window_id: XdgShell.WindowId) ?*Mapping {
+fn mappingForXdg(self: *Self, window_id: XdgShell.WindowId) ?*Mapping {
     for (self.mappings.items) |mapping| {
-        if (std.meta.eql(mapping.window_id, window_id)) return mapping;
+        const candidate = mapping.xdgId() orelse continue;
+        if (std.meta.eql(candidate, window_id)) return mapping;
     }
     return null;
+}
+
+fn mappingForXwayland(self: *Self, window_id: Xwm.WindowId) ?*Mapping {
+    for (self.mappings.items) |mapping| switch (mapping.backend) {
+        .xdg => {},
+        .xwayland => |candidate| if (candidate == window_id) return mapping,
+    };
+    return null;
+}
+
+const MappingMetadata = struct {
+    title: ?[:0]const u8,
+    app_id: ?[:0]const u8,
+};
+
+fn mappingMetadata(self: *Self, mapping: *const Mapping) ?MappingMetadata {
+    return switch (mapping.backend) {
+        .xdg => |window_id| metadata: {
+            const info = self.xdg_shell.windowInfo(window_id) orelse return null;
+            break :metadata .{ .title = info.title, .app_id = info.app_id };
+        },
+        .xwayland => |window_id| metadata: {
+            const info = self.xwayland.window_info(self.xwayland.context, window_id) orelse
+                return null;
+            break :metadata .{ .title = info.title, .app_id = info.app_id };
+        },
+    };
+}
+
+fn mappingConfiguration(self: *Self, mapping: *const Mapping) XdgShell.ToplevelConfigure {
+    const window_id = mapping.xdgId() orelse return .{};
+    const info = self.xdg_shell.windowInfo(window_id) orelse return .{};
+    return info.configuration;
+}
+
+fn mappingParent(self: *Self, mapping: *const Mapping) ?XdgShell.WindowId {
+    const window_id = mapping.xdgId() orelse return null;
+    const info = self.xdg_shell.windowInfo(window_id) orelse return null;
+    return info.parent;
 }
 
 fn handleFor(self: *Self, list: *List, mapping: *Mapping) ?*Handle {
@@ -526,9 +612,8 @@ pub fn syncOutput(self: *Self, output_id: OutputLayout.Id) void {
     for (self.wlr_handles.items) |handle| {
         if (!handle.initialized or handle.closed) continue;
         const mapping = handle.mapping orelse continue;
-        const surface_id = self.xdg_shell.windowSurface(mapping.window_id) orelse continue;
         const current_index = handle.outputIndex(output_id);
-        const visible = output.containsSurface(surface_id);
+        const visible = output.containsSurface(mapping.surface_id);
         if (visible == (current_index != null)) continue;
         if (visible) {
             handle.outputs.append(self.allocator, output_id) catch {
@@ -561,7 +646,7 @@ pub fn windowForExtHandle(
 ) ?XdgShell.WindowId {
     for (self.handles.items) |handle| {
         if (handle.resource != resource or handle.closed) continue;
-        return (handle.mapping orelse return null).window_id;
+        return (handle.mapping orelse return null).xdgId();
     }
     return null;
 }
@@ -570,7 +655,8 @@ fn syncWlrChildParents(self: *Self, parent_id: XdgShell.WindowId) void {
     for (self.wlr_handles.items) |handle| {
         if (!handle.initialized or handle.closed) continue;
         const mapping = handle.mapping orelse continue;
-        const info = self.xdg_shell.windowInfo(mapping.window_id) orelse continue;
+        const window_id = mapping.xdgId() orelse continue;
+        const info = self.xdg_shell.windowInfo(window_id) orelse continue;
         if (info.parent == null or !std.meta.eql(info.parent.?, parent_id)) continue;
         handle.sendParent(info.parent);
         handle.resource.sendDone();
@@ -581,7 +667,8 @@ fn clearWlrChildParents(self: *Self, parent_id: XdgShell.WindowId) void {
     for (self.wlr_handles.items) |handle| {
         if (!handle.initialized or handle.closed or handle.resource.getVersion() < 3) continue;
         const mapping = handle.mapping orelse continue;
-        const info = self.xdg_shell.windowInfo(mapping.window_id) orelse continue;
+        const window_id = mapping.xdgId() orelse continue;
+        const info = self.xdg_shell.windowInfo(window_id) orelse continue;
         if (info.parent == null or !std.meta.eql(info.parent.?, parent_id)) continue;
         handle.resource.sendParent(null);
         handle.resource.sendDone();
@@ -591,48 +678,102 @@ fn clearWlrChildParents(self: *Self, parent_id: XdgShell.WindowId) void {
 fn windowCommitted(context: *anyopaque, window_id: XdgShell.WindowId) void {
     const self: *Self = @ptrCast(@alignCast(context));
     const info = self.xdg_shell.windowInfo(window_id) orelse return;
-    if (!info.mapped or self.mappingFor(window_id) != null) return;
-    self.addMapping(window_id) catch self.postNoMemory();
+    if (!info.mapped or self.mappingForXdg(window_id) != null) return;
+    const surface_id = self.xdg_shell.windowSurface(window_id) orelse return;
+    self.addMapping(.{ .xdg = window_id }, surface_id) catch self.postNoMemory();
 }
 
 fn windowUnmapped(context: *anyopaque, window_id: XdgShell.WindowId) void {
     const self: *Self = @ptrCast(@alignCast(context));
-    self.removeMapping(window_id);
+    self.removeMapping(self.mappingForXdg(window_id) orelse return);
 }
 
 fn windowDestroyed(context: *anyopaque, window_id: XdgShell.WindowId) void {
     const self: *Self = @ptrCast(@alignCast(context));
-    self.removeMapping(window_id);
+    self.removeMapping(self.mappingForXdg(window_id) orelse return);
 }
 
 fn windowMetadataChanged(context: *anyopaque, window_id: XdgShell.WindowId) void {
     const self: *Self = @ptrCast(@alignCast(context));
-    const mapping = self.mappingFor(window_id) orelse return;
-    const info = self.xdg_shell.windowInfo(window_id) orelse return;
+    const mapping = self.mappingForXdg(window_id) orelse return;
+    self.sendMetadata(mapping);
+}
+
+fn sendMetadata(self: *Self, mapping: *Mapping) void {
+    const metadata = self.mappingMetadata(mapping) orelse return;
     for (self.handles.items) |handle| {
         if (handle.mapping != mapping or handle.closed) continue;
-        if (info.title) |title| handle.resource.sendTitle(title.ptr);
-        if (info.app_id) |app_id| handle.resource.sendAppId(app_id.ptr);
+        if (metadata.title) |title| handle.resource.sendTitle(title.ptr);
+        if (metadata.app_id) |app_id| handle.resource.sendAppId(app_id.ptr);
         handle.resource.sendDone();
     }
     for (self.wlr_handles.items) |handle| {
         if (handle.mapping != mapping or !handle.initialized or handle.closed) continue;
-        if (info.title) |title| handle.resource.sendTitle(title.ptr);
-        if (info.app_id) |app_id| handle.resource.sendAppId(app_id.ptr);
-        handle.sendParent(info.parent);
+        handle.resource.sendTitle(if (metadata.title) |title| title.ptr else "");
+        handle.resource.sendAppId(if (metadata.app_id) |app_id| app_id.ptr else "");
+        handle.sendParent(self.mappingParent(mapping));
         handle.resource.sendDone();
     }
 }
 
 fn windowStateChanged(context: *anyopaque, window_id: XdgShell.WindowId) void {
     const self: *Self = @ptrCast(@alignCast(context));
-    const mapping = self.mappingFor(window_id) orelse return;
+    const mapping = self.mappingForXdg(window_id) orelse return;
     const info = self.xdg_shell.windowInfo(window_id) orelse return;
     for (self.wlr_handles.items) |handle| {
         if (handle.mapping != mapping or !handle.initialized or handle.closed) continue;
         handle.sendState(info.configuration);
         handle.resource.sendDone();
     }
+}
+
+pub fn xwaylandWindowAssociated(
+    self: *Self,
+    window_id: Xwm.WindowId,
+    surface_id: Surface.Id,
+) error{OutOfMemory}!void {
+    const info = self.xwayland.window_info(self.xwayland.context, window_id) orelse return;
+    if (!info.mapped or info.override_redirect or self.mappingForXwayland(window_id) != null) return;
+    try self.addMapping(.{ .xwayland = window_id }, surface_id);
+}
+
+pub fn xwaylandWindowDissociated(self: *Self, window_id: Xwm.WindowId) void {
+    self.removeMapping(self.mappingForXwayland(window_id) orelse return);
+}
+
+pub fn xwaylandWindowMapped(
+    self: *Self,
+    window_id: Xwm.WindowId,
+    mapped: bool,
+    surface_id: ?Surface.Id,
+) error{OutOfMemory}!void {
+    if (!mapped) {
+        self.xwaylandWindowDissociated(window_id);
+        return;
+    }
+    if (self.mappingForXwayland(window_id) != null) return;
+    const info = self.xwayland.window_info(self.xwayland.context, window_id) orelse return;
+    if (info.override_redirect) return;
+    try self.addMapping(.{ .xwayland = window_id }, surface_id orelse return);
+}
+
+pub fn xwaylandWindowConfigured(
+    self: *Self,
+    window_id: Xwm.WindowId,
+    override_redirect: bool,
+    surface_id: ?Surface.Id,
+) error{OutOfMemory}!void {
+    if (override_redirect) {
+        self.xwaylandWindowDissociated(window_id);
+        return;
+    }
+    const info = self.xwayland.window_info(self.xwayland.context, window_id) orelse return;
+    if (!info.mapped or self.mappingForXwayland(window_id) != null) return;
+    try self.addMapping(.{ .xwayland = window_id }, surface_id orelse return);
+}
+
+pub fn xwaylandWindowMetadataChanged(self: *Self, window_id: Xwm.WindowId) void {
+    self.sendMetadata(self.mappingForXwayland(window_id) orelse return);
 }
 
 fn identifierFor(allocator: std.mem.Allocator, generation: u64) ![:0]u8 {

@@ -872,7 +872,7 @@
         "security-context",
         "xdg-shell"
       ],
-      "status_detail": "Version 1 advertises every mapped xdg-toplevel with a never-reused opaque identifier, initial and updated title/app-id metadata, atomic done events, unmap/remap and close lifecycles, stopped-list handling, and sandboxed-client global filtering."
+      "status_detail": "Version 1 advertises every mapped xdg-toplevel and managed X11 window with a never-reused opaque identifier, initial and updated title/app-id metadata, atomic done events, unmap/remap and close lifecycles, stopped-list handling, and sandboxed-client global filtering."
     },
     {
       "id": "wlr-foreign-toplevel-management",
@@ -892,7 +892,7 @@
       "blocked_by": [
         "ext-foreign-toplevel-list"
       ],
-      "status_detail": "Deprecated compatibility protocol version 3 shares the ext foreign-toplevel mapping inventory and provides title/app-id, parent, state, output membership, close, activation, maximize, minimize, fullscreen, rectangle validation, stopped-manager teardown, and sandboxed-client global filtering."
+      "status_detail": "Deprecated compatibility protocol version 3 shares the ext foreign-toplevel mapping inventory for xdg-toplevel and managed X11 windows. It provides title/app-id, parent, state, output membership, close, activation, maximize, minimize, fullscreen, rectangle validation, stopped-manager teardown, and sandboxed-client global filtering; X11 controls currently support close and rectangle validation while policy controls remain XDG-only."
     },
     {
       "id": "workspace",

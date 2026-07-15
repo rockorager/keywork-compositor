@@ -632,6 +632,11 @@ pub fn create(
         display,
         &self.security_context,
         &self.xdg_shell,
+        .{
+            .context = self,
+            .window_info = riverXwaylandWindowInfo,
+            .close = riverCloseXwaylandWindow,
+        },
         &self.outputs,
     );
     self.foreign_toplevel_list_initialized = true;
@@ -3260,6 +3265,20 @@ fn xwmWindowMapped(context: *anyopaque, window_id: Xwm.WindowId, mapped: bool) v
     if (self.window_manager_initialized) {
         self.window_manager.xwaylandWindowMapped(window_id, mapped);
     }
+    if (self.foreign_toplevel_list_initialized) {
+        const surface_id = if (self.xwayland_windows.get(window_id)) |window|
+            window.surface_id
+        else
+            null;
+        self.foreign_toplevel_list.xwaylandWindowMapped(
+            window_id,
+            mapped,
+            surface_id,
+        ) catch {
+            log.err("failed to update X11 foreign-toplevel mapping", .{});
+            return self.terminate();
+        };
+    }
     refreshXwaylandSceneWindow(self, window_id);
 }
 
@@ -3275,6 +3294,16 @@ fn xwmWindowConfigured(
     if (self.window_manager_initialized) {
         self.window_manager.xwaylandWindowConfigured(window_id, geometry, override_redirect);
     }
+    if (self.foreign_toplevel_list_initialized) {
+        self.foreign_toplevel_list.xwaylandWindowConfigured(
+            window_id,
+            override_redirect,
+            window.surface_id,
+        ) catch {
+            log.err("failed to update X11 foreign-toplevel configuration", .{});
+            return self.terminate();
+        };
+    }
 }
 
 fn xwmWindowMetadataChanged(context: *anyopaque, window_id: Xwm.WindowId) void {
@@ -3287,6 +3316,9 @@ fn xwmWindowMetadataChanged(context: *anyopaque, window_id: Xwm.WindowId) void {
     });
     if (self.window_manager_initialized) {
         self.window_manager.xwaylandWindowMetadataChanged(window_id);
+    }
+    if (self.foreign_toplevel_list_initialized) {
+        self.foreign_toplevel_list.xwaylandWindowMetadataChanged(window_id);
     }
 }
 
@@ -3326,6 +3358,18 @@ fn xwmWindowAssociated(context: *anyopaque, window_id: Xwm.WindowId, surface_id:
             return;
         };
     }
+    if (self.foreign_toplevel_list_initialized) {
+        self.foreign_toplevel_list.xwaylandWindowAssociated(window_id, surface_id) catch {
+            if (self.window_manager_initialized) {
+                self.window_manager.xwaylandWindowDissociated(window_id);
+            }
+            _ = self.xwayland_windows.remove(window_id);
+            self.scene.removeWindow(scene_id);
+            log.err("failed to expose X11 window {d} through foreign-toplevel", .{window_id});
+            self.terminate();
+            return;
+        };
+    }
     configureXwaylandSceneWindow(self, scene_id, info.geometry);
     refreshXwaylandSceneWindow(self, window_id);
 }
@@ -3334,6 +3378,9 @@ fn xwmWindowDissociated(context: *anyopaque, window_id: Xwm.WindowId, _: Surface
     const self: *Self = @ptrCast(@alignCast(context));
     if (self.window_manager_initialized and self.xwayland_windows.contains(window_id)) {
         self.window_manager.xwaylandWindowDissociated(window_id);
+    }
+    if (self.foreign_toplevel_list_initialized) {
+        self.foreign_toplevel_list.xwaylandWindowDissociated(window_id);
     }
     removeXwaylandWindow(self, window_id);
 }
