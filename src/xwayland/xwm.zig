@@ -302,6 +302,43 @@ pub fn closeWindow(self: *Self, window_id: WindowId) void {
     _ = c.xcb_flush(self.connection);
 }
 
+pub fn resizeWindow(
+    self: *Self,
+    window_id: WindowId,
+    width: u16,
+    height: u16,
+) error{ InvalidWindow, XcbFlushFailed }!void {
+    std.debug.assert(width > 0 and height > 0);
+    const window = self.windows.get(window_id) orelse return error.InvalidWindow;
+    if (window.override_redirect) return error.InvalidWindow;
+    const values = [_]u32{ width, height };
+    _ = c.xcb_configure_window(
+        self.connection,
+        window_id,
+        c.XCB_CONFIG_WINDOW_WIDTH | c.XCB_CONFIG_WINDOW_HEIGHT,
+        &values,
+    );
+    if (c.xcb_flush(self.connection) <= 0) return error.XcbFlushFailed;
+}
+
+pub fn moveWindow(
+    self: *Self,
+    window_id: WindowId,
+    x: i16,
+    y: i16,
+) error{ InvalidWindow, XcbFlushFailed }!void {
+    const window = self.windows.get(window_id) orelse return error.InvalidWindow;
+    if (window.override_redirect) return error.InvalidWindow;
+    const values = [_]u32{ signedValue(x), signedValue(y) };
+    _ = c.xcb_configure_window(
+        self.connection,
+        window_id,
+        c.XCB_CONFIG_WINDOW_X | c.XCB_CONFIG_WINDOW_Y,
+        &values,
+    );
+    if (c.xcb_flush(self.connection) <= 0) return error.XcbFlushFailed;
+}
+
 fn resolveAtoms(self: *Self) !void {
     var cookies: [atom_count]c.xcb_intern_atom_cookie_t = undefined;
     for (atom_names, &cookies) |name, *cookie| {
