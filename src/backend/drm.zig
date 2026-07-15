@@ -330,7 +330,11 @@ pub fn activate(self: *Self, fd: std.posix.fd_t, selection: Selection, device_pa
         self.old_crtc = null;
     }
 
-    if (self.powered) {
+    if (!self.powered) {
+        if (c.drmModeSetCrtc(fd, self.crtc_id, 0, 0, 0, null, 0, null) != 0) {
+            return error.DisableFailed;
+        }
+    } else {
         log.info(
             "allocating scanout buffers for connector {s} at {d}x{d}",
             .{ self.name(), self.size.width, self.size.height },
@@ -453,10 +457,10 @@ pub fn setPowered(self: *Self, fd: std.posix.fd_t, powered: bool) !void {
     if (c.drmModeSetCrtc(fd, self.crtc_id, 0, 0, 0, null, 0, null) != 0) {
         return error.DisableFailed;
     }
-    self.notifyDeactivated();
     self.powered = false;
     self.mode_set = false;
     self.displayed = null;
+    self.notifyDeactivated();
     for (&self.buffers) |*buffer| destroyBuffer(fd, buffer);
 }
 

@@ -35,6 +35,7 @@ pub fn build(b: *std.Build) void {
     scanner.addCustomProtocol(b.path("protocol/wlr-output-management-unstable-v1.xml"));
     scanner.addCustomProtocol(river.path("protocol/upstream/virtual-keyboard-unstable-v1.xml"));
     scanner.addCustomProtocol(river.path("protocol/upstream/wlr-layer-shell-unstable-v1.xml"));
+    scanner.addCustomProtocol(river.path("protocol/upstream/wlr-output-power-management-unstable-v1.xml"));
     scanner.addCustomProtocol(river.path("protocol/river-window-management-v1.xml"));
     scanner.addCustomProtocol(river.path("protocol/river-layer-shell-v1.xml"));
     scanner.addCustomProtocol(river.path("protocol/river-input-management-v1.xml"));
@@ -74,6 +75,7 @@ pub fn build(b: *std.Build) void {
     scanner.generate("zwp_virtual_keyboard_manager_v1", 1);
     scanner.generate("zwlr_output_manager_v1", 4);
     scanner.generate("zwlr_layer_shell_v1", 5);
+    scanner.generate("zwlr_output_power_manager_v1", 1);
     scanner.generate("river_window_manager_v1", 5);
     scanner.generate("river_layer_shell_v1", 1);
     scanner.generate("river_input_manager_v1", 2);

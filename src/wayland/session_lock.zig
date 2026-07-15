@@ -26,6 +26,7 @@ listener: Listener,
 pub const Listener = struct {
     context: *anyopaque,
     state_changed: *const fn (*anyopaque, bool) void,
+    output_secure_without_frame: *const fn (*anyopaque, OutputLayout.Id) bool,
     repaint: *const fn (*anyopaque) void,
 };
 
@@ -178,6 +179,10 @@ pub fn refreshOutputs(self: *Self) void {
     }
 }
 
+pub fn refreshSecurity(self: *Self) void {
+    self.finishLockIfSecure();
+}
+
 fn finishLockIfSecure(self: *Self) void {
     const lock = self.active_lock orelse return;
     if (!self.session_locked or lock.outcome != .pending) return;
@@ -185,7 +190,11 @@ fn finishLockIfSecure(self: *Self) void {
     var outputs = self.outputs.iterator();
     while (outputs.next()) |entry| {
         output_count += 1;
-        if (!self.secured_outputs.contains(entry.id)) return;
+        if (!self.secured_outputs.contains(entry.id) and
+            !self.listener.output_secure_without_frame(self.listener.context, entry.id))
+        {
+            return;
+        }
     }
     if (output_count == 0) return;
     lock.outcome = .locked;
@@ -261,6 +270,7 @@ const Lock = struct {
             manager.listener.state_changed(manager.listener.context, true);
         }
         manager.requestRepaint();
+        manager.finishLockIfSecure();
     }
 
     fn handleRequest(

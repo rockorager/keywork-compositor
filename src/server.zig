@@ -35,6 +35,7 @@ const XdgActivation = @import("wayland/xdg_activation.zig");
 const Output = @import("wayland/output.zig");
 const OutputLayout = @import("wayland/output_layout.zig");
 const OutputManagement = @import("wayland/output_management.zig");
+const OutputPower = @import("wayland/output_power.zig");
 const OutputBackend = @import("backend/output.zig");
 const DrmDevice = @import("backend/drm_device.zig");
 const DrmOutput = @import("backend/drm.zig");
@@ -77,6 +78,8 @@ xdg_output: XdgOutput,
 xdg_output_initialized: bool,
 output_management: OutputManagement,
 output_management_initialized: bool,
+output_power: OutputPower,
+output_power_initialized: bool,
 single_pixel_buffer: SinglePixelBuffer,
 content_type: ContentType,
 security_context: SecurityContext,
@@ -221,6 +224,8 @@ pub fn create(
         .xdg_output_initialized = false,
         .output_management = undefined,
         .output_management_initialized = false,
+        .output_power = undefined,
+        .output_power_initialized = false,
         .single_pixel_buffer = undefined,
         .content_type = undefined,
         .security_context = undefined,
@@ -339,6 +344,22 @@ pub fn create(
             self.output_management.deinit();
             self.output_management_initialized = false;
         }
+        try self.output_power.init(
+            allocator,
+            display,
+            &self.outputs,
+            &self.security_context,
+            .{
+                .context = self,
+                .powered = outputPowerState,
+                .set_powered = setOutputPowerState,
+            },
+        );
+        self.output_power_initialized = true;
+        errdefer {
+            self.output_power.deinit();
+            self.output_power_initialized = false;
+        }
     }
     try self.single_pixel_buffer.init(allocator, display);
     errdefer self.single_pixel_buffer.deinit();
@@ -353,6 +374,7 @@ pub fn create(
         .{
             .context = self,
             .state_changed = sessionLockStateChanged,
+            .output_secure_without_frame = outputSecureWithoutFrame,
             .repaint = requestRepaint,
         },
     );
@@ -638,6 +660,10 @@ pub fn destroy(self: *Self) void {
     if (self.input_manager_initialized) {
         self.input_manager.deinit();
         self.input_manager_initialized = false;
+    }
+    if (self.output_power_initialized) {
+        self.output_power.deinit();
+        self.output_power_initialized = false;
     }
     if (self.output_management_initialized) {
         self.output_management.deinit();
@@ -981,6 +1007,7 @@ fn removeRenderOutput(self: *Self, id: RenderOutputId) bool {
     const render_output = self.render_outputs.remove(id) orelse return false;
     stopRenderOutput(render_output);
     const protocol_output = self.outputs.get(render_output.protocol_id).?;
+    if (self.output_power_initialized) self.output_power.removeOutput(render_output.protocol_id);
     if (self.window_manager_initialized) {
         self.window_manager.outputRemoved(render_output.protocol_id);
     }
@@ -1038,6 +1065,39 @@ fn findDrmRenderOutput(self: *Self, drm_output: *DrmOutput) ?struct {
         return .{ .id = entry.id, .output = entry.value.* };
     }
     return null;
+}
+
+fn findProtocolRenderOutput(self: *Self, output_id: OutputLayout.Id) ?*RenderOutput {
+    var iterator = self.render_outputs.iterator();
+    while (iterator.next()) |entry| {
+        if (std.meta.eql(entry.value.*.protocol_id, output_id)) return entry.value.*;
+    }
+    return null;
+}
+
+fn outputPowerState(context: *anyopaque, output_id: OutputLayout.Id) ?bool {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const render_output = self.findProtocolRenderOutput(output_id) orelse return null;
+    const drm_output = render_output.backend.drmOutput() orelse return null;
+    return drm_output.powered;
+}
+
+fn setOutputPowerState(context: *anyopaque, output_id: OutputLayout.Id, powered: bool) bool {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const render_output = self.findProtocolRenderOutput(output_id) orelse return false;
+    const drm_output = render_output.backend.drmOutput() orelse return false;
+    self.drm_device.setOutputPowered(drm_output, powered) catch |err| {
+        log.warn("failed to set output {s} power state: {t}", .{ drm_output.name(), err });
+        return false;
+    };
+    if (!powered) render_output.repaint_needed = false;
+    requestRepaint(self);
+    if (!powered) self.session_lock.refreshSecurity();
+    return true;
+}
+
+fn outputSecureWithoutFrame(context: *anyopaque, output_id: OutputLayout.Id) bool {
+    return outputPowerState(context, output_id) == false;
 }
 
 fn setDrmOutputConfiguration(
@@ -1306,6 +1366,10 @@ fn requestRepaint(context: *anyopaque) void {
     var render_outputs = self.render_outputs.iterator();
     while (render_outputs.next()) |entry| {
         const render_output = entry.value.*;
+        if (!render_output.backend.powered()) {
+            render_output.repaint_needed = false;
+            continue;
+        }
         render_output.repaint_needed = true;
         self.scheduleRepaint(render_output);
     }

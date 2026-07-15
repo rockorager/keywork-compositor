@@ -938,15 +938,16 @@
       "interfaces": [
         {
           "name": "zwlr_output_power_manager_v1",
-          "current_version": null,
+          "current_version": 1,
           "target_version": 1
         }
       ],
-      "status": "not_started",
+      "status": "done",
       "privileged": true,
       "blocked_by": [
         "wlr-output-management"
-      ]
+      ],
+      "status_detail": "Version 1 provides exclusive per-output DRM power controls with immediate initial and changed mode events, invalid-mode errors, and failed/inert handling for duplicate controls, unsupported or removed outputs, and hardware failures. Powering off suspends scanout and rendering while preserving wl_output and compositor layout state; powering on recreates scanout buffers and schedules a fresh frame. The privileged global is hidden from sandboxed security-context clients."
     },
     {
       "id": "image-capture-source",
