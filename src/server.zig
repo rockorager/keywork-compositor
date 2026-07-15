@@ -621,6 +621,7 @@ pub fn create(
         display,
         &self.security_context,
         &self.image_capture_source,
+        &self.linux_dmabuf,
         .{
             .context = self,
             .constraints = captureConstraints,

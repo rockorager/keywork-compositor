@@ -7,6 +7,7 @@ const wayland = @import("wayland");
 const presentation = @import("../presentation.zig");
 const render = @import("../render/types.zig");
 const ImageCaptureSource = @import("image_capture_source.zig");
+const LinuxDmabuf = @import("linux_dmabuf.zig");
 const SecurityContext = @import("security_context.zig");
 
 const wl = wayland.server.wl;
@@ -16,6 +17,7 @@ allocator: std.mem.Allocator,
 global: *wl.Global,
 security_context: *SecurityContext,
 sources: *ImageCaptureSource,
+linux_dmabuf: *LinuxDmabuf,
 listener: Listener,
 sessions: std.ArrayList(*Session),
 frames: std.ArrayList(*Frame),
@@ -42,13 +44,16 @@ pub const Listener = struct {
 const Destination = struct {
     resource: ?*wl.Buffer = null,
     shm: ?*wl.shm.Buffer = null,
+    dmabuf: ?*LinuxDmabuf.Buffer = null,
     destroy_listener: wl.Listener(*wl.Resource) = undefined,
 
     fn set(self: *Destination, resource: *wl.Buffer) void {
         self.clear();
         const shm = wl.shm.Buffer.get(@ptrCast(resource));
+        const dmabuf = if (shm == null) LinuxDmabuf.Buffer.fromResource(resource) else null;
         self.resource = resource;
         self.shm = if (shm) |buffer| wl_shm_buffer_ref(buffer) else null;
+        self.dmabuf = dmabuf;
         self.destroy_listener = wl.Listener(*wl.Resource).init(handleResourceDestroy);
         @as(*wl.Resource, @ptrCast(resource)).addDestroyListener(&self.destroy_listener);
     }
@@ -58,6 +63,7 @@ const Destination = struct {
         if (self.shm) |buffer| wl_shm_buffer_unref(buffer);
         self.resource = null;
         self.shm = null;
+        self.dmabuf = null;
     }
 
     fn attached(self: *const Destination) bool {
@@ -71,6 +77,7 @@ const Destination = struct {
         const self: *Destination = @fieldParentPtr("destroy_listener", listener);
         listener.link.remove();
         self.resource = null;
+        self.dmabuf = null;
     }
 };
 
@@ -145,6 +152,24 @@ const Session = struct {
         self.resource.sendBufferSize(constraints.size.width, constraints.size.height);
         self.resource.sendShmFormat(.argb8888);
         self.resource.sendShmFormat(.xrgb8888);
+        if (self.owner.linux_dmabuf.allocationDevice()) |device_value| {
+            var device = device_value;
+            var device_array: wl.Array = .{
+                .size = @sizeOf(LinuxDmabuf.Device),
+                .alloc = @sizeOf(LinuxDmabuf.Device),
+                .data = @ptrCast(&device),
+            };
+            self.resource.sendDmabufDevice(&device_array);
+            for (LinuxDmabuf.capture_formats) |format| {
+                var modifiers = [_]u64{format.modifier};
+                var modifier_array: wl.Array = .{
+                    .size = @sizeOf(@TypeOf(modifiers)),
+                    .alloc = @sizeOf(@TypeOf(modifiers)),
+                    .data = @ptrCast(&modifiers),
+                };
+                self.resource.sendDmabufFormat(format.format, &modifier_array);
+            }
+        }
         self.resource.sendDone();
     }
 
@@ -263,12 +288,40 @@ const Frame = struct {
             }
             return self.fail(.buffer_constraints);
         }
-        const shm = self.destination.shm orelse return self.fail(.buffer_constraints);
-        shm.beginAccess();
-        defer shm.endAccess();
-        const pixel_buffer = shmPixelBuffer(shm, expected.size) orelse
-            return self.fail(.buffer_constraints);
-        const timestamp = self.owner.listener.capture(
+        const timestamp = if (self.destination.shm) |shm| timestamp: {
+            shm.beginAccess();
+            defer shm.endAccess();
+            const pixel_buffer = shmPixelBuffer(shm, expected.size) orelse
+                return self.fail(.buffer_constraints);
+            break :timestamp self.performCapture(target, pixel_buffer) orelse return;
+        } else if (self.destination.dmabuf) |dmabuf| timestamp: {
+            if (self.owner.linux_dmabuf.allocationDevice() == null or
+                !std.meta.eql(dmabuf.size(), expected.size)) return self.fail(.buffer_constraints);
+            const pixel_count = expected.size.pixelCount() catch
+                return self.fail(.buffer_constraints);
+            const pixels = self.owner.allocator.alloc(u32, pixel_count) catch {
+                self.resource.postNoMemory();
+                return;
+            };
+            defer self.owner.allocator.free(pixels);
+            const pixel_buffer: render.PixelBuffer = .{
+                .size = expected.size,
+                .stride_pixels = expected.size.width,
+                .pixels = pixels,
+            };
+            const value = self.performCapture(target, pixel_buffer) orelse return;
+            dmabuf.copyFromPixels(pixel_buffer) catch return self.fail(.unknown);
+            break :timestamp value;
+        } else return self.fail(.buffer_constraints);
+        self.ready(expected, timestamp);
+    }
+
+    fn performCapture(
+        self: *Frame,
+        target: ImageCaptureSource.Target,
+        pixel_buffer: render.PixelBuffer,
+    ) ?presentation.Timestamp {
+        return self.owner.listener.capture(
             self.owner.listener.context,
             target,
             self.paint_cursors,
@@ -277,10 +330,20 @@ const Frame = struct {
             error.Stopped => {
                 self.fail(.stopped);
                 self.stopSession();
-                return;
+                return null;
             },
-            error.Failed => return self.fail(.unknown),
+            error.Failed => {
+                self.fail(.unknown);
+                return null;
+            },
         };
+    }
+
+    fn ready(
+        self: *Frame,
+        expected: Constraints,
+        timestamp: presentation.Timestamp,
+    ) void {
         self.resource.sendTransform(expected.transform);
         self.resource.sendDamage(
             0,
@@ -360,6 +423,7 @@ pub fn init(
     display: *wl.Server,
     security_context: *SecurityContext,
     sources: *ImageCaptureSource,
+    linux_dmabuf: *LinuxDmabuf,
     listener: Listener,
 ) !void {
     self.* = .{
@@ -367,6 +431,7 @@ pub fn init(
         .global = undefined,
         .security_context = security_context,
         .sources = sources,
+        .linux_dmabuf = linux_dmabuf,
         .listener = listener,
         .sessions = .empty,
         .frames = .empty,

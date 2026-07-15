@@ -24,6 +24,18 @@ const linear_modifier: u64 = 0;
 const argb8888: u32 = linux.DRM_FORMAT_ARGB8888;
 const xrgb8888: u32 = linux.DRM_FORMAT_XRGB8888;
 
+pub const Device = linux.dev_t;
+
+pub const CaptureFormat = struct {
+    format: u32,
+    modifier: u64,
+};
+
+pub const capture_formats = [_]CaptureFormat{
+    .{ .format = argb8888, .modifier = linear_modifier },
+    .{ .format = xrgb8888, .modifier = linear_modifier },
+};
+
 allocator: std.mem.Allocator,
 io: std.Io,
 global: *wl.Global,
@@ -68,6 +80,10 @@ pub fn deinit(self: *Self) void {
     self.global.destroy();
     if (self.feedback_state) |state| state.file.close(self.io);
     self.* = undefined;
+}
+
+pub fn allocationDevice(self: *const Self) ?Device {
+    return if (self.feedback_state) |state| state.device else null;
 }
 
 fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
@@ -596,6 +612,59 @@ pub const Buffer = struct {
             for (pixels) |*pixel| pixel.* |= 0xff00_0000;
         }
         return pixels;
+    }
+
+    pub fn copyFromPixels(
+        self: *const Buffer,
+        source: render.PixelBuffer,
+    ) CopyError!void {
+        const descriptor = self.descriptor;
+        if (!std.meta.eql(source.size, descriptor.size) or
+            source.stride_pixels < source.size.width) return error.ImportFailed;
+        const source_row_offset = std.math.mul(
+            usize,
+            source.size.height - 1,
+            source.stride_pixels,
+        ) catch return error.ImportFailed;
+        const required_pixels = std.math.add(
+            usize,
+            source_row_offset,
+            source.size.width,
+        ) catch return error.ImportFailed;
+        if (source.pixels.len < required_pixels) return error.ImportFailed;
+
+        const mapping = std.posix.mmap(
+            null,
+            descriptor.required_bytes,
+            .{ .READ = true, .WRITE = true },
+            .{ .TYPE = .SHARED },
+            descriptor.plane.fd,
+            0,
+        ) catch return error.ImportFailed;
+        defer std.posix.munmap(mapping);
+
+        if (!syncDmaBuf(descriptor.plane.fd, linux.DMA_BUF_SYNC_WRITE)) {
+            return error.ImportFailed;
+        }
+        const source_bytes = std.mem.sliceAsBytes(source.pixels);
+        const row_bytes = @as(usize, descriptor.size.width) * @sizeOf(u32);
+        for (0..descriptor.size.height) |source_y| {
+            const destination_y = if (descriptor.y_inverted)
+                descriptor.size.height - source_y - 1
+            else
+                source_y;
+            const source_offset = source_y * source.stride_pixels * @sizeOf(u32);
+            const destination_offset = @as(usize, descriptor.plane.offset) +
+                destination_y * descriptor.plane.stride;
+            @memcpy(
+                mapping[destination_offset..][0..row_bytes],
+                source_bytes[source_offset..][0..row_bytes],
+            );
+        }
+        if (!syncDmaBuf(
+            descriptor.plane.fd,
+            linux.DMA_BUF_SYNC_WRITE | linux.DMA_BUF_SYNC_END,
+        )) return error.ImportFailed;
     }
 
     fn handleRequest(resource: *wl.Buffer, request: wl.Buffer.Request, _: *Buffer) void {

@@ -1002,7 +1002,7 @@
         "image-capture-source",
         "linux-dmabuf"
       ],
-      "status_detail": "Version 1 base sessions synchronously capture complete output scenes or mapped toplevel surface trees into ARGB8888/XRGB8888 wl_shm buffers. Output sessions honor paint-cursors, captures preserve session/frame lifetime rules, constraints are refreshed on size changes, source invalidation stops sessions, and frame metadata includes full conservative damage plus monotonic timestamps. The privileged global is security-context filtered. DMA-BUF destinations and dedicated cursor-image sessions remain to complete the target."
+      "status_detail": "Version 1 base sessions synchronously capture complete output scenes or mapped toplevel surface trees into ARGB8888/XRGB8888 wl_shm buffers and CPU-mappable linear DMA-BUFs. DMA-BUF constraints advertise the allocation device, formats, and modifiers when available, with stride, offset, and Y-inversion respected during writes. Output sessions honor paint-cursors, captures preserve session/frame lifetime rules, constraints are refreshed on size changes, source invalidation stops sessions, and frame metadata includes full conservative damage plus monotonic timestamps. The privileged global is security-context filtered. Dedicated cursor-image sessions remain to complete the target."
     },
     {
       "id": "wlr-screencopy",
