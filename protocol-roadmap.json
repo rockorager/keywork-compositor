@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "updated": "2026-07-14",
+  "updated": "2026-07-15",
   "baseline": {
     "wayland": "1.25.0",
     "wayland_protocols": "1.49"
@@ -87,7 +87,7 @@
       "status": "done",
       "privileged": false,
       "blocked_by": [],
-      "status_detail": "Version 10 keyboard, pointer, and touch capabilities are implemented, including focus, client cursor surfaces, multi-contact touch routing, cancellation, frames, shape, orientation, and nested input forwarding."
+      "status_detail": "Version 10 keyboard, pointer, and touch capabilities are implemented, including focus, client cursor surfaces, multi-contact touch routing, cancellation, frames, shape, orientation, nested input forwarding, and dynamically managed native input seats."
     },
     {
       "id": "wl-data-device-manager",
@@ -601,12 +601,12 @@
           "target_version": 2
         }
       ],
-      "status": "in_progress",
+      "status": "done",
       "privileged": true,
       "blocked_by": [
         "wl-seat"
       ],
-      "status_detail": "Version 2 device discovery, hotplug lifetime, repeat, scroll-factor, and output/rectangle mapping are implemented for native libinput devices. Named seat state is tracked; routing devices through dynamically-created wl_seat globals remains to be completed."
+      "status_detail": "Version 2 is implemented for native libinput devices, including discovery, hotplug lifetime, repeat, scroll-factor, output/rectangle mapping, dynamic named wl_seat globals, per-seat capabilities and focus, and live keyboard, pointer, button, scroll, touch, and cursor routing. Device-local key, button, and touch state is balanced or cancelled across reassignment and removal."
     },
     {
       "id": "river-libinput-config",
@@ -667,7 +667,7 @@
         "river-window-management",
         "river-xkb-config"
       ],
-      "status_detail": "Version 3 is implemented for the default River seat, including keysym/modifier matching, layout overrides, press/release capture, repeat cancellation, chord key eating, modifier watches, and window-manager manage-sequence enforcement."
+      "status_detail": "Version 3 is implemented for every active River seat, including seat-scoped keysym/modifier matching, layout overrides, press/release capture, repeat cancellation, chord key eating, modifier watches, device reassignment cleanup, and window-manager manage-sequence enforcement."
     },
     {
       "id": "river-layer-shell",
