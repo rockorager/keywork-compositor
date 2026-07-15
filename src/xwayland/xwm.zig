@@ -22,6 +22,7 @@ wm_window: c.xcb_window_t,
 atoms: [atom_count]c.xcb_atom_t,
 windows: std.AutoHashMapUnmanaged(WindowId, Window),
 serial_windows: std.AutoHashMapUnmanaged(u64, WindowId),
+client_list: std.ArrayList(WindowId),
 focused_window: ?WindowId,
 xfixes_event_base: u8,
 clipboard_selection: XSelection,
@@ -146,6 +147,7 @@ const Atom = enum {
     net_wm_cm_s0,
     net_supported,
     net_supporting_wm_check,
+    net_client_list,
     net_wm_name,
     net_active_window,
     net_close_window,
@@ -205,6 +207,7 @@ const atom_names: [atom_count][]const u8 = .{
     "_NET_WM_CM_S0",
     "_NET_SUPPORTED",
     "_NET_SUPPORTING_WM_CHECK",
+    "_NET_CLIENT_LIST",
     "_NET_WM_NAME",
     "_NET_ACTIVE_WINDOW",
     "_NET_CLOSE_WINDOW",
@@ -307,6 +310,7 @@ pub fn init(
         .atoms = undefined,
         .windows = .empty,
         .serial_windows = .empty,
+        .client_list = .empty,
         .focused_window = null,
         .xfixes_event_base = 0,
         .clipboard_selection = undefined,
@@ -451,8 +455,10 @@ pub fn deinit(self: *Self) void {
         self.removeWindow(entry.key_ptr.*);
     }
     std.debug.assert(self.serial_windows.count() == 0);
+    std.debug.assert(self.client_list.items.len == 0);
     self.serial_windows.deinit(self.allocator);
     self.windows.deinit(self.allocator);
+    self.client_list.deinit(self.allocator);
     c.xcb_disconnect(self.connection);
     self.* = undefined;
 }
@@ -841,6 +847,7 @@ fn publishWmIdentity(self: *Self) !void {
     );
     const supported = [_]c.xcb_atom_t{
         self.atomValue(.net_supporting_wm_check),
+        self.atomValue(.net_client_list),
         self.atomValue(.net_wm_name),
         self.atomValue(.net_active_window),
         self.atomValue(.net_close_window),
@@ -887,6 +894,34 @@ fn publishWmIdentity(self: *Self) !void {
         1,
         &active_window,
     ));
+    self.publishClientList();
+}
+
+fn publishClientList(self: *Self) void {
+    _ = c.xcb_change_property(
+        self.connection,
+        c.XCB_PROP_MODE_REPLACE,
+        self.screen.root,
+        self.atomValue(.net_client_list),
+        c.XCB_ATOM_WINDOW,
+        32,
+        @intCast(self.client_list.items.len),
+        if (self.client_list.items.len == 0) null else self.client_list.items.ptr,
+    );
+}
+
+fn updateClientListMembership(self: *Self, window_id: WindowId, listed: bool) !void {
+    for (self.client_list.items, 0..) |candidate, index| {
+        if (candidate != window_id) continue;
+        if (!listed) {
+            _ = self.client_list.orderedRemove(index);
+            self.publishClientList();
+        }
+        return;
+    }
+    if (!listed) return;
+    try self.client_list.append(self.allocator, window_id);
+    self.publishClientList();
 }
 
 fn refreshInputModel(self: *Self, window_id: WindowId, window: *Window) void {
@@ -1456,6 +1491,7 @@ fn removeWindow(self: *Self, window_id: WindowId) void {
         self.focusWindow(null) catch log.err("failed to clear X11 input focus", .{});
     }
     const removed = self.windows.fetchRemove(window_id) orelse return;
+    self.updateClientListMembership(window_id, false) catch unreachable;
     if (removed.value.serial) |serial|
         std.debug.assert(self.serial_windows.remove(serial));
     if (removed.value.surface_id) |surface_id|
@@ -1514,6 +1550,7 @@ fn handleMapNotify(self: *Self, event: *const c.xcb_map_notify_event_t) !void {
         self.listener.metadata_changed(self.listener.context, event.window);
     }
     window.mapped = true;
+    try self.updateClientListMembership(event.window, !override_redirect);
     self.listener.mapped(self.listener.context, event.window, true);
 }
 
@@ -1526,6 +1563,7 @@ fn handleUnmapNotify(self: *Self, event: *const c.xcb_unmap_notify_event_t) void
         self.listener.dissociated(self.listener.context, event.window, surface_id);
     if (window.serial) |serial|
         std.debug.assert(self.serial_windows.remove(serial));
+    self.updateClientListMembership(event.window, false) catch unreachable;
     window.serial = null;
     window.surface_id = null;
     if (!window.mapped) return;
@@ -1642,6 +1680,9 @@ fn handleConfigureNotify(
     window.geometry = geometry;
     const override_redirect_changed = window.override_redirect != override_redirect;
     window.override_redirect = override_redirect;
+    if (override_redirect_changed and window.mapped) {
+        try self.updateClientListMembership(event.window, !override_redirect);
+    }
     if (override_redirect and self.focused_window == event.window) {
         self.focusWindow(null) catch log.err("failed to clear X11 input focus", .{});
     }
