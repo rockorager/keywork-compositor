@@ -204,6 +204,8 @@ pub const KeyboardFocusListener = struct {
 pub const KeyboardGrab = struct {
     context: *anyopaque,
     token: u64,
+    surface: ?Surface.Id = null,
+    cancel: ?*const fn (*anyopaque) void = null,
     keymap: *const fn (*anyopaque, wl.Keyboard.KeymapFormat, std.posix.fd_t, u32) void,
     key: *const fn (*anyopaque, u32, u32, u32, wl.Keyboard.KeyState) void,
     modifiers: *const fn (*anyopaque, u32, u32, u32, u32) void,
@@ -387,26 +389,55 @@ pub fn removeKeyboardFocusListener(self: *Self, context: *anyopaque) void {
 }
 
 pub fn setKeyboardGrab(self: *Self, grab: KeyboardGrab) void {
-    std.debug.assert(self.keyboard_grab == null);
-    self.keyboard_grab = grab;
-    if (self.keymap) |keymap| {
-        grab.keymap(grab.context, keymap.format, keymap.file.handle, keymap.size);
+    if (self.keyboard_grab) |active| {
+        const cancel = active.cancel orelse unreachable;
+        cancel(active.context);
     }
-    grab.repeat_info(grab.context, self.repeat_info.rate, self.repeat_info.delay);
-    grab.modifiers(
-        grab.context,
-        self.modifiers.depressed,
-        self.modifiers.latched,
-        self.modifiers.locked,
-        self.modifiers.group,
-    );
+    std.debug.assert(self.installKeyboardGrab(grab));
+}
+
+pub fn trySetKeyboardGrab(self: *Self, grab: KeyboardGrab) bool {
+    if (self.keyboard_grab != null) return false;
+    return self.installKeyboardGrab(grab);
+}
+
+fn installKeyboardGrab(self: *Self, grab: KeyboardGrab) bool {
+    std.debug.assert(self.keyboard_grab == null);
+    if (grab.surface) |surface_id| {
+        if (Surface.resourceFor(self.surface_store, surface_id) == null) return false;
+        if (self.parent_focused) self.sendLeave();
+    }
+    self.keyboard_grab = grab;
+    if (grab.surface != null) {
+        if (self.parent_focused and self.keymap != null) self.sendEnter();
+        self.notifyKeyboardFocus();
+    } else {
+        if (self.keymap) |keymap| {
+            grab.keymap(grab.context, keymap.format, keymap.file.handle, keymap.size);
+        }
+        grab.repeat_info(grab.context, self.repeat_info.rate, self.repeat_info.delay);
+        grab.modifiers(
+            grab.context,
+            self.modifiers.depressed,
+            self.modifiers.latched,
+            self.modifiers.locked,
+            self.modifiers.group,
+        );
+    }
+    return true;
 }
 
 pub fn clearKeyboardGrab(self: *Self, context: *anyopaque, restore_focus: bool) void {
     const grab = self.keyboard_grab orelse unreachable;
     std.debug.assert(grab.context == context);
+    if (grab.surface != null and self.parent_focused) self.sendLeave();
     self.keyboard_grab = null;
     if (!restore_focus) return;
+    if (grab.surface != null) {
+        self.notifyKeyboardFocus();
+        if (self.parent_focused and self.keymap != null) self.sendEnter();
+        return;
+    }
     const surface = self.focusedSurface() orelse return;
     if (!self.parent_focused or self.keymap == null) return;
     const serial = self.display.nextSerial();
@@ -542,14 +573,14 @@ pub fn restoreUnfocusedCursor(self: *Self) void {
 pub fn keyboardFocusedClient(self: *Self) ?*wl.Client {
     if (!self.hasKeyboardCapability()) return null;
     if (!self.parent_focused or self.keymap == null) return null;
-    const surface = self.focusedSurface() orelse return null;
+    const surface = self.keyboardDeliverySurface() orelse return null;
     return surface.getClient();
 }
 
 pub fn keyboardFocusedSurface(self: *const Self) ?Surface.Id {
     if (!self.hasKeyboardCapability()) return null;
     if (!self.parent_focused or self.keymap == null) return null;
-    const focus = self.focus orelse return null;
+    const focus = self.keyboardDeliverySurfaceId() orelse return null;
     if (Surface.resourceFor(self.surface_store, focus) == null) return null;
     return focus;
 }
@@ -674,7 +705,7 @@ pub fn setKeymap(
         self.sendRepeatInfo(entry.resource);
     }
     if (self.keyboard_grab) |grab| {
-        grab.keymap(grab.context, format, fd, size);
+        if (grab.surface == null) grab.keymap(grab.context, format, fd, size);
     }
     if (old_focus == null and self.keyboardFocusedClient() != null) {
         self.notifyKeyboardFocus();
@@ -688,11 +719,17 @@ pub fn setRepeatInfo(self: *Self, rate: i32, delay: i32) void {
     for (self.keyboard_resources.items) |entry| {
         if (self.keyboardResourceActive(entry)) self.sendRepeatInfo(entry.resource);
     }
-    if (self.keyboard_grab) |grab| grab.repeat_info(grab.context, rate, delay);
+    if (self.keyboard_grab) |grab| {
+        if (grab.surface == null) grab.repeat_info(grab.context, rate, delay);
+    }
 }
 
 pub fn setKeyboardFocus(self: *Self, focus: ?Surface.Id) void {
     if (std.meta.eql(self.focus, focus)) return;
+    if (self.keyboard_grab) |grab| if (grab.surface != null) {
+        self.focus = focus;
+        return;
+    };
     if (self.parent_focused) self.sendLeave();
     self.focus = focus;
     if (self.parent_focused) {
@@ -796,7 +833,21 @@ fn keyWithGrab(
     if (!self.parent_focused or self.keymap == null) return;
     if (route_to_grab) |token| {
         const grab = self.keyboard_grab orelse return;
-        if (grab.token != token or state == .repeated) return;
+        if (grab.token != token) return;
+        if (grab.surface) |surface_id| {
+            const surface = Surface.resourceFor(self.surface_store, surface_id) orelse return;
+            const serial = self.display.nextSerial();
+            if (state == .pressed) self.recordUserAction(surface.getClient(), serial);
+            for (self.keyboard_resources.items) |entry| {
+                if (!self.keyboardResourceActive(entry)) continue;
+                const resource = entry.resource;
+                if (resource.getClient() != surface.getClient()) continue;
+                if (state == .repeated and resource.getVersion() < 10) continue;
+                resource.sendKey(serial, time, key_code, state);
+            }
+            return;
+        }
+        if (state == .repeated) return;
         grab.key(grab.context, self.display.nextSerial(), time, key_code, state);
         return;
     }
@@ -848,6 +899,17 @@ fn setModifiersWithGrab(
     };
     if (allow_grab) {
         if (self.keyboard_grab) |grab| {
+            if (grab.surface) |surface_id| {
+                const surface = Surface.resourceFor(self.surface_store, surface_id) orelse return;
+                const serial = self.display.nextSerial();
+                for (self.keyboard_resources.items) |entry| {
+                    if (!self.keyboardResourceActive(entry)) continue;
+                    if (entry.resource.getClient() == surface.getClient()) {
+                        self.sendModifiers(entry.resource, serial);
+                    }
+                }
+                return;
+            }
             grab.modifiers(grab.context, depressed, latched, locked, group);
             return;
         }
@@ -1247,7 +1309,7 @@ fn createKeyboard(self: *Self, seat: *wl.Seat, id: u32) void {
     if (self.keymap == null) return;
     self.sendKeymap(resource);
     self.sendRepeatInfo(resource);
-    const surface = self.focusedSurface() orelse return;
+    const surface = self.keyboardDeliverySurface() orelse return;
     if (self.parent_focused and resource.getClient() == surface.getClient()) {
         const serial = self.display.nextSerial();
         self.recordSelectionSerial(surface.getClient(), serial);
@@ -1374,6 +1436,18 @@ fn focusedSurface(self: *Self) ?*wl.Surface {
     return Surface.resourceFor(self.surface_store, self.focus orelse return null);
 }
 
+fn keyboardDeliverySurfaceId(self: *const Self) ?Surface.Id {
+    if (self.keyboard_grab) |grab| if (grab.surface) |surface_id| return surface_id;
+    return self.focus;
+}
+
+fn keyboardDeliverySurface(self: *Self) ?*wl.Surface {
+    return Surface.resourceFor(
+        self.surface_store,
+        self.keyboardDeliverySurfaceId() orelse return null,
+    );
+}
+
 fn hasKeyboardCapability(self: *const Self) bool {
     return (self.keyboard_available or self.virtual_keyboard_count > 0) and self.keymap != null;
 }
@@ -1487,7 +1561,7 @@ fn sendRepeatInfo(self: *const Self, resource: *wl.Keyboard) void {
 
 fn sendEnter(self: *Self) void {
     if (self.keymap == null) return;
-    const surface = self.focusedSurface() orelse return;
+    const surface = self.keyboardDeliverySurface() orelse return;
     const serial = self.display.nextSerial();
     self.recordSelectionSerial(surface.getClient(), serial);
     for (self.keyboard_resources.items) |entry| {
@@ -1506,7 +1580,7 @@ fn sendEnterTo(self: *Self, resource: *wl.Keyboard, surface: *wl.Surface, serial
 }
 
 fn sendLeave(self: *Self) void {
-    const surface = self.focusedSurface() orelse return;
+    const surface = self.keyboardDeliverySurface() orelse return;
     const serial = self.display.nextSerial();
     for (self.keyboard_resources.items) |entry| {
         if (!self.keyboardResourceActive(entry)) continue;

@@ -1054,16 +1054,17 @@
       "interfaces": [
         {
           "name": "zwp_xwayland_keyboard_grab_manager_v1",
-          "current_version": null,
+          "current_version": 1,
           "target_version": 1
         }
       ],
-      "status": "not_started",
+      "status": "done",
       "privileged": true,
       "blocked_by": [
         "wl-seat",
         "xwayland-shell"
-      ]
+      ],
+      "status_detail": "Version 1 is exposed as a private global only to the compositor-launched Xwayland client. Active grabs route physical key and modifier events to the requested Xwayland surface independently of normal keyboard focus, preserve press/release ownership and repeat behavior, and restore the underlying focus on teardown. Grabs yield to input-method keyboard grabs and are canceled before a session lock takes focus."
     },
     {
       "id": "gtk-shell",

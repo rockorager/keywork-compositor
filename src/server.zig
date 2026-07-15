@@ -31,6 +31,7 @@ const ForeignToplevelList = @import("wayland/foreign_toplevel_list.zig");
 const ImageCaptureSource = @import("wayland/image_capture_source.zig");
 const ImageCopyCapture = @import("wayland/image_copy_capture.zig");
 const Screencopy = @import("wayland/screencopy.zig");
+const XwaylandKeyboardGrab = @import("wayland/xwayland_keyboard_grab.zig");
 const XwaylandShell = @import("wayland/xwayland_shell.zig");
 const XwaylandServer = @import("xwayland/server.zig");
 const Xwm = @import("xwayland/xwm.zig");
@@ -130,6 +131,8 @@ image_copy_capture: ImageCopyCapture,
 image_copy_capture_initialized: bool,
 screencopy: Screencopy,
 screencopy_initialized: bool,
+xwayland_keyboard_grab: XwaylandKeyboardGrab,
+xwayland_keyboard_grab_initialized: bool,
 xwayland_shell: XwaylandShell,
 xwayland_shell_initialized: bool,
 xwayland_server: XwaylandServer,
@@ -320,6 +323,8 @@ pub fn create(
         .image_copy_capture_initialized = false,
         .screencopy = undefined,
         .screencopy_initialized = false,
+        .xwayland_keyboard_grab = undefined,
+        .xwayland_keyboard_grab_initialized = false,
         .xwayland_shell = undefined,
         .xwayland_shell_initialized = false,
         .xwayland_server = undefined,
@@ -708,10 +713,17 @@ pub fn create(
         self.xwayland_shell.deinit();
         self.xwayland_shell_initialized = false;
     }
+    try self.xwayland_keyboard_grab.init(allocator, display, &self.security_context);
+    self.xwayland_keyboard_grab_initialized = true;
+    errdefer {
+        self.xwayland_keyboard_grab.deinit();
+        self.xwayland_keyboard_grab_initialized = false;
+    }
     self.xwayland_server.init(
         allocator,
         display,
         &self.xwayland_shell,
+        &self.xwayland_keyboard_grab,
         .{
             .context = self,
             .ready = xwaylandReady,
@@ -885,6 +897,8 @@ pub fn destroy(self: *Self) void {
     self.xwayland_server_initialized = false;
     std.debug.assert(self.xwayland_windows.count() == 0);
     self.xwayland_windows.deinit(allocator);
+    self.xwayland_keyboard_grab.deinit();
+    self.xwayland_keyboard_grab_initialized = false;
     self.xwayland_shell.deinit();
     self.xwayland_shell_initialized = false;
     self.screencopy.deinit();
@@ -1710,6 +1724,7 @@ fn idleInhibitorSurfaceVisible(context: *anyopaque, surface_id: Surface.Id) bool
 fn sessionLockStateChanged(context: *anyopaque, locked: bool) void {
     const self: *Self = @ptrCast(@alignCast(context));
     self.refreshIdleInhibition();
+    if (locked) self.xwayland_keyboard_grab.cancelAll();
     self.pointer_constraints.deactivateAll();
     self.data_device.cancel();
     self.tablet.cancelFocus();

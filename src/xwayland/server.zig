@@ -4,6 +4,7 @@ const Self = @This();
 
 const std = @import("std");
 const wayland = @import("wayland");
+const XwaylandKeyboardGrab = @import("../wayland/xwayland_keyboard_grab.zig");
 const XwaylandShell = @import("../wayland/xwayland_shell.zig");
 
 const c = @cImport({
@@ -33,6 +34,7 @@ allocator: std.mem.Allocator,
 display: *wl.Server,
 event_loop: *wl.EventLoop,
 shell: *XwaylandShell,
+keyboard_grab: *XwaylandKeyboardGrab,
 listener: Listener,
 client: ?*wl.Client,
 client_destroy_listener: wl.Listener(*wl.Client),
@@ -68,6 +70,7 @@ pub fn init(
     allocator: std.mem.Allocator,
     display: *wl.Server,
     shell: *XwaylandShell,
+    keyboard_grab: *XwaylandKeyboardGrab,
     listener: Listener,
 ) void {
     self.* = .{
@@ -75,6 +78,7 @@ pub fn init(
         .display = display,
         .event_loop = display.getEventLoop(),
         .shell = shell,
+        .keyboard_grab = keyboard_grab,
         .listener = listener,
         .client = null,
         .client_destroy_listener = wl.Listener(*wl.Client).init(clientDestroyed),
@@ -138,6 +142,7 @@ pub fn start(
     self.client = client;
     client.addDestroyListener(&self.client_destroy_listener);
     try self.shell.authorizeClient(client);
+    self.keyboard_grab.authorizeClient(client);
 
     self.wm_fd = wm_fds[0];
     wm_fds[0] = invalid_fd;
