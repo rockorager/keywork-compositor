@@ -23,6 +23,7 @@ atoms: [atom_count]c.xcb_atom_t,
 windows: std.AutoHashMapUnmanaged(WindowId, Window),
 serial_windows: std.AutoHashMapUnmanaged(u64, WindowId),
 client_list: std.ArrayList(WindowId),
+client_stacking: std.ArrayList(WindowId),
 focused_window: ?WindowId,
 xfixes_event_base: u8,
 clipboard_selection: XSelection,
@@ -148,6 +149,7 @@ const Atom = enum {
     net_supported,
     net_supporting_wm_check,
     net_client_list,
+    net_client_list_stacking,
     net_wm_name,
     net_active_window,
     net_close_window,
@@ -208,6 +210,7 @@ const atom_names: [atom_count][]const u8 = .{
     "_NET_SUPPORTED",
     "_NET_SUPPORTING_WM_CHECK",
     "_NET_CLIENT_LIST",
+    "_NET_CLIENT_LIST_STACKING",
     "_NET_WM_NAME",
     "_NET_ACTIVE_WINDOW",
     "_NET_CLOSE_WINDOW",
@@ -311,6 +314,7 @@ pub fn init(
         .windows = .empty,
         .serial_windows = .empty,
         .client_list = .empty,
+        .client_stacking = .empty,
         .focused_window = null,
         .xfixes_event_base = 0,
         .clipboard_selection = undefined,
@@ -456,9 +460,11 @@ pub fn deinit(self: *Self) void {
     }
     std.debug.assert(self.serial_windows.count() == 0);
     std.debug.assert(self.client_list.items.len == 0);
+    std.debug.assert(self.client_stacking.items.len == 0);
     self.serial_windows.deinit(self.allocator);
     self.windows.deinit(self.allocator);
     self.client_list.deinit(self.allocator);
+    self.client_stacking.deinit(self.allocator);
     c.xcb_disconnect(self.connection);
     self.* = undefined;
 }
@@ -500,6 +506,26 @@ pub fn windowInfo(self: *const Self, window_id: WindowId) ?WindowInfo {
 
 pub fn windowForSerial(self: *const Self, serial: u64) ?WindowId {
     return self.serial_windows.get(serial);
+}
+
+pub fn setClientStacking(self: *Self, window_ids: []const WindowId) error{XcbFlushFailed}!void {
+    var ordered_index: usize = 0;
+    for (self.client_stacking.items) |window_id| {
+        if (ordered_index == window_ids.len) break;
+        if (window_id == window_ids[ordered_index]) ordered_index += 1;
+    }
+    if (ordered_index == window_ids.len) return;
+
+    for (window_ids) |window_id| {
+        for (self.client_stacking.items, 0..) |candidate, index| {
+            if (candidate != window_id) continue;
+            const moved = self.client_stacking.orderedRemove(index);
+            self.client_stacking.appendAssumeCapacity(moved);
+            break;
+        }
+    }
+    self.publishClientStacking();
+    if (c.xcb_flush(self.connection) <= 0) return error.XcbFlushFailed;
 }
 
 pub fn dragStarted(self: *Self) void {
@@ -848,6 +874,7 @@ fn publishWmIdentity(self: *Self) !void {
     const supported = [_]c.xcb_atom_t{
         self.atomValue(.net_supporting_wm_check),
         self.atomValue(.net_client_list),
+        self.atomValue(.net_client_list_stacking),
         self.atomValue(.net_wm_name),
         self.atomValue(.net_active_window),
         self.atomValue(.net_close_window),
@@ -895,6 +922,7 @@ fn publishWmIdentity(self: *Self) !void {
         &active_window,
     ));
     self.publishClientList();
+    self.publishClientStacking();
 }
 
 fn publishClientList(self: *Self) void {
@@ -910,18 +938,41 @@ fn publishClientList(self: *Self) void {
     );
 }
 
+fn publishClientStacking(self: *Self) void {
+    _ = c.xcb_change_property(
+        self.connection,
+        c.XCB_PROP_MODE_REPLACE,
+        self.screen.root,
+        self.atomValue(.net_client_list_stacking),
+        c.XCB_ATOM_WINDOW,
+        32,
+        @intCast(self.client_stacking.items.len),
+        if (self.client_stacking.items.len == 0) null else self.client_stacking.items.ptr,
+    );
+}
+
 fn updateClientListMembership(self: *Self, window_id: WindowId, listed: bool) !void {
     for (self.client_list.items, 0..) |candidate, index| {
         if (candidate != window_id) continue;
         if (!listed) {
             _ = self.client_list.orderedRemove(index);
+            for (self.client_stacking.items, 0..) |stacked, stack_index| {
+                if (stacked != window_id) continue;
+                _ = self.client_stacking.orderedRemove(stack_index);
+                break;
+            }
             self.publishClientList();
+            self.publishClientStacking();
         }
         return;
     }
     if (!listed) return;
-    try self.client_list.append(self.allocator, window_id);
+    try self.client_list.ensureUnusedCapacity(self.allocator, 1);
+    try self.client_stacking.ensureUnusedCapacity(self.allocator, 1);
+    self.client_list.appendAssumeCapacity(window_id);
+    self.client_stacking.appendAssumeCapacity(window_id);
     self.publishClientList();
+    self.publishClientStacking();
 }
 
 fn refreshInputModel(self: *Self, window_id: WindowId, window: *Window) void {

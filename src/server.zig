@@ -140,6 +140,7 @@ xwayland_server_initialized: bool,
 xwm: Xwm,
 xwm_initialized: bool,
 xwayland_windows: std.AutoHashMapUnmanaged(Xwm.WindowId, XwaylandWindow),
+xwayland_client_stack: std.ArrayList(Xwm.WindowId),
 workspace: Workspace,
 workspace_initialized: bool,
 text_input: TextInput,
@@ -332,6 +333,7 @@ pub fn create(
         .xwm = undefined,
         .xwm_initialized = false,
         .xwayland_windows = .empty,
+        .xwayland_client_stack = .empty,
         .workspace = undefined,
         .workspace_initialized = false,
         .text_input = undefined,
@@ -356,6 +358,7 @@ pub fn create(
     errdefer self.dynamic_seats.deinit(allocator);
     errdefer self.render_outputs.deinit(allocator);
     errdefer self.xwayland_windows.deinit(allocator);
+    errdefer self.xwayland_client_stack.deinit(allocator);
     errdefer self.renderer.deinit();
     if (output_kind == .drm) {
         try self.session.init(allocator, display.getEventLoop());
@@ -627,6 +630,7 @@ pub fn create(
             .set_minimized = riverSetXwaylandWindowMinimized,
             .close = riverCloseXwaylandWindow,
             .refresh_scene = riverRefreshXwaylandScene,
+            .stacking_changed = riverXwaylandStackingChanged,
         },
         &self.layer_shell,
         .{ .context = self, .route = routePointer },
@@ -905,6 +909,7 @@ pub fn destroy(self: *Self) void {
     self.xwayland_server_initialized = false;
     std.debug.assert(self.xwayland_windows.count() == 0);
     self.xwayland_windows.deinit(allocator);
+    self.xwayland_client_stack.deinit(allocator);
     self.xwayland_keyboard_grab.deinit();
     self.xwayland_keyboard_grab_initialized = false;
     self.xwayland_shell.deinit();
@@ -3563,9 +3568,35 @@ fn applyXwaylandSceneStacking(self: *Self, window_id: Xwm.WindowId) void {
     } else if (!info.participatesInWindowManagement()) {
         self.scene.placeTop(window.scene_id);
     } else if (info.parent) |parent_id| {
-        const parent = self.xwayland_windows.get(parent_id) orelse return;
-        self.scene.placeAbove(window.scene_id, parent.scene_id);
+        if (self.xwayland_windows.get(parent_id)) |parent| {
+            self.scene.placeAbove(window.scene_id, parent.scene_id);
+        }
     }
+    syncXwaylandClientStacking(self);
+}
+
+fn syncXwaylandClientStacking(self: *Self) void {
+    if (!self.xwm_initialized) return;
+    self.xwayland_client_stack.clearRetainingCapacity();
+    var scene_windows = self.scene.iterator();
+    while (scene_windows.next()) |scene_window| {
+        var xwayland_windows = self.xwayland_windows.iterator();
+        while (xwayland_windows.next()) |entry| {
+            if (!std.meta.eql(entry.value_ptr.scene_id, scene_window.id)) continue;
+            const info = self.xwm.windowInfo(entry.key_ptr.*) orelse break;
+            if (info.mapped and !info.override_redirect) {
+                self.xwayland_client_stack.append(
+                    self.allocator,
+                    entry.key_ptr.*,
+                ) catch return self.terminate();
+            }
+            break;
+        }
+    }
+    self.xwm.setClientStacking(self.xwayland_client_stack.items) catch {
+        log.err("failed to publish X11 client stacking", .{});
+        self.terminate();
+    };
 }
 
 fn riverXwaylandWindowInfo(context: *anyopaque, window_id: Xwm.WindowId) ?Xwm.WindowInfo {
@@ -3711,9 +3742,15 @@ fn riverRefreshXwaylandScene(context: *anyopaque, window_id: Xwm.WindowId) void 
     if (self.xwm_initialized) refreshXwaylandSceneWindow(self, window_id);
 }
 
+fn riverXwaylandStackingChanged(context: *anyopaque) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    syncXwaylandClientStacking(self);
+}
+
 fn removeXwaylandWindow(self: *Self, window_id: Xwm.WindowId) void {
     const removed = self.xwayland_windows.fetchRemove(window_id) orelse return;
     self.scene.removeWindow(removed.value.scene_id);
+    syncXwaylandClientStacking(self);
 }
 
 fn xwaylandWindowForSurface(self: *Self, surface_id: Surface.Id) ?Xwm.WindowId {
@@ -3747,6 +3784,7 @@ fn focusXwaylandSurface(self: *Self, root: ?Surface.Id) void {
             if (info.window_type != .desktop) self.scene.placeTop(entry.value_ptr.scene_id);
         }
     }
+    syncXwaylandClientStacking(self);
     self.refreshKeyboardFocus();
 }
 

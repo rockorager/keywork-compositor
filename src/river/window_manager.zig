@@ -76,6 +76,7 @@ pub const XwaylandController = struct {
     set_minimized: *const fn (*anyopaque, Xwm.WindowId, bool) void,
     close: *const fn (*anyopaque, Xwm.WindowId) void,
     refresh_scene: *const fn (*anyopaque, Xwm.WindowId) void,
+    stacking_changed: *const fn (*anyopaque) void,
 };
 
 const SeatState = struct {
@@ -1664,6 +1665,7 @@ fn finishRender(self: *Self, manager: *river.WindowManagerV1) void {
     };
     self.stack_operations.clearRetainingCapacity();
     self.enforceXwaylandAuxiliaryStacking();
+    self.xwayland.stacking_changed(self.xwayland.context);
     for (self.seat_states.items) |state| if (self.reroutePointer(state)) self.requestManage();
     switch (self.sequence.finishRender()) {
         .invalid => unreachable,
