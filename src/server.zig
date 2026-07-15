@@ -888,6 +888,10 @@ fn nativeInputListener(render_output: *RenderOutput) NativeInput.Listener {
         .tablet_tool_axis = nativeTabletToolAxis,
         .tablet_tool_tip = nativeTabletToolTip,
         .tablet_tool_button = nativeTabletToolButton,
+        .tablet_pad_button = nativeTabletPadButton,
+        .tablet_pad_ring = nativeTabletPadRing,
+        .tablet_pad_strip = nativeTabletPadStrip,
+        .tablet_pad_dial = nativeTabletPadDial,
         .touch_available = touchAvailable,
         .touch_down = nativeTouchDown,
         .touch_up = nativeTouchUp,
@@ -952,7 +956,17 @@ fn inputDeviceAdded(context: *anyopaque, device: *InputManager.Device) void {
     const seat = self.seatForName(device.seat_name) orelse return;
     if (device.device_type == .tablet) {
         const info = self.native_input.tabletInfo(device.id) orelse return;
-        self.tablet.addTablet(device.id, seat, device.name, info) catch return self.terminate();
+        self.tablet.addTablet(
+            device.id,
+            device.physical_id,
+            seat,
+            device.name,
+            info,
+        ) catch return self.terminate();
+    }
+    if (device.device_type == .tablet_pad) {
+        const info = self.native_input.tabletPadInfo(device.id) orelse return;
+        self.tablet.addPad(device.id, device.physical_id, seat, info) catch return self.terminate();
     }
     self.refreshSeatCapabilities(seat, device.seat_name);
     if (device.device_type == .keyboard) self.prepareSeatKeyboard(seat, device.id);
@@ -967,6 +981,7 @@ fn inputDeviceRemoved(context: *anyopaque, device: *InputManager.Device) void {
         self.cancelDeviceGestures(device.id);
     }
     if (device.device_type == .tablet) self.tablet.removeTablet(device.id);
+    if (device.device_type == .tablet_pad) self.tablet.removePad(device.id);
     if (device.device_type == .touch) self.cancelDeviceTouches(device.id);
     self.refreshSeatCapabilities(seat, device.seat_name);
     if (device.device_type == .keyboard) self.prepareAnySeatKeyboard(seat, device.seat_name);
@@ -991,6 +1006,9 @@ fn inputDeviceSeatChanged(
     const next = self.seatForName(device.seat_name) orelse return;
     if (device.device_type == .tablet) {
         self.tablet.moveTablet(device.id, next) catch return self.terminate();
+    }
+    if (device.device_type == .tablet_pad) {
+        self.tablet.movePad(device.id, next) catch return self.terminate();
     }
     self.refreshSeatCapabilities(next, device.seat_name);
     if (device.device_type == .keyboard) {
@@ -1024,7 +1042,7 @@ fn refreshSeatCapabilities(self: *Self, seat: *Seat, name: []const u8) void {
             .keyboard => keyboard = true,
             .pointer => pointer = true,
             .touch => touch = true,
-            .tablet => {},
+            .tablet, .tablet_pad => {},
         }
     }
     if (seat == &self.seat and !pointer) {
@@ -1748,6 +1766,64 @@ fn nativeTabletToolButton(
         button,
         pressed,
     ) catch self.terminate();
+}
+
+fn nativeTabletPadButton(
+    context: *anyopaque,
+    device_id: NativeInput.DeviceId,
+    time: u32,
+    button: u32,
+    pressed: bool,
+    group: u32,
+    mode: u32,
+) void {
+    const self = serverForOutput(context);
+    self.idle_notify.notifyActivity(self.seatForDevice(device_id));
+    self.tablet.padButton(device_id, time, button, pressed, group, mode);
+}
+
+fn nativeTabletPadRing(
+    context: *anyopaque,
+    device_id: NativeInput.DeviceId,
+    time: u32,
+    ring: u32,
+    position: f64,
+    finger: bool,
+    group: u32,
+    mode: u32,
+) void {
+    const self = serverForOutput(context);
+    self.idle_notify.notifyActivity(self.seatForDevice(device_id));
+    self.tablet.padRing(device_id, time, ring, position, finger, group, mode);
+}
+
+fn nativeTabletPadStrip(
+    context: *anyopaque,
+    device_id: NativeInput.DeviceId,
+    time: u32,
+    strip: u32,
+    position: f64,
+    finger: bool,
+    group: u32,
+    mode: u32,
+) void {
+    const self = serverForOutput(context);
+    self.idle_notify.notifyActivity(self.seatForDevice(device_id));
+    self.tablet.padStrip(device_id, time, strip, position, finger, group, mode);
+}
+
+fn nativeTabletPadDial(
+    context: *anyopaque,
+    device_id: NativeInput.DeviceId,
+    time: u32,
+    dial: u32,
+    value120: i32,
+    group: u32,
+    mode: u32,
+) void {
+    const self = serverForOutput(context);
+    self.idle_notify.notifyActivity(self.seatForDevice(device_id));
+    self.tablet.padDial(device_id, time, dial, value120, group, mode);
 }
 
 const TabletAxisRoute = struct {

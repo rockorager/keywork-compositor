@@ -93,6 +93,10 @@ pub const Listener = struct {
     tablet_tool_axis: *const fn (*anyopaque, DeviceId, TabletToolId, u32, TabletToolAxes) void,
     tablet_tool_tip: *const fn (*anyopaque, DeviceId, TabletToolId, u32, TabletToolAxes, bool) void,
     tablet_tool_button: *const fn (*anyopaque, DeviceId, TabletToolId, u32, TabletToolAxes, u32, bool) void,
+    tablet_pad_button: *const fn (*anyopaque, DeviceId, u32, u32, bool, u32, u32) void,
+    tablet_pad_ring: *const fn (*anyopaque, DeviceId, u32, u32, f64, bool, u32, u32) void,
+    tablet_pad_strip: *const fn (*anyopaque, DeviceId, u32, u32, f64, bool, u32, u32) void,
+    tablet_pad_dial: *const fn (*anyopaque, DeviceId, u32, u32, i32, u32, u32) void,
     touch_available: *const fn (*anyopaque, bool) void,
     touch_down: *const fn (*anyopaque, DeviceId, u32, i32, f64, f64) void,
     touch_up: *const fn (*anyopaque, DeviceId, u32, i32) void,
@@ -250,6 +254,7 @@ pub const DeviceType = enum {
     pointer,
     touch,
     tablet,
+    tablet_pad,
 };
 
 pub const DeviceInfo = struct {
@@ -264,6 +269,21 @@ pub const TabletInfo = struct {
     product: u32,
     bustype: u32,
     path: ?[:0]const u8,
+};
+
+pub const TabletPadGroupInfo = struct {
+    buttons: []const u32,
+    rings: []const u32,
+    strips: []const u32,
+    dials: []const u32,
+    mode_count: u32,
+    current_mode: u32,
+};
+
+pub const TabletPadInfo = struct {
+    path: ?[:0]const u8,
+    button_count: u32,
+    groups: []const TabletPadGroupInfo,
 };
 
 pub const TabletToolType = enum {
@@ -324,6 +344,7 @@ const InputDevice = struct {
     scroll_factor: f64 = 1,
     map: ?DeviceMap = null,
     tablet_info: ?TabletInfo = null,
+    tablet_pad_info: ?TabletPadInfo = null,
 };
 
 const TabletTool = struct {
@@ -545,6 +566,11 @@ pub fn deviceIterator(self: *const Self) DeviceIterator {
 pub fn tabletInfo(self: *Self, id: DeviceId) ?TabletInfo {
     const device = self.findInputDeviceById(id) orelse return null;
     return device.tablet_info;
+}
+
+pub fn tabletPadInfo(self: *Self, id: DeviceId) ?TabletPadInfo {
+    const device = self.findInputDeviceById(id) orelse return null;
+    return device.tablet_pad_info;
 }
 
 pub fn tabletToolInfo(self: *const Self, id: TabletToolId) ?TabletToolInfo {
@@ -981,6 +1007,18 @@ fn processEvent(self: *Self, event: *c.struct_libinput_event) void {
         c.LIBINPUT_EVENT_TABLET_TOOL_BUTTON => self.tabletToolButton(
             c.libinput_event_get_tablet_tool_event(event).?,
         ),
+        c.LIBINPUT_EVENT_TABLET_PAD_BUTTON => self.tabletPadButton(
+            c.libinput_event_get_tablet_pad_event(event).?,
+        ),
+        c.LIBINPUT_EVENT_TABLET_PAD_RING => self.tabletPadRing(
+            c.libinput_event_get_tablet_pad_event(event).?,
+        ),
+        c.LIBINPUT_EVENT_TABLET_PAD_STRIP => self.tabletPadStrip(
+            c.libinput_event_get_tablet_pad_event(event).?,
+        ),
+        c.LIBINPUT_EVENT_TABLET_PAD_DIAL => self.tabletPadDial(
+            c.libinput_event_get_tablet_pad_event(event).?,
+        ),
         c.LIBINPUT_EVENT_TOUCH_DOWN => self.touchDown(c.libinput_event_get_touch_event(event).?),
         c.LIBINPUT_EVENT_TOUCH_UP => self.touchUp(c.libinput_event_get_touch_event(event).?),
         c.LIBINPUT_EVENT_TOUCH_MOTION => self.touchMotion(c.libinput_event_get_touch_event(event).?),
@@ -1004,11 +1042,19 @@ fn deviceAdded(self: *Self, device: *c.struct_libinput_device) void {
         device,
         c.LIBINPUT_DEVICE_CAP_TOUCH,
     ) != 0;
+    const has_tablet = c.libinput_device_has_capability(
+        device,
+        c.LIBINPUT_DEVICE_CAP_TABLET_TOOL,
+    ) != 0;
+    const has_tablet_pad = c.libinput_device_has_capability(
+        device,
+        c.LIBINPUT_DEVICE_CAP_TABLET_PAD,
+    ) != 0;
     const name_pointer = c.libinput_device_get_name(device);
     const name = if (name_pointer == null) "unknown" else std.mem.span(name_pointer);
     log.info(
-        "added {s} (keyboard={}, pointer={}, touch={})",
-        .{ name, has_keyboard, has_pointer, has_touch },
+        "added {s} (keyboard={}, pointer={}, touch={}, tablet={}, tablet_pad={})",
+        .{ name, has_keyboard, has_pointer, has_touch, has_tablet, has_tablet_pad },
     );
     const old_device_count = self.input_devices.items.len;
     if (has_keyboard) self.addInputDevice(device, .keyboard, name) catch |err| {
@@ -1023,10 +1069,20 @@ fn deviceAdded(self: *Self, device: *c.struct_libinput_device) void {
         self.rollbackInputDevices(old_device_count);
         return self.fail(err);
     };
-    if (c.libinput_device_has_capability(device, c.LIBINPUT_DEVICE_CAP_TABLET_TOOL) != 0) {
+    if (has_tablet) {
         self.addInputDevice(device, .tablet, name) catch |err| {
             self.rollbackInputDevices(old_device_count);
             return self.fail(err);
+        };
+    }
+    if (has_tablet_pad) {
+        self.addInputDevice(device, .tablet_pad, name) catch |err| {
+            if (err == error.InvalidTabletPad) {
+                log.warn("ignoring invalid tablet pad metadata for {s}", .{name});
+            } else {
+                self.rollbackInputDevices(old_device_count);
+                return self.fail(err);
+            }
         };
     }
     if (has_keyboard) {
@@ -1109,6 +1165,11 @@ fn addInputDevice(
         };
     }
     errdefer if (tablet_info) |info| if (info.path) |path| self.allocator.free(path);
+    const tablet_pad_info = if (device_type == .tablet_pad)
+        try self.createTabletPadInfo(libinput_device)
+    else
+        null;
+    errdefer if (tablet_pad_info) |info| self.deinitTabletPadInfo(info);
     try self.input_devices.append(self.allocator, .{
         .info = .{
             .id = id,
@@ -1119,11 +1180,134 @@ fn addInputDevice(
         .libinput_device = libinput_device,
         .keyboard = keyboard,
         .tablet_info = tablet_info,
+        .tablet_pad_info = tablet_pad_info,
     });
     if (device_type == .keyboard and self.active_keyboard == null) self.active_keyboard = id;
     if (self.device_listener) |listener| {
         listener.added(listener.context, self.input_devices.items[self.input_devices.items.len - 1].info);
     }
+}
+
+fn createTabletPadInfo(
+    self: *Self,
+    device: *c.struct_libinput_device,
+) !TabletPadInfo {
+    var path: ?[:0]u8 = null;
+    if (c.libinput_device_get_udev_device(device)) |udev_device| {
+        defer _ = c.udev_device_unref(udev_device);
+        if (c.udev_device_get_devnode(udev_device)) |devnode| {
+            path = try self.allocator.dupeSentinel(u8, std.mem.span(devnode), 0);
+        }
+    }
+    errdefer if (path) |value| self.allocator.free(value);
+
+    const button_count = try tabletPadCount(c.libinput_device_tablet_pad_get_num_buttons(device));
+    const ring_count = try tabletPadCount(c.libinput_device_tablet_pad_get_num_rings(device));
+    const strip_count = try tabletPadCount(c.libinput_device_tablet_pad_get_num_strips(device));
+    const dial_count = try tabletPadCount(c.libinput_device_tablet_pad_get_num_dials(device));
+    const group_count_native = c.libinput_device_tablet_pad_get_num_mode_groups(device);
+    if (group_count_native <= 0) return error.InvalidTabletPad;
+    const groups = try self.allocator.alloc(TabletPadGroupInfo, @intCast(group_count_native));
+    var initialized: usize = 0;
+    errdefer {
+        for (groups[0..initialized]) |group| self.deinitTabletPadGroupInfo(group);
+        self.allocator.free(groups);
+    }
+    while (initialized < groups.len) : (initialized += 1) {
+        const group = c.libinput_device_tablet_pad_get_mode_group(
+            device,
+            @intCast(initialized),
+        ) orelse return error.InvalidTabletPad;
+        groups[initialized] = try self.createTabletPadGroupInfo(
+            group,
+            button_count,
+            ring_count,
+            strip_count,
+            dial_count,
+        );
+    }
+    return .{
+        .path = path,
+        .button_count = button_count,
+        .groups = groups,
+    };
+}
+
+fn createTabletPadGroupInfo(
+    self: *Self,
+    group: *c.struct_libinput_tablet_pad_mode_group,
+    button_count: u32,
+    ring_count: u32,
+    strip_count: u32,
+    dial_count: u32,
+) !TabletPadGroupInfo {
+    var buttons: std.ArrayList(u32) = .empty;
+    defer buttons.deinit(self.allocator);
+    var rings: std.ArrayList(u32) = .empty;
+    defer rings.deinit(self.allocator);
+    var strips: std.ArrayList(u32) = .empty;
+    defer strips.deinit(self.allocator);
+    var dials: std.ArrayList(u32) = .empty;
+    defer dials.deinit(self.allocator);
+    for (0..button_count) |index| {
+        if (c.libinput_tablet_pad_mode_group_has_button(group, @intCast(index)) != 0) {
+            try buttons.append(self.allocator, @intCast(index));
+        }
+    }
+    for (0..ring_count) |index| {
+        if (c.libinput_tablet_pad_mode_group_has_ring(group, @intCast(index)) != 0) {
+            try rings.append(self.allocator, @intCast(index));
+        }
+    }
+    for (0..strip_count) |index| {
+        if (c.libinput_tablet_pad_mode_group_has_strip(group, @intCast(index)) != 0) {
+            try strips.append(self.allocator, @intCast(index));
+        }
+    }
+    for (0..dial_count) |index| {
+        if (c.libinput_tablet_pad_mode_group_has_dial(group, @intCast(index)) != 0) {
+            try dials.append(self.allocator, @intCast(index));
+        }
+    }
+    const mode_count = c.libinput_tablet_pad_mode_group_get_num_modes(group);
+    if (mode_count == 0) return error.InvalidTabletPad;
+    const current_mode = c.libinput_tablet_pad_mode_group_get_mode(group);
+    if (current_mode >= mode_count) return error.InvalidTabletPad;
+
+    const owned_buttons = try buttons.toOwnedSlice(self.allocator);
+    errdefer self.allocator.free(owned_buttons);
+    const owned_rings = try rings.toOwnedSlice(self.allocator);
+    errdefer self.allocator.free(owned_rings);
+    const owned_strips = try strips.toOwnedSlice(self.allocator);
+    errdefer self.allocator.free(owned_strips);
+    const owned_dials = try dials.toOwnedSlice(self.allocator);
+    errdefer self.allocator.free(owned_dials);
+    return .{
+        .buttons = owned_buttons,
+        .rings = owned_rings,
+        .strips = owned_strips,
+        .dials = owned_dials,
+        .mode_count = mode_count,
+        .current_mode = current_mode,
+    };
+}
+
+fn deinitTabletPadInfo(self: *Self, info: TabletPadInfo) void {
+    if (info.path) |path| self.allocator.free(path);
+    for (info.groups) |group| self.deinitTabletPadGroupInfo(group);
+    self.allocator.free(info.groups);
+}
+
+fn deinitTabletPadGroupInfo(self: *Self, info: TabletPadGroupInfo) void {
+    self.allocator.free(info.dials);
+    self.allocator.free(info.strips);
+    self.allocator.free(info.rings);
+    self.allocator.free(info.buttons);
+}
+
+fn tabletPadCount(value: c_int) !u32 {
+    if (value < 0) return error.InvalidTabletPad;
+    return @intCast(value);
 }
 
 fn rollbackInputDevices(self: *Self, old_count: usize) void {
@@ -1166,6 +1350,7 @@ fn deinitInputDevice(self: *Self, device: *InputDevice) void {
         keyboard.keymap.unref();
     }
     if (device.tablet_info) |info| if (info.path) |path| self.allocator.free(path);
+    if (device.tablet_pad_info) |info| self.deinitTabletPadInfo(info);
     self.allocator.free(device.info.name);
 }
 
@@ -1752,6 +1937,104 @@ fn tabletToolButton(self: *Self, event: *c.struct_libinput_event_tablet_tool) vo
     );
 }
 
+const TabletPadEventRoute = struct {
+    device: *InputDevice,
+    time: u32,
+    group: u32,
+    mode: u32,
+};
+
+fn tabletPadButton(self: *Self, event: *c.struct_libinput_event_tablet_pad) void {
+    const route = self.tabletPadEventRoute(event) orelse return;
+    self.listener.tablet_pad_button(
+        self.listener.context,
+        route.device.info.id,
+        route.time,
+        c.libinput_event_tablet_pad_get_button_number(event),
+        c.libinput_event_tablet_pad_get_button_state(event) == c.LIBINPUT_BUTTON_STATE_PRESSED,
+        route.group,
+        route.mode,
+    );
+}
+
+fn tabletPadRing(self: *Self, event: *c.struct_libinput_event_tablet_pad) void {
+    const route = self.tabletPadEventRoute(event) orelse return;
+    self.listener.tablet_pad_ring(
+        self.listener.context,
+        route.device.info.id,
+        route.time,
+        c.libinput_event_tablet_pad_get_ring_number(event),
+        c.libinput_event_tablet_pad_get_ring_position(event),
+        c.libinput_event_tablet_pad_get_ring_source(event) ==
+            c.LIBINPUT_TABLET_PAD_RING_SOURCE_FINGER,
+        route.group,
+        route.mode,
+    );
+}
+
+fn tabletPadStrip(self: *Self, event: *c.struct_libinput_event_tablet_pad) void {
+    const route = self.tabletPadEventRoute(event) orelse return;
+    self.listener.tablet_pad_strip(
+        self.listener.context,
+        route.device.info.id,
+        route.time,
+        c.libinput_event_tablet_pad_get_strip_number(event),
+        c.libinput_event_tablet_pad_get_strip_position(event),
+        c.libinput_event_tablet_pad_get_strip_source(event) ==
+            c.LIBINPUT_TABLET_PAD_STRIP_SOURCE_FINGER,
+        route.group,
+        route.mode,
+    );
+}
+
+fn tabletPadDial(self: *Self, event: *c.struct_libinput_event_tablet_pad) void {
+    const route = self.tabletPadEventRoute(event) orelse return;
+    const value120 = protocolValue120(
+        c.libinput_event_tablet_pad_get_dial_delta_v120(event),
+    ) orelse return;
+    self.listener.tablet_pad_dial(
+        self.listener.context,
+        route.device.info.id,
+        route.time,
+        c.libinput_event_tablet_pad_get_dial_number(event),
+        value120,
+        route.group,
+        route.mode,
+    );
+}
+
+fn tabletPadEventRoute(
+    self: *Self,
+    event: *c.struct_libinput_event_tablet_pad,
+) ?TabletPadEventRoute {
+    const base = c.libinput_event_tablet_pad_get_base_event(event) orelse return null;
+    const device = self.eventInputDevice(base, .tablet_pad) orelse return null;
+    const group = c.libinput_event_tablet_pad_get_mode_group(event) orelse return null;
+    const group_index = c.libinput_tablet_pad_mode_group_get_index(group);
+    const info = device.tablet_pad_info orelse return null;
+    if (group_index >= info.groups.len) return null;
+    const mode = c.libinput_event_tablet_pad_get_mode(event);
+    if (mode >= info.groups[group_index].mode_count) return null;
+    return .{
+        .device = device,
+        .time = c.libinput_event_tablet_pad_get_time(event),
+        .group = group_index,
+        .mode = mode,
+    };
+}
+
+fn protocolValue120(value: f64) ?i32 {
+    if (!std.math.isFinite(value)) return null;
+    const rounded = @round(value);
+    const clamped = std.math.clamp(
+        rounded,
+        @as(f64, @floatFromInt(std.math.minInt(i32))),
+        @as(f64, @floatFromInt(std.math.maxInt(i32))),
+    );
+    const result: i32 = @intFromFloat(clamped);
+    return if (result == 0) null else result;
+}
+
 fn tabletToolAxes(
     self: *const Self,
     device: *const InputDevice,
@@ -2090,6 +2373,13 @@ test "native pointer coordinates stay inside the output" {
     try std.testing.expectEqual(@as(f64, 0), clampCoordinate(-5, 100));
     try std.testing.expectEqual(@as(f64, 99), clampCoordinate(120, 100));
     try std.testing.expectEqual(@as(f64, 42.5), clampCoordinate(42.5, 100));
+}
+
+test "tablet pad dial deltas use nonzero value120 units" {
+    try std.testing.expectEqual(@as(?i32, 120), protocolValue120(120));
+    try std.testing.expectEqual(@as(?i32, -30), protocolValue120(-30.4));
+    try std.testing.expectEqual(@as(?i32, null), protocolValue120(0.1));
+    try std.testing.expectEqual(@as(?i32, null), protocolValue120(std.math.nan(f64)));
 }
 
 test "libinput configuration status mapping" {

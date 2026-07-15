@@ -19,10 +19,17 @@ listener: Listener,
 seat_bindings: std.ArrayList(*SeatBinding),
 devices: std.ArrayList(*Device),
 tools: std.ArrayList(*Tool),
+pad_devices: std.ArrayList(*Pad),
 tablet_resources: std.ArrayList(*TabletResource),
 tool_resources: std.ArrayList(*ToolResource),
+pad_resources: std.ArrayList(*PadResource),
+pad_group_resources: std.ArrayList(*PadGroupResource),
+pad_ring_resources: std.ArrayList(*PadRingResource),
+pad_strip_resources: std.ArrayList(*PadStripResource),
+pad_dial_resources: std.ArrayList(*PadDialResource),
 next_tool_cursor_owner_id: u64,
 next_tool_resource_generation: u64,
+next_tool_focus_generation: u64,
 cursor_surface_count: usize,
 
 pub fn init(
@@ -41,10 +48,17 @@ pub fn init(
         .seat_bindings = .empty,
         .devices = .empty,
         .tools = .empty,
+        .pad_devices = .empty,
         .tablet_resources = .empty,
         .tool_resources = .empty,
+        .pad_resources = .empty,
+        .pad_group_resources = .empty,
+        .pad_ring_resources = .empty,
+        .pad_strip_resources = .empty,
+        .pad_dial_resources = .empty,
         .next_tool_cursor_owner_id = 1,
         .next_tool_resource_generation = 1,
+        .next_tool_focus_generation = 1,
         .cursor_surface_count = 0,
     };
 }
@@ -53,13 +67,25 @@ pub fn deinit(self: *Self) void {
     std.debug.assert(self.seat_bindings.items.len == 0);
     std.debug.assert(self.tablet_resources.items.len == 0);
     std.debug.assert(self.tool_resources.items.len == 0);
+    std.debug.assert(self.pad_resources.items.len == 0);
+    std.debug.assert(self.pad_group_resources.items.len == 0);
+    std.debug.assert(self.pad_ring_resources.items.len == 0);
+    std.debug.assert(self.pad_strip_resources.items.len == 0);
+    std.debug.assert(self.pad_dial_resources.items.len == 0);
     std.debug.assert(self.cursor_surface_count == 0);
     while (self.tools.pop()) |tool| self.destroyTool(tool);
+    while (self.pad_devices.pop()) |pad| self.destroyPad(pad);
     while (self.devices.pop()) |device| self.destroyDevice(device);
     self.global.destroy();
     self.tool_resources.deinit(self.allocator);
     self.tablet_resources.deinit(self.allocator);
+    self.pad_dial_resources.deinit(self.allocator);
+    self.pad_strip_resources.deinit(self.allocator);
+    self.pad_ring_resources.deinit(self.allocator);
+    self.pad_group_resources.deinit(self.allocator);
+    self.pad_resources.deinit(self.allocator);
     self.tools.deinit(self.allocator);
+    self.pad_devices.deinit(self.allocator);
     self.devices.deinit(self.allocator);
     self.seat_bindings.deinit(self.allocator);
     self.* = undefined;
@@ -68,6 +94,7 @@ pub fn deinit(self: *Self) void {
 pub fn addTablet(
     self: *Self,
     id: NativeInput.DeviceId,
+    physical_id: NativeInput.PhysicalDeviceId,
     seat: *Seat,
     name: [:0]const u8,
     info: NativeInput.TabletInfo,
@@ -85,6 +112,7 @@ pub fn addTablet(
     device.* = .{
         .manager = self,
         .id = id,
+        .physical_id = physical_id,
         .seat = seat,
         .name = name_copy,
         .vendor = info.vendor,
@@ -125,6 +153,158 @@ pub fn moveTablet(self: *Self, id: NativeInput.DeviceId, seat: *Seat) !void {
                 self.createToolResource(binding, tool) catch binding.resource.?.postNoMemory();
             }
         }
+    }
+}
+
+pub fn addPad(
+    self: *Self,
+    id: NativeInput.DeviceId,
+    physical_id: NativeInput.PhysicalDeviceId,
+    seat: *Seat,
+    info: NativeInput.TabletPadInfo,
+) !void {
+    std.debug.assert(self.findPad(id) == null);
+    const pad = try self.allocator.create(Pad);
+    errdefer self.allocator.destroy(pad);
+    const path = if (info.path) |value|
+        try self.allocator.dupeSentinel(u8, value, 0)
+    else
+        null;
+    errdefer if (path) |value| self.allocator.free(value);
+    const groups = try self.allocator.alloc(PadGroup, info.groups.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (groups[0..initialized]) |group| self.deinitPadGroup(group);
+        self.allocator.free(groups);
+    }
+    while (initialized < groups.len) : (initialized += 1) {
+        groups[initialized] = try self.copyPadGroup(info.groups[initialized]);
+    }
+    pad.* = .{
+        .manager = self,
+        .id = id,
+        .physical_id = physical_id,
+        .seat = seat,
+        .path = path,
+        .button_count = info.button_count,
+        .groups = groups,
+        .focus = null,
+        .focus_destroy_listener = wl.Listener(*wl.Resource).init(handlePadFocusDestroyed),
+    };
+    try self.pad_devices.append(self.allocator, pad);
+    for (self.seat_bindings.items) |binding| {
+        if (binding.resource != null and binding.seat == seat) {
+            self.createPadResource(binding, pad) catch binding.resource.?.postNoMemory();
+        }
+    }
+    self.refreshPadFocus(pad, 0);
+}
+
+pub fn removePad(self: *Self, id: NativeInput.DeviceId) void {
+    const pad = self.findPad(id) orelse return;
+    self.unadvertisePad(pad);
+    for (self.pad_devices.items, 0..) |candidate, index| {
+        if (candidate != pad) continue;
+        _ = self.pad_devices.orderedRemove(index);
+        self.destroyPad(pad);
+        return;
+    }
+    unreachable;
+}
+
+pub fn movePad(self: *Self, id: NativeInput.DeviceId, seat: *Seat) !void {
+    const pad = self.findPad(id) orelse return;
+    if (pad.seat == seat) return;
+    self.unadvertisePad(pad);
+    pad.seat = seat;
+    for (self.seat_bindings.items) |binding| {
+        if (binding.resource != null and binding.seat == seat) {
+            self.createPadResource(binding, pad) catch binding.resource.?.postNoMemory();
+        }
+    }
+    self.refreshPadFocus(pad, 0);
+}
+
+pub fn padButton(
+    self: *Self,
+    id: NativeInput.DeviceId,
+    time: u32,
+    button_index: u32,
+    pressed: bool,
+    group_index: u32,
+    mode: u32,
+) void {
+    const pad = self.findPad(id) orelse return;
+    self.updatePadMode(pad, time, group_index, mode);
+    if (button_index >= pad.button_count) return;
+    for (self.pad_resources.items) |adapter| {
+        if (adapter.pad == pad and adapter.active) adapter.resource.sendButton(
+            time,
+            button_index,
+            if (pressed) .pressed else .released,
+        );
+    }
+}
+
+pub fn padRing(
+    self: *Self,
+    id: NativeInput.DeviceId,
+    time: u32,
+    ring_index: u32,
+    position: f64,
+    finger: bool,
+    group_index: u32,
+    mode: u32,
+) void {
+    const pad = self.findPad(id) orelse return;
+    self.updatePadMode(pad, time, group_index, mode);
+    for (self.pad_ring_resources.items) |adapter| {
+        if (adapter.pad != pad or adapter.index != ring_index or
+            !self.padBindingActive(adapter.binding, pad)) continue;
+        if (finger) adapter.resource.sendSource(.finger);
+        if (position < 0) adapter.resource.sendStop() else adapter.resource.sendAngle(fixed(position));
+        adapter.resource.sendFrame(time);
+    }
+}
+
+pub fn padStrip(
+    self: *Self,
+    id: NativeInput.DeviceId,
+    time: u32,
+    strip_index: u32,
+    position: f64,
+    finger: bool,
+    group_index: u32,
+    mode: u32,
+) void {
+    const pad = self.findPad(id) orelse return;
+    self.updatePadMode(pad, time, group_index, mode);
+    for (self.pad_strip_resources.items) |adapter| {
+        if (adapter.pad != pad or adapter.index != strip_index or
+            !self.padBindingActive(adapter.binding, pad)) continue;
+        if (finger) adapter.resource.sendSource(.finger);
+        if (position < 0) adapter.resource.sendStop() else adapter.resource.sendPosition(normalizedUnsigned(position));
+        adapter.resource.sendFrame(time);
+    }
+}
+
+pub fn padDial(
+    self: *Self,
+    id: NativeInput.DeviceId,
+    time: u32,
+    dial_index: u32,
+    value120: i32,
+    group_index: u32,
+    mode: u32,
+) void {
+    std.debug.assert(value120 != 0);
+    const pad = self.findPad(id) orelse return;
+    self.updatePadMode(pad, time, group_index, mode);
+    for (self.pad_dial_resources.items) |adapter| {
+        if (adapter.pad != pad or adapter.index != dial_index or
+            !self.padBindingActive(adapter.binding, pad)) continue;
+        adapter.resource.sendDelta(value120);
+        adapter.resource.sendFrame(time);
     }
 }
 
@@ -244,6 +424,7 @@ pub fn button(
 const Device = struct {
     manager: *Self,
     id: NativeInput.DeviceId,
+    physical_id: NativeInput.PhysicalDeviceId,
     seat: *Seat,
     name: [:0]u8,
     vendor: u32,
@@ -357,6 +538,7 @@ pub fn cancelFocus(self: *Self) void {
 const Tool = struct {
     manager: *Self,
     cursor_owner_id: u64,
+    focus_generation: u64,
     info: NativeInput.TabletToolInfo,
     device: *Device,
     in_proximity: bool,
@@ -367,6 +549,33 @@ const Tool = struct {
     pressed_buttons: std.ArrayList(u32),
     position: ?Point,
     cursor: ?Cursor,
+};
+
+const PadGroup = struct {
+    buttons: []u32,
+    rings: []u32,
+    strips: []u32,
+    dials: []u32,
+    mode_count: u32,
+    current_mode: u32,
+};
+
+const PadFocus = struct {
+    tablet_id: NativeInput.DeviceId,
+    surface_id: Surface.Id,
+    resource: *wl.Surface,
+};
+
+const Pad = struct {
+    manager: *Self,
+    id: NativeInput.DeviceId,
+    physical_id: NativeInput.PhysicalDeviceId,
+    seat: *Seat,
+    path: ?[:0]u8,
+    button_count: u32,
+    groups: []PadGroup,
+    focus: ?PadFocus,
+    focus_destroy_listener: wl.Listener(*wl.Resource),
 };
 
 const SeatBinding = struct {
@@ -390,6 +599,41 @@ const ToolResource = struct {
     tool: ?*Tool,
     active: bool,
     proximity_serial: ?u32,
+};
+
+const PadResource = struct {
+    binding: *SeatBinding,
+    resource: *zwp.TabletPadV2,
+    pad: ?*Pad,
+    active: bool,
+};
+
+const PadGroupResource = struct {
+    binding: *SeatBinding,
+    resource: *zwp.TabletPadGroupV2,
+    pad: ?*Pad,
+    group_index: u32,
+};
+
+const PadRingResource = struct {
+    binding: *SeatBinding,
+    resource: *zwp.TabletPadRingV2,
+    pad: ?*Pad,
+    index: u32,
+};
+
+const PadStripResource = struct {
+    binding: *SeatBinding,
+    resource: *zwp.TabletPadStripV2,
+    pad: ?*Pad,
+    index: u32,
+};
+
+const PadDialResource = struct {
+    binding: *SeatBinding,
+    resource: *zwp.TabletPadDialV2,
+    pad: ?*Pad,
+    index: u32,
 };
 
 fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
@@ -444,6 +688,10 @@ fn createSeatBinding(
     }
     for (self.tools.items) |tool| {
         if (tool.device.seat == seat) self.createToolResource(binding, tool) catch
+            resource.postNoMemory();
+    }
+    for (self.pad_devices.items) |pad| {
+        if (pad.seat == seat) self.createPadResource(binding, pad) catch
             resource.postNoMemory();
     }
 }
@@ -601,6 +849,249 @@ fn handleToolDestroy(_: *zwp.TabletToolV2, adapter: *ToolResource) void {
     releaseBinding(binding);
 }
 
+fn createPadResource(self: *Self, binding: *SeatBinding, pad: *Pad) !void {
+    const seat_resource = binding.resource orelse return;
+    const resource = try zwp.TabletPadV2.create(
+        binding.client,
+        seat_resource.getVersion(),
+        0,
+    );
+    errdefer resource.destroy();
+    const adapter = try self.allocator.create(PadResource);
+    errdefer self.allocator.destroy(adapter);
+    adapter.* = .{
+        .binding = binding,
+        .resource = resource,
+        .pad = pad,
+        .active = false,
+    };
+    try self.pad_resources.append(self.allocator, adapter);
+    retainBinding(binding);
+    resource.setHandler(*PadResource, handlePadRequest, handlePadDestroy, adapter);
+    seat_resource.sendPadAdded(resource);
+    if (pad.path) |path| resource.sendPath(path);
+    if (pad.button_count != 0) resource.sendButtons(pad.button_count);
+    for (pad.groups, 0..) |group, group_index| {
+        self.createPadGroupResource(adapter, @intCast(group_index), group) catch {
+            resource.postNoMemory();
+            return;
+        };
+    }
+    resource.sendDone();
+    if (pad.focus) |focus| self.enterPadResource(adapter, pad, focus, 0);
+}
+
+fn createPadGroupResource(
+    self: *Self,
+    pad_adapter: *PadResource,
+    group_index: u32,
+    group: PadGroup,
+) !void {
+    const binding = pad_adapter.binding;
+    const pad = pad_adapter.pad.?;
+    const resource = try zwp.TabletPadGroupV2.create(
+        binding.client,
+        pad_adapter.resource.getVersion(),
+        0,
+    );
+    errdefer resource.destroy();
+    const adapter = try self.allocator.create(PadGroupResource);
+    errdefer self.allocator.destroy(adapter);
+    adapter.* = .{
+        .binding = binding,
+        .resource = resource,
+        .pad = pad,
+        .group_index = group_index,
+    };
+    try self.pad_group_resources.append(self.allocator, adapter);
+    retainBinding(binding);
+    resource.setHandler(*PadGroupResource, handlePadGroupRequest, handlePadGroupDestroy, adapter);
+    pad_adapter.resource.sendGroup(resource);
+    var button_array = arrayFromU32s(group.buttons);
+    resource.sendButtons(&button_array);
+    for (group.rings) |index| {
+        const ring = self.createPadRingResource(
+            binding,
+            pad,
+            index,
+            pad_adapter.resource.getVersion(),
+        ) catch {
+            resource.postNoMemory();
+            return;
+        };
+        resource.sendRing(ring);
+    }
+    for (group.strips) |index| {
+        const strip = self.createPadStripResource(
+            binding,
+            pad,
+            index,
+            pad_adapter.resource.getVersion(),
+        ) catch {
+            resource.postNoMemory();
+            return;
+        };
+        resource.sendStrip(strip);
+    }
+    if (resource.getVersion() >= zwp.TabletPadGroupV2.dial_since_version) {
+        for (group.dials) |index| {
+            const dial = self.createPadDialResource(
+                binding,
+                pad,
+                index,
+                pad_adapter.resource.getVersion(),
+            ) catch {
+                resource.postNoMemory();
+                return;
+            };
+            resource.sendDial(dial);
+        }
+    }
+    if (group.mode_count > 1) resource.sendModes(group.mode_count);
+    resource.sendDone();
+}
+
+fn createPadRingResource(
+    self: *Self,
+    binding: *SeatBinding,
+    pad: *Pad,
+    index: u32,
+    version: u32,
+) !*zwp.TabletPadRingV2 {
+    const resource = try zwp.TabletPadRingV2.create(binding.client, version, 0);
+    errdefer resource.destroy();
+    const adapter = try self.allocator.create(PadRingResource);
+    errdefer self.allocator.destroy(adapter);
+    adapter.* = .{ .binding = binding, .resource = resource, .pad = pad, .index = index };
+    try self.pad_ring_resources.append(self.allocator, adapter);
+    retainBinding(binding);
+    resource.setHandler(*PadRingResource, handlePadRingRequest, handlePadRingDestroy, adapter);
+    return resource;
+}
+
+fn createPadStripResource(
+    self: *Self,
+    binding: *SeatBinding,
+    pad: *Pad,
+    index: u32,
+    version: u32,
+) !*zwp.TabletPadStripV2 {
+    const resource = try zwp.TabletPadStripV2.create(binding.client, version, 0);
+    errdefer resource.destroy();
+    const adapter = try self.allocator.create(PadStripResource);
+    errdefer self.allocator.destroy(adapter);
+    adapter.* = .{ .binding = binding, .resource = resource, .pad = pad, .index = index };
+    try self.pad_strip_resources.append(self.allocator, adapter);
+    retainBinding(binding);
+    resource.setHandler(*PadStripResource, handlePadStripRequest, handlePadStripDestroy, adapter);
+    return resource;
+}
+
+fn createPadDialResource(
+    self: *Self,
+    binding: *SeatBinding,
+    pad: *Pad,
+    index: u32,
+    version: u32,
+) !*zwp.TabletPadDialV2 {
+    const resource = try zwp.TabletPadDialV2.create(binding.client, version, 0);
+    errdefer resource.destroy();
+    const adapter = try self.allocator.create(PadDialResource);
+    errdefer self.allocator.destroy(adapter);
+    adapter.* = .{ .binding = binding, .resource = resource, .pad = pad, .index = index };
+    try self.pad_dial_resources.append(self.allocator, adapter);
+    retainBinding(binding);
+    resource.setHandler(*PadDialResource, handlePadDialRequest, handlePadDialDestroy, adapter);
+    return resource;
+}
+
+fn handlePadRequest(
+    resource: *zwp.TabletPadV2,
+    request: zwp.TabletPadV2.Request,
+    _: *PadResource,
+) void {
+    switch (request) {
+        .destroy => resource.destroy(),
+        .set_feedback => {},
+    }
+}
+
+fn handlePadDestroy(_: *zwp.TabletPadV2, adapter: *PadResource) void {
+    const manager = adapter.binding.manager;
+    const binding = adapter.binding;
+    removeAdapter(PadResource, manager.allocator, &manager.pad_resources, adapter);
+    releaseBinding(binding);
+}
+
+fn handlePadGroupRequest(
+    resource: *zwp.TabletPadGroupV2,
+    request: zwp.TabletPadGroupV2.Request,
+    _: *PadGroupResource,
+) void {
+    if (request == .destroy) resource.destroy();
+}
+
+fn handlePadGroupDestroy(_: *zwp.TabletPadGroupV2, adapter: *PadGroupResource) void {
+    const manager = adapter.binding.manager;
+    const binding = adapter.binding;
+    removeAdapter(PadGroupResource, manager.allocator, &manager.pad_group_resources, adapter);
+    releaseBinding(binding);
+}
+
+fn handlePadRingRequest(
+    resource: *zwp.TabletPadRingV2,
+    request: zwp.TabletPadRingV2.Request,
+    _: *PadRingResource,
+) void {
+    switch (request) {
+        .destroy => resource.destroy(),
+        .set_feedback => {},
+    }
+}
+
+fn handlePadRingDestroy(_: *zwp.TabletPadRingV2, adapter: *PadRingResource) void {
+    const manager = adapter.binding.manager;
+    const binding = adapter.binding;
+    removeAdapter(PadRingResource, manager.allocator, &manager.pad_ring_resources, adapter);
+    releaseBinding(binding);
+}
+
+fn handlePadStripRequest(
+    resource: *zwp.TabletPadStripV2,
+    request: zwp.TabletPadStripV2.Request,
+    _: *PadStripResource,
+) void {
+    switch (request) {
+        .destroy => resource.destroy(),
+        .set_feedback => {},
+    }
+}
+
+fn handlePadStripDestroy(_: *zwp.TabletPadStripV2, adapter: *PadStripResource) void {
+    const manager = adapter.binding.manager;
+    const binding = adapter.binding;
+    removeAdapter(PadStripResource, manager.allocator, &manager.pad_strip_resources, adapter);
+    releaseBinding(binding);
+}
+
+fn handlePadDialRequest(
+    resource: *zwp.TabletPadDialV2,
+    request: zwp.TabletPadDialV2.Request,
+    _: *PadDialResource,
+) void {
+    switch (request) {
+        .destroy => resource.destroy(),
+        .set_feedback => {},
+    }
+}
+
+fn handlePadDialDestroy(_: *zwp.TabletPadDialV2, adapter: *PadDialResource) void {
+    const manager = adapter.binding.manager;
+    const binding = adapter.binding;
+    removeAdapter(PadDialResource, manager.allocator, &manager.pad_dial_resources, adapter);
+    releaseBinding(binding);
+}
+
 fn setToolCursor(
     self: *Self,
     adapter: *ToolResource,
@@ -671,6 +1162,160 @@ fn activeToolResource(
     return tool;
 }
 
+fn copyPadGroup(self: *Self, info: NativeInput.TabletPadGroupInfo) !PadGroup {
+    const buttons = try self.allocator.dupe(u32, info.buttons);
+    errdefer self.allocator.free(buttons);
+    const rings = try self.allocator.dupe(u32, info.rings);
+    errdefer self.allocator.free(rings);
+    const strips = try self.allocator.dupe(u32, info.strips);
+    errdefer self.allocator.free(strips);
+    const dials = try self.allocator.dupe(u32, info.dials);
+    errdefer self.allocator.free(dials);
+    return .{
+        .buttons = buttons,
+        .rings = rings,
+        .strips = strips,
+        .dials = dials,
+        .mode_count = info.mode_count,
+        .current_mode = info.current_mode,
+    };
+}
+
+fn deinitPadGroup(self: *Self, group: PadGroup) void {
+    self.allocator.free(group.dials);
+    self.allocator.free(group.strips);
+    self.allocator.free(group.rings);
+    self.allocator.free(group.buttons);
+}
+
+fn refreshPadsForSeat(self: *Self, seat: *Seat, time: u32) void {
+    for (self.pad_devices.items) |pad| {
+        if (pad.seat == seat) self.refreshPadFocus(pad, time);
+    }
+}
+
+fn refreshPadFocus(self: *Self, pad: *Pad, time: u32) void {
+    self.refreshPadFocusExcluding(pad, time, null);
+}
+
+fn refreshPadFocusExcluding(
+    self: *Self,
+    pad: *Pad,
+    time: u32,
+    excluded_surface: ?Surface.Id,
+) void {
+    const linked = self.hasLinkedTablet(pad);
+    var candidate: ?*Tool = null;
+    for (self.tools.items) |tool| {
+        if (!tool.in_proximity or tool.focus_resource == null or tool.device.seat != pad.seat) continue;
+        if (excluded_surface) |surface_id| {
+            if (std.meta.eql(tool.focus.?, surface_id)) continue;
+        }
+        if (linked and tool.device.physical_id != pad.physical_id) continue;
+        if (candidate == null or tool.focus_generation > candidate.?.focus_generation) candidate = tool;
+    }
+    if (candidate) |tool| {
+        const surface_id = tool.focus.?;
+        if (pad.focus) |focus| {
+            if (focus.tablet_id == tool.device.id and std.meta.eql(focus.surface_id, surface_id)) return;
+            self.leavePadFocus(pad);
+        }
+        self.enterPadFocus(pad, tool.device, tool.focus_resource.?, time);
+    } else if (pad.focus != null) {
+        self.leavePadFocus(pad);
+    }
+}
+
+fn hasLinkedTablet(self: *const Self, pad: *const Pad) bool {
+    for (self.devices.items) |device| {
+        if (device.seat == pad.seat and device.physical_id == pad.physical_id) return true;
+    }
+    return false;
+}
+
+fn enterPadFocus(self: *Self, pad: *Pad, tablet: *Device, surface: *wl.Surface, time: u32) void {
+    std.debug.assert(pad.focus == null);
+    pad.focus = .{
+        .tablet_id = tablet.id,
+        .surface_id = Surface.fromResource(surface).handle(),
+        .resource = surface,
+    };
+    @as(*wl.Resource, @ptrCast(surface)).addDestroyListener(&pad.focus_destroy_listener);
+    const focus = pad.focus.?;
+    for (self.pad_resources.items) |adapter| self.enterPadResource(adapter, pad, focus, time);
+}
+
+fn enterPadResource(
+    self: *Self,
+    adapter: *PadResource,
+    pad: *Pad,
+    focus: PadFocus,
+    time: u32,
+) void {
+    if (adapter.pad != pad or adapter.binding.client != focus.resource.getClient()) return;
+    const tablet = self.findDevice(focus.tablet_id) orelse return;
+    const tablet_adapter = self.tabletResource(adapter.binding, tablet) orelse return;
+    const serial = self.display.nextSerial();
+    adapter.active = true;
+    adapter.resource.sendEnter(serial, tablet_adapter.resource, focus.resource);
+    for (self.pad_group_resources.items) |group_adapter| {
+        if (group_adapter.pad != pad or group_adapter.binding != adapter.binding) continue;
+        const group_index: usize = @intCast(group_adapter.group_index);
+        if (group_index >= pad.groups.len) continue;
+        group_adapter.resource.sendModeSwitch(
+            time,
+            serial,
+            pad.groups[group_index].current_mode,
+        );
+    }
+}
+
+fn leavePadFocus(self: *Self, pad: *Pad) void {
+    const focus = pad.focus orelse return;
+    const serial = self.display.nextSerial();
+    for (self.pad_resources.items) |adapter| {
+        if (adapter.pad != pad or !adapter.active) continue;
+        adapter.resource.sendLeave(serial, focus.resource);
+        adapter.active = false;
+    }
+    pad.focus_destroy_listener.link.remove();
+    pad.focus = null;
+}
+
+fn handlePadFocusDestroyed(listener: *wl.Listener(*wl.Resource), _: *wl.Resource) void {
+    const pad: *Pad = @fieldParentPtr("focus_destroy_listener", listener);
+    const surface_id = pad.focus.?.surface_id;
+    listener.link.remove();
+    pad.focus = null;
+    for (pad.manager.pad_resources.items) |adapter| {
+        if (adapter.pad == pad) adapter.active = false;
+    }
+    pad.manager.refreshPadFocusExcluding(pad, 0, surface_id);
+}
+
+fn updatePadMode(self: *Self, pad: *Pad, time: u32, group_index: u32, mode: u32) void {
+    if (group_index >= pad.groups.len) return;
+    const group = &pad.groups[group_index];
+    if (mode >= group.mode_count or mode == group.current_mode) return;
+    group.current_mode = mode;
+    if (pad.focus == null) return;
+    const serial = self.display.nextSerial();
+    for (self.pad_group_resources.items) |adapter| {
+        if (adapter.pad == pad and adapter.group_index == group_index and
+            self.padBindingActive(adapter.binding, pad))
+        {
+            adapter.resource.sendModeSwitch(time, serial, mode);
+        }
+    }
+}
+
+fn padBindingActive(self: *const Self, binding: *SeatBinding, pad: *Pad) bool {
+    for (self.pad_resources.items) |adapter| {
+        if (adapter.binding == binding and adapter.pad == pad) return adapter.active;
+    }
+    return false;
+}
+
 fn hasOtherActiveResource(
     self: *const Self,
     tool: *Tool,
@@ -695,6 +1340,7 @@ fn ensureTool(
     tool.* = .{
         .manager = self,
         .cursor_owner_id = self.next_tool_cursor_owner_id,
+        .focus_generation = 0,
         .info = info,
         .device = device,
         .in_proximity = false,
@@ -732,6 +1378,12 @@ fn updateFocus(self: *Self, tool: *Tool, target: ?Seat.PointerFocus, time: u32) 
     const surface = Surface.resourceFor(self.surface_store, focus.surface_id) orelse return;
     tool.focus = focus.surface_id;
     tool.focus_resource = surface;
+    tool.focus_generation = self.next_tool_focus_generation;
+    self.next_tool_focus_generation = std.math.add(
+        u64,
+        self.next_tool_focus_generation,
+        1,
+    ) catch unreachable;
     @as(*wl.Resource, @ptrCast(surface)).addDestroyListener(&tool.focus_destroy_listener);
     const serial = self.display.nextSerial();
     for (self.tool_resources.items) |adapter| {
@@ -745,12 +1397,15 @@ fn updateFocus(self: *Self, tool: *Tool, target: ?Seat.PointerFocus, time: u32) 
         }
         if (tool.tip_down) adapter.resource.sendDown(serial);
     }
+    self.refreshPadsForSeat(tool.device.seat, time);
 }
 
 fn leaveFocus(self: *Self, tool: *Tool, time: u32, release_state: bool) void {
     if (tool.focus == null) {
         tool.position = null;
         self.clearToolCursor(tool);
+        tool.focus_generation = 0;
+        self.refreshPadsForSeat(tool.device.seat, time);
         if (release_state) self.clearToolState(tool);
         return;
     }
@@ -774,8 +1429,10 @@ fn leaveFocus(self: *Self, tool: *Tool, time: u32, release_state: bool) void {
     tool.focus_destroy_listener.link.remove();
     tool.focus = null;
     tool.focus_resource = null;
+    tool.focus_generation = 0;
     tool.position = null;
     self.clearToolCursor(tool);
+    self.refreshPadsForSeat(tool.device.seat, time);
     if (release_state) self.clearToolState(tool);
 }
 
@@ -870,11 +1527,34 @@ fn unadvertiseTool(self: *Self, tool: *Tool, removed: bool) void {
     }
 }
 
+fn unadvertisePad(self: *Self, pad: *Pad) void {
+    self.leavePadFocus(pad);
+    for (self.pad_resources.items) |adapter| {
+        if (adapter.pad != pad) continue;
+        adapter.resource.sendRemoved();
+        adapter.pad = null;
+        adapter.active = false;
+    }
+    for (self.pad_group_resources.items) |adapter| {
+        if (adapter.pad == pad) adapter.pad = null;
+    }
+    for (self.pad_ring_resources.items) |adapter| {
+        if (adapter.pad == pad) adapter.pad = null;
+    }
+    for (self.pad_strip_resources.items) |adapter| {
+        if (adapter.pad == pad) adapter.pad = null;
+    }
+    for (self.pad_dial_resources.items) |adapter| {
+        if (adapter.pad == pad) adapter.pad = null;
+    }
+}
+
 fn handleFocusDestroyed(listener: *wl.Listener(*wl.Resource), _: *wl.Resource) void {
     const tool: *Tool = @fieldParentPtr("focus_destroy_listener", listener);
     listener.link.remove();
     tool.focus = null;
     tool.focus_resource = null;
+    tool.focus_generation = 0;
     const serial = tool.manager.display.nextSerial();
     for (tool.manager.tool_resources.items) |adapter| {
         if (adapter.tool != tool or !adapter.active) continue;
@@ -904,6 +1584,13 @@ fn findDevice(self: *Self, id: NativeInput.DeviceId) ?*Device {
     return null;
 }
 
+fn findPad(self: *const Self, id: NativeInput.DeviceId) ?*Pad {
+    for (self.pad_devices.items) |pad| {
+        if (pad.id == id) return pad;
+    }
+    return null;
+}
+
 fn findTool(
     self: *const Self,
     device_id: NativeInput.DeviceId,
@@ -927,6 +1614,14 @@ fn destroyTool(self: *Self, tool: *Tool) void {
     if (tool.focus_resource != null) tool.focus_destroy_listener.link.remove();
     tool.pressed_buttons.deinit(self.allocator);
     self.allocator.destroy(tool);
+}
+
+fn destroyPad(self: *Self, pad: *Pad) void {
+    if (pad.focus != null) pad.focus_destroy_listener.link.remove();
+    for (pad.groups) |group| self.deinitPadGroup(group);
+    self.allocator.free(pad.groups);
+    if (pad.path) |path| self.allocator.free(path);
+    self.allocator.destroy(pad);
 }
 
 fn destroyDevice(self: *Self, device: *Device) void {
@@ -1074,6 +1769,14 @@ fn fixed(value: f64) wl.Fixed {
     const minimum = @as(f64, @floatFromInt(std.math.minInt(i32))) / 256.0;
     const maximum = @as(f64, @floatFromInt(std.math.maxInt(i32))) / 256.0;
     return wl.Fixed.fromDouble(std.math.clamp(value, minimum, maximum));
+}
+
+fn arrayFromU32s(values: []const u32) wl.Array {
+    return .{
+        .size = values.len * @sizeOf(u32),
+        .alloc = values.len * @sizeOf(u32),
+        .data = if (values.len == 0) null else @ptrCast(@constCast(values.ptr)),
+    };
 }
 
 test "tablet axes normalize protocol values" {

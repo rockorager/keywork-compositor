@@ -804,13 +804,13 @@
           "target_version": 2
         }
       ],
-      "status": "in_progress",
+      "status": "done",
       "privileged": false,
       "blocked_by": [
         "cursor-shape",
         "wl-seat"
       ],
-      "status_detail": "Stable version 2 advertises seat-scoped tablet and tool objects and forwards libinput proximity, motion, pressure, distance, tilt, rotation, slider, wheel, tip, and button events to the focused surface. Device hotplug, dynamic seat reassignment, surface destruction, implicit tool grabs, framing, tablet metadata, per-tool cursor surfaces, and cursor-shape-v1 integration are implemented; tablet pads remain."
+      "status_detail": "Stable version 2 advertises seat-scoped tablets, tools, and pads. Tool proximity, axes, tip, buttons, independent cursor surfaces, and cursor-shape-v1 integration are implemented alongside pad buttons, groups, modes, rings, strips, and version 2 dials. Pad focus follows the newest eligible tablet tool, prefers a tablet sharing the physical device, and supports standalone pads; hotplug, dynamic seat reassignment, session locking, surface destruction, and framed event delivery are handled. Feedback descriptions are accepted and intentionally ignored."
     },
     {
       "id": "ext-data-control",

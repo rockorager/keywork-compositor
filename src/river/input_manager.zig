@@ -369,6 +369,7 @@ fn createDeviceResource(self: *Self, manager: *ManagerResource, device: *Device)
         .pointer => .pointer,
         .touch => .touch,
         .tablet => .tablet,
+        .tablet_pad => .tablet,
     });
     resource.sendName(device.name);
     if (resource.getVersion() >= river.InputDeviceV1.done_since_version) resource.sendDone();
