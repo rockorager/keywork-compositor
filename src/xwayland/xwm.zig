@@ -4,6 +4,7 @@ const Self = @This();
 
 const std = @import("std");
 const wayland = @import("wayland");
+const Surface = @import("../wayland/surface.zig");
 
 const c = @cImport({
     @cInclude("stdlib.h");
@@ -13,12 +14,40 @@ const c = @cImport({
 const wl = wayland.server.wl;
 const log = std.log.scoped(.xwm);
 
+allocator: std.mem.Allocator,
 connection: *c.xcb_connection_t,
 screen: *c.xcb_screen_t,
 event_source: *wl.EventSource,
 wm_window: c.xcb_window_t,
 atoms: [atom_count]c.xcb_atom_t,
+windows: std.AutoHashMapUnmanaged(WindowId, Window),
+serial_windows: std.AutoHashMapUnmanaged(u64, WindowId),
 listener: Listener,
+
+pub const WindowId = u32;
+
+pub const Geometry = struct {
+    x: i16,
+    y: i16,
+    width: u16,
+    height: u16,
+};
+
+pub const WindowInfo = struct {
+    id: WindowId,
+    geometry: Geometry,
+    override_redirect: bool,
+    mapped: bool,
+    surface_id: ?Surface.Id,
+};
+
+const Window = struct {
+    geometry: Geometry,
+    override_redirect: bool,
+    mapped: bool = false,
+    serial: ?u64 = null,
+    surface_id: ?Surface.Id = null,
+};
 
 const Atom = enum {
     wm_s0,
@@ -27,6 +56,7 @@ const Atom = enum {
     net_supporting_wm_check,
     net_wm_name,
     utf8_string,
+    wl_surface_serial,
 };
 
 const atom_count = std.meta.fields(Atom).len;
@@ -37,15 +67,24 @@ const atom_names: [atom_count][]const u8 = .{
     "_NET_SUPPORTING_WM_CHECK",
     "_NET_WM_NAME",
     "UTF8_STRING",
+    "WL_SURFACE_SERIAL",
 };
 
 pub const Listener = struct {
     context: *anyopaque,
     failed: *const fn (*anyopaque) void,
+    created: *const fn (*anyopaque, WindowInfo) void,
+    destroyed: *const fn (*anyopaque, WindowId) void,
+    mapped: *const fn (*anyopaque, WindowId, bool) void,
+    configured: *const fn (*anyopaque, WindowId, Geometry, bool) void,
+    serial: *const fn (*anyopaque, WindowId, u64) void,
+    associated: *const fn (*anyopaque, WindowId, Surface.Id) void,
+    dissociated: *const fn (*anyopaque, WindowId, Surface.Id) void,
 };
 
 pub fn init(
     self: *Self,
+    allocator: std.mem.Allocator,
     event_loop: *wl.EventLoop,
     fd: std.posix.fd_t,
     listener: Listener,
@@ -64,11 +103,14 @@ pub fn init(
             return error.XcbSetupFailed,
     );
     self.* = .{
+        .allocator = allocator,
         .connection = connection,
         .screen = screen,
         .event_source = undefined,
         .wm_window = c.XCB_WINDOW_NONE,
         .atoms = undefined,
+        .windows = .empty,
+        .serial_windows = .empty,
         .listener = listener,
     };
 
@@ -125,8 +167,48 @@ pub fn init(
 
 pub fn deinit(self: *Self) void {
     self.event_source.remove();
+    while (self.windows.count() > 0) {
+        var iterator = self.windows.iterator();
+        const entry = iterator.next().?;
+        self.removeWindow(entry.key_ptr.*);
+    }
+    std.debug.assert(self.serial_windows.count() == 0);
+    self.serial_windows.deinit(self.allocator);
+    self.windows.deinit(self.allocator);
     c.xcb_disconnect(self.connection);
     self.* = undefined;
+}
+
+pub fn associateSurface(self: *Self, serial: u64, surface_id: Surface.Id) bool {
+    const window_id = self.serial_windows.get(serial) orelse return false;
+    const window = self.windows.getPtr(window_id) orelse return false;
+    if (window.surface_id) |current| return std.meta.eql(current, surface_id);
+    window.surface_id = surface_id;
+    log.debug("associated X11 window {d} with surface serial {d}", .{ window_id, serial });
+    self.listener.associated(self.listener.context, window_id, surface_id);
+    return true;
+}
+
+pub fn removeSurfaceAssociation(
+    self: *Self,
+    serial: u64,
+    surface_id: Surface.Id,
+) void {
+    const window_id = self.serial_windows.get(serial) orelse return;
+    const window = self.windows.getPtr(window_id) orelse return;
+    if (window.surface_id) |current| {
+        if (!std.meta.eql(current, surface_id)) return;
+        self.listener.dissociated(self.listener.context, window_id, current);
+    }
+    std.debug.assert(self.serial_windows.remove(serial));
+    window.serial = null;
+    window.surface_id = null;
+    log.debug("removed surface association from X11 window {d}", .{window_id});
+}
+
+pub fn windowInfo(self: *const Self, window_id: WindowId) ?WindowInfo {
+    const window = self.windows.get(window_id) orelse return null;
+    return info(window_id, window);
 }
 
 fn resolveAtoms(self: *Self) !void {
@@ -290,9 +372,21 @@ fn handleEvents(_: std.posix.fd_t, mask: wl.EventMask, self: *Self) c_int {
     }
     if (mask.readable) {
         while (c.xcb_poll_for_event(self.connection)) |event| {
-            if (event.*.response_type & 0x7f == 0)
+            if (event.*.response_type & 0x7f == 0) {
                 logX11Error("event", @ptrCast(event));
+            } else {
+                self.dispatchEvent(event) catch |err| {
+                    log.err("failed to process X11 event: {t}", .{err});
+                    std.c.free(event);
+                    self.listener.failed(self.listener.context);
+                    return 0;
+                };
+            }
             std.c.free(event);
+        }
+        if (c.xcb_flush(self.connection) <= 0) {
+            self.listener.failed(self.listener.context);
+            return 0;
         }
     }
     if (c.xcb_connection_has_error(self.connection) != 0) {
@@ -300,6 +394,188 @@ fn handleEvents(_: std.posix.fd_t, mask: wl.EventMask, self: *Self) c_int {
         return 0;
     }
     return 0;
+}
+
+fn dispatchEvent(self: *Self, event: [*c]c.xcb_generic_event_t) !void {
+    switch (event.*.response_type & 0x7f) {
+        c.XCB_CREATE_NOTIFY => try self.handleCreate(@ptrCast(event)),
+        c.XCB_DESTROY_NOTIFY => self.handleDestroy(@ptrCast(event)),
+        c.XCB_MAP_REQUEST => self.handleMapRequest(@ptrCast(event)),
+        c.XCB_MAP_NOTIFY => self.handleMapNotify(@ptrCast(event)),
+        c.XCB_UNMAP_NOTIFY => self.handleUnmapNotify(@ptrCast(event)),
+        c.XCB_CONFIGURE_REQUEST => self.handleConfigureRequest(@ptrCast(event)),
+        c.XCB_CONFIGURE_NOTIFY => self.handleConfigureNotify(@ptrCast(event)),
+        c.XCB_CLIENT_MESSAGE => try self.handleClientMessage(@ptrCast(event)),
+        else => {},
+    }
+}
+
+fn handleCreate(self: *Self, event: *const c.xcb_create_notify_event_t) !void {
+    if (event.window == self.wm_window or self.windows.contains(event.window)) return;
+    const window: Window = .{
+        .geometry = .{
+            .x = event.x,
+            .y = event.y,
+            .width = event.width,
+            .height = event.height,
+        },
+        .override_redirect = event.override_redirect != 0,
+    };
+    try self.windows.put(self.allocator, event.window, window);
+    self.listener.created(self.listener.context, info(event.window, window));
+}
+
+fn handleDestroy(self: *Self, event: *const c.xcb_destroy_notify_event_t) void {
+    self.removeWindow(event.window);
+}
+
+fn removeWindow(self: *Self, window_id: WindowId) void {
+    const removed = self.windows.fetchRemove(window_id) orelse return;
+    if (removed.value.serial) |serial|
+        std.debug.assert(self.serial_windows.remove(serial));
+    if (removed.value.surface_id) |surface_id|
+        self.listener.dissociated(self.listener.context, window_id, surface_id);
+    self.listener.destroyed(self.listener.context, window_id);
+}
+
+fn handleMapRequest(self: *Self, event: *const c.xcb_map_request_event_t) void {
+    if (!self.windows.contains(event.window)) return;
+    _ = c.xcb_map_window(self.connection, event.window);
+}
+
+fn handleMapNotify(self: *Self, event: *const c.xcb_map_notify_event_t) void {
+    const window = self.windows.getPtr(event.window) orelse return;
+    const override_redirect = event.override_redirect != 0;
+    if (window.override_redirect != override_redirect) {
+        window.override_redirect = override_redirect;
+        self.listener.configured(
+            self.listener.context,
+            event.window,
+            window.geometry,
+            override_redirect,
+        );
+    }
+    if (window.mapped) return;
+    window.mapped = true;
+    self.listener.mapped(self.listener.context, event.window, true);
+}
+
+fn handleUnmapNotify(self: *Self, event: *const c.xcb_unmap_notify_event_t) void {
+    const window = self.windows.getPtr(event.window) orelse return;
+    if (window.surface_id) |surface_id|
+        self.listener.dissociated(self.listener.context, event.window, surface_id);
+    if (window.serial) |serial|
+        std.debug.assert(self.serial_windows.remove(serial));
+    window.serial = null;
+    window.surface_id = null;
+    if (!window.mapped) return;
+    window.mapped = false;
+    self.listener.mapped(self.listener.context, event.window, false);
+}
+
+fn handleConfigureRequest(
+    self: *Self,
+    event: *const c.xcb_configure_request_event_t,
+) void {
+    const window = self.windows.getPtr(event.window) orelse return;
+    var requested = window.geometry;
+    if (event.value_mask & c.XCB_CONFIG_WINDOW_X != 0) requested.x = event.x;
+    if (event.value_mask & c.XCB_CONFIG_WINDOW_Y != 0) requested.y = event.y;
+    if (event.value_mask & c.XCB_CONFIG_WINDOW_WIDTH != 0) requested.width = event.width;
+    if (event.value_mask & c.XCB_CONFIG_WINDOW_HEIGHT != 0) requested.height = event.height;
+    const values = [_]u32{
+        signedValue(requested.x),
+        signedValue(requested.y),
+        requested.width,
+        requested.height,
+        0,
+    };
+    _ = c.xcb_configure_window(
+        self.connection,
+        event.window,
+        c.XCB_CONFIG_WINDOW_X |
+            c.XCB_CONFIG_WINDOW_Y |
+            c.XCB_CONFIG_WINDOW_WIDTH |
+            c.XCB_CONFIG_WINDOW_HEIGHT |
+            c.XCB_CONFIG_WINDOW_BORDER_WIDTH,
+        &values,
+    );
+    if (!window.override_redirect and std.meta.eql(window.geometry, requested))
+        self.sendConfigureNotify(event.window, window.*);
+}
+
+fn handleConfigureNotify(
+    self: *Self,
+    event: *const c.xcb_configure_notify_event_t,
+) void {
+    const window = self.windows.getPtr(event.window) orelse return;
+    const geometry: Geometry = .{
+        .x = event.x,
+        .y = event.y,
+        .width = event.width,
+        .height = event.height,
+    };
+    const override_redirect = event.override_redirect != 0;
+    if (std.meta.eql(window.geometry, geometry) and
+        window.override_redirect == override_redirect) return;
+    window.geometry = geometry;
+    window.override_redirect = override_redirect;
+    self.listener.configured(
+        self.listener.context,
+        event.window,
+        geometry,
+        override_redirect,
+    );
+}
+
+fn sendConfigureNotify(self: *Self, window_id: WindowId, window: Window) void {
+    var event: c.xcb_configure_notify_event_t = std.mem.zeroes(c.xcb_configure_notify_event_t);
+    event.response_type = c.XCB_CONFIGURE_NOTIFY;
+    event.event = window_id;
+    event.window = window_id;
+    event.above_sibling = c.XCB_WINDOW_NONE;
+    event.x = window.geometry.x;
+    event.y = window.geometry.y;
+    event.width = window.geometry.width;
+    event.height = window.geometry.height;
+    event.override_redirect = @intFromBool(window.override_redirect);
+    _ = c.xcb_send_event(
+        self.connection,
+        0,
+        window_id,
+        c.XCB_EVENT_MASK_STRUCTURE_NOTIFY,
+        @ptrCast(&event),
+    );
+}
+
+fn handleClientMessage(
+    self: *Self,
+    event: *const c.xcb_client_message_event_t,
+) !void {
+    if (event.type != self.atomValue(.wl_surface_serial) or event.format != 32) return;
+    const window = self.windows.getPtr(event.window) orelse return;
+    const serial = @as(u64, event.data.data32[1]) << 32 | event.data.data32[0];
+    if (serial == 0 or window.serial != null or self.serial_windows.contains(serial)) {
+        log.warn("ignored invalid surface serial for X11 window {d}", .{event.window});
+        return;
+    }
+    try self.serial_windows.put(self.allocator, serial, event.window);
+    window.serial = serial;
+    self.listener.serial(self.listener.context, event.window, serial);
+}
+
+fn info(window_id: WindowId, window: Window) WindowInfo {
+    return .{
+        .id = window_id,
+        .geometry = window.geometry,
+        .override_redirect = window.override_redirect,
+        .mapped = window.mapped,
+        .surface_id = window.surface_id,
+    };
+}
+
+fn signedValue(value: i16) u32 {
+    return @bitCast(@as(i32, value));
 }
 
 fn logX11Error(operation: []const u8, x_error: *const c.xcb_generic_error_t) void {

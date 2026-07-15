@@ -3153,9 +3153,15 @@ fn screencopyConstraints(context: *anyopaque, target: Screencopy.Target) ?render
     return render_output.backend.size();
 }
 
-fn xwaylandSurfaceAssociated(_: *anyopaque, _: u64, _: Surface.Id) void {}
+fn xwaylandSurfaceAssociated(context: *anyopaque, serial: u64, surface_id: Surface.Id) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    if (self.xwm_initialized) _ = self.xwm.associateSurface(serial, surface_id);
+}
 
-fn xwaylandSurfaceRemoved(_: *anyopaque, _: u64, _: Surface.Id) void {}
+fn xwaylandSurfaceRemoved(context: *anyopaque, serial: u64, surface_id: Surface.Id) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    if (self.xwm_initialized) self.xwm.removeSurfaceAssociation(serial, surface_id);
+}
 
 fn xwaylandReady(
     context: *anyopaque,
@@ -3164,9 +3170,16 @@ fn xwaylandReady(
 ) bool {
     const self: *Self = @ptrCast(@alignCast(context));
     std.debug.assert(!self.xwm_initialized);
-    self.xwm.init(self.display.getEventLoop(), wm_fd, .{
+    self.xwm.init(self.allocator, self.display.getEventLoop(), wm_fd, .{
         .context = self,
         .failed = xwmFailed,
+        .created = xwmWindowCreated,
+        .destroyed = xwmWindowDestroyed,
+        .mapped = xwmWindowMapped,
+        .configured = xwmWindowConfigured,
+        .serial = xwmWindowSerial,
+        .associated = xwmWindowAssociated,
+        .dissociated = xwmWindowDissociated,
     }) catch |err| {
         log.err("failed to initialize XWM: {t}", .{err});
         return false;
@@ -3192,6 +3205,24 @@ fn xwmFailed(context: *anyopaque) void {
     self.xwm_initialized = false;
     self.xwayland_server.terminate();
 }
+
+fn xwmWindowCreated(_: *anyopaque, _: Xwm.WindowInfo) void {}
+
+fn xwmWindowDestroyed(_: *anyopaque, _: Xwm.WindowId) void {}
+
+fn xwmWindowMapped(_: *anyopaque, _: Xwm.WindowId, _: bool) void {}
+
+fn xwmWindowConfigured(_: *anyopaque, _: Xwm.WindowId, _: Xwm.Geometry, _: bool) void {}
+
+fn xwmWindowSerial(context: *anyopaque, _: Xwm.WindowId, serial: u64) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const surface_id = self.xwayland_shell.surfaceForSerial(serial) orelse return;
+    _ = self.xwm.associateSurface(serial, surface_id);
+}
+
+fn xwmWindowAssociated(_: *anyopaque, _: Xwm.WindowId, _: Surface.Id) void {}
+
+fn xwmWindowDissociated(_: *anyopaque, _: Xwm.WindowId, _: Surface.Id) void {}
 
 fn captureImage(
     context: *anyopaque,
