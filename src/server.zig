@@ -3211,6 +3211,7 @@ fn xwaylandReady(
         .destroyed = xwmWindowDestroyed,
         .mapped = xwmWindowMapped,
         .configured = xwmWindowConfigured,
+        .metadata_changed = xwmWindowMetadataChanged,
         .serial = xwmWindowSerial,
         .associated = xwmWindowAssociated,
         .dissociated = xwmWindowDissociated,
@@ -3266,6 +3267,16 @@ fn xwmWindowConfigured(
     const self: *Self = @ptrCast(@alignCast(context));
     const window = self.xwayland_windows.get(window_id) orelse return;
     configureXwaylandSceneWindow(self, window.scene_id, geometry);
+}
+
+fn xwmWindowMetadataChanged(context: *anyopaque, window_id: Xwm.WindowId) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const info = self.xwm.windowInfo(window_id) orelse return;
+    log.debug("X11 window {d} metadata changed: app_id={?s} title={?s}", .{
+        window_id,
+        info.app_id,
+        info.title,
+    });
 }
 
 fn xwmWindowSerial(context: *anyopaque, _: Xwm.WindowId, serial: u64) void {

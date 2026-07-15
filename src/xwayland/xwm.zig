@@ -41,6 +41,10 @@ pub const WindowInfo = struct {
     override_redirect: bool,
     mapped: bool,
     surface_id: ?Surface.Id,
+    title: ?[:0]const u8,
+    app_id: ?[:0]const u8,
+    instance: ?[:0]const u8,
+    can_close: bool,
 };
 
 const Window = struct {
@@ -49,6 +53,19 @@ const Window = struct {
     mapped: bool = false,
     serial: ?u64 = null,
     surface_id: ?Surface.Id = null,
+    title: ?[:0]u8 = null,
+    app_id: ?[:0]u8 = null,
+    instance: ?[:0]u8 = null,
+    accepts_input: bool = true,
+    take_focus: bool = false,
+    delete_window: bool = false,
+
+    fn deinit(self: *Window, allocator: std.mem.Allocator) void {
+        if (self.title) |value| allocator.free(value);
+        if (self.app_id) |value| allocator.free(value);
+        if (self.instance) |value| allocator.free(value);
+        self.* = undefined;
+    }
 };
 
 const Atom = enum {
@@ -61,6 +78,8 @@ const Atom = enum {
     utf8_string,
     wm_protocols,
     wm_take_focus,
+    wm_delete_window,
+    wm_state,
     wl_surface_serial,
 };
 
@@ -75,6 +94,8 @@ const atom_names: [atom_count][]const u8 = .{
     "UTF8_STRING",
     "WM_PROTOCOLS",
     "WM_TAKE_FOCUS",
+    "WM_DELETE_WINDOW",
+    "WM_STATE",
     "WL_SURFACE_SERIAL",
 };
 
@@ -85,6 +106,7 @@ pub const Listener = struct {
     destroyed: *const fn (*anyopaque, WindowId) void,
     mapped: *const fn (*anyopaque, WindowId, bool) void,
     configured: *const fn (*anyopaque, WindowId, Geometry, bool) void,
+    metadata_changed: *const fn (*anyopaque, WindowId) void,
     serial: *const fn (*anyopaque, WindowId, u64) void,
     associated: *const fn (*anyopaque, WindowId, Surface.Id) void,
     dissociated: *const fn (*anyopaque, WindowId, Surface.Id) void,
@@ -249,9 +271,9 @@ pub fn focusWindow(self: *Self, requested_window: ?WindowId) error{XcbFlushFaile
     );
 
     if (window_id) |id| {
-        const model = self.readInputModel(id);
-        if (model.take_focus) self.sendTakeFocus(id);
-        if (model.accepts_input) {
+        const window = self.windows.get(id) orelse unreachable;
+        if (window.take_focus) self.sendWmMessage(id, .wm_take_focus);
+        if (window.accepts_input) {
             _ = c.xcb_set_input_focus(
                 self.connection,
                 c.XCB_INPUT_FOCUS_POINTER_ROOT,
@@ -268,6 +290,16 @@ pub fn focusWindow(self: *Self, requested_window: ?WindowId) error{XcbFlushFaile
         );
     }
     if (c.xcb_flush(self.connection) <= 0) return error.XcbFlushFailed;
+}
+
+pub fn closeWindow(self: *Self, window_id: WindowId) void {
+    const window = self.windows.get(window_id) orelse return;
+    if (window.delete_window) {
+        self.sendWmMessage(window_id, .wm_delete_window);
+    } else {
+        _ = c.xcb_kill_client(self.connection, window_id);
+    }
+    _ = c.xcb_flush(self.connection);
 }
 
 fn resolveAtoms(self: *Self) !void {
@@ -375,13 +407,8 @@ fn publishWmIdentity(self: *Self) !void {
     ));
 }
 
-const InputModel = struct {
-    accepts_input: bool = true,
-    take_focus: bool = false,
-};
-
-fn readInputModel(self: *Self, window_id: WindowId) InputModel {
-    var model: InputModel = .{};
+fn refreshInputModel(self: *Self, window_id: WindowId, window: *Window) void {
+    window.accepts_input = true;
     var hints = std.mem.zeroes(c.xcb_icccm_wm_hints_t);
     if (c.xcb_icccm_get_wm_hints_reply(
         self.connection,
@@ -389,9 +416,13 @@ fn readInputModel(self: *Self, window_id: WindowId) InputModel {
         &hints,
         null,
     ) != 0 and hints.flags & c.XCB_ICCCM_WM_HINT_INPUT != 0) {
-        model.accepts_input = hints.input != 0;
+        window.accepts_input = hints.input != 0;
     }
+}
 
+fn refreshProtocols(self: *Self, window_id: WindowId, window: *Window) void {
+    window.take_focus = false;
+    window.delete_window = false;
     var protocols = std.mem.zeroes(c.xcb_icccm_get_wm_protocols_reply_t);
     if (c.xcb_icccm_get_wm_protocols_reply(
         self.connection,
@@ -406,21 +437,21 @@ fn readInputModel(self: *Self, window_id: WindowId) InputModel {
         defer c.xcb_icccm_get_wm_protocols_reply_wipe(&protocols);
         for (protocols.atoms[0..protocols.atoms_len]) |protocol| {
             if (protocol == self.atomValue(.wm_take_focus)) {
-                model.take_focus = true;
-                break;
+                window.take_focus = true;
+            } else if (protocol == self.atomValue(.wm_delete_window)) {
+                window.delete_window = true;
             }
         }
     }
-    return model;
 }
 
-fn sendTakeFocus(self: *Self, window_id: WindowId) void {
+fn sendWmMessage(self: *Self, window_id: WindowId, message: Atom) void {
     var event = std.mem.zeroes(c.xcb_client_message_event_t);
     event.response_type = c.XCB_CLIENT_MESSAGE;
     event.format = 32;
     event.window = window_id;
     event.type = self.atomValue(.wm_protocols);
-    event.data.data32[0] = self.atomValue(.wm_take_focus);
+    event.data.data32[0] = self.atomValue(message);
     event.data.data32[1] = c.XCB_CURRENT_TIME;
     _ = c.xcb_send_event(
         self.connection,
@@ -428,6 +459,102 @@ fn sendTakeFocus(self: *Self, window_id: WindowId) void {
         window_id,
         c.XCB_EVENT_MASK_NO_EVENT,
         @ptrCast(&event),
+    );
+}
+
+fn refreshMetadata(self: *Self, window_id: WindowId, window: *Window) !bool {
+    const title_changed = replaceOwnedString(
+        self.allocator,
+        &window.title,
+        try self.readTitle(window_id),
+    );
+    const class_changed = try self.refreshClass(window_id, window);
+    return title_changed or class_changed;
+}
+
+fn readTitle(self: *Self, window_id: WindowId) !?[:0]u8 {
+    return try self.readTextProperty(window_id, self.atomValue(.net_wm_name)) orelse
+        try self.readTextProperty(window_id, c.XCB_ATOM_WM_NAME);
+}
+
+fn readTextProperty(self: *Self, window_id: WindowId, property: c.xcb_atom_t) !?[:0]u8 {
+    var value = std.mem.zeroes(c.xcb_icccm_get_text_property_reply_t);
+    if (c.xcb_icccm_get_text_property_reply(
+        self.connection,
+        c.xcb_icccm_get_text_property(self.connection, window_id, property),
+        &value,
+        null,
+    ) == 0) return null;
+    defer c.xcb_icccm_get_text_property_reply_wipe(&value);
+    if (value.format != 8 or value.name == null or value.name_len == 0) return null;
+    const bytes = @as([*]const u8, @ptrCast(value.name))[0..value.name_len];
+    const text = bytes[0 .. std.mem.indexOfScalar(u8, bytes, 0) orelse bytes.len];
+    if (text.len == 0 or !std.unicode.utf8ValidateSlice(text)) return null;
+    return @as(?[:0]u8, try self.allocator.dupeSentinel(u8, text, 0));
+}
+
+fn refreshClass(self: *Self, window_id: WindowId, window: *Window) !bool {
+    var value = std.mem.zeroes(c.xcb_icccm_get_wm_class_reply_t);
+    if (c.xcb_icccm_get_wm_class_reply(
+        self.connection,
+        c.xcb_icccm_get_wm_class(self.connection, window_id),
+        &value,
+        null,
+    ) == 0) {
+        const instance_changed = replaceOwnedString(self.allocator, &window.instance, null);
+        const app_id_changed = replaceOwnedString(self.allocator, &window.app_id, null);
+        return instance_changed or app_id_changed;
+    }
+    defer c.xcb_icccm_get_wm_class_reply_wipe(&value);
+    const instance = try duplicateCString(self.allocator, value.instance_name);
+    errdefer if (instance) |text| self.allocator.free(text);
+    const app_id = try duplicateCString(self.allocator, value.class_name);
+    const instance_changed = replaceOwnedString(self.allocator, &window.instance, instance);
+    const app_id_changed = replaceOwnedString(self.allocator, &window.app_id, app_id);
+    return instance_changed or app_id_changed;
+}
+
+fn duplicateCString(
+    allocator: std.mem.Allocator,
+    value: [*c]const u8,
+) !?[:0]u8 {
+    if (value == null) return null;
+    const text = std.mem.span(value);
+    if (text.len == 0 or !std.unicode.utf8ValidateSlice(text)) return null;
+    return @as(?[:0]u8, try allocator.dupeSentinel(u8, text, 0));
+}
+
+fn replaceOwnedString(
+    allocator: std.mem.Allocator,
+    target: *?[:0]u8,
+    replacement: ?[:0]u8,
+) bool {
+    if (target.*) |current| {
+        if (replacement) |next| {
+            if (std.mem.eql(u8, current, next)) {
+                allocator.free(next);
+                return false;
+            }
+        }
+        allocator.free(current);
+    } else if (replacement == null) {
+        return false;
+    }
+    target.* = replacement;
+    return true;
+}
+
+fn setWmState(self: *Self, window_id: WindowId, state: c_int) void {
+    const values = [_]u32{ @bitCast(state), c.XCB_WINDOW_NONE };
+    _ = c.xcb_change_property(
+        self.connection,
+        c.XCB_PROP_MODE_REPLACE,
+        window_id,
+        self.atomValue(.wm_state),
+        self.atomValue(.wm_state),
+        32,
+        values.len,
+        &values,
     );
 }
 
@@ -529,11 +656,12 @@ fn dispatchEvent(self: *Self, event: [*c]c.xcb_generic_event_t) !void {
     switch (event.*.response_type & 0x7f) {
         c.XCB_CREATE_NOTIFY => try self.handleCreate(@ptrCast(event)),
         c.XCB_DESTROY_NOTIFY => self.handleDestroy(@ptrCast(event)),
-        c.XCB_MAP_REQUEST => self.handleMapRequest(@ptrCast(event)),
+        c.XCB_MAP_REQUEST => try self.handleMapRequest(@ptrCast(event)),
         c.XCB_MAP_NOTIFY => self.handleMapNotify(@ptrCast(event)),
         c.XCB_UNMAP_NOTIFY => self.handleUnmapNotify(@ptrCast(event)),
         c.XCB_CONFIGURE_REQUEST => self.handleConfigureRequest(@ptrCast(event)),
         c.XCB_CONFIGURE_NOTIFY => self.handleConfigureNotify(@ptrCast(event)),
+        c.XCB_PROPERTY_NOTIFY => try self.handlePropertyNotify(@ptrCast(event)),
         c.XCB_CLIENT_MESSAGE => try self.handleClientMessage(@ptrCast(event)),
         else => {},
     }
@@ -551,6 +679,14 @@ fn handleCreate(self: *Self, event: *const c.xcb_create_notify_event_t) !void {
         .override_redirect = event.override_redirect != 0,
     };
     try self.windows.put(self.allocator, event.window, window);
+    const event_mask: u32 = c.XCB_EVENT_MASK_PROPERTY_CHANGE |
+        c.XCB_EVENT_MASK_FOCUS_CHANGE;
+    _ = c.xcb_change_window_attributes(
+        self.connection,
+        event.window,
+        c.XCB_CW_EVENT_MASK,
+        &event_mask,
+    );
     self.listener.created(self.listener.context, info(event.window, window));
 }
 
@@ -568,10 +704,20 @@ fn removeWindow(self: *Self, window_id: WindowId) void {
     if (removed.value.surface_id) |surface_id|
         self.listener.dissociated(self.listener.context, window_id, surface_id);
     self.listener.destroyed(self.listener.context, window_id);
+    var window = removed.value;
+    window.deinit(self.allocator);
 }
 
-fn handleMapRequest(self: *Self, event: *const c.xcb_map_request_event_t) void {
-    if (!self.windows.contains(event.window)) return;
+fn handleMapRequest(self: *Self, event: *const c.xcb_map_request_event_t) !void {
+    const window = self.windows.getPtr(event.window) orelse return;
+    if (try self.refreshMetadata(event.window, window)) {
+        self.listener.metadata_changed(self.listener.context, event.window);
+    }
+    self.refreshInputModel(event.window, window);
+    self.refreshProtocols(event.window, window);
+    if (!window.override_redirect) {
+        self.setWmState(event.window, c.XCB_ICCCM_WM_STATE_NORMAL);
+    }
     _ = c.xcb_map_window(self.connection, event.window);
 }
 
@@ -608,7 +754,25 @@ fn handleUnmapNotify(self: *Self, event: *const c.xcb_unmap_notify_event_t) void
     window.surface_id = null;
     if (!window.mapped) return;
     window.mapped = false;
+    if (!window.override_redirect) {
+        self.setWmState(event.window, c.XCB_ICCCM_WM_STATE_WITHDRAWN);
+    }
     self.listener.mapped(self.listener.context, event.window, false);
+}
+
+fn handlePropertyNotify(self: *Self, event: *const c.xcb_property_notify_event_t) !void {
+    const window = self.windows.getPtr(event.window) orelse return;
+    if (event.atom == self.atomValue(.net_wm_name) or
+        event.atom == c.XCB_ATOM_WM_NAME or event.atom == c.XCB_ATOM_WM_CLASS)
+    {
+        if (try self.refreshMetadata(event.window, window)) {
+            self.listener.metadata_changed(self.listener.context, event.window);
+        }
+    } else if (event.atom == c.XCB_ATOM_WM_HINTS) {
+        self.refreshInputModel(event.window, window);
+    } else if (event.atom == self.atomValue(.wm_protocols)) {
+        self.refreshProtocols(event.window, window);
+    }
 }
 
 fn handleConfigureRequest(
@@ -712,6 +876,10 @@ fn info(window_id: WindowId, window: Window) WindowInfo {
         .override_redirect = window.override_redirect,
         .mapped = window.mapped,
         .surface_id = window.surface_id,
+        .title = window.title,
+        .app_id = window.app_id,
+        .instance = window.instance,
+        .can_close = window.delete_window,
     };
 }
 
