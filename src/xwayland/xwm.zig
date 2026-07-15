@@ -26,6 +26,7 @@ client_list: std.ArrayList(WindowId),
 client_stacking: std.ArrayList(WindowId),
 focused_window: ?WindowId,
 xfixes_event_base: u8,
+xres_available: bool,
 clipboard_selection: XSelection,
 primary_selection: XSelection,
 dnd_selection: XSelection,
@@ -107,6 +108,7 @@ pub const WindowInfo = struct {
     min_size: Size,
     max_size: Size,
     can_close: bool,
+    unreliable_pid: ?i32,
     modal: bool,
     fullscreen: bool,
     maximized: bool,
@@ -141,6 +143,7 @@ const Window = struct {
     take_focus: bool = false,
     delete_window: bool = false,
     net_wm_state: []c.xcb_atom_t = &.{},
+    unreliable_pid: ?i32 = null,
     modal: bool = false,
     fullscreen: bool = false,
     maximized_horz: bool = false,
@@ -339,6 +342,7 @@ pub fn init(
         .client_stacking = .empty,
         .focused_window = null,
         .xfixes_event_base = 0,
+        .xres_available = false,
         .clipboard_selection = undefined,
         .primary_selection = undefined,
         .dnd_selection = undefined,
@@ -349,6 +353,7 @@ pub fn init(
     try self.resolveAtoms();
     try self.checkComposite();
     self.xfixes_event_base = try self.checkXfixes();
+    self.xres_available = self.checkXres();
     self.wm_window = c.xcb_generate_id(connection);
     if (self.wm_window == c.XCB_WINDOW_NONE) return error.XidAllocationFailed;
     try checkRequest(connection, c.xcb_create_window_checked(
@@ -495,8 +500,13 @@ pub fn associateSurface(self: *Self, serial: u64, surface_id: Surface.Id) bool {
     const window_id = self.serial_windows.get(serial) orelse return false;
     const window = self.windows.getPtr(window_id) orelse return false;
     if (window.surface_id) |current| return std.meta.eql(current, surface_id);
+    if (self.xres_available) window.unreliable_pid = self.readClientPid(window_id);
     window.surface_id = surface_id;
-    log.debug("associated X11 window {d} with surface serial {d}", .{ window_id, serial });
+    log.debug("associated X11 window {d} with surface serial {d} and client pid {?d}", .{
+        window_id,
+        serial,
+        window.unreliable_pid,
+    });
     self.listener.associated(self.listener.context, window_id, surface_id);
     return true;
 }
@@ -937,6 +947,57 @@ fn checkXfixes(self: *Self) !u8 {
         return error.XfixesUnavailable;
     }
     return extension.*.first_event;
+}
+
+fn checkXres(self: *Self) bool {
+    const extension_name = "X-Resource";
+    const extension = c.xcb_query_extension_reply(
+        self.connection,
+        c.xcb_query_extension(
+            self.connection,
+            extension_name.len,
+            extension_name.ptr,
+        ),
+        null,
+    ) orelse return false;
+    defer std.c.free(extension);
+    if (extension.*.present == 0) return false;
+    const reply = c.xcb_res_query_version_reply(
+        self.connection,
+        c.xcb_res_query_version(
+            self.connection,
+            c.XCB_RES_MAJOR_VERSION,
+            c.XCB_RES_MINOR_VERSION,
+        ),
+        null,
+    ) orelse return false;
+    defer std.c.free(reply);
+    return reply.*.server_major > 1 or
+        (reply.*.server_major == 1 and reply.*.server_minor >= 2);
+}
+
+fn readClientPid(self: *Self, window_id: WindowId) ?i32 {
+    const spec: c.xcb_res_client_id_spec_t = .{
+        .client = window_id,
+        .mask = c.XCB_RES_CLIENT_ID_MASK_LOCAL_CLIENT_PID,
+    };
+    const reply = c.xcb_res_query_client_ids_reply(
+        self.connection,
+        c.xcb_res_query_client_ids(self.connection, 1, &spec),
+        null,
+    ) orelse return null;
+    defer std.c.free(reply);
+    var values = c.xcb_res_query_client_ids_ids_iterator(reply);
+    while (values.rem > 0) : (c.xcb_res_client_id_value_next(&values)) {
+        const value = values.data orelse return null;
+        if (value.*.spec.mask & c.XCB_RES_CLIENT_ID_MASK_LOCAL_CLIENT_PID == 0 or
+            c.xcb_res_client_id_value_value_length(value) == 0) continue;
+        const pid_values = c.xcb_res_client_id_value_value(value) orelse return null;
+        const pid = pid_values[0];
+        if (pid == 0 or pid > std.math.maxInt(i32)) return null;
+        return @intCast(pid);
+    }
+    return null;
 }
 
 fn publishWmIdentity(self: *Self) !void {
@@ -2066,6 +2127,7 @@ fn info(self: *const Self, window_id: WindowId, window: Window) WindowInfo {
         .min_size = window.min_size,
         .max_size = window.max_size,
         .can_close = window.delete_window,
+        .unreliable_pid = window.unreliable_pid,
         .modal = window.modal,
         .fullscreen = window.fullscreen,
         .maximized = window.maximized_horz and window.maximized_vert,

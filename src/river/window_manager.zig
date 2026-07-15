@@ -1388,9 +1388,18 @@ fn createWindowResource(
     window.resource = resource;
     manager.sendWindow(resource);
     if (resource.getVersion() >= river.WindowV1.unreliable_pid_since_version) {
-        if (window.xdgId()) |xdg_id| {
-            const info = self.xdg_shell.windowInfo(xdg_id) orelse unreachable;
-            resource.sendUnreliablePid(info.unreliable_pid);
+        switch (window.backend) {
+            .xdg => |xdg_id| {
+                const info = self.xdg_shell.windowInfo(xdg_id) orelse unreachable;
+                resource.sendUnreliablePid(info.unreliable_pid);
+            },
+            .xwayland => |xwayland_id| {
+                const info = self.xwayland.window_info(
+                    self.xwayland.context,
+                    xwayland_id,
+                ) orelse unreachable;
+                if (info.unreliable_pid) |pid| resource.sendUnreliablePid(pid);
+            },
         }
     }
     if (resource.getVersion() >= river.WindowV1.identifier_since_version) {
