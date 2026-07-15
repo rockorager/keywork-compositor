@@ -239,7 +239,11 @@ fn handleRequest(
         ) catch resource.postNoMemory(),
         .get_data_device => |get| {
             if (!self.seat.ownsResource(get.seat)) {
-                resource.getClient().postImplementationError("unknown wl_seat resource");
+                createInertDevice(
+                    resource.getClient(),
+                    resource.getVersion(),
+                    get.id,
+                ) catch resource.postNoMemory();
                 return;
             }
             DeviceResource.create(
@@ -249,6 +253,22 @@ fn handleRequest(
                 get.id,
             ) catch resource.postNoMemory();
         },
+    }
+}
+
+fn createInertDevice(client: *wl.Client, version: u32, id: u32) !void {
+    const resource = try wl.DataDevice.create(client, version, id);
+    resource.setHandler(?*anyopaque, inertDeviceRequest, null, null);
+}
+
+fn inertDeviceRequest(
+    resource: *wl.DataDevice,
+    request: wl.DataDevice.Request,
+    _: ?*anyopaque,
+) void {
+    switch (request) {
+        .release => resource.destroy(),
+        .start_drag, .set_selection => {},
     }
 }
 

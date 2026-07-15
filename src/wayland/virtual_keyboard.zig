@@ -99,11 +99,12 @@ fn handleManagerRequest(
 ) void {
     switch (request) {
         .create_virtual_keyboard => |create| {
-            if (!self.seat.ownsResource(create.seat)) {
-                resource.getClient().postImplementationError("unknown wl_seat resource");
-                return;
-            }
-            Device.create(self, resource, create.id) catch resource.postNoMemory();
+            Device.create(
+                self,
+                resource,
+                create.id,
+                self.seat.ownsResource(create.seat),
+            ) catch resource.postNoMemory();
         },
     }
 }
@@ -111,6 +112,7 @@ fn handleManagerRequest(
 const Device = struct {
     manager: *Self,
     resource: *zwp.VirtualKeyboardV1,
+    active: bool,
     has_keymap: bool,
     registered: bool,
     pressed_keys: std.ArrayList(u32),
@@ -119,6 +121,7 @@ const Device = struct {
         manager: *Self,
         manager_resource: *zwp.VirtualKeyboardManagerV1,
         id: u32,
+        active: bool,
     ) !void {
         const resource = try zwp.VirtualKeyboardV1.create(
             manager_resource.getClient(),
@@ -131,6 +134,7 @@ const Device = struct {
         self.* = .{
             .manager = manager,
             .resource = resource,
+            .active = active,
             .has_keymap = false,
             .registered = false,
             .pressed_keys = .empty,
@@ -145,6 +149,20 @@ const Device = struct {
         request: zwp.VirtualKeyboardV1.Request,
         self: *Device,
     ) void {
+        if (!self.active) {
+            switch (request) {
+                .destroy => resource.destroy(),
+                .keymap => |keymap| {
+                    const file: std.Io.File = .{
+                        .handle = keymap.fd,
+                        .flags = .{ .nonblocking = false },
+                    };
+                    file.close(self.manager.io);
+                },
+                .key, .modifiers => {},
+            }
+            return;
+        }
         switch (request) {
             .destroy => resource.destroy(),
             .keymap => |keymap| self.setKeymap(resource, keymap.format, keymap.fd, keymap.size),

@@ -177,12 +177,13 @@ fn handleManagerRequest(
     switch (request) {
         .destroy => resource.destroy(),
         .get_input_method => |get| {
-            if (!self.seat.ownsResource(get.seat)) {
-                resource.getClient().postImplementationError("unknown wl_seat resource");
-                return;
-            }
-            Method.create(self, resource.getClient(), resource.getVersion(), get.input_method) catch
-                resource.postNoMemory();
+            Method.create(
+                self,
+                resource.getClient(),
+                resource.getVersion(),
+                get.input_method,
+                !self.seat.ownsResource(get.seat),
+            ) catch resource.postNoMemory();
         },
     }
 }
@@ -222,6 +223,7 @@ const Method = struct {
         client: *wl.Client,
         version: u32,
         id: u32,
+        force_inert: bool,
     ) error{ OutOfMemory, ResourceCreateFailed }!void {
         const resource = try zwp.InputMethodV2.create(client, version, id);
         errdefer resource.destroy();
@@ -234,7 +236,7 @@ const Method = struct {
             .allocator = manager.allocator,
             .manager = manager,
             .resource = resource,
-            .available = manager.active_method == null,
+            .available = !force_inert and manager.active_method == null,
         };
         resource.setHandler(*Method, handleRequest, handleDestroy, self);
         if (!self.available) {

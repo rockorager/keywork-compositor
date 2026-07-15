@@ -304,7 +304,11 @@ fn handleManagerRequest(
         .destroy => resource.destroy(),
         .get_text_input => |get| {
             if (!self.seat.ownsResource(get.seat)) {
-                resource.getClient().postImplementationError("unknown wl_seat resource");
+                createInertInput(
+                    resource.getClient(),
+                    resource.getVersion(),
+                    get.id,
+                ) catch resource.postNoMemory();
                 return;
             }
             InputResource.create(
@@ -314,6 +318,22 @@ fn handleManagerRequest(
                 get.id,
             ) catch resource.postNoMemory();
         },
+    }
+}
+
+fn createInertInput(client: *wl.Client, version: u32, id: u32) !void {
+    const resource = try zwp.TextInputV3.create(client, version, id);
+    resource.setHandler(?*anyopaque, inertInputRequest, null, null);
+}
+
+fn inertInputRequest(
+    resource: *zwp.TextInputV3,
+    request: zwp.TextInputV3.Request,
+    _: ?*anyopaque,
+) void {
+    switch (request) {
+        .destroy => resource.destroy(),
+        else => {},
     }
 }
 
