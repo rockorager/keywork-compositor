@@ -157,6 +157,20 @@ pub const PointerHandle = struct {
     generation: u64,
 };
 
+pub const PointerBinding = struct {
+    seat: *Self,
+    generation: u64,
+
+    pub fn isActive(self: PointerBinding) bool {
+        for (self.seat.pointer_resources.items) |entry| {
+            if (entry.generation == self.generation) {
+                return self.seat.pointerResourceActive(entry);
+            }
+        }
+        return false;
+    }
+};
+
 pub const ShapeCursor = struct {
     client: *wl.Client,
     buffer: render.PixelBuffer,
@@ -314,6 +328,14 @@ pub fn ownsResource(self: *Self, resource: *wl.Seat) bool {
 pub fn fromResource(resource: *wl.Seat) *Self {
     const data = resource.getUserData() orelse unreachable;
     return @ptrCast(@alignCast(data));
+}
+
+pub fn pointerBinding(resource: *wl.Pointer) ?PointerBinding {
+    const data = resource.getUserData() orelse return null;
+    const self: *Self = @ptrCast(@alignCast(data));
+    const handle = self.pointerHandle(resource) orelse return null;
+    if (!self.pointerHandleIsActive(handle)) return null;
+    return .{ .seat = self, .generation = handle.generation };
 }
 
 pub fn pointerHandle(self: *const Self, resource: *wl.Pointer) ?PointerHandle {
@@ -474,6 +496,10 @@ pub fn pointerFocusedClient(self: *const Self) ?*wl.Client {
     const focus = self.pointer_focus orelse return null;
     const resource = Surface.resourceFor(self.surface_store, focus.surface_id) orelse return null;
     return resource.getClient();
+}
+
+pub fn pointerFocusedResource(self: *Self) ?*wl.Surface {
+    return self.pointerSurface();
 }
 
 pub fn pointerPosition(self: *const Self) ?struct { x: f64, y: f64 } {

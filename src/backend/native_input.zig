@@ -78,6 +78,14 @@ pub const Listener = struct {
     pointer_axis_stop: *const fn (*anyopaque, DeviceId, u32, wl.Pointer.Axis) void,
     pointer_axis_discrete: *const fn (*anyopaque, DeviceId, wl.Pointer.Axis, i32) void,
     pointer_axis_value120: *const fn (*anyopaque, DeviceId, wl.Pointer.Axis, i32) void,
+    swipe_begin: *const fn (*anyopaque, DeviceId, u32, u32) void,
+    swipe_update: *const fn (*anyopaque, DeviceId, u32, f64, f64) void,
+    swipe_end: *const fn (*anyopaque, DeviceId, u32, bool) void,
+    pinch_begin: *const fn (*anyopaque, DeviceId, u32, u32) void,
+    pinch_update: *const fn (*anyopaque, DeviceId, u32, f64, f64, f64, f64) void,
+    pinch_end: *const fn (*anyopaque, DeviceId, u32, bool) void,
+    hold_begin: *const fn (*anyopaque, DeviceId, u32, u32) void,
+    hold_end: *const fn (*anyopaque, DeviceId, u32, bool) void,
     touch_available: *const fn (*anyopaque, bool) void,
     touch_down: *const fn (*anyopaque, DeviceId, u32, i32, f64, f64) void,
     touch_up: *const fn (*anyopaque, DeviceId, u32, i32) void,
@@ -855,6 +863,30 @@ fn processEvent(self: *Self, event: *c.struct_libinput_event) void {
             c.libinput_event_get_pointer_event(event).?,
             .continuous,
         ),
+        c.LIBINPUT_EVENT_GESTURE_SWIPE_BEGIN => self.swipeBegin(
+            c.libinput_event_get_gesture_event(event).?,
+        ),
+        c.LIBINPUT_EVENT_GESTURE_SWIPE_UPDATE => self.swipeUpdate(
+            c.libinput_event_get_gesture_event(event).?,
+        ),
+        c.LIBINPUT_EVENT_GESTURE_SWIPE_END => self.swipeEnd(
+            c.libinput_event_get_gesture_event(event).?,
+        ),
+        c.LIBINPUT_EVENT_GESTURE_PINCH_BEGIN => self.pinchBegin(
+            c.libinput_event_get_gesture_event(event).?,
+        ),
+        c.LIBINPUT_EVENT_GESTURE_PINCH_UPDATE => self.pinchUpdate(
+            c.libinput_event_get_gesture_event(event).?,
+        ),
+        c.LIBINPUT_EVENT_GESTURE_PINCH_END => self.pinchEnd(
+            c.libinput_event_get_gesture_event(event).?,
+        ),
+        c.LIBINPUT_EVENT_GESTURE_HOLD_BEGIN => self.holdBegin(
+            c.libinput_event_get_gesture_event(event).?,
+        ),
+        c.LIBINPUT_EVENT_GESTURE_HOLD_END => self.holdEnd(
+            c.libinput_event_get_gesture_event(event).?,
+        ),
         c.LIBINPUT_EVENT_TOUCH_DOWN => self.touchDown(c.libinput_event_get_touch_event(event).?),
         c.LIBINPUT_EVENT_TOUCH_UP => self.touchUp(c.libinput_event_get_touch_event(event).?),
         c.LIBINPUT_EVENT_TOUCH_MOTION => self.touchMotion(c.libinput_event_get_touch_event(event).?),
@@ -1427,6 +1459,106 @@ fn pointerScrollAxis(
             self.listener.pointer_axis_discrete(self.listener.context, device.info.id, axis, discrete);
         }
     }
+}
+
+fn swipeBegin(self: *Self, event: *c.struct_libinput_event_gesture) void {
+    const device = self.gestureInputDevice(event) orelse return;
+    const fingers = gestureFingerCount(event) orelse return;
+    self.listener.swipe_begin(
+        self.listener.context,
+        device.info.id,
+        c.libinput_event_gesture_get_time(event),
+        fingers,
+    );
+}
+
+fn swipeUpdate(self: *Self, event: *c.struct_libinput_event_gesture) void {
+    const device = self.gestureInputDevice(event) orelse return;
+    self.listener.swipe_update(
+        self.listener.context,
+        device.info.id,
+        c.libinput_event_gesture_get_time(event),
+        c.libinput_event_gesture_get_dx(event),
+        c.libinput_event_gesture_get_dy(event),
+    );
+}
+
+fn swipeEnd(self: *Self, event: *c.struct_libinput_event_gesture) void {
+    const device = self.gestureInputDevice(event) orelse return;
+    self.listener.swipe_end(
+        self.listener.context,
+        device.info.id,
+        c.libinput_event_gesture_get_time(event),
+        c.libinput_event_gesture_get_cancelled(event) != 0,
+    );
+}
+
+fn pinchBegin(self: *Self, event: *c.struct_libinput_event_gesture) void {
+    const device = self.gestureInputDevice(event) orelse return;
+    const fingers = gestureFingerCount(event) orelse return;
+    self.listener.pinch_begin(
+        self.listener.context,
+        device.info.id,
+        c.libinput_event_gesture_get_time(event),
+        fingers,
+    );
+}
+
+fn pinchUpdate(self: *Self, event: *c.struct_libinput_event_gesture) void {
+    const device = self.gestureInputDevice(event) orelse return;
+    self.listener.pinch_update(
+        self.listener.context,
+        device.info.id,
+        c.libinput_event_gesture_get_time(event),
+        c.libinput_event_gesture_get_dx(event),
+        c.libinput_event_gesture_get_dy(event),
+        c.libinput_event_gesture_get_scale(event),
+        c.libinput_event_gesture_get_angle_delta(event),
+    );
+}
+
+fn pinchEnd(self: *Self, event: *c.struct_libinput_event_gesture) void {
+    const device = self.gestureInputDevice(event) orelse return;
+    self.listener.pinch_end(
+        self.listener.context,
+        device.info.id,
+        c.libinput_event_gesture_get_time(event),
+        c.libinput_event_gesture_get_cancelled(event) != 0,
+    );
+}
+
+fn holdBegin(self: *Self, event: *c.struct_libinput_event_gesture) void {
+    const device = self.gestureInputDevice(event) orelse return;
+    const fingers = gestureFingerCount(event) orelse return;
+    self.listener.hold_begin(
+        self.listener.context,
+        device.info.id,
+        c.libinput_event_gesture_get_time(event),
+        fingers,
+    );
+}
+
+fn holdEnd(self: *Self, event: *c.struct_libinput_event_gesture) void {
+    const device = self.gestureInputDevice(event) orelse return;
+    self.listener.hold_end(
+        self.listener.context,
+        device.info.id,
+        c.libinput_event_gesture_get_time(event),
+        c.libinput_event_gesture_get_cancelled(event) != 0,
+    );
+}
+
+fn gestureInputDevice(
+    self: *Self,
+    event: *c.struct_libinput_event_gesture,
+) ?*InputDevice {
+    const base = c.libinput_event_gesture_get_base_event(event) orelse return null;
+    return self.eventInputDevice(base, .pointer);
+}
+
+fn gestureFingerCount(event: *c.struct_libinput_event_gesture) ?u32 {
+    const fingers = c.libinput_event_gesture_get_finger_count(event);
+    return if (fingers > 0) @intCast(fingers) else null;
 }
 
 fn touchDown(self: *Self, event: *c.struct_libinput_event_touch) void {

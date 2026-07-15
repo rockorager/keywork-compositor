@@ -780,15 +780,16 @@
       "interfaces": [
         {
           "name": "zwp_pointer_gestures_v1",
-          "current_version": null,
+          "current_version": 3,
           "target_version": 3
         }
       ],
-      "status": "not_started",
+      "status": "done",
       "privileged": false,
       "blocked_by": [
         "wl-seat"
-      ]
+      ],
+      "status_detail": "Version 3 forwards libinput swipe, pinch, and hold gestures to the focused pointer client on each native input seat. Gesture routing remains bound to its starting seat, enforces one active gesture per seat, resets idle notifications, and sends cancellation when a device moves or disappears."
     },
     {
       "id": "tablet-v2",

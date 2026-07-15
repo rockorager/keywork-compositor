@@ -18,6 +18,7 @@ const SecurityContext = @import("wayland/security_context.zig");
 const SessionLock = @import("wayland/session_lock.zig");
 const CursorShape = @import("wayland/cursor_shape.zig");
 const RelativePointer = @import("wayland/relative_pointer.zig");
+const PointerGestures = @import("wayland/pointer_gestures.zig");
 const PointerConstraints = @import("wayland/pointer_constraints.zig");
 const IdleInhibit = @import("wayland/idle_inhibit.zig");
 const IdleNotify = @import("wayland/idle_notify.zig");
@@ -87,6 +88,7 @@ session_lock: SessionLock,
 session_lock_initialized: bool,
 cursor_shape: CursorShape,
 relative_pointer: RelativePointer,
+pointer_gestures: PointerGestures,
 pointer_constraints: PointerConstraints,
 idle_inhibit: IdleInhibit,
 idle_notify: IdleNotify,
@@ -102,6 +104,7 @@ dynamic_seats: std.ArrayList(*SeatEntry),
 input_device_listener: InputManager.DeviceListener,
 routed_keys: std.ArrayList(RoutedKey),
 routed_buttons: std.ArrayList(RoutedButton),
+routed_gestures: std.ArrayList(RoutedGesture),
 routed_touches: std.ArrayList(RoutedTouch),
 next_touch_id: u31,
 data_device: DataDevice,
@@ -157,6 +160,14 @@ const RoutedButton = struct {
     device_id: NativeInput.DeviceId,
     seat: *Seat,
     button: u32,
+};
+
+const GestureKind = enum { swipe, pinch, hold };
+
+const RoutedGesture = struct {
+    device_id: NativeInput.DeviceId,
+    seat: *Seat,
+    kind: GestureKind,
 };
 
 const RoutedTouch = struct {
@@ -233,6 +244,7 @@ pub fn create(
         .session_lock_initialized = false,
         .cursor_shape = undefined,
         .relative_pointer = undefined,
+        .pointer_gestures = undefined,
         .pointer_constraints = undefined,
         .idle_inhibit = undefined,
         .idle_notify = undefined,
@@ -252,6 +264,7 @@ pub fn create(
         },
         .routed_keys = .empty,
         .routed_buttons = .empty,
+        .routed_gestures = .empty,
         .routed_touches = .empty,
         .next_touch_id = 0,
         .data_device = undefined,
@@ -272,6 +285,7 @@ pub fn create(
         .listening = false,
     };
     errdefer self.routed_touches.deinit(allocator);
+    errdefer self.routed_gestures.deinit(allocator);
     errdefer self.routed_buttons.deinit(allocator);
     errdefer self.routed_keys.deinit(allocator);
     errdefer self.dynamic_seats.deinit(allocator);
@@ -387,6 +401,8 @@ pub fn create(
     errdefer self.cursor_shape.deinit();
     try self.relative_pointer.init(allocator, display, &self.seat);
     errdefer self.relative_pointer.deinit();
+    try self.pointer_gestures.init(allocator, display);
+    errdefer self.pointer_gestures.deinit();
     try self.pointer_constraints.init(
         allocator,
         display,
@@ -691,6 +707,7 @@ pub fn destroy(self: *Self) void {
     self.presentation_protocol.deinit();
     self.idle_inhibit.deinit();
     self.pointer_constraints.deinit();
+    self.pointer_gestures.deinit();
     self.relative_pointer.deinit();
     self.cursor_shape.deinit();
     self.session_lock.deinit();
@@ -707,6 +724,7 @@ pub fn destroy(self: *Self) void {
     self.outputs.deinit();
     self.render_outputs.deinit(allocator);
     self.routed_touches.deinit(allocator);
+    self.routed_gestures.deinit(allocator);
     self.routed_buttons.deinit(allocator);
     self.routed_keys.deinit(allocator);
     for (self.dynamic_seats.items) |entry| {
@@ -840,6 +858,14 @@ fn nativeInputListener(render_output: *RenderOutput) NativeInput.Listener {
         .pointer_axis_stop = nativePointerAxisStop,
         .pointer_axis_discrete = nativePointerAxisDiscrete,
         .pointer_axis_value120 = nativePointerAxisValue120,
+        .swipe_begin = nativeSwipeBegin,
+        .swipe_update = nativeSwipeUpdate,
+        .swipe_end = nativeSwipeEnd,
+        .pinch_begin = nativePinchBegin,
+        .pinch_update = nativePinchUpdate,
+        .pinch_end = nativePinchEnd,
+        .hold_begin = nativeHoldBegin,
+        .hold_end = nativeHoldEnd,
         .touch_available = touchAvailable,
         .touch_down = nativeTouchDown,
         .touch_up = nativeTouchUp,
@@ -884,6 +910,7 @@ fn inputSeatDestroyed(context: *anyopaque, name: [:0]const u8) void {
     const self: *Self = @ptrCast(@alignCast(context));
     for (self.dynamic_seats.items) |entry| {
         if (entry.removed or !std.mem.eql(u8, entry.name, name)) continue;
+        self.cancelSeatGestures(&entry.seat);
         entry.seat.setKeyboardAvailable(false);
         entry.seat.setPointerAvailable(false);
         entry.seat.setTouchAvailable(false);
@@ -909,7 +936,10 @@ fn inputDeviceRemoved(context: *anyopaque, device: *InputManager.Device) void {
     const self: *Self = @ptrCast(@alignCast(context));
     const seat = self.seatForName(device.seat_name) orelse return;
     if (device.device_type == .keyboard) self.releaseDeviceKeys(device.id);
-    if (device.device_type == .pointer) self.releaseDeviceButtons(device.id);
+    if (device.device_type == .pointer) {
+        self.releaseDeviceButtons(device.id);
+        self.cancelDeviceGestures(device.id);
+    }
     if (device.device_type == .touch) self.cancelDeviceTouches(device.id);
     self.refreshSeatCapabilities(seat, device.seat_name);
     if (device.device_type == .keyboard) self.prepareAnySeatKeyboard(seat, device.seat_name);
@@ -922,7 +952,10 @@ fn inputDeviceSeatChanged(
 ) void {
     const self: *Self = @ptrCast(@alignCast(context));
     if (device.device_type == .keyboard) self.releaseDeviceKeys(device.id);
-    if (device.device_type == .pointer) self.releaseDeviceButtons(device.id);
+    if (device.device_type == .pointer) {
+        self.releaseDeviceButtons(device.id);
+        self.cancelDeviceGestures(device.id);
+    }
     if (device.device_type == .touch) self.cancelDeviceTouches(device.id);
     if (self.seatForName(previous_name)) |previous| {
         self.refreshSeatCapabilities(previous, previous_name);
@@ -1565,6 +1598,44 @@ fn nativePointerAxisDiscrete(context: *anyopaque, id: NativeInput.DeviceId, axis
 fn nativePointerAxisValue120(context: *anyopaque, id: NativeInput.DeviceId, axis: wl.Pointer.Axis, value: i32) void {
     serverForOutput(context).seatForDevice(id).pointerAxisValue120(axis, value);
 }
+fn nativeSwipeBegin(context: *anyopaque, id: NativeInput.DeviceId, time: u32, fingers: u32) void {
+    serverForOutput(context).beginGesture(id, time, fingers, .swipe);
+}
+fn nativeSwipeUpdate(context: *anyopaque, id: NativeInput.DeviceId, time: u32, dx: f64, dy: f64) void {
+    const self = serverForOutput(context);
+    const seat = self.gestureSeat(id, .swipe) orelse return;
+    self.idle_notify.notifyActivity(seat);
+    self.pointer_gestures.updateSwipe(seat, time, dx, dy);
+}
+fn nativeSwipeEnd(context: *anyopaque, id: NativeInput.DeviceId, time: u32, cancelled: bool) void {
+    serverForOutput(context).endGesture(id, time, .swipe, cancelled);
+}
+fn nativePinchBegin(context: *anyopaque, id: NativeInput.DeviceId, time: u32, fingers: u32) void {
+    serverForOutput(context).beginGesture(id, time, fingers, .pinch);
+}
+fn nativePinchUpdate(
+    context: *anyopaque,
+    id: NativeInput.DeviceId,
+    time: u32,
+    dx: f64,
+    dy: f64,
+    scale: f64,
+    rotation: f64,
+) void {
+    const self = serverForOutput(context);
+    const seat = self.gestureSeat(id, .pinch) orelse return;
+    self.idle_notify.notifyActivity(seat);
+    self.pointer_gestures.updatePinch(seat, time, dx, dy, scale, rotation);
+}
+fn nativePinchEnd(context: *anyopaque, id: NativeInput.DeviceId, time: u32, cancelled: bool) void {
+    serverForOutput(context).endGesture(id, time, .pinch, cancelled);
+}
+fn nativeHoldBegin(context: *anyopaque, id: NativeInput.DeviceId, time: u32, fingers: u32) void {
+    serverForOutput(context).beginGesture(id, time, fingers, .hold);
+}
+fn nativeHoldEnd(context: *anyopaque, id: NativeInput.DeviceId, time: u32, cancelled: bool) void {
+    serverForOutput(context).endGesture(id, time, .hold, cancelled);
+}
 fn nativeTouchDown(context: *anyopaque, device_id: NativeInput.DeviceId, time: u32, id: i32, x: f64, y: f64) void {
     const output: *RenderOutput = @ptrCast(@alignCast(context));
     output.server.routeTouchDown(output, device_id, time, id, x, y);
@@ -1700,6 +1771,100 @@ fn seatButtonHeld(self: *const Self, seat: *Seat, button: u32) bool {
         if (routed.seat == seat and routed.button == button) return true;
     }
     return false;
+}
+
+fn beginGesture(
+    self: *Self,
+    device_id: NativeInput.DeviceId,
+    time: u32,
+    fingers: u32,
+    kind: GestureKind,
+) void {
+    const seat = self.seatForDevice(device_id);
+    var index: usize = 0;
+    while (index < self.routed_gestures.items.len) {
+        const routed = self.routed_gestures.items[index];
+        if (routed.device_id == device_id or routed.seat == seat) {
+            self.cancelRoutedGesture(index);
+        } else {
+            index += 1;
+        }
+    }
+    self.routed_gestures.append(self.allocator, .{
+        .device_id = device_id,
+        .seat = seat,
+        .kind = kind,
+    }) catch return self.terminate();
+    self.idle_notify.notifyActivity(seat);
+    switch (kind) {
+        .swipe => self.pointer_gestures.beginSwipe(seat, time, fingers),
+        .pinch => self.pointer_gestures.beginPinch(seat, time, fingers),
+        .hold => self.pointer_gestures.beginHold(seat, time, fingers),
+    }
+}
+
+fn endGesture(
+    self: *Self,
+    device_id: NativeInput.DeviceId,
+    time: u32,
+    kind: GestureKind,
+    cancelled: bool,
+) void {
+    for (self.routed_gestures.items, 0..) |routed, index| {
+        if (routed.device_id != device_id or routed.kind != kind) continue;
+        _ = self.routed_gestures.orderedRemove(index);
+        self.idle_notify.notifyActivity(routed.seat);
+        self.sendGestureEnd(routed.seat, time, kind, cancelled);
+        return;
+    }
+}
+
+fn gestureSeat(self: *const Self, device_id: NativeInput.DeviceId, kind: GestureKind) ?*Seat {
+    for (self.routed_gestures.items) |routed| {
+        if (routed.device_id == device_id and routed.kind == kind) return routed.seat;
+    }
+    return null;
+}
+
+fn cancelDeviceGestures(self: *Self, device_id: NativeInput.DeviceId) void {
+    var index: usize = 0;
+    while (index < self.routed_gestures.items.len) {
+        if (self.routed_gestures.items[index].device_id == device_id) {
+            self.cancelRoutedGesture(index);
+        } else {
+            index += 1;
+        }
+    }
+}
+
+fn cancelSeatGestures(self: *Self, seat: *Seat) void {
+    var index: usize = 0;
+    while (index < self.routed_gestures.items.len) {
+        if (self.routed_gestures.items[index].seat == seat) {
+            self.cancelRoutedGesture(index);
+        } else {
+            index += 1;
+        }
+    }
+}
+
+fn cancelRoutedGesture(self: *Self, index: usize) void {
+    const routed = self.routed_gestures.orderedRemove(index);
+    self.sendGestureEnd(routed.seat, 0, routed.kind, true);
+}
+
+fn sendGestureEnd(
+    self: *Self,
+    seat: *Seat,
+    time: u32,
+    kind: GestureKind,
+    cancelled: bool,
+) void {
+    switch (kind) {
+        .swipe => self.pointer_gestures.endSwipe(seat, time, cancelled),
+        .pinch => self.pointer_gestures.endPinch(seat, time, cancelled),
+        .hold => self.pointer_gestures.endHold(seat, time, cancelled),
+    }
 }
 
 fn routeTouchDown(
