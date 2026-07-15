@@ -2683,6 +2683,7 @@ fn pointerButtonForSeat(
     else
         null;
     if (self.window_manager.pointerButtonForSeat(seat, button, state, root)) {
+        if (state == .released) seat.forgetPressedPointerButton(button);
         if (seat == &self.seat) self.pointer_constraints.deactivateAll();
         seat.suppressPointerFocus(true);
         return;
@@ -3314,6 +3315,7 @@ fn xwaylandReady(
             .minimize_requested = xwmWindowMinimizeRequested,
             .activation_requested = xwmWindowActivationRequested,
             .activation_changed = xwmWindowActivationChanged,
+            .move_resize_requested = xwmWindowMoveResizeRequested,
             .serial = xwmWindowSerial,
             .associated = xwmWindowAssociated,
             .dissociated = xwmWindowDissociated,
@@ -3471,6 +3473,34 @@ fn xwmWindowActivationChanged(context: *anyopaque, window_id: Xwm.WindowId) void
     if (self.foreign_toplevel_list_initialized) {
         self.foreign_toplevel_list.xwaylandWindowStateChanged(window_id);
     }
+}
+
+fn xwmWindowMoveResizeRequested(
+    context: *anyopaque,
+    window_id: Xwm.WindowId,
+    request: Xwm.MoveResizeRequest,
+    x11_button: u32,
+) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    if (!self.window_manager_initialized) return;
+    if (request == .cancel) {
+        self.window_manager.xwaylandWindowMoveResizeRequested(window_id, request);
+        return;
+    }
+    const info = self.xwm.windowInfo(window_id) orelse return;
+    const surface_id = info.surface_id orelse return;
+    const button = x11PointerButton(x11_button) orelse return;
+    if (!self.seat.hasPressedPointerButtonForSurface(button, surface_id)) return;
+    self.window_manager.xwaylandWindowMoveResizeRequested(window_id, request);
+}
+
+fn x11PointerButton(button: u32) ?u32 {
+    return switch (button) {
+        1 => 0x110,
+        2 => 0x112,
+        3 => 0x111,
+        else => null,
+    };
 }
 
 fn xwmWindowSerial(context: *anyopaque, _: Xwm.WindowId, serial: u64) void {
@@ -5020,6 +5050,14 @@ test "server adds and removes independent render outputs" {
         Output.Position{ .x = 1280 },
         server.outputs.get(second.protocol_id).?.logicalPosition(),
     );
+}
+
+test "X11 pointer buttons map to Linux button codes" {
+    try std.testing.expectEqual(@as(?u32, 0x110), x11PointerButton(1));
+    try std.testing.expectEqual(@as(?u32, 0x112), x11PointerButton(2));
+    try std.testing.expectEqual(@as(?u32, 0x111), x11PointerButton(3));
+    try std.testing.expectEqual(@as(?u32, null), x11PointerButton(0));
+    try std.testing.expectEqual(@as(?u32, null), x11PointerButton(4));
 }
 
 test "fullscreen selection is isolated to each output" {

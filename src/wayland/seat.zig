@@ -517,6 +517,25 @@ pub fn hasPressedPointerButton(self: *const Self, button: u32) bool {
     return false;
 }
 
+pub fn hasPressedPointerButtonForSurface(
+    self: *const Self,
+    button: u32,
+    surface_id: Surface.Id,
+) bool {
+    for (self.pressed_pointer_buttons.items) |press| {
+        if (press.button == button and std.meta.eql(press.surface_id, surface_id)) return true;
+    }
+    return false;
+}
+
+pub fn forgetPressedPointerButton(self: *Self, button: u32) void {
+    for (self.pressed_pointer_buttons.items, 0..) |press, index| {
+        if (press.button != button) continue;
+        _ = self.pressed_pointer_buttons.orderedRemove(index);
+        return;
+    }
+}
+
 pub fn serialIsOlder(candidate: u32, current: u32) bool {
     return candidate -% current > std.math.maxInt(u32) / 2;
 }

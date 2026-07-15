@@ -1151,6 +1151,43 @@ pub fn xwaylandWindowActivationRequested(
     self.requestManage();
 }
 
+pub fn xwaylandWindowMoveResizeRequested(
+    self: *Self,
+    xwayland_id: Xwm.WindowId,
+    request: Xwm.MoveResizeRequest,
+) void {
+    const manager = self.active orelse return;
+    const info = self.xwayland.window_info(self.xwayland.context, xwayland_id) orelse return;
+    if (!info.participatesInWindowManagement() or
+        !self.known_xwayland_windows.contains(xwayland_id)) return;
+    const id = self.ensureXwaylandWindow(xwayland_id) catch {
+        manager.postNoMemory();
+        return;
+    };
+    const pending: PendingWindowRequest.Request = switch (request) {
+        .move => .pointer_move,
+        .resize => |edges| .{ .pointer_resize = .{
+            .top = edges.top,
+            .bottom = edges.bottom,
+            .left = edges.left,
+            .right = edges.right,
+        } },
+        .cancel => {
+            const state = self.default_seat_state;
+            if (state.focused == null or !std.meta.eql(state.focused.?, id) or
+                state.operation == null) return;
+            state.pending_operation = .end;
+            self.requestManage();
+            return;
+        },
+    };
+    self.window_requests.append(self.allocator, .{ .id = id, .request = pending }) catch {
+        manager.postNoMemory();
+        return;
+    };
+    self.requestManage();
+}
+
 pub fn xwaylandWindowDisplayed(self: *Self, xwayland_id: Xwm.WindowId) bool {
     const id = self.findXwaylandWindow(xwayland_id) orelse return true;
     const window = self.windows.get(id) orelse return true;
