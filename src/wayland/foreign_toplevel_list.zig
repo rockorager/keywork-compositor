@@ -555,6 +555,17 @@ pub fn removeOutput(self: *Self, output_id: OutputLayout.Id) void {
     }
 }
 
+pub fn windowForExtHandle(
+    self: *Self,
+    resource: *ext.ForeignToplevelHandleV1,
+) ?XdgShell.WindowId {
+    for (self.handles.items) |handle| {
+        if (handle.resource != resource or handle.closed) continue;
+        return (handle.mapping orelse return null).window_id;
+    }
+    return null;
+}
+
 fn syncWlrChildParents(self: *Self, parent_id: XdgShell.WindowId) void {
     for (self.wlr_handles.items) |handle| {
         if (!handle.initialized or handle.closed) continue;

@@ -96,6 +96,7 @@ test {
     _ = @import("wayland/selection_source.zig");
     _ = @import("wayland/data_control.zig");
     _ = @import("wayland/foreign_toplevel_list.zig");
+    _ = @import("wayland/image_capture_source.zig");
     _ = @import("wayland/workspace.zig");
     _ = @import("wayland/text_input.zig");
     _ = @import("wayland/input_method.zig");

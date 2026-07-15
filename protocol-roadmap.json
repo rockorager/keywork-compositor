@@ -965,22 +965,23 @@
       "interfaces": [
         {
           "name": "ext_output_image_capture_source_manager_v1",
-          "current_version": null,
+          "current_version": 1,
           "target_version": 1
         },
         {
           "name": "ext_foreign_toplevel_image_capture_source_manager_v1",
-          "current_version": null,
+          "current_version": 1,
           "target_version": 1
         }
       ],
-      "status": "not_started",
+      "status": "done",
       "privileged": true,
       "blocked_by": [
         "ext-foreign-toplevel-list",
         "security-context",
         "wl-output"
-      ]
+      ],
+      "status_detail": "Version 1 creates persistent opaque sources for live wl_output resources and mapped ext-foreign-toplevel handles. Sources survive factory and foreign-handle destruction, become inert when their output is removed or their toplevel unmaps, and expose source invalidation to capture consumers. Both privileged factory globals are hidden from sandboxed security-context clients."
     },
     {
       "id": "image-copy-capture",
