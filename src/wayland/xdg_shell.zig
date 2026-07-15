@@ -398,6 +398,12 @@ pub fn windowInfo(self: *Self, id: WindowId) ?WindowInfo {
     };
 }
 
+pub fn windowSurface(self: *Self, id: WindowId) ?Surface.Id {
+    const window = self.windows.get(id) orelse return null;
+    const xdg_surface = self.xdg_surfaces.get(window.xdg_surface_id) orelse return null;
+    return xdg_surface.surface_id;
+}
+
 pub const AttachPopupError = error{
     ForeignResource,
     AlreadyAttached,

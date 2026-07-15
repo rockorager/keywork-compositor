@@ -5,6 +5,7 @@ const std = @import("std");
 const wayland = @import("wayland");
 const NativeInput = @import("../backend/native_input.zig");
 const SecurityContext = @import("../wayland/security_context.zig");
+const Seat = @import("../wayland/seat.zig");
 const InputManager = @import("input_manager.zig");
 const WindowManager = @import("window_manager.zig");
 const wl = wayland.server.wl;
@@ -25,6 +26,7 @@ const Binding = struct {
     owner: *Self,
     resource: *river.XkbBindingV1,
     generation: ?u64,
+    seat: ?*Seat,
     keysym: u32,
     modifiers: u32,
     layout_override: ?u32 = null,
@@ -32,7 +34,9 @@ const Binding = struct {
 
     fn active(self: *const Binding) bool {
         const generation = self.generation orelse return false;
-        return self.owner.window_manager.bindingSessionActive(generation, self.resource.getClient());
+        const seat = self.seat orelse return false;
+        return self.owner.window_manager.seatActive(seat) and
+            self.owner.window_manager.bindingSessionActive(generation, self.resource.getClient());
     }
 };
 
@@ -40,13 +44,17 @@ const BindingsSeat = struct {
     owner: *Self,
     resource: *river.XkbBindingsSeatV1,
     generation: ?u64,
+    seat: ?*Seat,
     seat_id: u32,
     ensure_next_key_eaten: bool = false,
     watched_modifiers: u32 = 0,
+    modifiers: u32 = 0,
 
     fn active(self: *const BindingsSeat) bool {
         const generation = self.generation orelse return false;
-        return self.owner.window_manager.bindingSessionActive(generation, self.resource.getClient());
+        const seat = self.seat orelse return false;
+        return self.owner.window_manager.seatActive(seat) and
+            self.owner.window_manager.bindingSessionActive(generation, self.resource.getClient());
     }
 };
 
@@ -54,6 +62,7 @@ const HeldKey = struct {
     device_id: NativeInput.DeviceId,
     key_code: u32,
     binding: ?*Binding,
+    captured: bool,
     stop_repeat_sent: bool = false,
 };
 
@@ -82,6 +91,7 @@ pub fn init(
             .context = self,
             .added = deviceAdded,
             .removed = deviceRemoved,
+            .seat_changed = deviceSeatChanged,
         },
         .bindings = .empty,
         .seats = .empty,
@@ -167,6 +177,7 @@ fn createBinding(
         .owner = self,
         .resource = resource,
         .generation = self.window_manager.bindingSession(seat),
+        .seat = self.window_manager.bindingSeat(seat),
         .keysym = keysym,
         .modifiers = modifiers & 0xed,
     };
@@ -227,6 +238,7 @@ fn createSeat(self: *Self, parent: *river.XkbBindingsV1, seat: *river.SeatV1, id
         .owner = self,
         .resource = resource,
         .generation = generation,
+        .seat = self.window_manager.bindingSeat(seat),
         .seat_id = seat_id,
     };
     self.seats.append(self.allocator, adapter) catch {
@@ -272,25 +284,28 @@ fn keyboardKey(context: *anyopaque, event: NativeInput.KeyboardEvent) bool {
 
 fn keyPressed(self: *Self, event: NativeInput.KeyboardEvent) bool {
     for (self.held_keys.items) |held| {
-        if (held.device_id == event.device_id and held.key_code == event.key_code) return true;
+        if (held.device_id == event.device_id and held.key_code == event.key_code) return held.captured;
     }
+    const event_device = self.input_manager.findDevice(event.device_id) orelse return false;
     if (!event.seat_level) {
         for (self.held_keys.items) |held| {
             if (held.key_code != event.key_code) continue;
+            const held_device = self.input_manager.findDevice(held.device_id) orelse continue;
+            if (!std.mem.eql(u8, held_device.seat_name, event_device.seat_name)) continue;
             self.held_keys.append(self.allocator, .{
                 .device_id = event.device_id,
                 .key_code = event.key_code,
                 .binding = null,
+                .captured = held.captured,
             }) catch return true;
-            return true;
+            return held.captured;
         }
-        return false;
     }
 
     var session: ?EventSession = null;
     for (self.held_keys.items) |*held| {
         const binding = held.binding orelse continue;
-        if (held.stop_repeat_sent or !binding.active() or
+        if (held.stop_repeat_sent or !binding.active() or !seatMatchesDevice(binding.seat.?, event_device) or
             binding.resource.getVersion() < river.XkbBindingV1.stop_repeat_since_version) continue;
         binding.resource.sendStopRepeat();
         held.stop_repeat_sent = true;
@@ -299,7 +314,8 @@ fn keyPressed(self: *Self, event: NativeInput.KeyboardEvent) bool {
 
     var matched: ?*Binding = null;
     for (self.bindings.items) |binding| {
-        if (!binding.active() or !binding.enabled or binding.modifiers != event.modifiers) continue;
+        if (!binding.active() or !seatMatchesDevice(binding.seat.?, event_device) or
+            !binding.enabled or binding.modifiers != event.modifiers) continue;
         const keysym_matches = if (binding.layout_override) |layout|
             self.native_input.?.keyboardMatchesKeysym(
                 event.device_id,
@@ -317,23 +333,23 @@ fn keyPressed(self: *Self, event: NativeInput.KeyboardEvent) bool {
     var eaten_by: ?*BindingsSeat = null;
     if (matched == null and !event.is_modifier) {
         for (self.seats.items) |seat| {
-            if (!seat.active() or !seat.ensure_next_key_eaten) continue;
+            if (!seat.active() or !seatMatchesDevice(seat.seat.?, event_device) or
+                !seat.ensure_next_key_eaten) continue;
             seat.ensure_next_key_eaten = false;
             eaten_by = seat;
             break;
         }
     }
     const captured = matched != null or eaten_by != null;
-    if (captured) {
-        self.held_keys.append(self.allocator, .{
-            .device_id = event.device_id,
-            .key_code = event.key_code,
-            .binding = matched,
-        }) catch {
-            if (matched) |binding| binding.resource.postNoMemory() else eaten_by.?.resource.postNoMemory();
-            return true;
-        };
-    }
+    self.held_keys.append(self.allocator, .{
+        .device_id = event.device_id,
+        .key_code = event.key_code,
+        .binding = matched,
+        .captured = captured,
+    }) catch {
+        if (matched) |binding| binding.resource.postNoMemory() else if (eaten_by) |seat| seat.resource.postNoMemory();
+        return true;
+    };
     if (matched) |binding| {
         binding.resource.sendPressed();
         session = bindingSession(binding);
@@ -353,7 +369,7 @@ fn keyReleased(self: *Self, event: NativeInput.KeyboardEvent) bool {
             binding.resource.sendReleased();
             self.requestManage(bindingSession(binding));
         };
-        return true;
+        return held.captured;
     }
     return false;
 }
@@ -363,6 +379,19 @@ fn deviceAdded(_: *anyopaque, _: *InputManager.Device) void {}
 fn deviceRemoved(context: *anyopaque, device: *InputManager.Device) void {
     if (device.device_type != .keyboard) return;
     const self: *Self = @ptrCast(@alignCast(context));
+    self.releaseDevice(device);
+    self.syncSeatModifiers(device.seat_name);
+}
+
+fn deviceSeatChanged(context: *anyopaque, device: *InputManager.Device, previous_name: [:0]const u8) void {
+    if (device.device_type != .keyboard) return;
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.releaseDevice(device);
+    self.syncSeatModifiers(previous_name);
+    self.syncSeatModifiers(device.seat_name);
+}
+
+fn releaseDevice(self: *Self, device: *InputManager.Device) void {
     var session: ?EventSession = null;
     var index: usize = 0;
     while (index < self.held_keys.items.len) {
@@ -380,15 +409,46 @@ fn deviceRemoved(context: *anyopaque, device: *InputManager.Device) void {
     if (session) |event_session| self.requestManage(event_session);
 }
 
-fn modifiersChanged(context: *anyopaque, old: u32, new: u32) void {
-    const self: *Self = @ptrCast(@alignCast(context));
+fn syncSeatModifiers(self: *Self, name: []const u8) void {
+    var modifiers: u32 = 0;
+    var devices = self.input_manager.deviceIterator();
+    while (devices.next()) |device| {
+        if (device.device_type != .keyboard or !std.mem.eql(u8, device.seat_name, name)) continue;
+        modifiers = if (self.native_input) |native_input|
+            native_input.deviceEffectiveModifiers(device.id) orelse 0
+        else
+            0;
+        break;
+    }
     var session: ?EventSession = null;
     for (self.seats.items) |seat| {
-        if (!seat.active() or (seat.watched_modifiers & (old ^ new)) == 0) continue;
+        if (!seat.active() or !std.mem.eql(u8, seat.seat.?.name(), name)) continue;
+        const old = seat.modifiers;
+        seat.modifiers = modifiers;
+        if ((seat.watched_modifiers & (old ^ modifiers)) == 0) continue;
+        seat.resource.sendModifiersUpdate(@bitCast(old & 0xed), @bitCast(modifiers & 0xed));
+        session = seatSession(seat);
+    }
+    if (session) |event_session| self.requestManage(event_session);
+}
+
+fn modifiersChanged(context: *anyopaque, source: ?NativeInput.DeviceId, _: u32, new: u32) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const device = if (source) |id| self.input_manager.findDevice(id) else null;
+    var session: ?EventSession = null;
+    for (self.seats.items) |seat| {
+        if (!seat.active() or (device != null and !seatMatchesDevice(seat.seat.?, device.?))) continue;
+        const old = seat.modifiers;
+        seat.modifiers = new;
+        if ((seat.watched_modifiers & (old ^ new)) == 0) continue;
         seat.resource.sendModifiersUpdate(@bitCast(old & 0xed), @bitCast(new & 0xed));
         session = seatSession(seat);
     }
     if (session) |event_session| self.requestManage(event_session);
+}
+
+fn seatMatchesDevice(seat: *const Seat, device: *const InputManager.Device) bool {
+    return std.mem.eql(u8, seat.name(), device.seat_name);
 }
 
 fn bindingSession(binding: *Binding) EventSession {

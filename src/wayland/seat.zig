@@ -680,6 +680,13 @@ pub fn parentKeyboardEnter(self: *Self, pressed_keys: []const u32) error{OutOfMe
     self.sendEnter();
 }
 
+pub fn ensureParentKeyboardEnter(self: *Self) void {
+    if (self.parent_focused) return;
+    self.parent_focused = true;
+    self.notifyKeyboardFocus();
+    self.sendEnter();
+}
+
 pub fn parentKeyboardLeave(self: *Self) void {
     if (self.parent_focused) self.sendLeave();
     self.parent_focused = false;

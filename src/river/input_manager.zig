@@ -49,6 +49,7 @@ pub const DeviceListener = struct {
     context: *anyopaque,
     added: *const fn (*anyopaque, *Device) void,
     removed: *const fn (*anyopaque, *Device) void,
+    seat_changed: ?*const fn (*anyopaque, *Device, [:0]const u8) void = null,
 };
 
 pub const ResourceListener = struct {
@@ -331,6 +332,9 @@ fn destroySeat(self: *Self, name: []const u8) void {
             if (self.seat_listener) |listener| {
                 listener.device_changed(listener.context, device, previous);
             }
+            for (self.device_listeners.items) |listener| if (listener.seat_changed) |changed| {
+                changed(listener.context, device, previous);
+            };
         }
         if (self.seat_listener) |listener| listener.destroyed(listener.context, seat_name);
         const removed = self.seats.orderedRemove(index);
@@ -394,6 +398,9 @@ fn deviceRequest(
             if (self.seat_listener) |listener| {
                 listener.device_changed(listener.context, device, previous);
             }
+            for (self.device_listeners.items) |listener| if (listener.seat_changed) |changed| {
+                changed(listener.context, device, previous);
+            };
         },
         .set_repeat_info => |repeat| {
             if (repeat.rate < 0 or repeat.delay < 0) {

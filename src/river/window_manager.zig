@@ -557,6 +557,17 @@ pub fn focusedShellSurfaceForSeat(self: *Self, seat: *Seat) ?Surface.Id {
     return if (managed.adapter.surface) |surface| surface.handle() else null;
 }
 
+pub fn focusedSurfaceForSeat(self: *Self, seat: *Seat) ?Surface.Id {
+    const state = self.seatState(seat) orelse return null;
+    if (state.focused_shell_surface) |id| {
+        const managed = self.shell_surfaces.get(id) orelse return null;
+        return if (managed.adapter.surface) |surface| surface.handle() else null;
+    }
+    const id = state.focused orelse return null;
+    const window = self.windows.get(id) orelse return null;
+    return self.xdg_shell.windowSurface(window.xdg_id);
+}
+
 pub fn pointerGrabbed(self: *const Self) bool {
     return self.pointerGrabbedForSeat(self.default_seat_state.seat);
 }
@@ -632,6 +643,10 @@ pub fn bindingSeat(self: *Self, resource: *river.SeatV1) ?*Seat {
     _ = self.bindingSession(resource) orelse return null;
     const adapter: *SeatResource = @ptrCast(@alignCast(resource.getUserData().?));
     return adapter.seat_state.seat;
+}
+
+pub fn seatActive(self: *const Self, seat: *Seat) bool {
+    return self.seatState(seat) != null;
 }
 
 pub fn bindingSessionActive(self: *Self, generation: u64, client: *wl.Client) bool {

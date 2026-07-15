@@ -94,6 +94,7 @@ layer_shell: LayerShell,
 seat: Seat,
 dynamic_seats: std.ArrayList(*SeatEntry),
 input_device_listener: InputManager.DeviceListener,
+routed_keys: std.ArrayList(RoutedKey),
 data_device: DataDevice,
 primary_selection: PrimarySelection,
 text_input: TextInput,
@@ -135,6 +136,12 @@ const SeatEntry = struct {
     name: [:0]u8,
     seat: Seat,
     removed: bool,
+};
+
+const RoutedKey = struct {
+    device_id: NativeInput.DeviceId,
+    seat: *Seat,
+    key: u32,
 };
 
 const RenderOutputStore = slot_map.SlotMap(*RenderOutput, enum { render_output });
@@ -217,6 +224,7 @@ pub fn create(
             .added = inputDeviceAdded,
             .removed = inputDeviceRemoved,
         },
+        .routed_keys = .empty,
         .data_device = undefined,
         .primary_selection = undefined,
         .text_input = undefined,
@@ -234,6 +242,7 @@ pub fn create(
         .socket_buffer = undefined,
         .listening = false,
     };
+    errdefer self.routed_keys.deinit(allocator);
     errdefer self.dynamic_seats.deinit(allocator);
     errdefer self.render_outputs.deinit(allocator);
     errdefer self.renderer.deinit();
@@ -631,6 +640,7 @@ pub fn destroy(self: *Self) void {
     }
     self.outputs.deinit();
     self.render_outputs.deinit(allocator);
+    self.routed_keys.deinit(allocator);
     for (self.dynamic_seats.items) |entry| {
         entry.seat.deinit();
         allocator.free(entry.name);
@@ -792,7 +802,7 @@ fn inputSeatCreated(context: *anyopaque, name: [:0]const u8) error{OutOfMemory}!
         return error.OutOfMemory;
     };
     errdefer entry.seat.deinit();
-    try entry.seat.parentKeyboardEnter(&.{});
+    entry.seat.ensureParentKeyboardEnter();
     entry.seat.setRepaintListener(.{ .context = self, .request = requestRepaint });
     errdefer entry.seat.clearRepaintListener();
     try self.window_manager.seatAdded(&entry.seat);
@@ -830,6 +840,7 @@ fn inputDeviceAdded(context: *anyopaque, device: *InputManager.Device) void {
 fn inputDeviceRemoved(context: *anyopaque, device: *InputManager.Device) void {
     const self: *Self = @ptrCast(@alignCast(context));
     const seat = self.seatForName(device.seat_name) orelse return;
+    if (device.device_type == .keyboard) self.releaseDeviceKeys(device.id);
     self.refreshSeatCapabilities(seat, device.seat_name);
     if (device.device_type == .keyboard) self.prepareAnySeatKeyboard(seat, device.seat_name);
 }
@@ -840,6 +851,7 @@ fn inputDeviceSeatChanged(
     previous_name: [:0]const u8,
 ) void {
     const self: *Self = @ptrCast(@alignCast(context));
+    if (device.device_type == .keyboard) self.releaseDeviceKeys(device.id);
     if (self.seatForName(previous_name)) |previous| {
         self.refreshSeatCapabilities(previous, previous_name);
         if (device.device_type == .keyboard) self.prepareAnySeatKeyboard(previous, previous_name);
@@ -847,7 +859,7 @@ fn inputDeviceSeatChanged(
     const next = self.seatForName(device.seat_name) orelse return;
     self.refreshSeatCapabilities(next, device.seat_name);
     if (device.device_type == .keyboard) {
-        next.parentKeyboardEnter(&.{}) catch return self.terminate();
+        next.ensureParentKeyboardEnter();
         self.prepareSeatKeyboard(next, device.id);
     }
 }
@@ -896,6 +908,7 @@ fn prepareAnySeatKeyboard(self: *Self, seat: *Seat, name: []const u8) void {
         self.prepareSeatKeyboard(seat, device.id);
         return;
     }
+    seat.setModifiers(0, 0, 0, 0);
 }
 
 fn prepareSeatKeyboard(self: *Self, seat: *Seat, id: NativeInput.DeviceId) void {
@@ -907,6 +920,14 @@ fn prepareSeatKeyboard(self: *Self, seat: *Seat, id: NativeInput.DeviceId) void 
     seat.setKeymap(.xkb_v1, fd, state.keymap.size);
     if (self.native_input.deviceRepeatInfo(id)) |repeat| {
         seat.setRepeatInfo(repeat.rate, repeat.delay);
+    }
+    if (self.native_input.deviceModifiers(id)) |modifiers| {
+        seat.setModifiers(
+            modifiers.depressed,
+            modifiers.latched,
+            modifiers.locked,
+            modifiers.group,
+        );
     }
 }
 
@@ -1250,11 +1271,20 @@ fn sessionLockStateChanged(context: *anyopaque, locked: bool) void {
     self.seat.touchCancel();
     self.seat.suppressPointerFocus(true);
     self.window_manager.pointerMoved(null);
+    for (self.dynamic_seats.items) |entry| {
+        if (entry.removed) continue;
+        entry.seat.touchCancel();
+        entry.seat.suppressPointerFocus(true);
+        self.window_manager.pointerMovedForSeat(&entry.seat, null);
+    }
     self.xdg_shell.dismissPopupGrab();
     if (locked) {
         self.virtual_keyboard.setInhibited(true);
         self.input_method.setInhibited(true);
         self.seat.setKeyboardFocus(null);
+        for (self.dynamic_seats.items) |entry| {
+            if (!entry.removed) entry.seat.setKeyboardFocus(null);
+        }
     } else {
         self.seat.setKeyboardFocus(null);
         self.input_method.setInhibited(false);
@@ -1265,6 +1295,17 @@ fn sessionLockStateChanged(context: *anyopaque, locked: bool) void {
                 position.y,
                 self.pointerFocus(position.x, position.y),
             );
+        }
+        for (self.dynamic_seats.items) |entry| {
+            if (entry.removed) continue;
+            entry.seat.setKeyboardFocus(null);
+            if (entry.seat.pointerPosition()) |position| {
+                entry.seat.pointerEnter(
+                    position.x,
+                    position.y,
+                    self.pointerFocus(position.x, position.y),
+                );
+            }
         }
     }
 }
@@ -1333,17 +1374,24 @@ fn serverForOutput(context: *anyopaque) *Self {
     return output.server;
 }
 
-fn nativeKeyboardKeymap(context: *anyopaque, _: ?NativeInput.DeviceId, format: wl.Keyboard.KeymapFormat, fd: std.posix.fd_t, size: u32) void {
-    keyboardKeymap(context, format, fd, size);
+fn nativeKeyboardKeymap(context: *anyopaque, source: ?NativeInput.DeviceId, format: wl.Keyboard.KeymapFormat, fd: std.posix.fd_t, size: u32) void {
+    const self = serverForOutput(context);
+    const seat = if (source) |id| self.seatForDevice(id) else &self.seat;
+    seat.setKeymap(format, fd, size);
 }
-fn nativeKeyboardKey(context: *anyopaque, _: NativeInput.DeviceId, time: u32, key: u32, state: wl.Keyboard.KeyState) void {
-    keyboardKey(context, time, key, state);
+fn nativeKeyboardKey(context: *anyopaque, id: NativeInput.DeviceId, time: u32, key: u32, state: wl.Keyboard.KeyState) void {
+    const self = serverForOutput(context);
+    self.routeKeyboardKey(id, time, key, state);
 }
-fn nativeKeyboardModifiers(context: *anyopaque, _: ?NativeInput.DeviceId, depressed: u32, latched: u32, locked: u32, group: u32) void {
-    keyboardModifiers(context, depressed, latched, locked, group);
+fn nativeKeyboardModifiers(context: *anyopaque, source: ?NativeInput.DeviceId, depressed: u32, latched: u32, locked: u32, group: u32) void {
+    const self = serverForOutput(context);
+    const seat = if (source) |id| self.seatForDevice(id) else &self.seat;
+    seat.setModifiers(depressed, latched, locked, group);
 }
-fn nativeKeyboardRepeatInfo(context: *anyopaque, _: ?NativeInput.DeviceId, rate: i32, delay: i32) void {
-    keyboardRepeatInfo(context, rate, delay);
+fn nativeKeyboardRepeatInfo(context: *anyopaque, source: ?NativeInput.DeviceId, rate: i32, delay: i32) void {
+    const self = serverForOutput(context);
+    const seat = if (source) |id| self.seatForDevice(id) else &self.seat;
+    seat.setRepeatInfo(rate, delay);
 }
 fn nativePointerMotion(context: *anyopaque, _: NativeInput.DeviceId, time: u32, x: f64, y: f64) void {
     pointerMotion(context, time, x, y);
@@ -1386,6 +1434,64 @@ fn nativeTouchFrame(context: *anyopaque, _: NativeInput.DeviceId) void {
 }
 fn nativeTouchCancel(context: *anyopaque, _: NativeInput.DeviceId) void {
     touchCancel(context);
+}
+
+fn routeKeyboardKey(
+    self: *Self,
+    device_id: NativeInput.DeviceId,
+    time: u32,
+    key: u32,
+    state: wl.Keyboard.KeyState,
+) void {
+    const seat = self.seatForDevice(device_id);
+    switch (state) {
+        .pressed => {
+            for (self.routed_keys.items) |routed| {
+                if (routed.device_id == device_id and routed.key == key) return;
+            }
+            const already_pressed = self.seatKeyHeld(seat, key);
+            self.routed_keys.append(self.allocator, .{
+                .device_id = device_id,
+                .seat = seat,
+                .key = key,
+            }) catch return self.terminate();
+            if (already_pressed) return;
+        },
+        .released => {
+            for (self.routed_keys.items, 0..) |routed, index| {
+                if (routed.device_id != device_id or routed.key != key) continue;
+                _ = self.routed_keys.orderedRemove(index);
+                if (self.seatKeyHeld(routed.seat, key)) return;
+                routed.seat.key(time, key, state) catch return self.terminate();
+                return;
+            }
+            return;
+        },
+        .repeated => {},
+        else => return,
+    }
+    seat.key(time, key, state) catch self.terminate();
+}
+
+fn releaseDeviceKeys(self: *Self, device_id: NativeInput.DeviceId) void {
+    var index: usize = 0;
+    while (index < self.routed_keys.items.len) {
+        const routed = self.routed_keys.items[index];
+        if (routed.device_id != device_id) {
+            index += 1;
+            continue;
+        }
+        _ = self.routed_keys.orderedRemove(index);
+        if (self.seatKeyHeld(routed.seat, routed.key)) continue;
+        routed.seat.key(0, routed.key, .released) catch return self.terminate();
+    }
+}
+
+fn seatKeyHeld(self: *const Self, seat: *Seat, key: u32) bool {
+    for (self.routed_keys.items) |routed| {
+        if (routed.seat == seat and routed.key == key) return true;
+    }
+    return false;
 }
 
 fn keyboardAvailable(context: *anyopaque, available: bool) void {
@@ -2228,14 +2334,7 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
     };
     self.finishRepaintIfIdle();
     if (presented) |info| outputPresented(render_output, info);
-    const keyboard_focus = self.layer_shell.keyboardFocus(
-        self.xdg_shell.popupKeyboardFocus(),
-    ) orelse
-        self.window_manager.focusedShellSurface() orelse self.scene.focusedSurface() orelse if (!self.window_manager.hasActiveManager())
-        self.scene.topWindowSurface()
-    else
-        null;
-    self.seat.setKeyboardFocus(keyboard_focus);
+    self.refreshKeyboardFocus();
 }
 
 fn renderSessionLockFrame(
@@ -2285,7 +2384,34 @@ fn renderSessionLockFrame(
     };
     self.finishRepaintIfIdle();
     if (presented) |info| outputPresented(frame.render_output, info);
-    self.seat.setKeyboardFocus(self.session_lock.keyboardFocus());
+    self.refreshKeyboardFocus();
+}
+
+fn refreshKeyboardFocus(self: *Self) void {
+    if (self.session_lock.isLocked()) {
+        const focus = self.session_lock.keyboardFocus();
+        self.seat.setKeyboardFocus(focus);
+        for (self.dynamic_seats.items) |entry| {
+            if (!entry.removed) entry.seat.setKeyboardFocus(focus);
+        }
+        return;
+    }
+    const default_focus = self.layer_shell.keyboardFocus(
+        self.xdg_shell.popupKeyboardFocus(),
+    ) orelse
+        self.window_manager.focusedShellSurface() orelse self.scene.focusedSurface() orelse if (!self.window_manager.hasActiveManager())
+        self.scene.topWindowSurface()
+    else
+        null;
+    self.seat.setKeyboardFocus(default_focus);
+    for (self.dynamic_seats.items) |entry| {
+        if (entry.removed) continue;
+        const focus = self.window_manager.focusedSurfaceForSeat(&entry.seat) orelse if (!self.window_manager.hasActiveManager())
+            self.scene.focusedSurface() orelse self.scene.topWindowSurface()
+        else
+            null;
+        entry.seat.setKeyboardFocus(focus);
+    }
 }
 
 fn sessionLockCursorInfo(self: *Self) ?Seat.CursorInfo {
