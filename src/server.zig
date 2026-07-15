@@ -3366,6 +3366,7 @@ fn xwmWindowMapped(context: *anyopaque, window_id: Xwm.WindowId, mapped: bool) v
         };
     }
     refreshXwaylandSceneWindow(self, window_id);
+    applyXwaylandSceneStacking(self, window_id);
 }
 
 fn xwmWindowConfigured(
@@ -3390,6 +3391,7 @@ fn xwmWindowConfigured(
             return self.terminate();
         };
     }
+    applyXwaylandSceneStacking(self, window_id);
 }
 
 fn xwmWindowMetadataChanged(context: *anyopaque, window_id: Xwm.WindowId) void {
@@ -3410,6 +3412,7 @@ fn xwmWindowMetadataChanged(context: *anyopaque, window_id: Xwm.WindowId) void {
             return self.terminate();
         };
     }
+    applyXwaylandSceneStacking(self, window_id);
 }
 
 fn xwmWindowFullscreenRequested(context: *anyopaque, window_id: Xwm.WindowId, fullscreen: bool) void {
@@ -3515,6 +3518,7 @@ fn xwmWindowAssociated(context: *anyopaque, window_id: Xwm.WindowId, surface_id:
     }
     configureXwaylandSceneWindow(self, scene_id, info.geometry);
     refreshXwaylandSceneWindow(self, window_id);
+    applyXwaylandSceneStacking(self, window_id);
 }
 
 fn xwmWindowDissociated(context: *anyopaque, window_id: Xwm.WindowId, _: Surface.Id) void {
@@ -3549,6 +3553,19 @@ fn refreshXwaylandSceneWindow(self: *Self, window_id: Xwm.WindowId) void {
     const displayed = !self.window_manager_initialized or
         self.window_manager.xwaylandWindowDisplayed(window_id);
     self.scene.setMapped(window.scene_id, info.mapped and has_buffer and displayed);
+}
+
+fn applyXwaylandSceneStacking(self: *Self, window_id: Xwm.WindowId) void {
+    const window = self.xwayland_windows.get(window_id) orelse return;
+    const info = self.xwm.windowInfo(window_id) orelse return;
+    if (info.window_type == .desktop) {
+        self.scene.placeBottom(window.scene_id);
+    } else if (!info.participatesInWindowManagement()) {
+        self.scene.placeTop(window.scene_id);
+    } else if (info.parent) |parent_id| {
+        const parent = self.xwayland_windows.get(parent_id) orelse return;
+        self.scene.placeAbove(window.scene_id, parent.scene_id);
+    }
 }
 
 fn riverXwaylandWindowInfo(context: *anyopaque, window_id: Xwm.WindowId) ?Xwm.WindowInfo {
@@ -3725,7 +3742,10 @@ fn focusXwaylandSurface(self: *Self, root: ?Surface.Id) void {
     while (windows.next()) |entry| {
         const focused = target != null and entry.key_ptr.* == target.?;
         self.scene.setFocused(entry.value_ptr.scene_id, focused);
-        if (focused) self.scene.placeTop(entry.value_ptr.scene_id);
+        if (focused) {
+            const info = self.xwm.windowInfo(entry.key_ptr.*) orelse continue;
+            if (info.window_type != .desktop) self.scene.placeTop(entry.value_ptr.scene_id);
+        }
     }
     self.refreshKeyboardFocus();
 }

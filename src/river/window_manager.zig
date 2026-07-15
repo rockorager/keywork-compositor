@@ -1660,6 +1660,7 @@ fn finishRender(self: *Self, manager: *river.WindowManagerV1) void {
         },
     };
     self.stack_operations.clearRetainingCapacity();
+    self.enforceXwaylandAuxiliaryStacking();
     for (self.seat_states.items) |state| if (self.reroutePointer(state)) self.requestManage();
     switch (self.sequence.finishRender()) {
         .invalid => unreachable,
@@ -1671,6 +1672,42 @@ fn finishRender(self: *Self, manager: *river.WindowManagerV1) void {
             };
             manager.sendManageStart();
         },
+    }
+}
+
+fn enforceXwaylandAuxiliaryStacking(self: *Self) void {
+    var windows = self.known_xwayland_windows.iterator();
+    while (windows.next()) |entry| {
+        const info = self.xwayland.window_info(
+            self.xwayland.context,
+            entry.key_ptr.*,
+        ) orelse continue;
+        if (info.mapped and info.window_type == .desktop) {
+            self.scene.placeBottom(entry.value_ptr.scene_id);
+        }
+    }
+    windows = self.known_xwayland_windows.iterator();
+    while (windows.next()) |entry| {
+        const info = self.xwayland.window_info(
+            self.xwayland.context,
+            entry.key_ptr.*,
+        ) orelse continue;
+        if (!info.mapped or !info.participatesInWindowManagement()) continue;
+        const parent_id = info.parent orelse continue;
+        const parent = self.known_xwayland_windows.get(parent_id) orelse continue;
+        self.scene.placeAbove(entry.value_ptr.scene_id, parent.scene_id);
+    }
+    windows = self.known_xwayland_windows.iterator();
+    while (windows.next()) |entry| {
+        const info = self.xwayland.window_info(
+            self.xwayland.context,
+            entry.key_ptr.*,
+        ) orelse continue;
+        if (info.mapped and info.window_type != .desktop and
+            !info.participatesInWindowManagement())
+        {
+            self.scene.placeTop(entry.value_ptr.scene_id);
+        }
     }
 }
 
