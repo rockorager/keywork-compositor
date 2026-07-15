@@ -527,6 +527,29 @@ pub fn targetAtomForMime(self: *Self, mime_type: [:0]const u8) ?c.xcb_atom_t {
     return self.mimeAtom(mime_type);
 }
 
+pub fn mimeForTargetAtom(self: *Self, atom: c.xcb_atom_t) ?[:0]u8 {
+    return self.targetMime(atom);
+}
+
+pub fn reclaimWaylandSelection(self: *Self) void {
+    if (self.wayland_selection.hasSelection()) self.updateOwner();
+}
+
+pub fn receiveExternalData(
+    self: *Self,
+    target: c.xcb_atom_t,
+    timestamp: c.xcb_timestamp_t,
+    fd: std.posix.fd_t,
+) void {
+    const duplicate = std.c.fcntl(
+        fd,
+        std.posix.F.DUPFD_CLOEXEC,
+        @as(c_int, 0),
+    );
+    if (duplicate < 0) return;
+    self.startIncomingTransferForTarget(target, timestamp, duplicate) catch {};
+}
+
 pub fn ownsWindow(self: *const Self, window: c.xcb_window_t) bool {
     if (self.window == window) return true;
     for (self.incoming_transfers.items) |transfer| {
@@ -768,10 +791,22 @@ fn clearMimeTypes(self: *Self) void {
 }
 
 fn startIncomingTransfer(self: *Self, mime_type: []const u8, fd: std.posix.fd_t) !void {
-    errdefer _ = std.c.close(fd);
     const target = for (self.mime_types.items, self.target_atoms.items) |offered, atom| {
         if (std.mem.eql(u8, offered, mime_type)) break atom;
-    } else return error.UnsupportedMimeType;
+    } else {
+        _ = std.c.close(fd);
+        return error.UnsupportedMimeType;
+    };
+    try self.startIncomingTransferForTarget(target, c.XCB_CURRENT_TIME, fd);
+}
+
+fn startIncomingTransferForTarget(
+    self: *Self,
+    target: c.xcb_atom_t,
+    timestamp: c.xcb_timestamp_t,
+    fd: std.posix.fd_t,
+) !void {
+    errdefer _ = std.c.close(fd);
     try setNonblocking(fd);
 
     const transfer = try self.allocator.create(IncomingTransfer);
@@ -808,7 +843,7 @@ fn startIncomingTransfer(self: *Self, mime_type: []const u8, fd: std.posix.fd_t)
         self.atoms.selection,
         target,
         self.atoms.selection_data,
-        c.XCB_CURRENT_TIME,
+        timestamp,
     );
     if (c.xcb_flush(self.connection) <= 0) {
         transfer.destroy();

@@ -87,6 +87,7 @@ const OfferState = struct {
     device: DeviceId,
     source: ?SourceId,
     external_source: ?*const SelectionSource = null,
+    external_drag_source: ?*const ExternalDragSource = null,
     kind: Kind,
     drag_generation: u64 = 0,
     enter_serial: u32 = 0,
@@ -106,9 +107,10 @@ const OfferState = struct {
 
 const DragState = struct {
     generation: u64,
-    source: ?SourceId,
-    source_client: *wl.Client,
-    origin: Surface.Id,
+    source: ?DragSource,
+    source_client: ?*wl.Client,
+    origin: ?Surface.Id,
+    external_pointer_delivery: ?ExternalPointerDelivery = null,
     target: ?Target = null,
 
     const Target = struct {
@@ -118,6 +120,39 @@ const DragState = struct {
         x: f64,
         y: f64,
     };
+
+    const ExternalPointerDelivery = struct {
+        surface_id: Surface.Id,
+        start_global_x: f64,
+        start_global_y: f64,
+        start_surface_x: f64,
+        start_surface_y: f64,
+    };
+};
+
+const DragSource = union(enum) {
+    local: SourceId,
+    external: *const ExternalDragSource,
+};
+
+pub const ExternalDragSource = struct {
+    context: *anyopaque,
+    mime_types: *const fn (*anyopaque) []const [:0]const u8,
+    actions: *const fn (*anyopaque) wl.DataDeviceManager.DndAction,
+    send: *const fn (*anyopaque, [*:0]const u8, std.posix.fd_t) void,
+    target: *const fn (*anyopaque, ?[*:0]const u8) void,
+    action: *const fn (*anyopaque, wl.DataDeviceManager.DndAction) void,
+    drop_performed: *const fn (*anyopaque) void,
+    finished: *const fn (*anyopaque) void,
+    cancel: *const fn (*anyopaque) void,
+
+    fn hasMime(self: *const ExternalDragSource, mime_type: [*:0]const u8) bool {
+        const requested = std.mem.span(mime_type);
+        for (self.mime_types(self.context)) |offered| {
+            if (std.mem.eql(u8, offered, requested)) return true;
+        }
+        return false;
+    }
 };
 
 const RetainedExternalDrag = struct {
@@ -563,7 +598,7 @@ fn startDrag(
     self.drag_icon = icon;
     self.drag = .{
         .generation = self.next_drag_generation,
-        .source = source_id,
+        .source = if (source_id) |id| .{ .local = id } else null,
         .source_client = client,
         .origin = origin.handle(),
     };
@@ -607,18 +642,18 @@ pub fn drop(self: *Self) void {
         self.cancelDrag(true);
         return;
     };
-    const source_id = drag.source orelse {
+    const drag_source = drag.source orelse {
         self.sendDrop(target.client);
         self.sendLeave(target.client);
         self.finishPhysicalDrag();
         return;
     };
-    const source = self.sources.get(source_id) orelse {
+    if (!self.dragSourceAvailable(drag_source)) {
         self.finishPhysicalDrag();
         return;
-    };
+    }
 
-    if (source.resource.getVersion() >= 3) source.resource.sendDndDropPerformed();
+    self.dragSourceDropPerformed(drag_source);
     const accepted = self.generationAcceptsDrop(drag.generation);
     var needs_finish = false;
     var iterator = self.offers.iterator();
@@ -633,13 +668,13 @@ pub fn drop(self: *Self) void {
 
     if (!accepted) {
         self.sendLeave(target.client);
-        self.cancelDndSource(source_id);
+        self.cancelDndSource(drag_source);
         self.invalidateDragGeneration(drag.generation);
     } else {
         self.sendDrop(target.client);
         self.sendLeave(target.client);
         if (!needs_finish) {
-            if (source.resource.getVersion() >= 3) source.resource.sendDndFinished();
+            self.finishDndSource(drag_source);
             self.invalidateDragGeneration(drag.generation);
         }
     }
@@ -648,6 +683,98 @@ pub fn drop(self: *Self) void {
 
 pub fn cancel(self: *Self) void {
     self.cancelDrag(true);
+}
+
+pub fn startExternalDrag(self: *Self, source: *const ExternalDragSource) ?u64 {
+    if (self.drag != null or !self.seat.hasPressedPointerButton(0x110)) return null;
+    const pointer_focus = self.seat.pointerFocus() orelse return null;
+    const pointer_position = self.seat.pointerPosition() orelse return null;
+    self.cancelRetainedExternalDrag();
+    self.next_drag_generation = std.math.add(u64, self.next_drag_generation, 1) catch 1;
+    self.drag = .{
+        .generation = self.next_drag_generation,
+        .source = .{ .external = source },
+        .source_client = null,
+        .origin = null,
+        .external_pointer_delivery = .{
+            .surface_id = pointer_focus.surface_id,
+            .start_global_x = pointer_position.x,
+            .start_global_y = pointer_position.y,
+            .start_surface_x = pointer_focus.x,
+            .start_surface_y = pointer_focus.y,
+        },
+    };
+    self.notifyDragSelectionChanged();
+    self.listener.started(self.listener.context);
+    self.listener.repaint(self.listener.context);
+    return self.next_drag_generation;
+}
+
+pub fn dragIsExternal(self: *const Self) bool {
+    const drag = self.drag orelse return false;
+    const source = drag.source orelse return false;
+    return source == .external;
+}
+
+pub fn externalDragPointerFocus(self: *const Self, x: f64, y: f64) ?Seat.PointerFocus {
+    const drag = self.drag orelse return null;
+    if (drag.source == null or drag.source.? != .external) return null;
+    const delivery = drag.external_pointer_delivery orelse return null;
+    return .{
+        .surface_id = delivery.surface_id,
+        .x = delivery.start_surface_x + x - delivery.start_global_x,
+        .y = delivery.start_surface_y + y - delivery.start_global_y,
+    };
+}
+
+pub fn externalDragMimeOffered(self: *Self, source: *const ExternalDragSource, mime_type: [*:0]const u8) void {
+    const drag = self.drag orelse return;
+    if (!dragSourceIsExternal(drag.source, source)) return;
+    var offers = self.offers.iterator();
+    while (offers.next()) |entry| {
+        const offer = entry.value;
+        if (offer.kind == .drag and offer.drag_generation == drag.generation and
+            offer.active and offer.external_drag_source == source)
+        {
+            offer.resource.sendOffer(mime_type);
+        }
+    }
+}
+
+pub fn externalDragActionsChanged(self: *Self, source: *const ExternalDragSource) void {
+    const drag = self.drag orelse return;
+    if (!dragSourceIsExternal(drag.source, source)) return;
+    const source_actions = source.actions(source.context);
+    var offers = self.offers.iterator();
+    while (offers.next()) |entry| {
+        const offer = entry.value;
+        if (offer.kind != .drag or offer.drag_generation != drag.generation or
+            !offer.active or offer.external_drag_source != source) continue;
+        if (offer.resource.getVersion() >= 3) offer.resource.sendSourceActions(source_actions);
+        const selected = selectedAction(
+            source_actions,
+            destinationActions(offer),
+            offer.preferred_action,
+        );
+        if (actionBits(selected) == actionBits(offer.selected_action)) continue;
+        offer.selected_action = selected;
+        if (offer.resource.getVersion() >= 3) offer.resource.sendAction(selected);
+        source.action(source.context, selected);
+    }
+}
+
+pub fn externalDragSourceDestroyed(self: *Self, source: *const ExternalDragSource) void {
+    if (self.drag) |drag| {
+        if (dragSourceIsExternal(drag.source, source)) self.cancelDrag(false);
+    }
+    var offers = self.offers.iterator();
+    while (offers.next()) |entry| {
+        const offer = entry.value;
+        if (offer.external_drag_source != source) continue;
+        offer.external_drag_source = null;
+        offer.active = false;
+        offer.dropped = false;
+    }
 }
 
 pub fn dragSourceInfo(self: *Self) ?DragSourceInfo {
@@ -675,7 +802,10 @@ pub fn externalDragStatus(
 ) void {
     const drag = self.drag orelse return;
     if (drag.generation != generation) return;
-    const source_id = drag.source orelse return;
+    const source_id = switch (drag.source orelse return) {
+        .local => |id| id,
+        .external => return,
+    };
     const source = self.sources.get(source_id) orelse return;
     if (!accepted) source.resource.sendTarget(null);
     if (source.resource.getVersion() >= 3) source.resource.sendAction(if (accepted) selected else .{});
@@ -688,9 +818,12 @@ pub fn dropOnExternalTarget(
 ) bool {
     const drag = self.drag orelse return false;
     if (drag.generation != generation) return false;
-    const source_id = drag.source orelse {
+    const source_id = switch (drag.source orelse {
         self.finishPhysicalDrag();
         return false;
+    }) {
+        .local => |id| id,
+        .external => return false,
     };
     const source = self.sources.get(source_id) orelse {
         self.finishPhysicalDrag();
@@ -703,7 +836,7 @@ pub fn dropOnExternalTarget(
             .source = source_id,
         };
     } else {
-        self.cancelDndSource(source_id);
+        self.cancelDndSource(.{ .local = source_id });
     }
     self.invalidateDragGeneration(generation);
     self.finishPhysicalDrag();
@@ -754,10 +887,10 @@ pub fn iconInfo(self: *const Self) ?IconInfo {
 
 fn updateDragTarget(self: *Self, focus: ?Seat.PointerFocus) void {
     const drag = self.drag orelse return;
-    if (Surface.resourceFor(self.surface_store, drag.origin) == null) {
+    if (drag.origin) |origin| if (Surface.resourceFor(self.surface_store, origin) == null) {
         self.cancelDrag(true);
         return;
-    }
+    };
 
     if (drag.target) |target| {
         const unchanged = if (focus) |next|
@@ -774,7 +907,7 @@ fn updateDragTarget(self: *Self, focus: ?Seat.PointerFocus) void {
     const next = focus orelse return;
     const surface = Surface.resourceFor(self.surface_store, next.surface_id) orelse return;
     const client = surface.getClient();
-    if (drag.source == null and client != drag.source_client) return;
+    if (drag.source == null and client != drag.source_client.?) return;
 
     const serial = self.display.nextSerial();
     self.drag.?.target = .{
@@ -797,8 +930,8 @@ fn updateDragTarget(self: *Self, focus: ?Seat.PointerFocus) void {
         self.drag.?.target = null;
         return;
     }
-    if (drag.source) |source_id| self.notifySourceTarget(
-        source_id,
+    if (drag.source) |source| self.notifySourceTarget(
+        source,
         null,
         self.currentDragAction(drag.generation),
     );
@@ -814,8 +947,12 @@ fn sendCurrentDragToDevice(
     if (device.resource.getClient() != target.client) return false;
     const surface = Surface.resourceFor(self.surface_store, target.surface_id) orelse return false;
 
-    const offer_resource: ?*wl.DataOffer = if (drag.source) |source_id| offer: {
-        const source = self.sources.get(source_id) orelse return false;
+    const offer_resource: ?*wl.DataOffer = if (drag.source) |drag_source| offer: {
+        if (!self.dragSourceAvailable(drag_source)) return false;
+        const source_id: ?SourceId, const external_source: ?*const ExternalDragSource = switch (drag_source) {
+            .local => |id| .{ id, null },
+            .external => |source| .{ null, source },
+        };
         const resource = try OfferResource.create(
             self,
             target.client,
@@ -823,6 +960,7 @@ fn sendCurrentDragToDevice(
             device_id,
             source_id,
             null,
+            external_source,
             .drag,
             drag.generation,
             target.enter_serial,
@@ -831,14 +969,14 @@ fn sendCurrentDragToDevice(
         const state = self.offers.get(adapter.id).?;
         state.active = true;
         state.selected_action = selectedAction(
-            sourceActions(source),
+            self.dragSourceActions(drag_source),
             destinationActions(state),
             state.preferred_action,
         );
         device.resource.sendDataOffer(resource);
-        for (source.mime_types.items) |mime_type| resource.sendOffer(mime_type.ptr);
+        for (self.dragSourceMimeTypes(drag_source)) |mime_type| resource.sendOffer(mime_type.ptr);
         if (resource.getVersion() >= 3) {
-            resource.sendSourceActions(sourceActions(source));
+            resource.sendSourceActions(self.dragSourceActions(drag_source));
             resource.sendAction(state.selected_action);
         }
         break :offer resource;
@@ -866,8 +1004,9 @@ fn leaveDragTarget(self: *Self, notify_source: bool) void {
         if (offer.kind != .drag or offer.drag_generation != drag.generation or !offer.active) continue;
         offer.active = false;
         offer.source = null;
+        offer.external_drag_source = null;
     }
-    if (notify_source) if (drag.source) |source_id| self.notifySourceTarget(source_id, null, .{});
+    if (notify_source) if (drag.source) |source| self.notifySourceTarget(source, null, .{});
     self.drag.?.target = null;
 }
 
@@ -898,7 +1037,7 @@ fn finishPhysicalDrag(self: *Self) void {
 fn cancelDrag(self: *Self, notify_source: bool) void {
     const drag = self.drag orelse return;
     if (drag.target != null) self.leaveDragTarget(notify_source);
-    if (notify_source) if (drag.source) |source_id| self.cancelDndSource(source_id);
+    if (notify_source) if (drag.source) |source| self.cancelDndSource(source);
     self.invalidateDragGeneration(drag.generation);
     self.finishPhysicalDrag();
 }
@@ -921,6 +1060,7 @@ const OfferResource = struct {
         device_id: DeviceId,
         source_id: ?SourceId,
         external_source: ?*const SelectionSource,
+        external_drag_source: ?*const ExternalDragSource,
         kind: OfferState.Kind,
         drag_generation: u64,
         enter_serial: u32,
@@ -934,6 +1074,7 @@ const OfferResource = struct {
             .device = device_id,
             .source = source_id,
             .external_source = external_source,
+            .external_drag_source = external_drag_source,
             .kind = kind,
             .drag_generation = drag_generation,
             .enter_serial = enter_serial,
@@ -984,6 +1125,9 @@ const OfferResource = struct {
                 } else if (offer.external_source) |source| {
                     if (!source.hasMime(receive.mime_type)) return;
                     source.send(source.context, receive.mime_type, receive.fd);
+                } else if (offer.external_drag_source) |source| {
+                    if (!source.hasMime(receive.mime_type)) return;
+                    source.send(source.context, receive.mime_type, receive.fd);
                 }
             },
             .destroy => resource.destroy(),
@@ -1013,11 +1157,11 @@ fn acceptOffer(
     const offer = self.offers.get(offer_id) orelse return;
     if (offer.kind != .drag or (!offer.active and !offer.dropped)) return;
     if (offer.active and serial != offer.enter_serial) return;
-    const source_id = offer.source orelse return;
-    const source = self.sources.get(source_id) orelse return;
-    const accepted = if (mime_type) |value| sourceHasMime(source, value) else false;
+    const source = offerDragSource(offer) orelse return;
+    if (!self.dragSourceAvailable(source)) return;
+    const accepted = if (mime_type) |value| self.dragSourceHasMime(source, value) else false;
     offer.accepted = accepted;
-    source.resource.sendTarget(if (accepted) mime_type else null);
+    self.notifySourceMime(source, if (accepted) mime_type else null);
 }
 
 fn setOfferActions(
@@ -1046,11 +1190,12 @@ fn setOfferActions(
         offer.resource.postError(.invalid_action, "invalid preferred drag-and-drop action");
         return;
     }
-    const source_id = offer.source orelse return;
-    const source = self.sources.get(source_id) orelse return;
+    const source = offerDragSource(offer) orelse return;
+    if (!self.dragSourceAvailable(source)) return;
+    const source_actions = self.dragSourceActions(source);
     if (offer.dropped and actionBits(offer.selected_action) != actionBits(action(.ask))) return;
     if (offer.dropped and preferred_bits != 0 and
-        preferred_bits & actionBits(sourceActions(source)) == 0)
+        preferred_bits & actionBits(source_actions) == 0)
     {
         offer.resource.postError(.invalid_action, "preferred action was not offered by the source");
         return;
@@ -1058,11 +1203,11 @@ fn setOfferActions(
 
     offer.destination_actions = actions;
     offer.preferred_action = preferred;
-    const selected = selectedAction(sourceActions(source), actions, preferred);
+    const selected = selectedAction(source_actions, actions, preferred);
     if (actionBits(selected) == actionBits(offer.selected_action)) return;
     offer.selected_action = selected;
     offer.resource.sendAction(selected);
-    if (source.resource.getVersion() >= 3) source.resource.sendAction(selected);
+    self.notifySourceAction(source, selected);
 }
 
 fn finishOffer(self: *Self, offer_id: OfferId) void {
@@ -1074,35 +1219,35 @@ fn finishOffer(self: *Self, offer_id: OfferId) void {
         offer.resource.postError(.invalid_finish, "drag-and-drop offer cannot be finished");
         return;
     }
-    const source_id = offer.source orelse {
+    const source = offerDragSource(offer) orelse {
         offer.resource.postError(.invalid_finish, "drag-and-drop source is no longer available");
         return;
     };
-    const source = self.sources.get(source_id) orelse {
+    if (!self.dragSourceAvailable(source)) {
         offer.resource.postError(.invalid_finish, "drag-and-drop source is no longer available");
         return;
-    };
+    }
     offer.finished = true;
-    if (source.resource.getVersion() >= 3) source.resource.sendDndFinished();
+    self.finishDndSource(source);
     self.invalidateDragGeneration(offer.drag_generation);
 }
 
 fn offerDestroyed(self: *Self, offer_id: OfferId) void {
     const offer = self.offers.get(offer_id) orelse return;
-    if (offer.kind != .drag or !offer.dropped or offer.finished or offer.source == null) return;
+    const source = offerDragSource(offer) orelse return;
+    if (offer.kind != .drag or !offer.dropped or offer.finished or
+        !self.dragSourceAvailable(source)) return;
     var iterator = self.offers.iterator();
     while (iterator.next()) |entry| {
         if (std.meta.eql(entry.id, offer_id)) continue;
         const candidate = entry.value;
         if (candidate.kind == .drag and candidate.drag_generation == offer.drag_generation and
-            candidate.dropped and !candidate.finished and candidate.source != null) return;
+            candidate.dropped and !candidate.finished and offerDragSource(candidate) != null) return;
     }
-    const source_id = offer.source.?;
-    const source = self.sources.get(source_id) orelse return;
     if (offer.resource.getVersion() < 3) {
-        if (source.resource.getVersion() >= 3) source.resource.sendDndFinished();
+        self.finishDndSource(source);
     } else {
-        self.cancelDndSource(source_id);
+        self.cancelDndSource(source);
     }
     self.invalidateDragGeneration(offer.drag_generation);
 }
@@ -1133,25 +1278,75 @@ fn invalidateDragGeneration(self: *Self, generation: u64) void {
         const offer = entry.value;
         if (offer.kind != .drag or offer.drag_generation != generation) continue;
         offer.source = null;
+        offer.external_drag_source = null;
         offer.active = false;
         offer.dropped = false;
     }
 }
 
-fn cancelDndSource(self: *Self, source_id: SourceId) void {
-    const source = self.sources.get(source_id) orelse return;
-    if (source.resource.getVersion() >= 3) source.resource.sendCancelled();
+fn cancelDndSource(self: *Self, source: DragSource) void {
+    switch (source) {
+        .local => |id| if (self.sources.get(id)) |local| {
+            if (local.resource.getVersion() >= 3) local.resource.sendCancelled();
+        },
+        .external => |external| external.cancel(external.context),
+    }
 }
 
 fn notifySourceTarget(
     self: *Self,
-    source_id: SourceId,
+    source: DragSource,
     mime_type: ?[*:0]const u8,
     selected: wl.DataDeviceManager.DndAction,
 ) void {
-    const source = self.sources.get(source_id) orelse return;
-    source.resource.sendTarget(mime_type);
-    if (source.resource.getVersion() >= 3) source.resource.sendAction(selected);
+    switch (source) {
+        .local => |id| if (self.sources.get(id)) |local| {
+            local.resource.sendTarget(mime_type);
+            if (local.resource.getVersion() >= 3) local.resource.sendAction(selected);
+        },
+        .external => |external| {
+            external.target(external.context, mime_type);
+            external.action(external.context, selected);
+        },
+    }
+}
+
+fn notifySourceMime(self: *Self, source: DragSource, mime_type: ?[*:0]const u8) void {
+    switch (source) {
+        .local => |id| if (self.sources.get(id)) |local| local.resource.sendTarget(mime_type),
+        .external => |external| external.target(external.context, mime_type),
+    }
+}
+
+fn notifySourceAction(
+    self: *Self,
+    source: DragSource,
+    selected: wl.DataDeviceManager.DndAction,
+) void {
+    switch (source) {
+        .local => |id| if (self.sources.get(id)) |local| {
+            if (local.resource.getVersion() >= 3) local.resource.sendAction(selected);
+        },
+        .external => |external| external.action(external.context, selected),
+    }
+}
+
+fn finishDndSource(self: *Self, source: DragSource) void {
+    switch (source) {
+        .local => |id| if (self.sources.get(id)) |local| {
+            if (local.resource.getVersion() >= 3) local.resource.sendDndFinished();
+        },
+        .external => |external| external.finished(external.context),
+    }
+}
+
+fn dragSourceDropPerformed(self: *Self, source: DragSource) void {
+    switch (source) {
+        .local => |id| if (self.sources.get(id)) |local| {
+            if (local.resource.getVersion() >= 3) local.resource.sendDndDropPerformed();
+        },
+        .external => |external| external.drop_performed(external.context),
+    }
 }
 
 fn keyboardFocusChanged(context: *anyopaque, client: ?*wl.Client) void {
@@ -1194,9 +1389,10 @@ fn replaceSelection(
 
 fn sourceDestroyed(self: *Self, id: SourceId) void {
     if (self.drag) |drag| {
-        if (drag.source) |source_id| {
-            if (std.meta.eql(source_id, id)) self.cancelDrag(false);
-        }
+        if (drag.source) |source| switch (source) {
+            .local => |source_id| if (std.meta.eql(source_id, id)) self.cancelDrag(false),
+            .external => {},
+        };
     }
     var iterator = self.offers.iterator();
     while (iterator.next()) |entry| {
@@ -1225,9 +1421,14 @@ fn sourceDestroyed(self: *Self, id: SourceId) void {
 }
 
 fn currentDragSource(self: *Self) ?struct { u64, *SourceState } {
-    if (self.drag) |drag| if (drag.source) |source_id| {
-        const source = self.sources.get(source_id) orelse return null;
-        return .{ drag.generation, source };
+    if (self.drag) |drag| if (drag.source) |drag_source| {
+        switch (drag_source) {
+            .local => |source_id| {
+                const source = self.sources.get(source_id) orelse return null;
+                return .{ drag.generation, source };
+            },
+            .external => return null,
+        }
     };
     if (self.retained_external_drag) |retained| {
         const source = self.sources.get(retained.source) orelse return null;
@@ -1292,6 +1493,7 @@ fn sendSelectionToDevice(
         device_id,
         source_id,
         external_source,
+        null,
         .selection,
         0,
         0,
@@ -1395,6 +1597,51 @@ fn actionBits(value: wl.DataDeviceManager.DndAction) u32 {
 
 fn sourceActions(source: *const SourceState) wl.DataDeviceManager.DndAction {
     return if (source.resource.getVersion() < 3) action(.copy) else source.dnd_actions;
+}
+
+fn dragSourceIsExternal(source: ?DragSource, external: *const ExternalDragSource) bool {
+    const value = source orelse return false;
+    return switch (value) {
+        .local => false,
+        .external => |current| current == external,
+    };
+}
+
+fn offerDragSource(offer: *const OfferState) ?DragSource {
+    if (offer.source) |source| return .{ .local = source };
+    if (offer.external_drag_source) |source| return .{ .external = source };
+    return null;
+}
+
+fn dragSourceAvailable(self: *Self, source: DragSource) bool {
+    return switch (source) {
+        .local => |id| self.sources.get(id) != null,
+        .external => true,
+    };
+}
+
+fn dragSourceMimeTypes(self: *Self, source: DragSource) []const [:0]const u8 {
+    return switch (source) {
+        .local => |id| if (self.sources.get(id)) |local|
+            @ptrCast(local.mime_types.items)
+        else
+            &.{},
+        .external => |external| external.mime_types(external.context),
+    };
+}
+
+fn dragSourceActions(self: *Self, source: DragSource) wl.DataDeviceManager.DndAction {
+    return switch (source) {
+        .local => |id| if (self.sources.get(id)) |local| sourceActions(local) else .{},
+        .external => |external| external.actions(external.context),
+    };
+}
+
+fn dragSourceHasMime(self: *Self, source: DragSource, mime_type: [*:0]const u8) bool {
+    return switch (source) {
+        .local => |id| if (self.sources.get(id)) |local| sourceHasMime(local, mime_type) else false,
+        .external => |external| external.hasMime(mime_type),
+    };
 }
 
 fn destinationActions(offer: *const OfferState) wl.DataDeviceManager.DndAction {

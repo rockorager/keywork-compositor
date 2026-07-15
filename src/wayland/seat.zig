@@ -510,6 +510,13 @@ pub fn acceptsPointerGrabSerial(
     return false;
 }
 
+pub fn hasPressedPointerButton(self: *const Self, button: u32) bool {
+    for (self.pressed_pointer_buttons.items) |press| {
+        if (press.button == button) return true;
+    }
+    return false;
+}
+
 pub fn serialIsOlder(candidate: u32, current: u32) bool {
     return candidate -% current > std.math.maxInt(u32) / 2;
 }

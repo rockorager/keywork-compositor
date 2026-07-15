@@ -1,4 +1,4 @@
-//! Wayland-source to X11-target drag-and-drop interoperability.
+//! X11 and Wayland drag-and-drop interoperability.
 
 const Self = @This();
 
@@ -15,12 +15,28 @@ const protocol_version: u32 = 5;
 
 allocator: std.mem.Allocator,
 connection: *c.xcb_connection_t,
+screen: *c.xcb_screen_t,
 data_device: *DataDevice,
 selection: *XSelection,
 atoms: Atoms,
 target: ?Target,
 last_unaware: ?c.xcb_window_t,
 dropped: bool,
+incoming_owner: c.xcb_window_t,
+incoming_source: c.xcb_window_t,
+incoming_generation: ?u64,
+incoming_version: u32,
+incoming_timestamp: c.xcb_timestamp_t,
+incoming_actions: wl.DataDeviceManager.DndAction,
+incoming_selected_action: wl.DataDeviceManager.DndAction,
+incoming_target_accepted: bool,
+incoming_mime_types: std.ArrayList([:0]u8),
+incoming_target_atoms: std.ArrayList(c.xcb_atom_t),
+incoming_x_dropped: bool,
+incoming_wl_cancelled: bool,
+incoming_wl_finished: bool,
+proxy_mapped: bool,
+external_source: DataDevice.ExternalDragSource,
 
 pub const Atoms = struct {
     aware: c.xcb_atom_t,
@@ -51,6 +67,7 @@ pub fn init(
     self: *Self,
     allocator: std.mem.Allocator,
     connection: *c.xcb_connection_t,
+    screen: *c.xcb_screen_t,
     data_device: *DataDevice,
     selection: *XSelection,
     atoms: Atoms,
@@ -58,13 +75,41 @@ pub fn init(
     self.* = .{
         .allocator = allocator,
         .connection = connection,
+        .screen = screen,
         .data_device = data_device,
         .selection = selection,
         .atoms = atoms,
         .target = null,
         .last_unaware = null,
         .dropped = false,
+        .incoming_owner = c.XCB_WINDOW_NONE,
+        .incoming_source = c.XCB_WINDOW_NONE,
+        .incoming_generation = null,
+        .incoming_version = 0,
+        .incoming_timestamp = c.XCB_CURRENT_TIME,
+        .incoming_actions = copyAction(),
+        .incoming_selected_action = .{},
+        .incoming_target_accepted = false,
+        .incoming_mime_types = .empty,
+        .incoming_target_atoms = .empty,
+        .incoming_x_dropped = false,
+        .incoming_wl_cancelled = false,
+        .incoming_wl_finished = false,
+        .proxy_mapped = false,
+        .external_source = .{
+            .context = self,
+            .mime_types = externalMimeTypes,
+            .actions = externalActions,
+            .send = externalSend,
+            .target = externalTarget,
+            .action = externalAction,
+            .drop_performed = externalDropPerformed,
+            .finished = externalFinished,
+            .cancel = externalCancelled,
+        },
     };
+    errdefer self.incoming_mime_types.deinit(allocator);
+    errdefer self.incoming_target_atoms.deinit(allocator);
     const version = protocol_version;
     try checkRequest(connection, c.xcb_change_property_checked(
         connection,
@@ -79,6 +124,7 @@ pub fn init(
 }
 
 pub fn deinit(self: *Self) void {
+    self.clearIncoming(true);
     if (self.target) |target| {
         if (self.dropped) {
             self.data_device.finishExternalDrag(target.generation, false);
@@ -87,6 +133,8 @@ pub fn deinit(self: *Self) void {
             self.data_device.externalDragStatus(target.generation, false, .{});
         }
     }
+    self.incoming_mime_types.deinit(self.allocator);
+    self.incoming_target_atoms.deinit(self.allocator);
     self.* = undefined;
 }
 
@@ -97,6 +145,7 @@ pub fn dragStarted(self: *Self) void {
         self.target = null;
         self.dropped = false;
     }
+    if (self.data_device.dragIsExternal()) self.setProxyMapped(true);
 }
 
 pub fn dragMotion(
@@ -163,6 +212,7 @@ pub fn drop(self: *Self, time: u32) bool {
 }
 
 pub fn physicalDragEnded(self: *Self) void {
+    if (self.incoming_generation != null) return;
     if (self.dropped) return;
     self.dragLeft();
 }
@@ -175,6 +225,9 @@ pub fn sourceDestroyed(self: *Self, generation: u64) void {
 }
 
 pub fn windowDestroyed(self: *Self, window: c.xcb_window_t) void {
+    if (window == self.incoming_owner or window == self.incoming_source) {
+        self.clearIncoming(true);
+    }
     if (self.last_unaware == window) self.last_unaware = null;
     const target = self.target orelse return;
     if (target.surface_window != window and target.destination != window) return;
@@ -187,8 +240,58 @@ pub fn windowDestroyed(self: *Self, window: c.xcb_window_t) void {
     self.dropped = false;
 }
 
+pub fn handleXfixesNotify(
+    self: *Self,
+    event: *const c.xcb_xfixes_selection_notify_event_t,
+) void {
+    if (!self.selection.handlesSelection(event.selection) or
+        event.window != self.selection.ownerWindow()) return;
+    if (event.owner == self.selection.ownerWindow()) {
+        self.clearIncoming(true);
+        return;
+    }
+    if (event.owner == c.XCB_WINDOW_NONE) {
+        self.clearIncoming(true);
+        return;
+    }
+    if (self.incoming_owner == event.owner and self.incoming_generation != null) return;
+    self.clearIncoming(true);
+    if (self.data_device.isDragging()) {
+        if (!self.data_device.dragIsExternal()) self.selection.reclaimWaylandSelection();
+        return;
+    }
+    self.incoming_owner = event.owner;
+    self.setProxyMapped(true);
+    self.incoming_generation = self.data_device.startExternalDrag(&self.external_source) orelse {
+        self.clearIncoming(false);
+        return;
+    };
+    log.debug("started X11 drag from selection owner {d}", .{event.owner});
+}
+
+pub fn routeExternalDragOverXwayland(self: *Self, over_xwayland: bool) void {
+    if (!self.data_device.dragIsExternal() or self.incoming_x_dropped) return;
+    self.setProxyMapped(!over_xwayland);
+}
+
 pub fn handleClientMessage(self: *Self, event: *const c.xcb_client_message_event_t) bool {
     if (event.format != 32 or event.window != self.selection.ownerWindow()) return false;
+    if (event.type == self.atoms.enter) {
+        self.handleEnter(event);
+        return true;
+    }
+    if (event.type == self.atoms.position) {
+        self.handlePosition(event);
+        return true;
+    }
+    if (event.type == self.atoms.leave) {
+        self.handleIncomingLeave(event);
+        return true;
+    }
+    if (event.type == self.atoms.drop) {
+        self.handleIncomingDrop(event);
+        return true;
+    }
     if (event.type == self.atoms.status) {
         self.handleStatus(event);
         return true;
@@ -198,6 +301,121 @@ pub fn handleClientMessage(self: *Self, event: *const c.xcb_client_message_event
         return true;
     }
     return false;
+}
+
+fn handleEnter(self: *Self, event: *const c.xcb_client_message_event_t) void {
+    if (self.incoming_generation == null or self.incoming_x_dropped or
+        event.data.data32[0] == c.XCB_WINDOW_NONE) return;
+    if (self.incoming_source != c.XCB_WINDOW_NONE and
+        self.incoming_source != event.data.data32[0]) return;
+    const version = event.data.data32[1] >> 24;
+    if (version < 3 or version > protocol_version) return;
+    self.incoming_source = event.data.data32[0];
+    self.incoming_version = version;
+    self.incoming_actions = copyAction();
+    self.incoming_selected_action = .{};
+    self.incoming_target_accepted = false;
+    self.clearIncomingMimeTypes();
+    if (event.data.data32[1] & 1 != 0) {
+        self.readIncomingTypeList();
+    } else {
+        for (event.data.data32[2..5]) |target_atom| self.offerIncomingTarget(target_atom);
+    }
+}
+
+fn handlePosition(self: *Self, event: *const c.xcb_client_message_event_t) void {
+    if (!self.incomingMessageMatches(event)) return;
+    self.incoming_timestamp = event.data.data32[3];
+    var actions = copyAction();
+    if (event.data.data32[4] == self.atoms.action_move) {
+        actions.move = true;
+    } else if (event.data.data32[4] == self.atoms.action_ask) {
+        actions.ask = true;
+    }
+    if (actionBits(actions) != actionBits(self.incoming_actions)) {
+        self.incoming_actions = actions;
+        self.data_device.externalDragActionsChanged(&self.external_source);
+    }
+    self.sendIncomingStatus();
+}
+
+fn handleIncomingLeave(self: *Self, event: *const c.xcb_client_message_event_t) void {
+    if (!self.incomingMessageMatches(event) or self.incoming_x_dropped) return;
+    self.incoming_source = c.XCB_WINDOW_NONE;
+    self.incoming_version = 0;
+    self.incoming_timestamp = c.XCB_CURRENT_TIME;
+    self.incoming_actions = copyAction();
+    self.incoming_selected_action = .{};
+    self.incoming_target_accepted = false;
+    self.clearIncomingMimeTypes();
+    if (self.incoming_wl_cancelled or self.incoming_wl_finished) self.clearIncoming(false);
+}
+
+fn handleIncomingDrop(self: *Self, event: *const c.xcb_client_message_event_t) void {
+    if (!self.incomingMessageMatches(event) or self.incoming_x_dropped) return;
+    if (self.incoming_version >= 1 and event.data.data32[2] != 0) {
+        self.incoming_timestamp = event.data.data32[2];
+    }
+    self.incoming_x_dropped = true;
+    self.setProxyMapped(false);
+    if (self.incoming_wl_finished) {
+        self.finishIncoming(true);
+    } else if (self.incoming_wl_cancelled) {
+        self.finishIncoming(false);
+    }
+}
+
+fn incomingMessageMatches(
+    self: *const Self,
+    event: *const c.xcb_client_message_event_t,
+) bool {
+    return self.incoming_generation != null and
+        self.incoming_source != c.XCB_WINDOW_NONE and
+        self.incoming_source == event.data.data32[0];
+}
+
+fn readIncomingTypeList(self: *Self) void {
+    const reply = c.xcb_get_property_reply(
+        self.connection,
+        c.xcb_get_property(
+            self.connection,
+            0,
+            self.incoming_source,
+            self.atoms.type_list,
+            c.XCB_ATOM_ATOM,
+            0,
+            4096,
+        ),
+        null,
+    ) orelse return;
+    defer std.c.free(reply);
+    if (reply.*.type != c.XCB_ATOM_ATOM or reply.*.format != 32 or
+        reply.*.bytes_after != 0) return;
+    const value = c.xcb_get_property_value(reply) orelse return;
+    const target_atoms: [*]const c.xcb_atom_t = @ptrCast(@alignCast(value));
+    for (target_atoms[0..@intCast(reply.*.value_len)]) |target_atom| {
+        self.offerIncomingTarget(target_atom);
+    }
+}
+
+fn offerIncomingTarget(self: *Self, target_atom: c.xcb_atom_t) void {
+    if (target_atom == c.XCB_ATOM_NONE or
+        std.mem.indexOfScalar(c.xcb_atom_t, self.incoming_target_atoms.items, target_atom) != null) return;
+    const mime_type = self.selection.mimeForTargetAtom(target_atom) orelse return;
+    for (self.incoming_mime_types.items) |offered| {
+        if (!std.mem.eql(u8, offered, mime_type)) continue;
+        self.allocator.free(mime_type);
+        return;
+    }
+    self.incoming_mime_types.append(self.allocator, mime_type) catch {
+        self.allocator.free(mime_type);
+        return;
+    };
+    self.incoming_target_atoms.append(self.allocator, target_atom) catch {
+        self.allocator.free(self.incoming_mime_types.pop().?);
+        return;
+    };
+    self.data_device.externalDragMimeOffered(&self.external_source, mime_type.ptr);
 }
 
 fn handleStatus(self: *Self, event: *const c.xcb_client_message_event_t) void {
@@ -222,6 +440,156 @@ fn handleFinished(self: *Self, event: *const c.xcb_client_message_event_t) void 
     self.data_device.finishExternalDrag(target.generation, performed);
     self.target = null;
     self.dropped = false;
+}
+
+fn sendIncomingStatus(self: *Self) void {
+    if (self.incoming_source == c.XCB_WINDOW_NONE or self.incoming_x_dropped) return;
+    const accepted = !self.incoming_wl_cancelled and self.incoming_target_accepted and
+        actionBits(self.incoming_selected_action) != 0;
+    self.sendEvent(self.incoming_source, self.atoms.status, .{
+        self.selection.ownerWindow(),
+        2 | @as(u32, @intFromBool(accepted)),
+        0,
+        0,
+        if (accepted) self.atomForActions(self.incoming_selected_action) else c.XCB_ATOM_NONE,
+    });
+}
+
+fn finishIncoming(self: *Self, success: bool) void {
+    if (self.incoming_source != c.XCB_WINDOW_NONE and self.incoming_x_dropped) {
+        self.sendEvent(self.incoming_source, self.atoms.finished, .{
+            self.selection.ownerWindow(),
+            @intFromBool(success),
+            if (success) self.atomForActions(self.incoming_selected_action) else c.XCB_ATOM_NONE,
+            0,
+            0,
+        });
+    }
+    self.clearIncoming(false);
+}
+
+fn clearIncoming(self: *Self, notify_data_device: bool) void {
+    if (notify_data_device and self.incoming_generation != null) {
+        self.data_device.externalDragSourceDestroyed(&self.external_source);
+    }
+    self.setProxyMapped(false);
+    self.clearIncomingMimeTypes();
+    self.incoming_owner = c.XCB_WINDOW_NONE;
+    self.incoming_source = c.XCB_WINDOW_NONE;
+    self.incoming_generation = null;
+    self.incoming_version = 0;
+    self.incoming_timestamp = c.XCB_CURRENT_TIME;
+    self.incoming_actions = copyAction();
+    self.incoming_selected_action = .{};
+    self.incoming_target_accepted = false;
+    self.incoming_x_dropped = false;
+    self.incoming_wl_cancelled = false;
+    self.incoming_wl_finished = false;
+}
+
+fn clearIncomingMimeTypes(self: *Self) void {
+    for (self.incoming_mime_types.items) |mime_type| self.allocator.free(mime_type);
+    self.incoming_mime_types.clearRetainingCapacity();
+    self.incoming_target_atoms.clearRetainingCapacity();
+}
+
+fn setProxyMapped(self: *Self, mapped: bool) void {
+    if (self.proxy_mapped == mapped) return;
+    self.proxy_mapped = mapped;
+    const window = self.selection.ownerWindow();
+    if (mapped) {
+        const override_redirect: u32 = 1;
+        _ = c.xcb_change_window_attributes(
+            self.connection,
+            window,
+            c.XCB_CW_OVERRIDE_REDIRECT,
+            &override_redirect,
+        );
+        const width, const height = self.rootSize();
+        const values = [_]u32{
+            0,
+            0,
+            width,
+            height,
+            c.XCB_STACK_MODE_ABOVE,
+        };
+        _ = c.xcb_configure_window(
+            self.connection,
+            window,
+            c.XCB_CONFIG_WINDOW_X |
+                c.XCB_CONFIG_WINDOW_Y |
+                c.XCB_CONFIG_WINDOW_WIDTH |
+                c.XCB_CONFIG_WINDOW_HEIGHT |
+                c.XCB_CONFIG_WINDOW_STACK_MODE,
+            &values,
+        );
+        _ = c.xcb_map_window(self.connection, window);
+    } else {
+        _ = c.xcb_unmap_window(self.connection, window);
+    }
+    _ = c.xcb_flush(self.connection);
+}
+
+fn rootSize(self: *Self) struct { u16, u16 } {
+    const reply = c.xcb_get_geometry_reply(
+        self.connection,
+        c.xcb_get_geometry(self.connection, self.screen.root),
+        null,
+    ) orelse return .{ self.screen.width_in_pixels, self.screen.height_in_pixels };
+    defer std.c.free(reply);
+    return .{ reply.*.width, reply.*.height };
+}
+
+fn externalMimeTypes(context: *anyopaque) []const [:0]const u8 {
+    const self: *Self = @ptrCast(@alignCast(context));
+    return @ptrCast(self.incoming_mime_types.items);
+}
+
+fn externalActions(context: *anyopaque) wl.DataDeviceManager.DndAction {
+    const self: *Self = @ptrCast(@alignCast(context));
+    return self.incoming_actions;
+}
+
+fn externalSend(context: *anyopaque, mime_type: [*:0]const u8, fd: std.posix.fd_t) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const requested = std.mem.span(mime_type);
+    const target = for (self.incoming_mime_types.items, self.incoming_target_atoms.items) |offered, atom| {
+        if (std.mem.eql(u8, offered, requested)) break atom;
+    } else return;
+    self.selection.receiveExternalData(target, self.incoming_timestamp, fd);
+}
+
+fn externalTarget(context: *anyopaque, mime_type: ?[*:0]const u8) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const accepted = mime_type != null;
+    if (self.incoming_target_accepted == accepted) return;
+    self.incoming_target_accepted = accepted;
+    self.sendIncomingStatus();
+}
+
+fn externalAction(context: *anyopaque, selected: wl.DataDeviceManager.DndAction) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    if (actionBits(self.incoming_selected_action) == actionBits(selected)) return;
+    self.incoming_selected_action = selected;
+    self.sendIncomingStatus();
+}
+
+fn externalDropPerformed(_: *anyopaque) void {}
+
+fn externalFinished(context: *anyopaque) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.incoming_wl_finished = true;
+    if (self.incoming_x_dropped) self.finishIncoming(true);
+}
+
+fn externalCancelled(context: *anyopaque) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.incoming_wl_cancelled = true;
+    if (self.incoming_x_dropped) {
+        self.finishIncoming(false);
+    } else {
+        self.setProxyMapped(false);
+    }
 }
 
 fn resolveTarget(self: *Self, window: c.xcb_window_t) ?struct { c.xcb_window_t, u32 } {
@@ -407,6 +775,12 @@ fn actionForAtom(
 
 fn actionBits(actions: wl.DataDeviceManager.DndAction) u32 {
     return @bitCast(actions);
+}
+
+fn copyAction() wl.DataDeviceManager.DndAction {
+    var action: wl.DataDeviceManager.DndAction = .{};
+    action.copy = true;
+    return action;
 }
 
 fn targetMatches(target: Target, window: c.xcb_window_t) bool {

@@ -323,6 +323,7 @@ pub fn init(
     try self.dnd.init(
         allocator,
         connection,
+        screen,
         data_device,
         &self.dnd_selection,
         .{
@@ -433,6 +434,10 @@ pub fn dropDrag(self: *Self, time: u32) bool {
 
 pub fn physicalDragEnded(self: *Self) void {
     self.dnd.physicalDragEnded();
+}
+
+pub fn routeExternalDragOverXwayland(self: *Self, over_xwayland: bool) void {
+    self.dnd.routeExternalDragOverXwayland(over_xwayland);
 }
 
 pub fn dragSourceDestroyed(self: *Self, generation: u64) void {
@@ -1198,6 +1203,7 @@ fn dispatchEvent(self: *Self, event: [*c]c.xcb_generic_event_t) !void {
         self.clipboard_selection.handleXfixesNotify(@ptrCast(event));
         self.primary_selection.handleXfixesNotify(@ptrCast(event));
         self.dnd_selection.handleXfixesNotify(@ptrCast(event));
+        self.dnd.handleXfixesNotify(@ptrCast(event));
         return;
     }
     switch (response_type) {

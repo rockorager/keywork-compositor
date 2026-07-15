@@ -2521,7 +2521,11 @@ fn pointerEnter(context: *anyopaque, x: f64, y: f64) void {
     }
     if (self.data_device.isDragging()) {
         self.pointer_constraints.deactivateAll();
-        self.seat.pointerEnter(point.x, point.y, null);
+        self.seat.pointerEnter(
+            point.x,
+            point.y,
+            self.data_device.externalDragPointerFocus(point.x, point.y),
+        );
         self.routeActiveDrag(0, route, point.x, point.y, false);
         self.window_manager.pointerMoved(null);
         return;
@@ -2567,7 +2571,12 @@ fn pointerMotionForSeat(output: *RenderOutput, seat: *Seat, time: u32, x: f64, y
     if (seat == &self.seat and self.data_device.isDragging()) {
         self.pointer_constraints.deactivateAll();
         const route = self.pointerRoute(target.x, target.y);
-        seat.pointerMotion(time, target.x, target.y, null);
+        seat.pointerMotion(
+            time,
+            target.x,
+            target.y,
+            self.data_device.externalDragPointerFocus(target.x, target.y),
+        );
         self.routeActiveDrag(time, route, target.x, target.y, true);
         self.window_manager.pointerMovedForSeat(seat, null);
         return;
@@ -2700,7 +2709,7 @@ fn dragStarted(context: *anyopaque) void {
     if (self.xwm_initialized) self.xwm.dragStarted();
     const position = self.seat.pointerPosition() orelse return;
     const route = self.pointerRoute(position.x, position.y);
-    self.seat.suppressPointerFocus(true);
+    if (!self.data_device.dragIsExternal()) self.seat.suppressPointerFocus(true);
     self.window_manager.pointerMoved(null);
     self.routeActiveDrag(0, route, position.x, position.y, false);
 }
@@ -2733,12 +2742,21 @@ fn routeActiveDrag(
     motion: bool,
 ) void {
     if (self.xwm_initialized) {
-        if (route.root) |surface_id| if (self.xwaylandWindowForSurface(surface_id)) |window_id| {
-            self.data_device.pointerLeft();
-            self.xwm.dragMotion(window_id, time, x, y);
-            return;
-        };
-        self.xwm.dragLeft();
+        if (self.data_device.dragIsExternal()) {
+            if (route.root) |surface_id| if (self.xwaylandWindowForSurface(surface_id) != null) {
+                self.data_device.pointerLeft();
+                self.xwm.routeExternalDragOverXwayland(true);
+                return;
+            };
+            self.xwm.routeExternalDragOverXwayland(false);
+        } else {
+            if (route.root) |surface_id| if (self.xwaylandWindowForSurface(surface_id)) |window_id| {
+                self.data_device.pointerLeft();
+                self.xwm.dragMotion(window_id, time, x, y);
+                return;
+            };
+            self.xwm.dragLeft();
+        }
     }
     if (motion) {
         self.data_device.pointerMotion(time, route.focus);
