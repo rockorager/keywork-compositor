@@ -626,6 +626,7 @@ pub fn create(
             .context = self,
             .constraints = captureConstraints,
             .capture = captureImage,
+            .cursor_info = captureCursorInfo,
         },
     );
     self.image_copy_capture_initialized = true;
@@ -1554,6 +1555,7 @@ pub fn terminate(self: *Self) void {
 fn requestRepaint(context: *anyopaque) void {
     const self: *Self = @ptrCast(@alignCast(context));
     self.refreshIdleInhibition();
+    if (self.image_copy_capture_initialized) self.image_copy_capture.refreshCursors();
     var render_outputs = self.render_outputs.iterator();
     while (render_outputs.next()) |entry| {
         const render_output = entry.value.*;
@@ -3026,9 +3028,22 @@ fn pointInRoundedRect(x: f64, y: f64, rect: render.Rect, requested_radius: u32) 
 
 fn captureConstraints(
     context: *anyopaque,
-    target: ImageCaptureSource.Target,
+    target: ImageCopyCapture.Target,
 ) ?ImageCopyCapture.Constraints {
     const self: *Self = @ptrCast(@alignCast(context));
+    return switch (target) {
+        .source => |source| captureSourceConstraints(self, source),
+        .cursor => |cursor| if (self.cursorCaptureState(cursor)) |state|
+            .{ .size = state.size }
+        else
+            null,
+    };
+}
+
+fn captureSourceConstraints(
+    self: *Self,
+    target: ImageCaptureSource.Target,
+) ?ImageCopyCapture.Constraints {
     return switch (target) {
         .output => |output_id| output: {
             const render_output = self.renderOutputForProtocol(output_id) orelse return null;
@@ -3043,26 +3058,181 @@ fn captureConstraints(
 
 fn captureImage(
     context: *anyopaque,
-    target: ImageCaptureSource.Target,
+    target: ImageCopyCapture.Target,
     paint_cursors: bool,
     pixel_buffer: render.PixelBuffer,
 ) ImageCopyCapture.CaptureError!presentation.Timestamp {
     const self: *Self = @ptrCast(@alignCast(context));
     switch (target) {
-        .output => |output_id| self.captureOutput(
-            output_id,
-            paint_cursors,
-            pixel_buffer,
-        ) catch return error.Failed,
-        .toplevel => |window_id| {
-            if (self.session_lock.isLocked()) return error.Failed;
-            self.captureToplevel(window_id, pixel_buffer) catch |err| switch (err) {
-                error.Stopped => return error.Stopped,
-                else => return error.Failed,
-            };
+        .source => |source| switch (source) {
+            .output => |output_id| self.captureOutput(
+                output_id,
+                paint_cursors,
+                pixel_buffer,
+            ) catch return error.Failed,
+            .toplevel => |window_id| {
+                if (self.session_lock.isLocked()) return error.Failed;
+                self.captureToplevel(window_id, pixel_buffer) catch |err| switch (err) {
+                    error.Stopped => return error.Stopped,
+                    else => return error.Failed,
+                };
+            },
         },
+        .cursor => |cursor| self.captureCursor(cursor, pixel_buffer) catch return error.Failed,
     }
     return presentation.Info.now(self.io).timestamp;
+}
+
+const CursorCaptureState = struct {
+    cursor: Seat.CursorInfo,
+    bounds: render.Rect,
+    scale: render.Scale,
+    size: render.Size,
+    position: render.Position,
+    hotspot: render.Position,
+    entered: bool,
+};
+
+fn captureCursorInfo(
+    context: *anyopaque,
+    target: ImageCopyCapture.CursorTarget,
+) ?ImageCopyCapture.CursorInfo {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const state = self.cursorCaptureState(target) orelse return null;
+    return .{
+        .entered = state.entered,
+        .position = state.position,
+        .hotspot = state.hotspot,
+    };
+}
+
+fn cursorCaptureState(
+    self: *Self,
+    target: ImageCopyCapture.CursorTarget,
+) ?CursorCaptureState {
+    const source_bounds, const scale, const cursor = switch (target.source) {
+        .output => |output_id| output: {
+            const render_output = self.renderOutputForProtocol(output_id) orelse return null;
+            const output = self.outputs.get(output_id) orelse return null;
+            const cursor = self.seatCursorInfo(
+                target.seat,
+                self.session_lock.isLocked(),
+            ) orelse return null;
+            break :output .{
+                output.logicalRect(),
+                render_output.backend.renderScale(),
+                cursor,
+            };
+        },
+        .toplevel => |window_id| toplevel: {
+            if (self.session_lock.isLocked()) return null;
+            const bounds = self.toplevelCaptureBounds(window_id) orelse return null;
+            const cursor = self.seatCursorInfo(target.seat, false) orelse return null;
+            break :toplevel .{ bounds, render.Scale{}, cursor };
+        },
+    };
+    const pointer = target.seat.pointerPosition() orelse return null;
+    const pointer_x = floorToI32(pointer.x);
+    const pointer_y = floorToI32(pointer.y);
+    const bounds = switch (cursor) {
+        .shape => |shape| render.Rect{
+            .x = shape.x,
+            .y = shape.y,
+            .width = shape.buffer.size.width,
+            .height = shape.buffer.size.height,
+        },
+        .surface => |surface| bounds: {
+            var value: ?render.Rect = null;
+            self.addSurfaceTreeBounds(
+                surface.surface_id,
+                surface.x,
+                surface.y,
+                &value,
+            ) catch return null;
+            break :bounds value orelse return null;
+        },
+    };
+    const size = scale.apply(.{ .width = bounds.width, .height = bounds.height }) catch
+        return null;
+    if (size.width == 0 or size.height == 0) return null;
+    const position: render.Position = .{
+        .x = scaleCaptureCoordinate(@as(i64, pointer_x) - source_bounds.x, scale),
+        .y = scaleCaptureCoordinate(@as(i64, pointer_y) - source_bounds.y, scale),
+    };
+    const image_origin: render.Position = .{
+        .x = scaleCaptureCoordinate(@as(i64, bounds.x) - source_bounds.x, scale),
+        .y = scaleCaptureCoordinate(@as(i64, bounds.y) - source_bounds.y, scale),
+    };
+    return .{
+        .cursor = cursor,
+        .bounds = bounds,
+        .scale = scale,
+        .size = size,
+        .position = position,
+        .hotspot = .{
+            .x = position.x -| image_origin.x,
+            .y = position.y -| image_origin.y,
+        },
+        .entered = bounds.intersection(source_bounds) != null,
+    };
+}
+
+fn captureCursor(
+    self: *Self,
+    target: ImageCopyCapture.CursorTarget,
+    pixel_buffer: render.PixelBuffer,
+) renderer_types.Renderer.Error!void {
+    const state = self.cursorCaptureState(target) orelse return error.InvalidTarget;
+    if (!std.meta.eql(pixel_buffer.size, state.size)) return error.InvalidTarget;
+    const render_output = switch (target.source) {
+        .output => |output_id| self.renderOutputForProtocol(output_id),
+        .toplevel => self.firstRenderOutput(),
+    } orelse return error.InvalidTarget;
+    const output = self.outputs.get(render_output.protocol_id) orelse return error.InvalidTarget;
+    const frame: OutputFrame = .{
+        .render_output = render_output,
+        .output = output,
+        .target = self.renderer.makeTarget(pixel_buffer),
+        .size = pixel_buffer.size,
+        .scale = state.scale,
+        .origin = .{ .x = state.bounds.x, .y = state.bounds.y },
+        .visible_rect = state.bounds,
+        .track_visibility = false,
+    };
+    const clear_command = [_]render.Command{.{ .clear = render.Color.rgba(0, 0, 0, 0) }};
+    try self.renderCommands(&frame, &clear_command);
+    try self.renderCursor(&frame, state.cursor);
+}
+
+fn floorToI32(value: f64) i32 {
+    const floored = @floor(value);
+    if (floored <= std.math.minInt(i32)) return std.math.minInt(i32);
+    if (floored >= std.math.maxInt(i32)) return std.math.maxInt(i32);
+    return @intFromFloat(floored);
+}
+
+fn scaleCaptureCoordinate(value: i64, scale: render.Scale) i32 {
+    const product = @as(i128, value) * scale.numerator;
+    const rounded = if (product >= 0)
+        @divTrunc(product + render.Scale.denominator / 2, render.Scale.denominator)
+    else
+        -@divTrunc(-product + render.Scale.denominator / 2, render.Scale.denominator);
+    return @intCast(std.math.clamp(
+        rounded,
+        std.math.minInt(i32),
+        std.math.maxInt(i32),
+    ));
+}
+
+test "cursor capture metadata preserves fractional image placement" {
+    const scale: render.Scale = .{ .numerator = 180 };
+    const position = scaleCaptureCoordinate(8, scale);
+    const image_origin = scaleCaptureCoordinate(3, scale);
+    const hotspot = position -| image_origin;
+    try std.testing.expectEqual(@as(i32, 12), position);
+    try std.testing.expectEqual(@as(i32, 5), image_origin);
+    try std.testing.expectEqual(image_origin, position -| hotspot);
+    try std.testing.expectEqual(@as(i32, -5), scaleCaptureCoordinate(-3, scale));
 }
 
 fn captureOutput(

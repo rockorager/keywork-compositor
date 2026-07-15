@@ -9,6 +9,7 @@ const render = @import("../render/types.zig");
 const ImageCaptureSource = @import("image_capture_source.zig");
 const LinuxDmabuf = @import("linux_dmabuf.zig");
 const SecurityContext = @import("security_context.zig");
+const Seat = @import("seat.zig");
 
 const wl = wayland.server.wl;
 const ext = wayland.server.ext;
@@ -28,17 +29,34 @@ pub const Constraints = struct {
     transform: wl.Output.Transform = .normal,
 };
 
+pub const CursorTarget = struct {
+    source: ImageCaptureSource.Target,
+    seat: *Seat,
+};
+
+pub const Target = union(enum) {
+    source: ImageCaptureSource.Target,
+    cursor: CursorTarget,
+};
+
+pub const CursorInfo = struct {
+    entered: bool,
+    position: render.Position,
+    hotspot: render.Position,
+};
+
 pub const CaptureError = error{ Stopped, Failed };
 
 pub const Listener = struct {
     context: *anyopaque,
-    constraints: *const fn (*anyopaque, ImageCaptureSource.Target) ?Constraints,
+    constraints: *const fn (*anyopaque, Target) ?Constraints,
     capture: *const fn (
         *anyopaque,
-        ImageCaptureSource.Target,
+        Target,
         bool,
         render.PixelBuffer,
     ) CaptureError!presentation.Timestamp,
+    cursor_info: *const fn (*anyopaque, CursorTarget) ?CursorInfo,
 };
 
 const Destination = struct {
@@ -84,7 +102,7 @@ const Destination = struct {
 const Session = struct {
     owner: *Self,
     resource: *ext.ImageCopyCaptureSessionV1,
-    target: ?ImageCaptureSource.Target,
+    target: ?Target,
     constraints: ?Constraints,
     frame: ?*Frame = null,
     paint_cursors: bool,
@@ -94,7 +112,7 @@ const Session = struct {
         owner: *Self,
         client: *wl.Client,
         id: u32,
-        target: ?ImageCaptureSource.Target,
+        target: ?Target,
         paint_cursors: bool,
     ) !void {
         const resource = try ext.ImageCopyCaptureSessionV1.create(client, 1, id);
@@ -114,10 +132,12 @@ const Session = struct {
         };
         try owner.sessions.append(owner.allocator, self);
         resource.setHandler(*Session, handleRequest, handleDestroy, self);
-        if (target == null or constraints == null) {
+        if (target == null) {
             self.stop();
-        } else {
-            self.sendConstraints(constraints.?);
+        } else if (constraints) |value| {
+            self.sendConstraints(value);
+        } else if (target.? == .source) {
+            self.stop();
         }
     }
 
@@ -173,6 +193,21 @@ const Session = struct {
         self.resource.sendDone();
     }
 
+    fn refreshCursorConstraints(self: *Session) void {
+        if (self.stopped) return;
+        const target = self.target orelse return;
+        if (target != .cursor) return;
+        const current = self.owner.listener.constraints(
+            self.owner.listener.context,
+            target,
+        ) orelse return;
+        if (self.constraints) |previous| {
+            if (std.meta.eql(previous, current)) return;
+        }
+        self.constraints = current;
+        self.sendConstraints(current);
+    }
+
     fn stop(self: *Session) void {
         if (self.stopped) return;
         self.stopped = true;
@@ -185,7 +220,7 @@ const Frame = struct {
     owner: *Self,
     resource: *ext.ImageCopyCaptureFrameV1,
     session: ?*Session,
-    target: ?ImageCaptureSource.Target,
+    target: ?Target,
     constraints: ?Constraints,
     paint_cursors: bool,
     destination: Destination = .{},
@@ -273,12 +308,18 @@ const Frame = struct {
             return;
         }
         const target = self.target orelse return self.fail(.stopped);
-        const expected = self.constraints orelse return self.fail(.stopped);
-        const current = self.owner.listener.constraints(self.owner.listener.context, target) orelse {
-            self.fail(.stopped);
-            self.stopSession();
-            return;
+        const expected = self.constraints orelse return switch (target) {
+            .source => self.fail(.stopped),
+            .cursor => self.fail(.unknown),
         };
+        const current = self.owner.listener.constraints(self.owner.listener.context, target) orelse
+            return switch (target) {
+                .source => {
+                    self.fail(.stopped);
+                    self.stopSession();
+                },
+                .cursor => self.fail(.unknown),
+            };
         if (!std.meta.eql(current, expected)) {
             if (self.session) |session| {
                 if (!session.stopped) {
@@ -318,7 +359,7 @@ const Frame = struct {
 
     fn performCapture(
         self: *Frame,
-        target: ImageCaptureSource.Target,
+        target: Target,
         pixel_buffer: render.PixelBuffer,
     ) ?presentation.Timestamp {
         return self.owner.listener.capture(
@@ -374,16 +415,21 @@ const Frame = struct {
 const CursorSession = struct {
     owner: *Self,
     resource: *ext.ImageCopyCaptureCursorSessionV1,
+    target: ?CursorTarget,
     capture_session_created: bool = false,
+    entered: bool = false,
+    position: ?render.Position = null,
+    hotspot: ?render.Position = null,
 
-    fn create(owner: *Self, client: *wl.Client, id: u32) !void {
+    fn create(owner: *Self, client: *wl.Client, id: u32, target: ?CursorTarget) !void {
         const resource = try ext.ImageCopyCaptureCursorSessionV1.create(client, 1, id);
         errdefer resource.destroy();
         const self = try owner.allocator.create(CursorSession);
         errdefer owner.allocator.destroy(self);
-        self.* = .{ .owner = owner, .resource = resource };
+        self.* = .{ .owner = owner, .resource = resource, .target = target };
         try owner.cursor_sessions.append(owner.allocator, self);
         resource.setHandler(*CursorSession, handleRequest, handleDestroy, self);
+        self.refresh();
     }
 
     fn handleRequest(
@@ -399,9 +445,8 @@ const CursorSession = struct {
                     return;
                 }
                 self.capture_session_created = true;
-                // Dedicated cursor-image capture is added separately. Until then, the
-                // protocol-defined inert session reports that capture is unavailable.
-                Session.create(self.owner, resource.getClient(), get_session.session, null, false) catch
+                const target: ?Target = if (self.target) |value| .{ .cursor = value } else null;
+                Session.create(self.owner, resource.getClient(), get_session.session, target, false) catch
                     resource.postNoMemory();
             },
         }
@@ -414,6 +459,41 @@ const CursorSession = struct {
             break;
         }
         self.owner.allocator.destroy(self);
+    }
+
+    fn refresh(self: *CursorSession) void {
+        const info = if (self.target) |target| self.owner.listener.cursor_info(
+            self.owner.listener.context,
+            target,
+        ) else null;
+        const entered = if (info) |value| value.entered else false;
+        if (entered and !self.entered) self.resource.sendEnter();
+        if (!entered and self.entered) self.resource.sendLeave();
+        if (!entered) {
+            self.entered = false;
+            self.position = null;
+            self.hotspot = null;
+            return;
+        }
+
+        const value = info.?;
+        if (self.position == null or !std.meta.eql(self.position.?, value.position)) {
+            self.resource.sendPosition(value.position.x, value.position.y);
+        }
+        if (self.hotspot == null or !std.meta.eql(self.hotspot.?, value.hotspot)) {
+            self.resource.sendHotspot(value.hotspot.x, value.hotspot.y);
+        }
+        self.entered = true;
+        self.position = value.position;
+        self.hotspot = value.hotspot;
+    }
+
+    fn invalidate(self: *CursorSession) void {
+        if (self.entered) self.resource.sendLeave();
+        self.target = null;
+        self.entered = false;
+        self.position = null;
+        self.hotspot = null;
     }
 };
 
@@ -496,29 +576,49 @@ fn handleManagerRequest(
                 self,
                 resource.getClient(),
                 create.session,
-                target,
+                if (target) |value| .{ .source = value } else null,
                 create.options.paint_cursors,
             ) catch resource.postNoMemory();
         },
         .create_pointer_cursor_session => |create| {
-            _ = create.source;
-            _ = create.pointer;
-            CursorSession.create(self, resource.getClient(), create.session) catch
+            const source = self.sources.targetForResource(create.source);
+            const binding = Seat.pointerBinding(create.pointer);
+            const target: ?CursorTarget = if (source) |source_target|
+                if (binding) |pointer| .{ .source = source_target, .seat = pointer.seat } else null
+            else
+                null;
+            CursorSession.create(self, resource.getClient(), create.session, target) catch
                 resource.postNoMemory();
         },
     }
+}
+
+pub fn refreshCursors(self: *Self) void {
+    for (self.cursor_sessions.items) |session| session.refresh();
+    for (self.sessions.items) |session| session.refreshCursorConstraints();
 }
 
 fn sourceInvalidated(context: *anyopaque, target: ImageCaptureSource.Target) void {
     const self: *Self = @ptrCast(@alignCast(context));
     for (self.frames.items) |frame| {
         const current = frame.target orelse continue;
-        if (std.meta.eql(current, target)) frame.fail(.stopped);
+        if (std.meta.eql(sourceForTarget(current), target)) frame.fail(.stopped);
     }
     for (self.sessions.items) |session| {
         const current = session.target orelse continue;
-        if (std.meta.eql(current, target)) session.stop();
+        if (std.meta.eql(sourceForTarget(current), target)) session.stop();
     }
+    for (self.cursor_sessions.items) |session| {
+        const current = session.target orelse continue;
+        if (std.meta.eql(current.source, target)) session.invalidate();
+    }
+}
+
+fn sourceForTarget(target: Target) ImageCaptureSource.Target {
+    return switch (target) {
+        .source => |source| source,
+        .cursor => |cursor| cursor.source,
+    };
 }
 
 fn shmPixelBuffer(buffer: *wl.shm.Buffer, expected: render.Size) ?render.PixelBuffer {

@@ -996,13 +996,13 @@
           "target_version": 1
         }
       ],
-      "status": "in_progress",
+      "status": "done",
       "privileged": true,
       "blocked_by": [
         "image-capture-source",
         "linux-dmabuf"
       ],
-      "status_detail": "Version 1 base sessions synchronously capture complete output scenes or mapped toplevel surface trees into ARGB8888/XRGB8888 wl_shm buffers and CPU-mappable linear DMA-BUFs. DMA-BUF constraints advertise the allocation device, formats, and modifiers when available, with stride, offset, and Y-inversion respected during writes. Output sessions honor paint-cursors, captures preserve session/frame lifetime rules, constraints are refreshed on size changes, source invalidation stops sessions, and frame metadata includes full conservative damage plus monotonic timestamps. The privileged global is security-context filtered. Dedicated cursor-image sessions remain to complete the target."
+      "status_detail": "Version 1 synchronously captures complete output scenes, mapped toplevel surface trees, and dedicated pointer cursor images into ARGB8888/XRGB8888 wl_shm buffers or CPU-mappable linear DMA-BUFs. DMA-BUF constraints advertise the allocation device, formats, and modifiers when available, with stride, offset, and Y-inversion respected during writes. Output sessions honor paint-cursors. Cursor sessions track image intersection with enter/leave events, report scale-aware position and hotspot metadata, update constraints when cursor dimensions change, and include cursor-surface subsurfaces. Captures preserve session/frame lifetime rules, source invalidation stops sessions, and frame metadata includes full conservative damage plus monotonic timestamps. The privileged global is security-context filtered."
     },
     {
       "id": "wlr-screencopy",
