@@ -22,6 +22,12 @@ global: *wl.Global,
 contexts: std.ArrayList(*Context),
 clients: std.AutoHashMapUnmanaged(*const wl.Client, *ClientContext),
 restricted_globals: std.ArrayList(*wl.Global),
+private_globals: std.ArrayList(PrivateGlobal),
+
+const PrivateGlobal = struct {
+    global: *wl.Global,
+    client: ?*const wl.Client,
+};
 
 pub const Metadata = struct {
     sandbox_engine: ?[:0]const u8,
@@ -45,7 +51,9 @@ pub fn init(self: *Self, allocator: std.mem.Allocator, display: *wl.Server) !voi
         .contexts = .empty,
         .clients = .empty,
         .restricted_globals = .empty,
+        .private_globals = .empty,
     };
+    errdefer self.private_globals.deinit(allocator);
     errdefer self.restricted_globals.deinit(allocator);
     display.setGlobalFilter(*Self, globalFilter, self);
 }
@@ -60,6 +68,8 @@ pub fn deinit(self: *Self) void {
     self.display.setGlobalFilter(*Self, allowAllGlobals, self);
     self.global.destroy();
     std.debug.assert(self.restricted_globals.items.len == 0);
+    std.debug.assert(self.private_globals.items.len == 0);
+    self.private_globals.deinit(self.allocator);
     self.restricted_globals.deinit(self.allocator);
     self.clients.deinit(self.allocator);
     self.contexts.deinit(self.allocator);
@@ -85,7 +95,50 @@ pub fn unrestrictGlobal(self: *Self, global: *wl.Global) void {
     unreachable;
 }
 
+/// Hide a global from every client until one client is explicitly authorized.
+pub fn privatizeGlobal(self: *Self, global: *wl.Global) error{OutOfMemory}!void {
+    for (self.private_globals.items) |entry| std.debug.assert(entry.global != global);
+    try self.private_globals.append(self.allocator, .{ .global = global, .client = null });
+}
+
+pub fn authorizePrivateGlobal(
+    self: *Self,
+    global: *wl.Global,
+    client: *const wl.Client,
+) void {
+    for (self.private_globals.items) |*entry| {
+        if (entry.global != global) continue;
+        std.debug.assert(entry.client == null);
+        entry.client = client;
+        return;
+    }
+    unreachable;
+}
+
+pub fn clearPrivateGlobalClient(self: *Self, global: *wl.Global) void {
+    for (self.private_globals.items) |*entry| {
+        if (entry.global != global) continue;
+        std.debug.assert(entry.client != null);
+        entry.client = null;
+        return;
+    }
+    unreachable;
+}
+
+pub fn unprivatizeGlobal(self: *Self, global: *wl.Global) void {
+    for (self.private_globals.items, 0..) |entry, index| {
+        if (entry.global != global) continue;
+        std.debug.assert(entry.client == null);
+        _ = self.private_globals.orderedRemove(index);
+        return;
+    }
+    unreachable;
+}
+
 fn globalFilter(client: *const wl.Client, global: *const wl.Global, self: *Self) bool {
+    for (self.private_globals.items) |entry| {
+        if (entry.global == global) return entry.client == client;
+    }
     if (!self.clients.contains(client)) return true;
     if (global == self.global) return false;
     for (self.restricted_globals.items) |restricted| {
@@ -491,6 +544,37 @@ test "sandbox clients cannot see registered privileged globals" {
     try std.testing.expect(!globalFilter(client, manager.global, &manager));
     try std.testing.expect(!globalFilter(client, restricted, &manager));
     try std.testing.expect(globalFilter(client, unrestricted, &manager));
+}
+
+test "private globals are visible only to their authorized client" {
+    const display = try wl.Server.create();
+    defer display.destroy();
+
+    var manager: Self = undefined;
+    try manager.init(std.testing.allocator, display);
+    defer manager.deinit();
+
+    var context: u8 = 0;
+    const private = try wl.Global.create(
+        display,
+        wl.Compositor,
+        1,
+        *u8,
+        &context,
+        testGlobalBind,
+    );
+    defer private.destroy();
+    try manager.privatizeGlobal(private);
+    defer manager.unprivatizeGlobal(private);
+
+    const authorized: *const wl.Client = @ptrFromInt(0x1000);
+    const other: *const wl.Client = @ptrFromInt(0x2000);
+    try std.testing.expect(!globalFilter(authorized, private, &manager));
+    manager.authorizePrivateGlobal(private, authorized);
+    try std.testing.expect(globalFilter(authorized, private, &manager));
+    try std.testing.expect(!globalFilter(other, private, &manager));
+    manager.clearPrivateGlobalClient(private);
+    try std.testing.expect(!globalFilter(authorized, private, &manager));
 }
 
 test "listen fd validation rejects connected sockets" {

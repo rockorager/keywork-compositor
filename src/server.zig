@@ -31,6 +31,7 @@ const ForeignToplevelList = @import("wayland/foreign_toplevel_list.zig");
 const ImageCaptureSource = @import("wayland/image_capture_source.zig");
 const ImageCopyCapture = @import("wayland/image_copy_capture.zig");
 const Screencopy = @import("wayland/screencopy.zig");
+const XwaylandShell = @import("wayland/xwayland_shell.zig");
 const Workspace = @import("wayland/workspace.zig");
 const TextInput = @import("wayland/text_input.zig");
 const InputMethod = @import("wayland/input_method.zig");
@@ -127,6 +128,8 @@ image_copy_capture: ImageCopyCapture,
 image_copy_capture_initialized: bool,
 screencopy: Screencopy,
 screencopy_initialized: bool,
+xwayland_shell: XwaylandShell,
+xwayland_shell_initialized: bool,
 workspace: Workspace,
 workspace_initialized: bool,
 text_input: TextInput,
@@ -305,6 +308,8 @@ pub fn create(
         .image_copy_capture_initialized = false,
         .screencopy = undefined,
         .screencopy_initialized = false,
+        .xwayland_shell = undefined,
+        .xwayland_shell_initialized = false,
         .workspace = undefined,
         .workspace_initialized = false,
         .text_input = undefined,
@@ -656,6 +661,21 @@ pub fn create(
         self.screencopy.deinit();
         self.screencopy_initialized = false;
     }
+    try self.xwayland_shell.init(
+        allocator,
+        display,
+        &self.security_context,
+        .{
+            .context = self,
+            .associated = xwaylandSurfaceAssociated,
+            .removed = xwaylandSurfaceRemoved,
+        },
+    );
+    self.xwayland_shell_initialized = true;
+    errdefer {
+        self.xwayland_shell.deinit();
+        self.xwayland_shell_initialized = false;
+    }
     try self.workspace.init(allocator, display, &self.security_context, &self.outputs);
     self.workspace_initialized = true;
     errdefer {
@@ -814,6 +834,8 @@ pub fn destroy(self: *Self) void {
     }
     self.workspace.deinit();
     self.workspace_initialized = false;
+    self.xwayland_shell.deinit();
+    self.xwayland_shell_initialized = false;
     self.screencopy.deinit();
     self.screencopy_initialized = false;
     self.image_copy_capture.deinit();
@@ -3094,6 +3116,10 @@ fn screencopyConstraints(context: *anyopaque, target: Screencopy.Target) ?render
     }
     return render_output.backend.size();
 }
+
+fn xwaylandSurfaceAssociated(_: *anyopaque, _: u64, _: Surface.Id) void {}
+
+fn xwaylandSurfaceRemoved(_: *anyopaque, _: u64, _: Surface.Id) void {}
 
 fn captureImage(
     context: *anyopaque,

@@ -294,6 +294,7 @@ pub const Role = enum {
     input_popup,
     river_decoration,
     river_shell_surface,
+    xwayland,
 };
 
 pub const CommitInfo = struct {

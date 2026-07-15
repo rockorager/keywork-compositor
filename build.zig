@@ -30,6 +30,7 @@ pub fn build(b: *std.Build) void {
     scanner.addSystemProtocol("staging/ext-image-capture-source/ext-image-capture-source-v1.xml");
     scanner.addSystemProtocol("staging/ext-image-copy-capture/ext-image-copy-capture-v1.xml");
     scanner.addSystemProtocol("staging/ext-workspace/ext-workspace-v1.xml");
+    scanner.addSystemProtocol("staging/xwayland-shell/xwayland-shell-v1.xml");
     scanner.addSystemProtocol("stable/tablet/tablet-v2.xml");
     scanner.addSystemProtocol("unstable/pointer-gestures/pointer-gestures-unstable-v1.xml");
     scanner.addSystemProtocol("unstable/relative-pointer/relative-pointer-unstable-v1.xml");
@@ -79,6 +80,7 @@ pub fn build(b: *std.Build) void {
     scanner.generate("ext_foreign_toplevel_image_capture_source_manager_v1", 1);
     scanner.generate("ext_image_copy_capture_manager_v1", 1);
     scanner.generate("ext_workspace_manager_v1", 1);
+    scanner.generate("xwayland_shell_v1", 1);
     scanner.generate("zwp_tablet_manager_v2", 2);
     scanner.generate("zwp_pointer_gestures_v1", 3);
     scanner.generate("zwp_relative_pointer_manager_v1", 1);

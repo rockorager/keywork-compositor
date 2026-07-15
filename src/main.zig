@@ -99,6 +99,7 @@ test {
     _ = @import("wayland/image_capture_source.zig");
     _ = @import("wayland/image_copy_capture.zig");
     _ = @import("wayland/screencopy.zig");
+    _ = @import("wayland/xwayland_shell.zig");
     _ = @import("wayland/workspace.zig");
     _ = @import("wayland/text_input.zig");
     _ = @import("wayland/input_method.zig");
