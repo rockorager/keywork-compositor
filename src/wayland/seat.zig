@@ -194,6 +194,7 @@ pub const CursorInfo = union(enum) {
 pub const RepaintListener = struct {
     context: *anyopaque,
     request: *const fn (*anyopaque) void,
+    cursor_moved: *const fn (*anyopaque, CursorInfo, CursorInfo) void,
 };
 
 pub const KeyboardFocusListener = struct {
@@ -1697,8 +1698,17 @@ fn sendPointerLeave(self: *Self) void {
 
 fn setPointerPosition(self: *Self, x: f64, y: f64) void {
     std.debug.assert(std.math.isFinite(x) and std.math.isFinite(y));
+    const old_cursor = self.cursorInfo();
     self.pointer_position = .{ .x = x, .y = y };
-    if (self.active_cursor != null) self.requestRepaint();
+    const new_cursor = self.cursorInfo();
+    if (self.repaint_listener) |listener| {
+        if (old_cursor) |old| {
+            const new = new_cursor orelse unreachable;
+            listener.cursor_moved(listener.context, old, new);
+        } else if (new_cursor) |new| {
+            listener.cursor_moved(listener.context, new, new);
+        }
+    }
 }
 
 fn setCursor(

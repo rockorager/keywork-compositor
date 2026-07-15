@@ -5,6 +5,7 @@ const Self = @This();
 const std = @import("std");
 const NestedOutput = @import("nested_wayland.zig");
 const presentation = @import("../presentation.zig");
+const Region = @import("../region.zig");
 const render = @import("../render/types.zig");
 
 const c = @cImport({
@@ -24,6 +25,8 @@ device_access: DeviceAccess,
 listener: ?Listener,
 old_crtc: ?*c.drmModeCrtc,
 buffers: [buffer_count]Buffer,
+shadow_pixels: []u32,
+buffer_damage: [buffer_count]Region,
 mode: c.drmModeModeInfo,
 mode_index: usize,
 modes: []Mode,
@@ -115,6 +118,8 @@ pub fn init(
         .listener = null,
         .old_crtc = null,
         .buffers = .{ .{}, .{} },
+        .shadow_pixels = &.{},
+        .buffer_damage = .{ Region.init(), Region.init() },
         .mode = std.mem.zeroes(c.drmModeModeInfo),
         .mode_index = 0,
         .modes = &.{},
@@ -147,8 +152,10 @@ pub fn init(
 pub fn deinit(self: *Self) void {
     std.debug.assert(self.listener == null);
     std.debug.assert(self.old_crtc == null);
+    std.debug.assert(self.shadow_pixels.len == 0);
     self.clearIdentity();
     self.allocator.free(self.modes);
+    for (&self.buffer_damage) |*damage| damage.deinit();
     self.* = undefined;
 }
 
@@ -212,12 +219,13 @@ pub fn acquire(self: *Self) ?render.PixelBuffer {
     std.debug.assert(self.acquired == null);
     if (!self.ready()) return null;
     const index = self.availableBuffer().?;
-    const buffer = &self.buffers[index];
+    const pixel_count = self.size.pixelCount() catch unreachable;
+    std.debug.assert(self.shadow_pixels.len == pixel_count);
     self.acquired = index;
     return .{
         .size = self.size,
-        .stride_pixels = buffer.stride_pixels,
-        .pixels = buffer.pixels,
+        .stride_pixels = self.size.width,
+        .pixels = self.shadow_pixels,
     };
 }
 
@@ -225,11 +233,20 @@ pub fn cancel(self: *Self) void {
     self.acquired = null;
 }
 
-pub fn present(self: *Self) !?presentation.Info {
+pub fn present(self: *Self, frame_damage: *const Region) !?presentation.Info {
     const index = self.acquired orelse return error.NoAcquiredBuffer;
     const fd = self.device_access.fd(self.device_access.context) orelse return error.SessionInactive;
     if (!self.device_access.active(self.device_access.context)) return error.SessionInactive;
     const buffer = &self.buffers[index];
+    for (&self.buffer_damage) |*damage| try damage.unionWith(frame_damage);
+    copyShadowDamage(
+        buffer.pixels,
+        buffer.stride_pixels,
+        self.shadow_pixels,
+        self.size,
+        &self.buffer_damage[index],
+    );
+    self.buffer_damage[index].clear();
 
     if (!self.mode_set) {
         var connector_id = self.connector_id;
@@ -251,7 +268,6 @@ pub fn present(self: *Self) !?presentation.Info {
         return .{
             .timestamp = .fromNanoseconds(clock.now(self.io).nanoseconds),
             .refresh_nanoseconds = self.refresh_nanoseconds,
-            .flags = .{ .zero_copy = true },
         };
     }
 
@@ -336,13 +352,18 @@ pub fn activate(self: *Self, fd: std.posix.fd_t, selection: Selection, device_pa
         }
     } else {
         log.info(
-            "allocating scanout buffers for connector {s} at {d}x{d}",
+            "allocating CPU shadow and scanout buffers for connector {s} at {d}x{d}",
             .{ self.name(), self.size.width, self.size.height },
         );
-        errdefer for (&self.buffers) |*buffer| destroyBuffer(fd, buffer);
+        errdefer {
+            destroyShadowBuffer(self.allocator, &self.shadow_pixels);
+            for (&self.buffers) |*buffer| destroyBuffer(fd, buffer);
+        }
         for (&self.buffers) |*buffer| {
             try createBuffer(fd, self.size, buffer);
         }
+        try createShadowBuffer(self.allocator, self.size, &self.shadow_pixels);
+        self.resetBufferDamage(self.size);
     }
     log.info(
         "activated connector {s} ({d}) on {s} at {d}x{d}, CRTC {d}, enabled={}, powered={}: {s}",
@@ -416,7 +437,9 @@ fn release(self: *Self, fd: std.posix.fd_t) void {
     self.acquired = null;
     self.pending = null;
     self.displayed = null;
+    destroyShadowBuffer(self.allocator, &self.shadow_pixels);
     for (&self.buffers) |*buffer| destroyBuffer(fd, buffer);
+    for (&self.buffer_damage) |*damage| damage.clear();
     if (self.old_crtc) |old_crtc| {
         c.drmModeFreeCrtc(old_crtc);
         self.old_crtc = null;
@@ -442,8 +465,13 @@ pub fn setPowered(self: *Self, fd: std.posix.fd_t, powered: bool) !void {
     if (self.powered == powered) return;
     std.debug.assert(self.old_crtc != null);
     if (powered) {
-        errdefer for (&self.buffers) |*buffer| destroyBuffer(fd, buffer);
+        errdefer {
+            destroyShadowBuffer(self.allocator, &self.shadow_pixels);
+            for (&self.buffers) |*buffer| destroyBuffer(fd, buffer);
+        }
         for (&self.buffers) |*buffer| try createBuffer(fd, self.size, buffer);
+        try createShadowBuffer(self.allocator, self.size, &self.shadow_pixels);
+        self.resetBufferDamage(self.size);
         self.powered = true;
         self.mode_set = false;
         return;
@@ -461,7 +489,9 @@ pub fn setPowered(self: *Self, fd: std.posix.fd_t, powered: bool) !void {
     self.mode_set = false;
     self.displayed = null;
     self.notifyDeactivated();
+    destroyShadowBuffer(self.allocator, &self.shadow_pixels);
     for (&self.buffers) |*buffer| destroyBuffer(fd, buffer);
+    for (&self.buffer_damage) |*damage| damage.clear();
 }
 
 pub fn setMode(self: *Self, fd: std.posix.fd_t, mode_index: usize) !void {
@@ -473,16 +503,25 @@ pub fn setMode(self: *Self, fd: std.posix.fd_t, mode_index: usize) !void {
 
     if (self.powered) {
         var buffers: [buffer_count]Buffer = .{ .{}, .{} };
-        errdefer for (&buffers) |*buffer| destroyBuffer(fd, buffer);
+        var shadow_pixels: []u32 = &.{};
+        errdefer {
+            destroyShadowBuffer(self.allocator, &shadow_pixels);
+            for (&buffers) |*buffer| destroyBuffer(fd, buffer);
+        }
         for (&buffers) |*buffer| try createBuffer(fd, size, buffer);
+        try createShadowBuffer(self.allocator, size, &shadow_pixels);
         self.acquired = null;
         if (c.drmModeSetCrtc(fd, self.crtc_id, 0, 0, 0, null, 0, null) != 0) {
             return error.DisableFailed;
         }
         self.notifyDeactivated();
         var old_buffers = self.buffers;
+        const old_shadow_pixels = self.shadow_pixels;
         self.buffers = buffers;
+        self.shadow_pixels = shadow_pixels;
+        self.resetBufferDamage(size);
         for (&old_buffers) |*buffer| destroyBuffer(fd, buffer);
+        self.allocator.free(old_shadow_pixels);
         self.displayed = null;
         self.mode_set = false;
     }
@@ -547,7 +586,6 @@ fn handlePageFlip(
             .vsync = true,
             .hardware_clock = true,
             .hardware_completion = true,
-            .zero_copy = true,
         },
     });
     listener.ready(listener.context);
@@ -715,6 +753,62 @@ fn refreshNanoseconds(mode: c.drmModeModeInfo) u32 {
     return @intCast(std.time.ns_per_s / mode.vrefresh);
 }
 
+fn resetBufferDamage(self: *Self, size: render.Size) void {
+    for (&self.buffer_damage) |*damage| {
+        damage.setRectangle(0, 0, size.width, size.height);
+    }
+}
+
+fn createShadowBuffer(
+    allocator: std.mem.Allocator,
+    size: render.Size,
+    pixels: *[]u32,
+) !void {
+    std.debug.assert(pixels.*.len == 0);
+    pixels.* = try allocator.alloc(u32, try size.pixelCount());
+    @memset(pixels.*, 0);
+}
+
+fn destroyShadowBuffer(allocator: std.mem.Allocator, pixels: *[]u32) void {
+    allocator.free(pixels.*);
+    pixels.* = &.{};
+}
+
+fn copyShadowDamage(
+    destination: []u32,
+    destination_stride: u32,
+    source: []const u32,
+    size: render.Size,
+    damage: *const Region,
+) void {
+    std.debug.assert(destination_stride >= size.width);
+    const source_count = size.pixelCount() catch unreachable;
+    std.debug.assert(source.len >= source_count);
+    const destination_count = std.math.add(
+        usize,
+        std.math.mul(usize, size.height - 1, destination_stride) catch unreachable,
+        size.width,
+    ) catch unreachable;
+    std.debug.assert(destination.len >= destination_count);
+
+    var rectangles = damage.rectangleIterator();
+    while (rectangles.next()) |rectangle| {
+        std.debug.assert(rectangle.x >= 0 and rectangle.y >= 0);
+        const x: u32 = @intCast(rectangle.x);
+        const y: u32 = @intCast(rectangle.y);
+        std.debug.assert(x + rectangle.width <= size.width);
+        std.debug.assert(y + rectangle.height <= size.height);
+        for (0..rectangle.height) |row| {
+            const source_offset = (@as(usize, y) + row) * size.width + x;
+            const destination_offset = (@as(usize, y) + row) * destination_stride + x;
+            @memcpy(
+                destination[destination_offset..][0..rectangle.width],
+                source[source_offset..][0..rectangle.width],
+            );
+        }
+    }
+}
+
 fn createBuffer(fd: std.posix.fd_t, size: render.Size, buffer: *Buffer) !void {
     var create = std.mem.zeroes(c.struct_drm_mode_create_dumb);
     create.width = size.width;
@@ -751,6 +845,8 @@ fn createBuffer(fd: std.posix.fd_t, size: render.Size, buffer: *Buffer) !void {
         map.offset,
     );
     buffer.mapping = mapping;
+    std.debug.assert(create.pitch % @sizeOf(u32) == 0);
+    std.debug.assert(create.pitch >= size.width * @sizeOf(u32));
     buffer.stride_pixels = create.pitch / @sizeOf(u32);
     buffer.pixels = @as([*]u32, @ptrCast(@alignCast(mapping.ptr)))[0 .. mapping.len / @sizeOf(u32)];
     @memset(buffer.pixels, 0);
@@ -788,6 +884,29 @@ fn restoreCrtc(fd: std.posix.fd_t, connector_id: u32, old_crtc: *c.drmModeCrtc) 
     ) != 0) {
         log.err("failed to restore CRTC {d}", .{old_crtc.*.crtc_id});
     }
+}
+
+test "shadow copy respects scanout pitch" {
+    const untouched = 0xfeed_beef;
+    var destination = [_]u32{untouched} ** 10;
+    const source = [_]u32{ 1, 2, 3, 4, 5, 6 };
+    var damage = Region.init();
+    defer damage.deinit();
+    try damage.add(1, 0, 2, 2);
+
+    copyShadowDamage(
+        &destination,
+        5,
+        &source,
+        .{ .width = 3, .height = 2 },
+        &damage,
+    );
+
+    try std.testing.expectEqualSlices(
+        u32,
+        &.{ untouched, 2, 3, untouched, untouched, untouched, 5, 6, untouched, untouched },
+        &destination,
+    );
 }
 
 fn testDeviceFd(_: *anyopaque) ?std.posix.fd_t {

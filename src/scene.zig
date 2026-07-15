@@ -151,6 +151,7 @@ pub const Popup = struct {
 pub const RepaintListener = struct {
     context: *anyopaque,
     request: *const fn (*anyopaque) void,
+    surface_changed: *const fn (*anyopaque, Surface.Id) void,
 };
 
 pub const Iterator = struct {
@@ -487,7 +488,7 @@ pub fn setShellSurfacePosition(self: *Self, id: ShellSurfaceId, position: Positi
 
 pub fn shellSurfaceCommitted(self: *Self, id: ShellSurfaceId) void {
     const shell_surface = self.shell_surfaces.get(id) orelse return;
-    if (shell_surface.mapped) self.requestRepaint();
+    if (shell_surface.mapped) self.requestSurfaceChanged(shell_surface.surface_id);
 }
 
 pub fn addLayerSurface(
@@ -544,7 +545,7 @@ pub fn setLayerSurfaceLayer(
 
 pub fn layerSurfaceCommitted(self: *Self, id: LayerSurfaceId) void {
     const layer_surface = self.layer_surfaces.get(id) orelse return;
-    if (layer_surface.mapped) self.requestRepaint();
+    if (layer_surface.mapped) self.requestSurfaceChanged(layer_surface.surface_id);
 }
 
 pub fn addPopup(
@@ -604,7 +605,7 @@ pub fn setPopupContentGeometry(
 
 pub fn popupCommitted(self: *Self, id: PopupId) void {
     const popup = self.popups.get(id) orelse return;
-    if (popup.mapped) self.requestRepaint();
+    if (popup.mapped) self.requestSurfaceChanged(popup.surface_id);
 }
 
 pub fn addDecoration(
@@ -658,7 +659,7 @@ pub fn setMapped(self: *Self, id: Id, mapped: bool) void {
 
 pub fn surfaceCommitted(self: *Self, id: Id) void {
     const window = self.windows.get(id) orelse return;
-    if (window.mapped) self.requestRepaint();
+    if (window.mapped) self.requestSurfaceChanged(window.surface_id);
 }
 
 pub fn setPosition(self: *Self, id: Id, position: Position) void {
@@ -769,6 +770,7 @@ pub fn setContentGeometry(self: *Self, id: Id, geometry: ?ContentGeometry) void 
 
 pub fn setEffects(self: *Self, id: Id, effects: Effects) void {
     const window = self.windows.get(id) orelse return;
+    if (std.meta.eql(window.effects, effects)) return;
     window.effects = effects;
     if (window.mapped) self.requestRepaint();
 }
@@ -950,6 +952,12 @@ pub fn topWindowSurface(self: *Self) ?Surface.Id {
 
 fn requestRepaint(self: *Self) void {
     if (self.repaint_listener) |listener| listener.request(listener.context);
+}
+
+fn requestSurfaceChanged(self: *Self, surface_id: Surface.Id) void {
+    if (self.repaint_listener) |listener| {
+        listener.surface_changed(listener.context, surface_id);
+    }
 }
 
 fn layerIndex(layer: Layer) usize {

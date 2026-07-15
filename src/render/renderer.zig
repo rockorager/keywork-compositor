@@ -37,6 +37,13 @@ pub const Renderer = union(enum) {
         self.* = undefined;
     }
 
+    pub fn supportsPartialDamage(self: *const Renderer) bool {
+        return switch (self.*) {
+            .cpu => true,
+            .vulkan => false,
+        };
+    }
+
     pub fn makeTarget(self: *Renderer, pixels: render_types.PixelBuffer) Target {
         return switch (self.*) {
             .cpu => .{ .cpu = pixels },
@@ -65,7 +72,11 @@ pub const Renderer = union(enum) {
                 scaleCommand(local_command, frame.scale)
             else
                 local_command};
-            try self.renderDirect(.{ .size = physical_size, .commands = &commands }, target);
+            try self.renderDirect(.{
+                .size = physical_size,
+                .commands = &commands,
+                .damage = frame.damage,
+            }, target);
         }
     }
 

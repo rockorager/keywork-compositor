@@ -8,6 +8,7 @@ const DrmOutput = @import("drm.zig");
 const HeadlessOutput = @import("headless.zig");
 const NestedOutput = @import("nested_wayland.zig");
 const presentation = @import("../presentation.zig");
+const Region = @import("../region.zig");
 const render = @import("../render/types.zig");
 
 const wl = wayland.server.wl;
@@ -160,6 +161,13 @@ pub fn ready(self: *const Self) bool {
     };
 }
 
+pub fn persistentRenderTarget(self: *const Self) bool {
+    return switch (self.backend) {
+        .drm, .headless => true,
+        .nested => false,
+    };
+}
+
 pub fn powered(self: *const Self) bool {
     return switch (self.backend) {
         .drm => |output| output.powered,
@@ -200,9 +208,9 @@ pub fn cancel(self: *Self) void {
     }
 }
 
-pub fn present(self: *Self) !?presentation.Info {
+pub fn present(self: *Self, damage: *const Region) !?presentation.Info {
     return switch (self.backend) {
-        .drm => |output| output.present(),
+        .drm => |output| output.present(damage),
         .headless => presentation.Info.now(self.io),
         .nested => |*output| blk: {
             try output.present();

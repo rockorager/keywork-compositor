@@ -46,6 +46,8 @@ pub const State = struct {
     current_content_type: ContentType,
     pending_surface_damage: Region,
     pending_buffer_damage: Region,
+    current_damage: Region,
+    current_damage_precise: bool,
     pending_opaque: Region,
     current_opaque: Region,
     pending_input: InputRegion,
@@ -91,6 +93,8 @@ pub const State = struct {
             .current_content_type = .none,
             .pending_surface_damage = Region.init(),
             .pending_buffer_damage = Region.init(),
+            .current_damage = Region.init(),
+            .current_damage_precise = false,
             .pending_opaque = Region.init(),
             .current_opaque = Region.init(),
             .pending_input = InputRegion.init(),
@@ -132,6 +136,7 @@ pub const State = struct {
         if (self.cached_buffer) |*cached| cached.deinit();
         self.pending_surface_damage.deinit();
         self.pending_buffer_damage.deinit();
+        self.current_damage.deinit();
         self.cached_surface_damage.deinit();
         self.cached_buffer_damage.deinit();
         self.pending_opaque.deinit();
@@ -472,6 +477,18 @@ pub fn currentBuffer(store: *Store, id: Id) ?*BufferSnapshot {
     return if (surface_state.current_buffer) |*buffer| buffer else null;
 }
 
+/// The returned region is borrowed until the surface's next applied commit or
+/// any store insertion that reallocates its slots.
+pub fn currentDamage(store: *Store, id: Id) ?*const Region {
+    const surface_state = store.get(id) orelse return null;
+    return &surface_state.current_damage;
+}
+
+pub fn currentDamagePrecise(store: *Store, id: Id) bool {
+    const surface_state = store.get(id) orelse return false;
+    return surface_state.current_damage_precise;
+}
+
 pub fn acceptsInput(store: *Store, id: Id, x: f64, y: f64) bool {
     const surface_state = store.get(id) orelse return false;
     const buffer = if (surface_state.current_buffer) |*current| current else return false;
@@ -715,6 +732,9 @@ fn pendingCommitInfo(self: *Self) CommitInfo {
 fn applyPending(self: *Self, commit_info: CommitInfo) void {
     const surface_state = self.state();
     var applied_info = commit_info;
+    const previous_geometry = currentBufferGeometry(surface_state);
+    const offset_changed = surface_state.pending_offset_x != 0 or
+        surface_state.pending_offset_y != 0;
 
     surface_state.current_opaque.copyFrom(&surface_state.pending_opaque) catch {
         self.resource.postNoMemory();
@@ -726,7 +746,8 @@ fn applyPending(self: *Self, commit_info: CommitInfo) void {
     };
 
     if (self.has_pending_attachment) {
-        const snapshot = snapshotPendingAttachment(self) catch |err| switch (err) {
+        const reusable = if (surface_state.current_buffer) |*current| current else null;
+        const snapshot = snapshotPendingAttachment(self, reusable) catch |err| switch (err) {
             error.ImportFailed => failed: {
                 log.warn("DMA-BUF became unavailable after successful import", .{});
                 applied_info.has_buffer = false;
@@ -759,6 +780,13 @@ fn applyPending(self: *Self, commit_info: CommitInfo) void {
     surface_state.current_content_type = surface_state.pending_content_type;
     surface_state.current_offset_x = surface_state.pending_offset_x;
     surface_state.current_offset_y = surface_state.pending_offset_y;
+    updateCurrentDamage(
+        surface_state,
+        previous_geometry,
+        &surface_state.pending_surface_damage,
+        &surface_state.pending_buffer_damage,
+        offset_changed,
+    );
     surface_state.pending_offset_x = 0;
     surface_state.pending_offset_y = 0;
     surface_state.pending_surface_damage.clear();
@@ -785,7 +813,7 @@ fn cachePending(self: *Self) bool {
     defer if (snapshot) |*buffer| buffer.deinit();
 
     if (self.has_pending_attachment) {
-        snapshot = snapshotPendingAttachment(self) catch |err| switch (err) {
+        snapshot = snapshotPendingAttachment(self, null) catch |err| switch (err) {
             error.ImportFailed => failed: {
                 log.warn("DMA-BUF became unavailable after successful import", .{});
                 break :failed null;
@@ -869,6 +897,9 @@ fn cachePending(self: *Self) bool {
 fn applyCached(self: *Self) void {
     const surface_state = self.state();
     std.debug.assert(surface_state.has_cached_state);
+    const previous_geometry = currentBufferGeometry(surface_state);
+    const offset_changed = surface_state.cached_offset_x != 0 or
+        surface_state.cached_offset_y != 0;
     const commit_info: CommitInfo = .{
         .attachment_changed = surface_state.cached_attachment_changed,
         .had_buffer = surface_state.current_buffer != null,
@@ -909,6 +940,13 @@ fn applyCached(self: *Self) void {
     surface_state.current_content_type = surface_state.cached_content_type;
     surface_state.current_offset_x = surface_state.cached_offset_x;
     surface_state.current_offset_y = surface_state.cached_offset_y;
+    updateCurrentDamage(
+        surface_state,
+        previous_geometry,
+        &surface_state.cached_surface_damage,
+        &surface_state.cached_buffer_damage,
+        offset_changed,
+    );
     surface_state.cached_offset_x = 0;
     surface_state.cached_offset_y = 0;
     surface_state.cached_surface_damage.clear();
@@ -950,7 +988,10 @@ fn postBufferError(self: *Self, err: BufferSnapshot.Error) void {
     }
 }
 
-fn snapshotPendingAttachment(self: *Self) BufferSnapshot.Error!?BufferSnapshot {
+fn snapshotPendingAttachment(
+    self: *Self,
+    reusable: ?*BufferSnapshot,
+) BufferSnapshot.Error!?BufferSnapshot {
     const surface_state = self.state();
     if (self.pending_attachment.shm) |shm_buffer| {
         return try BufferSnapshot.copyShm(
@@ -959,6 +1000,9 @@ fn snapshotPendingAttachment(self: *Self) BufferSnapshot.Error!?BufferSnapshot {
             surface_state.pending_scale,
             surface_state.pending_transform,
             surface_state.pending_viewport,
+            reusable,
+            &surface_state.pending_surface_damage,
+            &surface_state.pending_buffer_damage,
         );
     }
     if (self.pending_attachment.dmabuf) |dmabuf_buffer| {
@@ -977,6 +1021,7 @@ fn snapshotPendingAttachment(self: *Self) BufferSnapshot.Error!?BufferSnapshot {
             surface_state.pending_scale,
             surface_state.pending_transform,
             surface_state.pending_viewport,
+            reusable,
         );
     }
     return null;
@@ -1251,6 +1296,123 @@ const Attachment = struct {
     }
 };
 
+const BufferGeometry = struct {
+    buffer_size: render_types.Size,
+    logical_size: render_types.Size,
+    transform: wl.Output.Transform,
+    source: ?render_types.SourceRect,
+};
+
+fn currentBufferGeometry(surface_state: *const State) ?BufferGeometry {
+    const buffer = surface_state.current_buffer orelse return null;
+    return .{
+        .buffer_size = buffer.buffer_size,
+        .logical_size = buffer.logical_size,
+        .transform = buffer.transform,
+        .source = buffer.source,
+    };
+}
+
+fn updateCurrentDamage(
+    surface_state: *State,
+    previous_geometry: ?BufferGeometry,
+    surface_damage: *const Region,
+    buffer_damage: *const Region,
+    offset_changed: bool,
+) void {
+    surface_state.current_damage.clear();
+    surface_state.current_damage_precise = !offset_changed;
+    const current_geometry = currentBufferGeometry(surface_state);
+    if (!std.meta.eql(previous_geometry, current_geometry)) {
+        const previous_size = if (previous_geometry) |geometry|
+            geometry.logical_size
+        else
+            render_types.Size{ .width = 0, .height = 0 };
+        const current_size = if (current_geometry) |geometry|
+            geometry.logical_size
+        else
+            render_types.Size{ .width = 0, .height = 0 };
+        surface_state.current_damage.setRectangle(
+            0,
+            0,
+            @max(previous_size.width, current_size.width),
+            @max(previous_size.height, current_size.height),
+        );
+        return;
+    }
+
+    surface_state.current_damage.copyFrom(surface_damage) catch {
+        return setFullCurrentDamage(surface_state);
+    };
+    const buffer = if (surface_state.current_buffer) |*current| current else return;
+    if (!addBufferDamage(&surface_state.current_damage, buffer_damage, buffer)) {
+        setFullCurrentDamage(surface_state);
+    }
+}
+
+fn setFullCurrentDamage(surface_state: *State) void {
+    const size = if (surface_state.current_buffer) |buffer|
+        buffer.logical_size
+    else
+        render_types.Size{ .width = 0, .height = 0 };
+    surface_state.current_damage.setRectangle(0, 0, size.width, size.height);
+}
+
+fn addBufferDamage(
+    destination: *Region,
+    damage: *const Region,
+    buffer: *const BufferSnapshot,
+) bool {
+    if (buffer.transform != .normal) return damage.isEmpty();
+    const source = buffer.source orelse render_types.SourceRect{
+        .x = 0,
+        .y = 0,
+        .width = @floatFromInt(buffer.buffer_size.width),
+        .height = @floatFromInt(buffer.buffer_size.height),
+    };
+    const logical_width: f64 = @floatFromInt(buffer.logical_size.width);
+    const logical_height: f64 = @floatFromInt(buffer.logical_size.height);
+    var rectangles = damage.rectangleIterator();
+    while (rectangles.next()) |rectangle| {
+        const rectangle_left: f64 = @floatFromInt(rectangle.x);
+        const rectangle_top: f64 = @floatFromInt(rectangle.y);
+        const rectangle_right = rectangle_left + @as(f64, @floatFromInt(rectangle.width));
+        const rectangle_bottom = rectangle_top + @as(f64, @floatFromInt(rectangle.height));
+        const left = @max(rectangle_left, source.x);
+        const top = @max(rectangle_top, source.y);
+        const right = @min(rectangle_right, source.x + source.width);
+        const bottom = @min(rectangle_bottom, source.y + source.height);
+        if (right <= left or bottom <= top) continue;
+
+        const logical_left = std.math.clamp(
+            @floor((left - source.x) * logical_width / source.width),
+            0,
+            logical_width,
+        );
+        const logical_top = std.math.clamp(
+            @floor((top - source.y) * logical_height / source.height),
+            0,
+            logical_height,
+        );
+        const logical_right = std.math.clamp(
+            @ceil((right - source.x) * logical_width / source.width),
+            0,
+            logical_width,
+        );
+        const logical_bottom = std.math.clamp(
+            @ceil((bottom - source.y) * logical_height / source.height),
+            0,
+            logical_height,
+        );
+        const x: i32 = @intFromFloat(logical_left);
+        const y: i32 = @intFromFloat(logical_top);
+        const width: i32 = @intFromFloat(logical_right - logical_left);
+        const height: i32 = @intFromFloat(logical_bottom - logical_top);
+        destination.add(x, y, width, height) catch return false;
+    }
+    return true;
+}
+
 pub const BufferSnapshot = struct {
     allocator: std.mem.Allocator,
     buffer_size: render_types.Size,
@@ -1275,6 +1437,9 @@ pub const BufferSnapshot = struct {
         scale: i32,
         transform: wl.Output.Transform,
         viewport: ViewportState,
+        reusable: ?*BufferSnapshot,
+        surface_damage: *const Region,
+        buffer_damage: *const Region,
     ) Error!BufferSnapshot {
         const width = shm_buffer.getWidth();
         const height = shm_buffer.getHeight();
@@ -1297,27 +1462,33 @@ pub const BufferSnapshot = struct {
         if (format != argb8888 and format != xrgb8888) return error.InvalidBuffer;
 
         const pixel_count = buffer_size.pixelCount() catch return error.InvalidBuffer;
-        const pixels = allocator.alloc(u32, pixel_count) catch return error.OutOfMemory;
-        errdefer allocator.free(pixels);
-
         shm_buffer.beginAccess();
         defer shm_buffer.endAccess();
         const data = shm_buffer.getData() orelse return error.InvalidBuffer;
+        const can_update_partially = if (reusable) |snapshot|
+            snapshot.pixels.len == pixel_count and
+                std.meta.eql(snapshot.buffer_size, buffer_size) and
+                std.meta.eql(snapshot.logical_size, geometry.logical_size) and
+                snapshot.transform == transform and
+                std.meta.eql(snapshot.source, geometry.source) and
+                surface_damage.isEmpty()
+        else
+            false;
+        const pixels = if (reusable) |snapshot|
+            snapshot.takePixels(pixel_count) orelse
+                allocator.alloc(u32, pixel_count) catch return error.OutOfMemory
+        else
+            allocator.alloc(u32, pixel_count) catch return error.OutOfMemory;
         const source: [*]const u8 = @ptrCast(data);
-        const destination = std.mem.sliceAsBytes(pixels);
         const source_stride: usize = @intCast(stride);
-        for (0..buffer_size.height) |y| {
-            const source_offset = y * source_stride;
-            const destination_offset = y * row_bytes;
-            @memcpy(
-                destination[destination_offset..][0..row_bytes],
-                source[source_offset..][0..row_bytes],
-            );
-        }
-
-        if (format == xrgb8888) {
-            for (pixels) |*pixel| pixel.* |= 0xff000000;
-        }
+        copyShmPixels(
+            pixels,
+            source,
+            source_stride,
+            buffer_size,
+            format == xrgb8888,
+            if (can_update_partially) buffer_damage else null,
+        );
 
         return .{
             .allocator = allocator,
@@ -1361,10 +1532,15 @@ pub const BufferSnapshot = struct {
         scale: i32,
         transform: wl.Output.Transform,
         viewport: ViewportState,
+        reusable: ?*BufferSnapshot,
     ) Error!BufferSnapshot {
         const buffer_size: render_types.Size = .{ .width = 1, .height = 1 };
         const geometry = try viewportGeometry(buffer_size, scale, transform, viewport);
-        const pixels = allocator.alloc(u32, 1) catch return error.OutOfMemory;
+        const pixels = if (reusable) |snapshot|
+            snapshot.takePixels(1) orelse
+                allocator.alloc(u32, 1) catch return error.OutOfMemory
+        else
+            allocator.alloc(u32, 1) catch return error.OutOfMemory;
         pixels[0] = pixel;
         return .{
             .allocator = allocator,
@@ -1390,8 +1566,15 @@ pub const BufferSnapshot = struct {
         self.source = geometry.source;
     }
 
+    fn takePixels(self: *BufferSnapshot, pixel_count: usize) ?[]u32 {
+        if (self.pixels.len != pixel_count) return null;
+        const pixels = self.pixels;
+        self.pixels = &.{};
+        return pixels;
+    }
+
     pub fn deinit(self: *BufferSnapshot) void {
-        self.allocator.free(self.pixels);
+        if (self.pixels.len > 0) self.allocator.free(self.pixels);
         self.* = undefined;
     }
 
@@ -1403,6 +1586,74 @@ pub const BufferSnapshot = struct {
         };
     }
 };
+
+fn copyShmPixels(
+    destination: []u32,
+    source: [*]const u8,
+    source_stride: usize,
+    size: render_types.Size,
+    force_opaque: bool,
+    damage: ?*const Region,
+) void {
+    const row_bytes = @as(usize, size.width) * @sizeOf(u32);
+    std.debug.assert(source_stride >= row_bytes);
+    std.debug.assert(destination.len >= @as(usize, size.width) * size.height);
+    if (damage) |region| {
+        var rectangles = region.rectangleIterator();
+        while (rectangles.next()) |rectangle| {
+            const clipped = (render_types.Rect{
+                .x = rectangle.x,
+                .y = rectangle.y,
+                .width = rectangle.width,
+                .height = rectangle.height,
+            }).clipTo(size) orelse continue;
+            copyShmRectangle(
+                destination,
+                source,
+                source_stride,
+                size.width,
+                clipped,
+                force_opaque,
+            );
+        }
+        return;
+    }
+    copyShmRectangle(
+        destination,
+        source,
+        source_stride,
+        size.width,
+        .{ .x = 0, .y = 0, .width = size.width, .height = size.height },
+        force_opaque,
+    );
+}
+
+fn copyShmRectangle(
+    destination: []u32,
+    source: [*]const u8,
+    source_stride: usize,
+    destination_stride: u32,
+    rectangle: render_types.Rect,
+    force_opaque: bool,
+) void {
+    std.debug.assert(rectangle.x >= 0 and rectangle.y >= 0);
+    const x: usize = @intCast(rectangle.x);
+    const y: usize = @intCast(rectangle.y);
+    const copy_bytes = @as(usize, rectangle.width) * @sizeOf(u32);
+    for (0..rectangle.height) |row| {
+        const source_offset = (y + row) * source_stride + x * @sizeOf(u32);
+        const destination_offset = (y + row) * destination_stride + x;
+        @memcpy(
+            std.mem.sliceAsBytes(destination[destination_offset..][0..rectangle.width]),
+            source[source_offset..][0..copy_bytes],
+        );
+        if (force_opaque) {
+            for (destination[destination_offset..][0..rectangle.width]) |*pixel| {
+                pixel.* |= 0xff000000;
+            }
+        }
+    }
+}
 
 const FrameCallback = struct {
     allocator: std.mem.Allocator,
@@ -1544,6 +1795,7 @@ test "single pixel snapshots use viewporter destination without changing color" 
         1,
         .normal,
         .{ .destination = .{ .width = 320, .height = 180 } },
+        null,
     );
     defer snapshot.deinit();
 
@@ -1556,6 +1808,88 @@ test "single pixel snapshots use viewporter destination without changing color" 
         snapshot.logical_size,
     );
     try std.testing.expectEqualSlices(u32, &.{0x8040_2000}, snapshot.pixels);
+}
+
+test "same-size snapshots recycle pixel storage" {
+    var first = try BufferSnapshot.copySinglePixel(
+        std.testing.allocator,
+        0x1122_3344,
+        1,
+        .normal,
+        .{},
+        null,
+    );
+    defer first.deinit();
+    const original_pointer = first.pixels.ptr;
+
+    var second = try BufferSnapshot.copySinglePixel(
+        std.testing.allocator,
+        0x5566_7788,
+        1,
+        .normal,
+        .{},
+        &first,
+    );
+    defer second.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), first.pixels.len);
+    try std.testing.expectEqual(original_pointer, second.pixels.ptr);
+    try std.testing.expectEqualSlices(u32, &.{0x5566_7788}, second.pixels);
+}
+
+test "buffer damage maps into logical surface coordinates" {
+    const buffer: BufferSnapshot = .{
+        .allocator = std.testing.allocator,
+        .buffer_size = .{ .width = 200, .height = 100 },
+        .logical_size = .{ .width = 100, .height = 50 },
+        .scale = 2,
+        .transform = .normal,
+        .source = null,
+        .pixels = &.{},
+    };
+    var buffer_damage = Region.init();
+    defer buffer_damage.deinit();
+    try buffer_damage.add(20, 10, 40, 20);
+    var surface_damage = Region.init();
+    defer surface_damage.deinit();
+
+    try std.testing.expect(addBufferDamage(&surface_damage, &buffer_damage, &buffer));
+    var rectangles = surface_damage.rectangleIterator();
+    try std.testing.expectEqual(
+        Region.Rectangle{ .x = 10, .y = 5, .width = 20, .height = 10 },
+        rectangles.next().?,
+    );
+    try std.testing.expectEqual(@as(?Region.Rectangle, null), rectangles.next());
+}
+
+test "SHM snapshot copying updates only damaged rows" {
+    const source = [_]u32{
+        0x0011_2233, 0x0044_5566, 0x0077_8899,
+        0x00aa_bbcc, 0x00dd_eeff, 0x0001_0203,
+    };
+    const untouched = 0x1234_5678;
+    var destination = [_]u32{untouched} ** source.len;
+    var damage = Region.init();
+    defer damage.deinit();
+    try damage.add(1, 0, 1, 2);
+
+    copyShmPixels(
+        &destination,
+        @ptrCast(&source),
+        3 * @sizeOf(u32),
+        .{ .width = 3, .height = 2 },
+        true,
+        &damage,
+    );
+
+    try std.testing.expectEqualSlices(
+        u32,
+        &.{
+            untouched, 0xff44_5566, untouched,
+            untouched, 0xffdd_eeff, untouched,
+        },
+        &destination,
+    );
 }
 
 test "viewport source is validated and converted to buffer coordinates" {

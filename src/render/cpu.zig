@@ -28,6 +28,7 @@ pub fn deinit(self: *Self) void {
 pub fn render(self: *Self, frame: render_types.Frame, target: render_types.PixelBuffer) Error!void {
     const destination = try createDestination(frame, target);
     defer _ = pixman.pixman_image_unref(destination);
+    try setDestinationDamage(destination, frame);
 
     for (frame.commands) |command| {
         switch (command) {
@@ -45,9 +46,34 @@ pub fn render(self: *Self, frame: render_types.Frame, target: render_types.Pixel
                 try fill(destination, clipped, solid.color, pixman.PIXMAN_OP_OVER);
             },
             .shadow => |shadow| try self.drawShadow(destination, frame.size, shadow),
-            .backdrop_blur => |blur| try self.drawBackdropBlur(target, blur),
+            .backdrop_blur => |blur| try self.drawBackdropBlur(target, blur, frame.damage),
             .image => |image| try composite(destination, frame.size, image),
         }
+    }
+}
+
+fn setDestinationDamage(
+    destination: *pixman.pixman_image_t,
+    frame: render_types.Frame,
+) Error!void {
+    const damage = frame.damage orelse return;
+    var region: pixman.pixman_region32_t = undefined;
+    pixman.pixman_region32_init(&region);
+    defer pixman.pixman_region32_fini(&region);
+
+    for (damage) |rectangle| {
+        const clipped = rectangle.clipTo(frame.size) orelse continue;
+        if (pixman.pixman_region32_union_rect(
+            &region,
+            &region,
+            clipped.x,
+            clipped.y,
+            clipped.width,
+            clipped.height,
+        ) == 0) return error.OutOfMemory;
+    }
+    if (pixman.pixman_image_set_clip_region32(destination, &region) == 0) {
+        return error.OutOfMemory;
     }
 }
 
@@ -208,6 +234,26 @@ fn drawShadow(
 }
 
 fn drawBackdropBlur(
+    self: *Self,
+    target: render_types.PixelBuffer,
+    blur: render_types.BackdropBlur,
+    damage: ?[]const render_types.Rect,
+) Error!void {
+    if (damage) |rectangles| {
+        for (rectangles) |rectangle| {
+            var damaged_blur = blur;
+            damaged_blur.clip = if (blur.clip) |clip|
+                clip.intersection(rectangle) orelse continue
+            else
+                rectangle;
+            try self.drawBackdropBlurArea(target, damaged_blur);
+        }
+        return;
+    }
+    try self.drawBackdropBlurArea(target, blur);
+}
+
+fn drawBackdropBlurArea(
     self: *Self,
     target: render_types.PixelBuffer,
     blur: render_types.BackdropBlur,
@@ -867,4 +913,37 @@ test "CPU renderer blurs the backdrop inside a window region" {
     try std.testing.expectEqual(@as(u32, 0xff555555), output.pixel(2, 0));
     try std.testing.expectEqual(@as(u32, 0xff000000), output.pixel(3, 0));
     try std.testing.expectEqual(@as(u32, 0xff000000), output.pixel(4, 0));
+}
+
+test "CPU renderer clips writes to frame damage and preserves stride padding" {
+    const untouched = 0x1122_3344;
+    var pixels = [_]u32{untouched} ** 10;
+    const target: render_types.PixelBuffer = .{
+        .size = .{ .width = 3, .height = 2 },
+        .stride_pixels = 5,
+        .pixels = &pixels,
+    };
+    const commands = [_]render_types.Command{
+        .{ .clear = render_types.Color.rgba(255, 0, 0, 255) },
+    };
+    const damage = [_]render_types.Rect{
+        .{ .x = 1, .y = 0, .width = 2, .height = 2 },
+    };
+
+    var renderer = Self.init(std.testing.allocator);
+    defer renderer.deinit();
+    try renderer.render(.{
+        .size = target.size,
+        .commands = &commands,
+        .damage = &damage,
+    }, target);
+
+    try std.testing.expectEqualSlices(
+        u32,
+        &.{
+            untouched, 0xffff0000, 0xffff0000, untouched, untouched,
+            untouched, 0xffff0000, 0xffff0000, untouched, untouched,
+        },
+        &pixels,
+    );
 }

@@ -56,6 +56,7 @@ const NativeInput = @import("backend/native_input.zig");
 const Session = @import("backend/session.zig");
 const renderer_types = @import("render/renderer.zig");
 const render = @import("render/types.zig");
+const Region = @import("region.zig");
 const Scene = @import("scene.zig");
 const Surface = @import("wayland/surface.zig");
 const Viewporter = @import("wayland/viewporter.zig");
@@ -166,6 +167,8 @@ const RenderOutput = struct {
     backend: OutputBackend,
     protocol_id: OutputLayout.Id,
     timer: ?*wl.EventSource,
+    damage: Region,
+    damage_rectangles: std.ArrayList(render.Rect),
     repaint_needed: bool,
     render_scheduled: bool,
     lock_frame_pending: bool,
@@ -242,6 +245,8 @@ const OutputFrame = struct {
     origin: render.Position,
     visible_rect: render.Rect,
     track_visibility: bool,
+    damage: ?[]const render.Rect = null,
+    presentation_damage: ?*const Region = null,
 };
 
 pub fn create(
@@ -763,14 +768,17 @@ pub fn create(
     self.subcompositor.setRepaintListener(.{
         .context = self,
         .request = requestRepaint,
+        .surface_changed = surfaceChanged,
     });
     self.scene.setRepaintListener(.{
         .context = self,
         .request = requestRepaint,
+        .surface_changed = surfaceChanged,
     });
     self.seat.setRepaintListener(.{
         .context = self,
         .request = requestRepaint,
+        .cursor_moved = cursorMoved,
     });
     self.layer_shell.setRepaintListener(.{
         .context = self,
@@ -1004,10 +1012,14 @@ fn addRenderOutput(
         .backend = undefined,
         .protocol_id = undefined,
         .timer = null,
+        .damage = Region.init(),
+        .damage_rectangles = .empty,
         .repaint_needed = false,
         .render_scheduled = false,
         .lock_frame_pending = false,
     };
+    errdefer render_output.damage.deinit();
+    errdefer render_output.damage_rectangles.deinit(self.allocator);
     try render_output.backend.init(
         self.allocator,
         io,
@@ -1049,8 +1061,7 @@ fn addRenderOutput(
         try self.window_manager.outputAdded(render_output.protocol_id);
     }
     if (self.session_lock_initialized) self.session_lock.refreshOutputs();
-    render_output.repaint_needed = true;
-    self.scheduleRepaint(render_output);
+    self.damageFullOutput(render_output);
     return id;
 }
 
@@ -1159,7 +1170,11 @@ fn inputSeatCreated(context: *anyopaque, name: [:0]const u8) error{OutOfMemory}!
     };
     errdefer entry.seat.deinit();
     entry.seat.ensureParentKeyboardEnter();
-    entry.seat.setRepaintListener(.{ .context = self, .request = requestRepaint });
+    entry.seat.setRepaintListener(.{
+        .context = self,
+        .request = requestRepaint,
+        .cursor_moved = cursorMoved,
+    });
     errdefer entry.seat.clearRepaintListener();
     try self.window_manager.seatAdded(&entry.seat);
     errdefer self.window_manager.seatRemoved(&entry.seat);
@@ -1350,6 +1365,8 @@ fn removeRenderOutput(self: *Self, id: RenderOutputId) bool {
         self.session_lock.refreshOutputs();
     }
     render_output.backend.deinit();
+    render_output.damage.deinit();
+    render_output.damage_rectangles.deinit(self.allocator);
     self.allocator.destroy(render_output);
     return true;
 }
@@ -1707,11 +1724,161 @@ fn requestRepaint(context: *anyopaque) void {
         const render_output = entry.value.*;
         if (!render_output.backend.powered()) {
             render_output.repaint_needed = false;
+            render_output.damage.clear();
             continue;
         }
+        self.damageFullOutput(render_output);
+    }
+}
+
+fn cursorMoved(context: *anyopaque, old: Seat.CursorInfo, new: Seat.CursorInfo) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.refreshIdleInhibition();
+    if (self.image_copy_capture_initialized) self.image_copy_capture.refreshCursors();
+    const old_bounds = self.cursorBounds(old) orelse return requestRepaint(self);
+    const new_bounds = self.cursorBounds(new) orelse return requestRepaint(self);
+    self.damageGlobalRect(old_bounds);
+    self.damageGlobalRect(new_bounds);
+}
+
+fn surfaceChanged(context: *anyopaque, surface_id: Surface.Id) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const surfaces = self.compositor.surfaceStore();
+    if (!Surface.currentDamagePrecise(surfaces, surface_id)) return requestRepaint(self);
+    const root = self.subcompositor.rootSurface(surface_id);
+    const root_position = self.scene.surfacePosition(root) orelse return requestRepaint(self);
+    const offset = self.subcompositor.surfaceOffset(surface_id);
+    const damage = Surface.currentDamage(surfaces, surface_id) orelse
+        return requestRepaint(self);
+    if (damage.isEmpty()) {
+        var bounds: ?render.Rect = null;
+        self.addSurfaceTreeBounds(root, root_position.x, root_position.y, &bounds) catch
+            return requestRepaint(self);
+        if (bounds) |rectangle| self.damageGlobalRect(rectangle);
+        return;
+    }
+
+    var rectangles = damage.rectangleIterator();
+    while (rectangles.next()) |rectangle| {
+        self.damageGlobalRect(.{
+            .x = root_position.x +| offset.x +| rectangle.x,
+            .y = root_position.y +| offset.y +| rectangle.y,
+            .width = rectangle.width,
+            .height = rectangle.height,
+        });
+    }
+}
+
+fn cursorBounds(self: *Self, cursor: Seat.CursorInfo) ?render.Rect {
+    return switch (cursor) {
+        .shape => |shape| .{
+            .x = shape.x,
+            .y = shape.y,
+            .width = shape.buffer.size.width,
+            .height = shape.buffer.size.height,
+        },
+        .surface => |surface| bounds: {
+            var value: ?render.Rect = null;
+            self.addSurfaceTreeBounds(
+                surface.surface_id,
+                surface.x,
+                surface.y,
+                &value,
+            ) catch return null;
+            break :bounds value;
+        },
+    };
+}
+
+fn damageGlobalRect(self: *Self, rectangle: render.Rect) void {
+    var render_outputs = self.render_outputs.iterator();
+    while (render_outputs.next()) |entry| {
+        const render_output = entry.value.*;
+        if (!render_output.backend.powered()) continue;
+        const output = self.outputs.get(render_output.protocol_id).?;
+        const output_rect = output.logicalRect();
+        const intersection = rectangle.intersection(output_rect) orelse continue;
+        const physical = scaleDamageRect(
+            .{
+                .x = intersection.x -| output_rect.x,
+                .y = intersection.y -| output_rect.y,
+                .width = intersection.width,
+                .height = intersection.height,
+            },
+            render_output.backend.renderScale(),
+            render_output.backend.modeSize(),
+        ) orelse continue;
+        render_output.damage.add(
+            physical.x,
+            physical.y,
+            @intCast(physical.width),
+            @intCast(physical.height),
+        ) catch {
+            self.damageFullOutput(render_output);
+            continue;
+        };
         render_output.repaint_needed = true;
         self.scheduleRepaint(render_output);
     }
+}
+
+fn scaleDamageRect(
+    logical: render.Rect,
+    scale: render.Scale,
+    target_size: render.Size,
+) ?render.Rect {
+    std.debug.assert(logical.x >= 0 and logical.y >= 0);
+    const denominator: i128 = render.Scale.denominator;
+    const left_product = @as(i128, logical.x) * scale.numerator;
+    const top_product = @as(i128, logical.y) * scale.numerator;
+    const right_product = (@as(i128, logical.x) + logical.width) * scale.numerator;
+    const bottom_product = (@as(i128, logical.y) + logical.height) * scale.numerator;
+    var left: i64 = @intCast(@divTrunc(left_product, denominator));
+    var top: i64 = @intCast(@divTrunc(top_product, denominator));
+    var right: i64 = @intCast(@divTrunc(right_product + denominator - 1, denominator));
+    var bottom: i64 = @intCast(@divTrunc(bottom_product + denominator - 1, denominator));
+    if (scale.numerator % render.Scale.denominator != 0) {
+        left -= 1;
+        top -= 1;
+        right += 1;
+        bottom += 1;
+    }
+    left = std.math.clamp(left, 0, target_size.width);
+    top = std.math.clamp(top, 0, target_size.height);
+    right = std.math.clamp(right, 0, target_size.width);
+    bottom = std.math.clamp(bottom, 0, target_size.height);
+    if (right <= left or bottom <= top) return null;
+    return .{
+        .x = @intCast(left),
+        .y = @intCast(top),
+        .width = @intCast(right - left),
+        .height = @intCast(bottom - top),
+    };
+}
+
+fn damageFullOutput(self: *Self, output: *RenderOutput) void {
+    const size = output.backend.modeSize();
+    output.damage.setRectangle(0, 0, size.width, size.height);
+    output.repaint_needed = true;
+    self.scheduleRepaint(output);
+}
+
+fn outputDamageRectangles(
+    self: *Self,
+    output: *RenderOutput,
+    damage: *const Region,
+) error{OutOfMemory}![]const render.Rect {
+    output.damage_rectangles.clearRetainingCapacity();
+    var rectangles = damage.rectangleIterator();
+    while (rectangles.next()) |rectangle| {
+        try output.damage_rectangles.append(self.allocator, .{
+            .x = rectangle.x,
+            .y = rectangle.y,
+            .width = rectangle.width,
+            .height = rectangle.height,
+        });
+    }
+    return output.damage_rectangles.items;
 }
 
 fn clearCursorShapes(context: *anyopaque) void {
@@ -4113,6 +4280,25 @@ test "screencopy region follows full output fractional pixel boundaries" {
     );
 }
 
+test "damage scaling covers fractional sampling edges" {
+    try std.testing.expectEqual(
+        render.Rect{ .x = 0, .y = 0, .width = 4, .height = 4 },
+        scaleDamageRect(
+            .{ .x = 1, .y = 1, .width = 1, .height = 1 },
+            .{ .numerator = 180 },
+            .{ .width = 10, .height = 10 },
+        ).?,
+    );
+    try std.testing.expectEqual(
+        render.Rect{ .x = 2, .y = 2, .width = 2, .height = 2 },
+        scaleDamageRect(
+            .{ .x = 1, .y = 1, .width = 1, .height = 1 },
+            .{ .numerator = 240 },
+            .{ .width = 10, .height = 10 },
+        ).?,
+    );
+}
+
 fn captureOutput(
     self: *Self,
     output_id: OutputLayout.Id,
@@ -4323,6 +4509,7 @@ fn handleRenderTimer(output_context: *RenderOutput) c_int {
     const self = output_context.server;
     output_context.render_scheduled = false;
     if (!output_context.repaint_needed or !output_context.backend.ready()) return 0;
+    std.debug.assert(!output_context.damage.isEmpty());
     output_context.repaint_needed = false;
     self.renderFrame(output_context) catch |err| {
         log.err("output frame failed: {t}", .{err});
@@ -4330,6 +4517,24 @@ fn handleRenderTimer(output_context: *RenderOutput) c_int {
     };
     self.scheduleRepaint(output_context);
     return 0;
+}
+
+fn outputHasBackdropBlur(self: *Self, visible_rect: render.Rect) bool {
+    var windows = self.scene.iterator();
+    while (windows.next()) |entry| {
+        const window = entry.window;
+        if (!window.mapped or window.effects.blur == null) continue;
+        const buffer = Surface.currentBuffer(
+            self.compositor.surfaceStore(),
+            window.surface_id,
+        ) orelse continue;
+        const geometry = window.content_geometry orelse Scene.ContentGeometry{
+            .size = buffer.logical_size,
+        };
+        const content_rect = windowContentRect(window, geometry.size) orelse continue;
+        if (content_rect.intersection(visible_rect) != null) return true;
+    }
+    return false;
 }
 
 fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Renderer.Error!void {
@@ -4342,6 +4547,19 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
     output.beginFrame();
     errdefer output.cancelFrame();
     const position = output.logicalPosition();
+    if (self.outputHasBackdropBlur(output.logicalRect())) {
+        const size = render_output.backend.modeSize();
+        render_output.damage.setRectangle(0, 0, size.width, size.height);
+    }
+    var frame_damage = Region.init();
+    defer frame_damage.deinit();
+    try frame_damage.copyFrom(&render_output.damage);
+    render_output.damage.clear();
+    const damage = if (render_output.backend.persistentRenderTarget() and
+        self.renderer.supportsPartialDamage())
+        try self.outputDamageRectangles(render_output, &frame_damage)
+    else
+        null;
     const frame: OutputFrame = .{
         .render_output = render_output,
         .output = output,
@@ -4351,6 +4569,8 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
         .origin = .{ .x = position.x, .y = position.y },
         .visible_rect = output.logicalRect(),
         .track_visibility = true,
+        .damage = damage,
+        .presentation_damage = &frame_damage,
     };
     const clear_command = [_]render.Command{.{ .clear = if (self.session_lock.isLocked())
         render.Color.rgba(0, 0, 0, 255)
@@ -4361,7 +4581,8 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
 
     const top_fullscreen = try self.renderDesktopContents(&frame, true);
 
-    const presented = render_output.backend.present() catch return error.InvalidTarget;
+    const presented = render_output.backend.present(&frame_damage) catch
+        return error.InvalidTarget;
     output.endFrame();
     self.foreign_toplevel_list.syncOutput(render_output.protocol_id);
 
@@ -4482,7 +4703,8 @@ fn renderSessionLockFrame(
     try self.renderSessionLockContents(frame, true);
 
     const lock_surface = self.session_lock.surfaceForOutput(frame.render_output.protocol_id);
-    const presented = frame.render_output.backend.present() catch return error.InvalidTarget;
+    const presented = frame.render_output.backend.present(frame.presentation_damage.?) catch
+        return error.InvalidTarget;
     frame.render_output.lock_frame_pending = true;
     frame.output.endFrame();
     self.foreign_toplevel_list.syncOutput(frame.render_output.protocol_id);
@@ -4751,6 +4973,7 @@ fn renderCommands(
     try self.renderer.render(.{
         .size = frame.size,
         .commands = commands,
+        .damage = frame.damage,
         .scale = frame.scale,
         .origin = frame.origin,
     }, frame.target);

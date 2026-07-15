@@ -29,6 +29,7 @@ pub const Point = struct {
 pub const RepaintListener = struct {
     context: *anyopaque,
     request: *const fn (*anyopaque) void,
+    surface_changed: *const fn (*anyopaque, Surface.Id) void,
 };
 
 pub const StackEntry = union(enum) {
@@ -604,7 +605,11 @@ const SubsurfaceResource = struct {
 
     fn afterSurfaceCommit(context: *anyopaque, _: Surface.CommitInfo) void {
         const self: *SubsurfaceResource = @ptrCast(@alignCast(context));
-        self.shell.requestRepaint();
+        const surface = self.surface orelse return;
+        if (surface.hasCachedCommit()) return;
+        if (self.shell.repaint_listener) |listener| {
+            listener.surface_changed(listener.context, surface.handle());
+        }
     }
 
     fn surfaceDestroyed(context: *anyopaque) void {

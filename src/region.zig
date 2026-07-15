@@ -12,6 +12,31 @@ region: pixman.pixman_region32_t,
 
 pub const Error = error{OutOfMemory};
 
+pub const Rectangle = struct {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+};
+
+pub const RectangleIterator = struct {
+    boxes: []const pixman.pixman_box32_t,
+    index: usize = 0,
+
+    pub fn next(self: *RectangleIterator) ?Rectangle {
+        if (self.index >= self.boxes.len) return null;
+        const box = self.boxes[self.index];
+        self.index += 1;
+        std.debug.assert(box.x2 > box.x1 and box.y2 > box.y1);
+        return .{
+            .x = box.x1,
+            .y = box.y1,
+            .width = @intCast(box.x2 - box.x1),
+            .height = @intCast(box.y2 - box.y1),
+        };
+    }
+};
+
 pub fn init() Self {
     var self: Self = undefined;
     pixman.pixman_region32_init(&self.region);
@@ -25,6 +50,28 @@ pub fn deinit(self: *Self) void {
 
 pub fn clear(self: *Self) void {
     pixman.pixman_region32_clear(&self.region);
+}
+
+pub fn setRectangle(self: *Self, x: i32, y: i32, width: u32, height: u32) void {
+    pixman.pixman_region32_fini(&self.region);
+    if (width == 0 or height == 0) {
+        pixman.pixman_region32_init(&self.region);
+    } else {
+        pixman.pixman_region32_init_rect(&self.region, x, y, width, height);
+    }
+}
+
+pub fn isEmpty(self: *const Self) bool {
+    return pixman.pixman_region32_not_empty(@constCast(&self.region)) == 0;
+}
+
+pub fn rectangleIterator(self: *const Self) RectangleIterator {
+    var count: c_int = 0;
+    const boxes = pixman.pixman_region32_rectangles(
+        @constCast(&self.region),
+        &count,
+    );
+    return .{ .boxes = boxes[0..@intCast(count)] };
 }
 
 pub fn copyFrom(self: *Self, other: *const Self) Error!void {
@@ -76,6 +123,10 @@ pub fn subtract(self: *Self, x: i32, y: i32, width: i32, height: i32) Error!void
     if (pixman.pixman_region32_subtract(&self.region, &self.region, &rectangle) == 0) {
         return error.OutOfMemory;
     }
+}
+
+pub fn translate(self: *Self, x: i32, y: i32) void {
+    pixman.pixman_region32_translate(&self.region, x, y);
 }
 
 pub fn contains(self: *const Self, x: i32, y: i32) bool {
@@ -242,6 +293,46 @@ test "region copy has independent storage" {
 
     try std.testing.expect(source.contains(1, 1));
     try std.testing.expect(!copy.contains(1, 1));
+}
+
+test "rectangle iteration preserves disjoint damage" {
+    var region = Self.init();
+    defer region.deinit();
+    try region.add(1, 2, 3, 4);
+    try region.add(10, 20, 5, 6);
+
+    var iterator = region.rectangleIterator();
+    try std.testing.expectEqual(
+        Rectangle{ .x = 1, .y = 2, .width = 3, .height = 4 },
+        iterator.next().?,
+    );
+    try std.testing.expectEqual(
+        Rectangle{ .x = 10, .y = 20, .width = 5, .height = 6 },
+        iterator.next().?,
+    );
+    try std.testing.expectEqual(@as(?Rectangle, null), iterator.next());
+}
+
+test "empty and translated regions expose current state" {
+    var region = Self.init();
+    defer region.deinit();
+    try std.testing.expect(region.isEmpty());
+    try region.add(1, 2, 3, 4);
+    try std.testing.expect(!region.isEmpty());
+    region.translate(5, -1);
+
+    var iterator = region.rectangleIterator();
+    try std.testing.expectEqual(
+        Rectangle{ .x = 6, .y = 1, .width = 3, .height = 4 },
+        iterator.next().?,
+    );
+
+    region.setRectangle(-2, -3, 7, 8);
+    iterator = region.rectangleIterator();
+    try std.testing.expectEqual(
+        Rectangle{ .x = -2, .y = -3, .width = 7, .height = 8 },
+        iterator.next().?,
+    );
 }
 
 test "region confinement stops at a rectangular edge" {
