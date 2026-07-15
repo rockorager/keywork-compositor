@@ -21,6 +21,7 @@ atoms: [atom_count]c.xcb_atom_t,
 windows: std.AutoHashMapUnmanaged(WindowId, Window),
 serial_windows: std.AutoHashMapUnmanaged(u64, WindowId),
 focused_window: ?WindowId,
+xfixes_event_base: u8,
 clipboard_selection: XSelection,
 listener: Listener,
 
@@ -109,6 +110,8 @@ const Atom = enum {
     wl_surface_serial,
     clipboard,
     targets,
+    selection_data,
+    incr,
     text,
 };
 
@@ -135,6 +138,8 @@ const atom_names: [atom_count][]const u8 = .{
     "WL_SURFACE_SERIAL",
     "CLIPBOARD",
     "TARGETS",
+    "_KEYWORK_SELECTION",
+    "INCR",
     "TEXT",
 };
 
@@ -187,12 +192,14 @@ pub fn init(
         .windows = .empty,
         .serial_windows = .empty,
         .focused_window = null,
+        .xfixes_event_base = 0,
         .clipboard_selection = undefined,
         .listener = listener,
     };
 
     try self.resolveAtoms();
     try self.checkComposite();
+    self.xfixes_event_base = try self.checkXfixes();
     self.wm_window = c.xcb_generate_id(connection);
     if (self.wm_window == c.XCB_WINDOW_NONE) return error.XidAllocationFailed;
     try checkRequest(connection, c.xcb_create_window_checked(
@@ -236,6 +243,8 @@ pub fn init(
         .{
             .selection = self.atomValue(.clipboard),
             .targets = self.atomValue(.targets),
+            .selection_data = self.atomValue(.selection_data),
+            .incr = self.atomValue(.incr),
             .utf8_string = self.atomValue(.utf8_string),
             .text = self.atomValue(.text),
         },
@@ -565,6 +574,40 @@ fn checkComposite(self: *Self) !void {
         std.c.free(err);
         return error.CompositeUnavailable;
     }
+}
+
+fn checkXfixes(self: *Self) !u8 {
+    const extension_name = "XFIXES";
+    const extension = c.xcb_query_extension_reply(
+        self.connection,
+        c.xcb_query_extension(
+            self.connection,
+            extension_name.len,
+            extension_name.ptr,
+        ),
+        null,
+    ) orelse return error.XfixesUnavailable;
+    defer std.c.free(extension);
+    if (extension.*.present == 0) return error.XfixesUnavailable;
+    var x_error: ?*c.xcb_generic_error_t = null;
+    const reply = c.xcb_xfixes_query_version_reply(
+        self.connection,
+        c.xcb_xfixes_query_version(self.connection, 5, 0),
+        &x_error,
+    ) orelse {
+        if (x_error) |err| {
+            logX11Error("query XFixes", err);
+            std.c.free(err);
+        }
+        return error.XfixesUnavailable;
+    };
+    defer std.c.free(reply);
+    if (x_error) |err| {
+        logX11Error("query XFixes", err);
+        std.c.free(err);
+        return error.XfixesUnavailable;
+    }
+    return extension.*.first_event;
 }
 
 fn publishWmIdentity(self: *Self) !void {
@@ -1030,7 +1073,12 @@ fn handleEvents(_: std.posix.fd_t, mask: wl.EventMask, self: *Self) c_int {
 }
 
 fn dispatchEvent(self: *Self, event: [*c]c.xcb_generic_event_t) !void {
-    switch (event.*.response_type & 0x7f) {
+    const response_type = event.*.response_type & 0x7f;
+    if (response_type == self.xfixes_event_base + c.XCB_XFIXES_SELECTION_NOTIFY) {
+        self.clipboard_selection.handleXfixesNotify(@ptrCast(event));
+        return;
+    }
+    switch (response_type) {
         c.XCB_CREATE_NOTIFY => try self.handleCreate(@ptrCast(event)),
         c.XCB_DESTROY_NOTIFY => self.handleDestroy(@ptrCast(event)),
         c.XCB_MAP_REQUEST => try self.handleMapRequest(@ptrCast(event)),
@@ -1041,12 +1089,15 @@ fn dispatchEvent(self: *Self, event: [*c]c.xcb_generic_event_t) !void {
         c.XCB_PROPERTY_NOTIFY => try self.handlePropertyNotify(@ptrCast(event)),
         c.XCB_CLIENT_MESSAGE => try self.handleClientMessage(@ptrCast(event)),
         c.XCB_SELECTION_REQUEST => self.handleSelectionRequest(@ptrCast(event)),
+        c.XCB_SELECTION_NOTIFY => self.clipboard_selection.handleNotify(@ptrCast(event)),
         else => {},
     }
 }
 
 fn handleCreate(self: *Self, event: *const c.xcb_create_notify_event_t) !void {
-    if (event.window == self.wm_window or self.windows.contains(event.window)) return;
+    if (event.window == self.wm_window or
+        self.clipboard_selection.ownsWindow(event.window) or
+        self.windows.contains(event.window)) return;
     const window: Window = .{
         .geometry = .{
             .x = event.x,

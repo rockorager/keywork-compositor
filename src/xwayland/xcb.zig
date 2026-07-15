@@ -5,4 +5,5 @@ pub const c = @cImport({
     @cInclude("xcb/xcb.h");
     @cInclude("xcb/composite.h");
     @cInclude("xcb/xcb_icccm.h");
+    @cInclude("xcb/xfixes.h");
 });

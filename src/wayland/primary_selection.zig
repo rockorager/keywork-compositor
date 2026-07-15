@@ -581,6 +581,14 @@ pub fn setExternalSelection(self: *Self, source: ?*const SelectionSource) void {
     self.replaceSelection(selection, self.display.nextSerial(), true);
 }
 
+pub fn externalSelectionIs(self: *const Self, source: *const SelectionSource) bool {
+    const selection = self.selection orelse return false;
+    return switch (selection) {
+        .local => false,
+        .external => |current| current == source,
+    };
+}
+
 pub fn externalSourceDestroyed(self: *Self, source: *const SelectionSource) void {
     const selection = self.selection orelse return;
     switch (selection) {
