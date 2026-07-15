@@ -26,7 +26,8 @@ layer_global: *wl.Global,
 security_context: *SecurityContext,
 outputs: *OutputLayout,
 output_id: OutputLayout.Id,
-seat_state: SeatState,
+seat_states: std.ArrayList(*SeatState),
+seat_state: *SeatState,
 scene: *Scene,
 xdg_shell: *XdgShell,
 layer_shell: *LayerShell,
@@ -59,7 +60,7 @@ const ShellSurfaceId = ShellSurfaceStore.Id;
 
 const SeatState = struct {
     seat: *Seat,
-    seat_resource: ?*river.SeatV1,
+    seat_resource: ?*SeatResource,
     focused: ?WindowId,
     pending_focus: PendingFocus,
     held_buttons: std.ArrayList(HeldButton),
@@ -72,6 +73,32 @@ const SeatState = struct {
     sent_hovered: ?WindowId,
     pending_interaction: ?Interaction,
     ignore_until_release: bool,
+
+    fn create(allocator: std.mem.Allocator, seat: *Seat) !*SeatState {
+        const self = try allocator.create(SeatState);
+        self.* = .{
+            .seat = seat,
+            .seat_resource = null,
+            .focused = null,
+            .pending_focus = .unchanged,
+            .held_buttons = .empty,
+            .last_pointer_position = null,
+            .operation = null,
+            .pending_operation = .unchanged,
+            .pending_warp = null,
+            .focused_shell_surface = null,
+            .desired_hovered = null,
+            .sent_hovered = null,
+            .pending_interaction = null,
+            .ignore_until_release = false,
+        };
+        return self;
+    }
+
+    fn destroy(self: *SeatState, allocator: std.mem.Allocator) void {
+        self.held_buttons.deinit(allocator);
+        allocator.destroy(self);
+    }
 };
 
 const ManagedNodeId = union(enum) {
@@ -291,6 +318,9 @@ pub fn init(
     layer_shell: *LayerShell,
     router: PointerRouter,
 ) !void {
+    const seat_state = try SeatState.create(allocator, seat);
+    errdefer seat_state.destroy(allocator);
+
     self.* = .{
         .allocator = allocator,
         .display = display,
@@ -299,22 +329,8 @@ pub fn init(
         .security_context = security_context,
         .outputs = outputs,
         .output_id = output_id,
-        .seat_state = .{
-            .seat = seat,
-            .seat_resource = null,
-            .focused = null,
-            .pending_focus = .unchanged,
-            .held_buttons = .empty,
-            .last_pointer_position = null,
-            .operation = null,
-            .pending_operation = .unchanged,
-            .pending_warp = null,
-            .focused_shell_surface = null,
-            .desired_hovered = null,
-            .sent_hovered = null,
-            .pending_interaction = null,
-            .ignore_until_release = false,
-        },
+        .seat_states = .empty,
+        .seat_state = seat_state,
         .scene = scene,
         .xdg_shell = xdg_shell,
         .layer_shell = layer_shell,
@@ -338,6 +354,8 @@ pub fn init(
         .pointer_bindings = .empty,
         .router = router,
     };
+    try self.seat_states.append(allocator, seat_state);
+    errdefer self.seat_states.deinit(allocator);
     errdefer self.windows.deinit(allocator);
     errdefer self.decorations.deinit(allocator);
     errdefer self.shell_surfaces.deinit(allocator);
@@ -462,7 +480,11 @@ pub fn deinit(self: *Self) void {
     self.output_resources.deinit(self.allocator);
     std.debug.assert(self.pointer_bindings.items.len == 0);
     self.pointer_bindings.deinit(self.allocator);
-    self.seat_state.held_buttons.deinit(self.allocator);
+    for (self.seat_states.items) |seat_state| {
+        std.debug.assert(seat_state.seat_resource == null);
+        seat_state.destroy(self.allocator);
+    }
+    self.seat_states.deinit(self.allocator);
     std.debug.assert(self.layer_bindings.items.len == 0);
     self.layer_bindings.deinit(self.allocator);
     self.security_context.unrestrictGlobal(self.layer_global);
@@ -530,7 +552,8 @@ pub fn pointerMoved(self: *Self, root: ?Surface.Id) void {
 pub fn bindingSession(self: *Self, resource: *river.SeatV1) ?u64 {
     const data = resource.getUserData() orelse return null;
     const seat_resource: *SeatResource = @ptrCast(@alignCast(data));
-    if (seat_resource.manager != self or self.seat_state.seat_resource != resource or self.active == null) return null;
+    if (seat_resource.manager != self or seat_resource.seat_state.seat_resource != seat_resource or
+        seat_resource.resource != resource or self.active == null) return null;
     if (seat_resource.owner_generation != self.session_generation or
         resource.getClient() != self.active.?.getClient()) return null;
     return self.session_generation;
@@ -564,7 +587,7 @@ pub fn pointerButton(self: *Self, button: u32, state: wl.Pointer.ButtonState, ro
     if (state == .pressed) {
         var matched: ?*PointerBinding = null;
         for (self.pointer_bindings.items) |binding| {
-            if (binding.active() and binding.enabled and binding.button == button and
+            if (binding.seat_state == self.seat_state and binding.active() and binding.enabled and binding.button == button and
                 binding.modifiers == self.seat_state.seat.effectiveModifiers())
             {
                 matched = binding;
@@ -643,7 +666,7 @@ fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
         resource.postNoMemory();
         return;
     };
-    self.createSeat(resource) catch {
+    for (self.seat_states.items) |seat_state| self.createSeat(resource, seat_state) catch {
         resource.postNoMemory();
         return;
     };
@@ -775,7 +798,8 @@ fn sendPendingState(self: *Self, manager: *river.WindowManagerV1) !void {
         window.metadata_dirty = false;
     }
 
-    if (self.seat_state.seat_resource) |seat_resource| {
+    if (self.seat_state.seat_resource) |seat_adapter| {
+        const seat_resource = seat_adapter.resource;
         if (!std.meta.eql(self.seat_state.sent_hovered, self.seat_state.desired_hovered)) {
             if (self.seat_state.sent_hovered != null) seat_resource.sendPointerLeave();
             self.seat_state.sent_hovered = null;
@@ -812,10 +836,10 @@ fn sendPendingState(self: *Self, manager: *river.WindowManagerV1) !void {
         const resource = window.resource orelse continue;
         switch (pending.request) {
             .pointer_move => if (self.seat_state.seat_resource) |seat| {
-                resource.sendPointerMoveRequested(seat);
+                resource.sendPointerMoveRequested(seat.resource);
             },
             .pointer_resize => |edges| if (self.seat_state.seat_resource) |seat| {
-                resource.sendPointerResizeRequested(seat, edges);
+                resource.sendPointerResizeRequested(seat.resource, edges);
             },
             .show_window_menu => |menu| {
                 resource.sendShowWindowMenuRequested(menu.x, menu.y);
@@ -831,7 +855,8 @@ fn sendPendingState(self: *Self, manager: *river.WindowManagerV1) !void {
         }
     }
     self.window_requests.clearRetainingCapacity();
-    if (self.seat_state.seat_resource) |seat_resource| if (seat_resource.getVersion() >= 2) {
+    if (self.seat_state.seat_resource) |seat_adapter| if (seat_adapter.resource.getVersion() >= 2) {
+        const seat_resource = seat_adapter.resource;
         if (self.seat_state.seat.pointerPosition()) |position| {
             const point: Point = .{ .x = pointerCoordinate(position.x), .y = pointerCoordinate(position.y) };
             if (self.seat_state.last_pointer_position == null or !std.meta.eql(self.seat_state.last_pointer_position.?, point)) {
@@ -1342,6 +1367,7 @@ const LayerBinding = struct {
         const data = resource.getUserData() orelse return false;
         const seat: *SeatResource = @ptrCast(@alignCast(data));
         return seat.manager == self.manager and seat.owner_generation == self.owner_generation.? and
+            seat.seat_state == self.manager.seat_state and seat.seat_state.seat_resource == seat and
             resource.getClient() == self.resource.getClient();
     }
 
@@ -1414,35 +1440,37 @@ const LayerSeat = struct {
 fn releaseManager(self: *Self) void {
     for (self.layer_bindings.items) |binding| binding.beginSession(null);
     for (self.pointer_bindings.items) |binding| binding.pending.clearRetainingCapacity();
-    var held_index: usize = 0;
-    while (held_index < self.seat_state.held_buttons.items.len) {
-        const held = &self.seat_state.held_buttons.items[held_index];
-        if (held.captured) {
-            held.binding = null;
-            held_index += 1;
-        } else {
-            _ = self.seat_state.held_buttons.orderedRemove(held_index);
+    for (self.seat_states.items) |seat_state| {
+        var held_index: usize = 0;
+        while (held_index < seat_state.held_buttons.items.len) {
+            const held = &seat_state.held_buttons.items[held_index];
+            if (held.captured) {
+                held.binding = null;
+                held_index += 1;
+            } else {
+                _ = seat_state.held_buttons.orderedRemove(held_index);
+            }
         }
+        seat_state.seat_resource = null;
+        seat_state.focused = null;
+        seat_state.pending_focus = .unchanged;
+        seat_state.seat.setUnfocusedCursorController(null);
+        seat_state.operation = null;
+        seat_state.pending_operation = .unchanged;
+        seat_state.pending_warp = null;
+        seat_state.focused_shell_surface = null;
+        seat_state.desired_hovered = null;
+        seat_state.sent_hovered = null;
+        seat_state.pending_interaction = null;
+        seat_state.ignore_until_release = seat_state.held_buttons.items.len != 0;
+        seat_state.last_pointer_position = null;
     }
     self.active = null;
-    self.seat_state.seat_resource = null;
     self.sequence.reset();
     self.window_requests.clearRetainingCapacity();
     self.stack_operations.clearRetainingCapacity();
-    self.seat_state.focused = null;
-    self.seat_state.pending_focus = .unchanged;
     self.presentation_mode = .vsync;
     self.pending_presentation_mode = null;
-    self.seat_state.seat.setUnfocusedCursorController(null);
-    self.seat_state.operation = null;
-    self.seat_state.pending_operation = .unchanged;
-    self.seat_state.pending_warp = null;
-    self.seat_state.focused_shell_surface = null;
-    self.seat_state.desired_hovered = null;
-    self.seat_state.sent_hovered = null;
-    self.seat_state.pending_interaction = null;
-    self.seat_state.ignore_until_release = self.seat_state.held_buttons.items.len != 0;
-    self.seat_state.last_pointer_position = null;
     self.releaseWindows();
     self.releaseShellSurfaces();
     const position = self.seat_state.seat.pointerPosition() orelse return;
@@ -2484,7 +2512,7 @@ fn createOutput(
     }
 }
 
-fn createSeat(self: *Self, manager: *river.WindowManagerV1) !void {
+fn createSeat(self: *Self, manager: *river.WindowManagerV1, seat_state: *SeatState) !void {
     const resource = try river.SeatV1.create(
         manager.getClient(),
         manager.getVersion(),
@@ -2497,13 +2525,15 @@ fn createSeat(self: *Self, manager: *river.WindowManagerV1) !void {
     adapter.* = .{
         .allocator = self.allocator,
         .manager = self,
+        .resource = resource,
+        .seat_state = seat_state,
         .owner_generation = self.session_generation,
     };
     resource.setHandler(*SeatResource, SeatResource.handleRequest, SeatResource.handleDestroy, adapter);
 
-    self.seat_state.seat_resource = resource;
+    seat_state.seat_resource = adapter;
     manager.sendSeat(resource);
-    resource.sendWlSeat(self.seat_state.seat.globalName(manager.getClient()));
+    resource.sendWlSeat(seat_state.seat.globalName(manager.getClient()));
 }
 
 const OutputResource = struct {
@@ -2572,6 +2602,8 @@ const OutputResource = struct {
 const SeatResource = struct {
     allocator: std.mem.Allocator,
     manager: *Self,
+    resource: *river.SeatV1,
+    seat_state: *SeatState,
     owner_generation: u64,
 
     fn handleRequest(
@@ -2594,37 +2626,38 @@ const SeatResource = struct {
                 if (self.manager.layer_focus_sent == .exclusive) return;
                 const id = self.resolveWindow(focus.window) orelse return;
                 _ = self.manager.layer_shell.relinquishNonExclusiveFocus();
-                self.manager.seat_state.pending_focus = .{ .window = id };
+                self.seat_state.pending_focus = .{ .window = id };
             },
             .clear_focus => {
                 if (!self.requireManage(manager_resource)) return;
                 if (self.manager.layer_focus_sent == .exclusive) return;
                 _ = self.manager.layer_shell.relinquishNonExclusiveFocus();
-                self.manager.seat_state.pending_focus = .clear;
+                self.seat_state.pending_focus = .clear;
             },
             .focus_shell_surface => |focus| {
                 if (!self.requireManage(manager_resource)) return;
                 if (self.manager.layer_focus_sent == .exclusive) return;
                 const id = self.resolveShellSurface(focus.shell_surface) orelse return;
                 _ = self.manager.layer_shell.relinquishNonExclusiveFocus();
-                self.manager.seat_state.pending_focus = .{ .shell_surface = id };
+                self.seat_state.pending_focus = .{ .shell_surface = id };
             },
             .op_start_pointer => {
-                if (self.requireManage(manager_resource) and self.manager.seat_state.operation == null and
-                    self.manager.seat_state.pending_operation != .end) self.manager.seat_state.pending_operation = .start;
+                if (self.requireManage(manager_resource) and self.seat_state.operation == null and
+                    self.seat_state.pending_operation != .end) self.seat_state.pending_operation = .start;
             },
             .op_end => {
-                if (self.requireManage(manager_resource)) self.manager.seat_state.pending_operation = .end;
+                if (self.requireManage(manager_resource)) self.seat_state.pending_operation = .end;
             },
             .get_pointer_binding => |get| PointerBinding.create(
                 self.manager,
+                self.seat_state,
                 get.id,
                 get.button,
                 @bitCast(get.modifiers),
             ) catch resource.postNoMemory(),
             .set_xcursor_theme => {},
             .pointer_warp => |warp| if (self.requireManage(manager_resource)) {
-                self.manager.seat_state.pending_warp = .{ .x = warp.x, .y = warp.y };
+                self.seat_state.pending_warp = .{ .x = warp.x, .y = warp.y };
             },
         }
     }
@@ -2657,13 +2690,15 @@ const SeatResource = struct {
     }
 
     fn handleDestroy(resource: *river.SeatV1, self: *SeatResource) void {
-        if (self.manager.seat_state.seat_resource == resource) self.manager.seat_state.seat_resource = null;
+        std.debug.assert(self.resource == resource);
+        if (self.seat_state.seat_resource == self) self.seat_state.seat_resource = null;
         self.allocator.destroy(self);
     }
 };
 
 const PointerBinding = struct {
     manager: *Self,
+    seat_state: *SeatState,
     resource: *river.PointerBindingV1,
     owner_generation: u64,
     button: u32,
@@ -2671,13 +2706,14 @@ const PointerBinding = struct {
     enabled: bool = false,
     pending: std.ArrayList(enum { pressed, released }) = .empty,
 
-    fn create(manager: *Self, id: u32, button: u32, modifiers: u32) !void {
+    fn create(manager: *Self, seat_state: *SeatState, id: u32, button: u32, modifiers: u32) !void {
         const resource = try river.PointerBindingV1.create(manager.active.?.getClient(), manager.active.?.getVersion(), id);
         errdefer resource.destroy();
         const self = try manager.allocator.create(PointerBinding);
         errdefer manager.allocator.destroy(self);
         self.* = .{
             .manager = manager,
+            .seat_state = seat_state,
             .resource = resource,
             .owner_generation = manager.session_generation,
             .button = button,
@@ -2706,7 +2742,7 @@ const PointerBinding = struct {
     }
 
     fn handleDestroy(_: *river.PointerBindingV1, self: *PointerBinding) void {
-        for (self.manager.seat_state.held_buttons.items) |*held| {
+        for (self.seat_state.held_buttons.items) |*held| {
             if (held.binding == self) held.binding = null;
         }
         for (self.manager.pointer_bindings.items, 0..) |binding, index| if (binding == self) {
