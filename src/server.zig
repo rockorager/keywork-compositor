@@ -30,6 +30,7 @@ const DataControl = @import("wayland/data_control.zig");
 const ForeignToplevelList = @import("wayland/foreign_toplevel_list.zig");
 const ImageCaptureSource = @import("wayland/image_capture_source.zig");
 const ImageCopyCapture = @import("wayland/image_copy_capture.zig");
+const Screencopy = @import("wayland/screencopy.zig");
 const Workspace = @import("wayland/workspace.zig");
 const TextInput = @import("wayland/text_input.zig");
 const InputMethod = @import("wayland/input_method.zig");
@@ -124,6 +125,8 @@ image_capture_source: ImageCaptureSource,
 image_capture_source_initialized: bool,
 image_copy_capture: ImageCopyCapture,
 image_copy_capture_initialized: bool,
+screencopy: Screencopy,
+screencopy_initialized: bool,
 workspace: Workspace,
 workspace_initialized: bool,
 text_input: TextInput,
@@ -300,6 +303,8 @@ pub fn create(
         .image_capture_source_initialized = false,
         .image_copy_capture = undefined,
         .image_copy_capture_initialized = false,
+        .screencopy = undefined,
+        .screencopy_initialized = false,
         .workspace = undefined,
         .workspace_initialized = false,
         .text_input = undefined,
@@ -634,6 +639,23 @@ pub fn create(
         self.image_copy_capture.deinit();
         self.image_copy_capture_initialized = false;
     }
+    try self.screencopy.init(
+        allocator,
+        display,
+        &self.security_context,
+        &self.outputs,
+        &self.linux_dmabuf,
+        .{
+            .context = self,
+            .constraints = screencopyConstraints,
+            .capture = captureScreencopy,
+        },
+    );
+    self.screencopy_initialized = true;
+    errdefer {
+        self.screencopy.deinit();
+        self.screencopy_initialized = false;
+    }
     try self.workspace.init(allocator, display, &self.security_context, &self.outputs);
     self.workspace_initialized = true;
     errdefer {
@@ -792,6 +814,8 @@ pub fn destroy(self: *Self) void {
     }
     self.workspace.deinit();
     self.workspace_initialized = false;
+    self.screencopy.deinit();
+    self.screencopy_initialized = false;
     self.image_copy_capture.deinit();
     self.image_copy_capture_initialized = false;
     self.image_capture_source.deinit();
@@ -1199,6 +1223,7 @@ fn removeRenderOutput(self: *Self, id: RenderOutputId) bool {
     if (self.image_capture_source_initialized) {
         self.image_capture_source.removeOutput(render_output.protocol_id);
     }
+    if (self.screencopy_initialized) self.screencopy.removeOutput(render_output.protocol_id);
     if (self.output_power_initialized) self.output_power.removeOutput(render_output.protocol_id);
     if (self.window_manager_initialized) {
         self.window_manager.outputRemoved(render_output.protocol_id);
@@ -3056,6 +3081,20 @@ fn captureSourceConstraints(
     };
 }
 
+fn screencopyConstraints(context: *anyopaque, target: Screencopy.Target) ?render.Size {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const render_output = self.renderOutputForProtocol(target.output) orelse return null;
+    if (target.region) |region| {
+        const physical = scaledScreencopyRegion(
+            region,
+            render_output.backend.renderScale(),
+            render_output.backend.size(),
+        ) orelse return null;
+        return .{ .width = physical.width, .height = physical.height };
+    }
+    return render_output.backend.size();
+}
+
 fn captureImage(
     context: *anyopaque,
     target: ImageCopyCapture.Target,
@@ -3080,6 +3119,22 @@ fn captureImage(
         },
         .cursor => |cursor| self.captureCursor(cursor, pixel_buffer) catch return error.Failed,
     }
+    return presentation.Info.now(self.io).timestamp;
+}
+
+fn captureScreencopy(
+    context: *anyopaque,
+    target: Screencopy.Target,
+    overlay_cursor: bool,
+    pixel_buffer: render.PixelBuffer,
+) Screencopy.CaptureError!presentation.Timestamp {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.captureOutputRegion(
+        target.output,
+        target.region,
+        overlay_cursor,
+        pixel_buffer,
+    ) catch return error.Failed;
     return presentation.Info.now(self.io).timestamp;
 }
 
@@ -3224,6 +3279,25 @@ fn scaleCaptureCoordinate(value: i64, scale: render.Scale) i32 {
     ));
 }
 
+fn scaledScreencopyRegion(
+    logical: render.Rect,
+    scale: render.Scale,
+    output_size: render.Size,
+) ?render.Rect {
+    const left = scaleCaptureCoordinate(logical.x, scale);
+    const top = scaleCaptureCoordinate(logical.y, scale);
+    const right = scaleCaptureCoordinate(@as(i64, logical.x) + logical.width, scale);
+    const bottom = scaleCaptureCoordinate(@as(i64, logical.y) + logical.height, scale);
+    if (left < 0 or top < 0 or right <= left or bottom <= top or
+        right > output_size.width or bottom > output_size.height) return null;
+    return .{
+        .x = left,
+        .y = top,
+        .width = @intCast(right - left),
+        .height = @intCast(bottom - top),
+    };
+}
+
 test "cursor capture metadata preserves fractional image placement" {
     const scale: render.Scale = .{ .numerator = 180 };
     const position = scaleCaptureCoordinate(8, scale);
@@ -3235,27 +3309,79 @@ test "cursor capture metadata preserves fractional image placement" {
     try std.testing.expectEqual(@as(i32, -5), scaleCaptureCoordinate(-3, scale));
 }
 
+test "screencopy region follows full output fractional pixel boundaries" {
+    try std.testing.expectEqual(
+        render.Rect{ .x = 2, .y = 0, .width = 1, .height = 3 },
+        scaledScreencopyRegion(
+            .{ .x = 1, .y = 0, .width = 1, .height = 2 },
+            .{ .numerator = 180 },
+            .{ .width = 6, .height = 6 },
+        ).?,
+    );
+}
+
 fn captureOutput(
     self: *Self,
     output_id: OutputLayout.Id,
     paint_cursors: bool,
     pixel_buffer: render.PixelBuffer,
 ) renderer_types.Renderer.Error!void {
+    return self.captureOutputRegion(output_id, null, paint_cursors, pixel_buffer);
+}
+
+fn captureOutputRegion(
+    self: *Self,
+    output_id: OutputLayout.Id,
+    local_region: ?render.Rect,
+    paint_cursors: bool,
+    pixel_buffer: render.PixelBuffer,
+) renderer_types.Renderer.Error!void {
     const render_output = self.renderOutputForProtocol(output_id) orelse
         return error.InvalidTarget;
     const output = self.outputs.get(output_id) orelse return error.InvalidTarget;
-    if (!std.meta.eql(pixel_buffer.size, render_output.backend.size())) {
-        return error.InvalidTarget;
+    if (local_region) |region| {
+        const physical = scaledScreencopyRegion(
+            region,
+            render_output.backend.renderScale(),
+            render_output.backend.size(),
+        ) orelse return error.InvalidTarget;
+        if (!std.meta.eql(pixel_buffer.size, render.Size{
+            .width = physical.width,
+            .height = physical.height,
+        })) return error.InvalidTarget;
+        const full_size = render_output.backend.size();
+        const pixel_count = full_size.pixelCount() catch return error.OutOfMemory;
+        const pixels = self.allocator.alloc(u32, pixel_count) catch return error.OutOfMemory;
+        defer self.allocator.free(pixels);
+        const full_buffer: render.PixelBuffer = .{
+            .size = full_size,
+            .stride_pixels = full_size.width,
+            .pixels = pixels,
+        };
+        try self.captureOutputRegion(output_id, null, paint_cursors, full_buffer);
+        for (0..physical.height) |y| {
+            const source_start = (@as(usize, @intCast(physical.y)) + y) * full_size.width +
+                @as(usize, @intCast(physical.x));
+            const destination_start = y * pixel_buffer.stride_pixels;
+            @memcpy(
+                pixel_buffer.pixels[destination_start..][0..physical.width],
+                full_buffer.pixels[source_start..][0..physical.width],
+            );
+        }
+        return;
     }
-    const position = output.logicalPosition();
+    const scale = render_output.backend.renderScale();
+    const expected_size = render_output.backend.size();
+    if (!std.meta.eql(pixel_buffer.size, expected_size)) return error.InvalidTarget;
+    const visible_rect = output.logicalRect();
     const frame: OutputFrame = .{
         .render_output = render_output,
         .output = output,
         .target = self.renderer.makeTarget(pixel_buffer),
         .size = pixel_buffer.size,
-        .scale = render_output.backend.renderScale(),
-        .origin = .{ .x = position.x, .y = position.y },
-        .visible_rect = output.logicalRect(),
+        .scale = scale,
+        .origin = .{ .x = visible_rect.x, .y = visible_rect.y },
+        .visible_rect = visible_rect,
         .track_visibility = false,
     };
     const clear_command = [_]render.Command{.{ .clear = if (self.session_lock.isLocked())

@@ -1013,15 +1013,16 @@
       "interfaces": [
         {
           "name": "zwlr_screencopy_manager_v1",
-          "current_version": null,
+          "current_version": 3,
           "target_version": 3
         }
       ],
-      "status": "not_started",
+      "status": "done",
       "privileged": true,
       "blocked_by": [
         "image-copy-capture"
-      ]
+      ],
+      "status_detail": "Version 3 captures complete outputs and clipped logical output regions into ARGB8888 wl_shm buffers or CPU-mappable linear ARGB8888 DMA-BUFs. Cursor overlay requests, copy and copy-with-damage, full conservative damage, output invalidation, frame timestamps, buffer validation, and Y-inversion flags are supported. Fractional-scale region boundaries match the corresponding physical pixels in full-output captures. The privileged global is security-context filtered."
     },
     {
       "id": "xwayland-shell",

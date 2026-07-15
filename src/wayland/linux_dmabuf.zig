@@ -562,6 +562,14 @@ pub const Buffer = struct {
         return self.descriptor.size;
     }
 
+    pub fn format(self: *const Buffer) u32 {
+        return self.descriptor.format;
+    }
+
+    pub fn yInverted(self: *const Buffer) bool {
+        return self.descriptor.y_inverted;
+    }
+
     pub fn copyPixels(
         self: *const Buffer,
         allocator: std.mem.Allocator,
