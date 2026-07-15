@@ -7,6 +7,7 @@ const wayland = @import("wayland");
 const DataDevice = @import("../wayland/data_device.zig");
 const PrimarySelection = @import("../wayland/primary_selection.zig");
 const Surface = @import("../wayland/surface.zig");
+const Xdnd = @import("dnd.zig");
 const XSelection = @import("selection.zig");
 
 const c = @import("xcb.zig").c;
@@ -25,6 +26,8 @@ focused_window: ?WindowId,
 xfixes_event_base: u8,
 clipboard_selection: XSelection,
 primary_selection: XSelection,
+dnd_selection: XSelection,
+dnd: Xdnd,
 listener: Listener,
 
 pub const WindowId = u32;
@@ -115,6 +118,20 @@ const Atom = enum {
     selection_data,
     incr,
     text,
+    xdnd_selection,
+    xdnd_aware,
+    xdnd_status,
+    xdnd_position,
+    xdnd_enter,
+    xdnd_leave,
+    xdnd_drop,
+    xdnd_finished,
+    xdnd_proxy,
+    xdnd_type_list,
+    xdnd_action_move,
+    xdnd_action_copy,
+    xdnd_action_ask,
+    xdnd_action_private,
 };
 
 const atom_count = std.meta.fields(Atom).len;
@@ -143,6 +160,20 @@ const atom_names: [atom_count][]const u8 = .{
     "_KEYWORK_SELECTION",
     "INCR",
     "TEXT",
+    "XdndSelection",
+    "XdndAware",
+    "XdndStatus",
+    "XdndPosition",
+    "XdndEnter",
+    "XdndLeave",
+    "XdndDrop",
+    "XdndFinished",
+    "XdndProxy",
+    "XdndTypeList",
+    "XdndActionMove",
+    "XdndActionCopy",
+    "XdndActionAsk",
+    "XdndActionPrivate",
 };
 
 pub const Listener = struct {
@@ -198,6 +229,8 @@ pub fn init(
         .xfixes_event_base = 0,
         .clipboard_selection = undefined,
         .primary_selection = undefined,
+        .dnd_selection = undefined,
+        .dnd = undefined,
         .listener = listener,
     };
 
@@ -271,6 +304,44 @@ pub fn init(
         .{ .primary = primary_selection },
     );
     errdefer self.primary_selection.deinit();
+    try self.dnd_selection.init(
+        allocator,
+        event_loop,
+        connection,
+        screen,
+        .{
+            .selection = self.atomValue(.xdnd_selection),
+            .targets = self.atomValue(.targets),
+            .selection_data = self.atomValue(.selection_data),
+            .incr = self.atomValue(.incr),
+            .utf8_string = self.atomValue(.utf8_string),
+            .text = self.atomValue(.text),
+        },
+        .{ .drag = data_device },
+    );
+    errdefer self.dnd_selection.deinit();
+    try self.dnd.init(
+        allocator,
+        connection,
+        data_device,
+        &self.dnd_selection,
+        .{
+            .aware = self.atomValue(.xdnd_aware),
+            .enter = self.atomValue(.xdnd_enter),
+            .position = self.atomValue(.xdnd_position),
+            .status = self.atomValue(.xdnd_status),
+            .leave = self.atomValue(.xdnd_leave),
+            .drop = self.atomValue(.xdnd_drop),
+            .finished = self.atomValue(.xdnd_finished),
+            .proxy = self.atomValue(.xdnd_proxy),
+            .type_list = self.atomValue(.xdnd_type_list),
+            .action_copy = self.atomValue(.xdnd_action_copy),
+            .action_move = self.atomValue(.xdnd_action_move),
+            .action_ask = self.atomValue(.xdnd_action_ask),
+            .action_private = self.atomValue(.xdnd_action_private),
+        },
+    );
+    errdefer self.dnd.deinit();
     if (c.xcb_flush(connection) <= 0) return error.XcbFlushFailed;
 
     const event_fd = c.xcb_get_file_descriptor(connection);
@@ -287,6 +358,8 @@ pub fn init(
 
 pub fn deinit(self: *Self) void {
     self.event_source.remove();
+    self.dnd.deinit();
+    self.dnd_selection.deinit();
     self.primary_selection.deinit();
     self.clipboard_selection.deinit();
     while (self.windows.count() > 0) {
@@ -338,6 +411,32 @@ pub fn windowInfo(self: *const Self, window_id: WindowId) ?WindowInfo {
 
 pub fn windowForSerial(self: *const Self, serial: u64) ?WindowId {
     return self.serial_windows.get(serial);
+}
+
+pub fn dragStarted(self: *Self) void {
+    self.dnd.dragStarted();
+}
+
+pub fn dragMotion(self: *Self, window_id: WindowId, time: u32, x: f64, y: f64) void {
+    const window = self.windows.get(window_id) orelse return self.dnd.dragLeft();
+    if (!window.mapped) return self.dnd.dragLeft();
+    self.dnd.dragMotion(window_id, time, x, y);
+}
+
+pub fn dragLeft(self: *Self) void {
+    self.dnd.dragLeft();
+}
+
+pub fn dropDrag(self: *Self, time: u32) bool {
+    return self.dnd.drop(time);
+}
+
+pub fn physicalDragEnded(self: *Self) void {
+    self.dnd.physicalDragEnded();
+}
+
+pub fn dragSourceDestroyed(self: *Self, generation: u64) void {
+    self.dnd.sourceDestroyed(generation);
 }
 
 pub fn focusWindow(self: *Self, requested_window: ?WindowId) error{XcbFlushFailed}!void {
@@ -1098,6 +1197,7 @@ fn dispatchEvent(self: *Self, event: [*c]c.xcb_generic_event_t) !void {
     if (response_type == self.xfixes_event_base + c.XCB_XFIXES_SELECTION_NOTIFY) {
         self.clipboard_selection.handleXfixesNotify(@ptrCast(event));
         self.primary_selection.handleXfixesNotify(@ptrCast(event));
+        self.dnd_selection.handleXfixesNotify(@ptrCast(event));
         return;
     }
     switch (response_type) {
@@ -1114,6 +1214,7 @@ fn dispatchEvent(self: *Self, event: [*c]c.xcb_generic_event_t) !void {
         c.XCB_SELECTION_NOTIFY => {
             self.clipboard_selection.handleNotify(@ptrCast(event));
             self.primary_selection.handleNotify(@ptrCast(event));
+            self.dnd_selection.handleNotify(@ptrCast(event));
         },
         else => {},
     }
@@ -1123,6 +1224,7 @@ fn handleCreate(self: *Self, event: *const c.xcb_create_notify_event_t) !void {
     if (event.window == self.wm_window or
         self.clipboard_selection.ownsWindow(event.window) or
         self.primary_selection.ownsWindow(event.window) or
+        self.dnd_selection.ownsWindow(event.window) or
         self.windows.contains(event.window)) return;
     const window: Window = .{
         .geometry = .{
@@ -1148,6 +1250,8 @@ fn handleCreate(self: *Self, event: *const c.xcb_create_notify_event_t) !void {
 fn handleDestroy(self: *Self, event: *const c.xcb_destroy_notify_event_t) void {
     self.clipboard_selection.handleRequestorDestroyed(event.window);
     self.primary_selection.handleRequestorDestroyed(event.window);
+    self.dnd_selection.handleRequestorDestroyed(event.window);
+    self.dnd.windowDestroyed(event.window);
     self.removeWindow(event.window);
 }
 
@@ -1156,6 +1260,8 @@ fn handleSelectionRequest(self: *Self, event: *const c.xcb_selection_request_eve
         self.clipboard_selection.handleRequest(event);
     } else if (self.primary_selection.handlesSelection(event.selection)) {
         self.primary_selection.handleRequest(event);
+    } else if (self.dnd_selection.handlesSelection(event.selection)) {
+        self.dnd_selection.handleRequest(event);
     }
 }
 
@@ -1241,6 +1347,7 @@ fn handleUnmapNotify(self: *Self, event: *const c.xcb_unmap_notify_event_t) void
 fn handlePropertyNotify(self: *Self, event: *const c.xcb_property_notify_event_t) !void {
     if (self.clipboard_selection.handlePropertyNotify(event)) return;
     if (self.primary_selection.handlePropertyNotify(event)) return;
+    if (self.dnd_selection.handlePropertyNotify(event)) return;
     const window = self.windows.getPtr(event.window) orelse return;
     if (event.atom == self.atomValue(.net_wm_name) or
         event.atom == c.XCB_ATOM_WM_NAME or
@@ -1373,6 +1480,7 @@ fn handleClientMessage(
     event: *const c.xcb_client_message_event_t,
 ) !void {
     if (event.format != 32) return;
+    if (self.dnd.handleClientMessage(event)) return;
     if (event.type == self.atomValue(.wm_change_state)) {
         self.handleWmChangeStateMessage(event);
         return;

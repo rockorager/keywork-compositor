@@ -27,8 +27,10 @@ selection: ?Selection,
 selection_serial: u32,
 selection_generation: u64,
 selection_listeners: std.ArrayList(SelectionListener),
+drag_selection_listeners: std.ArrayList(SelectionListener),
 focused_client: ?*wl.Client,
 drag: ?DragState,
+retained_external_drag: ?RetainedExternalDrag,
 next_drag_generation: u64,
 drag_icon: ?*DragIcon,
 
@@ -36,6 +38,7 @@ pub const Listener = struct {
     context: *anyopaque,
     started: *const fn (*anyopaque) void,
     ended: *const fn (*anyopaque) void,
+    external_source_destroyed: *const fn (*anyopaque, u64) void,
     repaint: *const fn (*anyopaque) void,
 };
 
@@ -117,6 +120,17 @@ const DragState = struct {
     };
 };
 
+const RetainedExternalDrag = struct {
+    generation: u64,
+    source: SourceId,
+};
+
+pub const DragSourceInfo = struct {
+    generation: u64,
+    mime_types: []const [:0]const u8,
+    actions: wl.DataDeviceManager.DndAction,
+};
+
 const DragIcon = struct {
     manager: *Self,
     surface: *Surface,
@@ -194,8 +208,10 @@ pub fn init(
         .selection_serial = 0,
         .selection_generation = 0,
         .selection_listeners = .empty,
+        .drag_selection_listeners = .empty,
         .focused_client = null,
         .drag = null,
+        .retained_external_drag = null,
         .next_drag_generation = 0,
         .drag_icon = null,
     };
@@ -206,6 +222,7 @@ pub fn init(
     errdefer self.offers.deinit(allocator);
     errdefer self.offer_adapters.deinit(allocator);
     errdefer self.selection_listeners.deinit(allocator);
+    errdefer self.drag_selection_listeners.deinit(allocator);
     self.global = try wl.Global.create(display, wl.DataDeviceManager, 4, *Self, self, bind);
     errdefer self.global.destroy();
     try seat.addKeyboardFocusListener(.{
@@ -217,6 +234,7 @@ pub fn init(
 pub fn deinit(self: *Self) void {
     self.cancelDrag(false);
     std.debug.assert(self.selection_listeners.items.len == 0);
+    std.debug.assert(self.drag_selection_listeners.items.len == 0);
     self.seat.removeKeyboardFocusListener(self);
     self.global.destroy();
     std.debug.assert(self.sources.len() == 0);
@@ -232,6 +250,7 @@ pub fn deinit(self: *Self) void {
     self.device_adapters.deinit(self.allocator);
     self.devices.deinit(self.allocator);
     self.selection_listeners.deinit(self.allocator);
+    self.drag_selection_listeners.deinit(self.allocator);
     self.* = undefined;
 }
 
@@ -538,6 +557,7 @@ fn startDrag(
         };
     } else null;
 
+    self.cancelRetainedExternalDrag();
     self.next_drag_generation = std.math.add(u64, self.next_drag_generation, 1) catch 1;
     if (source_id) |id| self.sources.get(id).?.used = true;
     self.drag_icon = icon;
@@ -548,6 +568,7 @@ fn startDrag(
         .origin = origin.handle(),
     };
     self.seat.setDragCursorController(client);
+    self.notifyDragSelectionChanged();
     self.listener.started(self.listener.context);
     self.listener.repaint(self.listener.context);
 }
@@ -627,6 +648,98 @@ pub fn drop(self: *Self) void {
 
 pub fn cancel(self: *Self) void {
     self.cancelDrag(true);
+}
+
+pub fn dragSourceInfo(self: *Self) ?DragSourceInfo {
+    const generation, const source = self.currentDragSource() orelse return null;
+    return .{
+        .generation = generation,
+        .mime_types = @ptrCast(source.mime_types.items),
+        .actions = sourceActions(source),
+    };
+}
+
+pub fn sendDragSelection(self: *Self, mime_type: [*:0]const u8, fd: std.posix.fd_t) void {
+    const current = self.currentDragSource() orelse return;
+    const source = current[1];
+    if (!sourceHasMime(source, mime_type)) return;
+    source.resource.sendTarget(mime_type);
+    source.resource.sendSend(mime_type, fd);
+}
+
+pub fn externalDragStatus(
+    self: *Self,
+    generation: u64,
+    accepted: bool,
+    selected: wl.DataDeviceManager.DndAction,
+) void {
+    const drag = self.drag orelse return;
+    if (drag.generation != generation) return;
+    const source_id = drag.source orelse return;
+    const source = self.sources.get(source_id) orelse return;
+    if (!accepted) source.resource.sendTarget(null);
+    if (source.resource.getVersion() >= 3) source.resource.sendAction(if (accepted) selected else .{});
+}
+
+pub fn dropOnExternalTarget(
+    self: *Self,
+    generation: u64,
+    accepted: bool,
+) bool {
+    const drag = self.drag orelse return false;
+    if (drag.generation != generation) return false;
+    const source_id = drag.source orelse {
+        self.finishPhysicalDrag();
+        return false;
+    };
+    const source = self.sources.get(source_id) orelse {
+        self.finishPhysicalDrag();
+        return false;
+    };
+    if (accepted) {
+        if (source.resource.getVersion() >= 3) source.resource.sendDndDropPerformed();
+        self.retained_external_drag = .{
+            .generation = generation,
+            .source = source_id,
+        };
+    } else {
+        self.cancelDndSource(source_id);
+    }
+    self.invalidateDragGeneration(generation);
+    self.finishPhysicalDrag();
+    return accepted;
+}
+
+pub fn finishExternalDrag(self: *Self, generation: u64, performed: bool) void {
+    const retained = self.retained_external_drag orelse return;
+    if (retained.generation != generation) return;
+    if (self.sources.get(retained.source)) |source| {
+        if (source.resource.getVersion() >= 3) {
+            if (performed) {
+                source.resource.sendDndFinished();
+            } else {
+                source.resource.sendCancelled();
+            }
+        }
+    }
+    self.retained_external_drag = null;
+    self.notifyDragSelectionChanged();
+}
+
+pub fn addDragSelectionListener(self: *Self, listener: SelectionListener) error{OutOfMemory}!void {
+    for (self.drag_selection_listeners.items) |existing| {
+        std.debug.assert(existing.context != listener.context);
+    }
+    try self.drag_selection_listeners.append(self.allocator, listener);
+}
+
+pub fn removeDragSelectionListener(self: *Self, context: *anyopaque) void {
+    for (self.drag_selection_listeners.items, 0..) |listener, index| {
+        if (listener.context != context) continue;
+        _ = self.drag_selection_listeners.orderedRemove(index);
+        return;
+    }
+    unreachable;
 }
 
 pub fn iconInfo(self: *const Self) ?IconInfo {
@@ -775,6 +888,7 @@ fn sendLeave(self: *Self, client: *wl.Client) void {
 fn finishPhysicalDrag(self: *Self) void {
     std.debug.assert(self.drag != null);
     self.drag = null;
+    self.notifyDragSelectionChanged();
     self.clearDragIcon();
     self.seat.setDragCursorController(null);
     self.listener.ended(self.listener.context);
@@ -1098,6 +1212,41 @@ fn sourceDestroyed(self: *Self, id: SourceId) void {
             .external => {},
         }
     }
+    if (self.retained_external_drag) |retained| {
+        if (std.meta.eql(retained.source, id)) {
+            self.retained_external_drag = null;
+            self.notifyDragSelectionChanged();
+            self.listener.external_source_destroyed(
+                self.listener.context,
+                retained.generation,
+            );
+        }
+    }
+}
+
+fn currentDragSource(self: *Self) ?struct { u64, *SourceState } {
+    if (self.drag) |drag| if (drag.source) |source_id| {
+        const source = self.sources.get(source_id) orelse return null;
+        return .{ drag.generation, source };
+    };
+    if (self.retained_external_drag) |retained| {
+        const source = self.sources.get(retained.source) orelse return null;
+        return .{ retained.generation, source };
+    }
+    return null;
+}
+
+fn cancelRetainedExternalDrag(self: *Self) void {
+    const retained = self.retained_external_drag orelse return;
+    if (self.sources.get(retained.source)) |source| {
+        if (source.resource.getVersion() >= 3) source.resource.sendCancelled();
+    }
+    self.retained_external_drag = null;
+    self.notifyDragSelectionChanged();
+}
+
+fn notifyDragSelectionChanged(self: *Self) void {
+    for (self.drag_selection_listeners.items) |listener| listener.changed(listener.context);
 }
 
 fn deviceDestroyed(self: *Self, id: DeviceId) void {

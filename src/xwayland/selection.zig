@@ -43,6 +43,7 @@ pub const Atoms = struct {
 pub const WaylandSelection = union(enum) {
     clipboard: *DataDevice,
     primary: *PrimarySelection,
+    drag: *DataDevice,
 
     fn addListener(self: WaylandSelection, listener: DataDevice.SelectionListener) !void {
         switch (self) {
@@ -52,6 +53,7 @@ pub const WaylandSelection = union(enum) {
                 .changed = listener.changed,
                 .offered = listener.offered,
             }),
+            .drag => |selection| try selection.addDragSelectionListener(listener),
         }
     }
 
@@ -59,6 +61,7 @@ pub const WaylandSelection = union(enum) {
         switch (self) {
             .clipboard => |selection| selection.removeSelectionListener(context),
             .primary => |selection| selection.removeSelectionListener(context),
+            .drag => |selection| selection.removeDragSelectionListener(context),
         }
     }
 
@@ -66,6 +69,7 @@ pub const WaylandSelection = union(enum) {
         return switch (self) {
             .clipboard => |selection| selection.hasSelection(),
             .primary => |selection| selection.hasSelection(),
+            .drag => |selection| selection.dragSourceInfo() != null,
         };
     }
 
@@ -73,6 +77,7 @@ pub const WaylandSelection = union(enum) {
         return switch (self) {
             .clipboard => |selection| selection.selectionMimeTypes(),
             .primary => |selection| selection.selectionMimeTypes(),
+            .drag => |selection| if (selection.dragSourceInfo()) |source| source.mime_types else &.{},
         };
     }
 
@@ -80,6 +85,7 @@ pub const WaylandSelection = union(enum) {
         switch (self) {
             .clipboard => |selection| selection.sendSelection(mime_type, fd),
             .primary => |selection| selection.sendSelection(mime_type, fd),
+            .drag => |selection| selection.sendDragSelection(mime_type, fd),
         }
     }
 
@@ -87,6 +93,7 @@ pub const WaylandSelection = union(enum) {
         return switch (self) {
             .clipboard => |selection| selection.externalSelectionIs(source),
             .primary => |selection| selection.externalSelectionIs(source),
+            .drag => false,
         };
     }
 
@@ -94,6 +101,7 @@ pub const WaylandSelection = union(enum) {
         switch (self) {
             .clipboard => |selection| selection.setExternalSelection(source),
             .primary => |selection| selection.setExternalSelection(source),
+            .drag => {},
         }
     }
 
@@ -101,7 +109,15 @@ pub const WaylandSelection = union(enum) {
         switch (self) {
             .clipboard => |selection| selection.externalSourceDestroyed(source),
             .primary => |selection| selection.externalSourceDestroyed(source),
+            .drag => {},
         }
+    }
+
+    fn supportsExternal(self: WaylandSelection) bool {
+        return switch (self) {
+            .clipboard, .primary => true,
+            .drag => false,
+        };
     }
 };
 
@@ -503,6 +519,14 @@ pub fn handlesSelection(self: *const Self, atom: c.xcb_atom_t) bool {
     return self.atoms.selection == atom;
 }
 
+pub fn ownerWindow(self: *const Self) c.xcb_window_t {
+    return self.window;
+}
+
+pub fn targetAtomForMime(self: *Self, mime_type: [:0]const u8) ?c.xcb_atom_t {
+    return self.mimeAtom(mime_type);
+}
+
 pub fn ownsWindow(self: *const Self, window: c.xcb_window_t) bool {
     if (self.window == window) return true;
     for (self.incoming_transfers.items) |transfer| {
@@ -554,6 +578,7 @@ pub fn handleXfixesNotify(self: *Self, event: *const c.xcb_xfixes_selection_noti
         }
         return;
     }
+    if (!self.wayland_selection.supportsExternal()) return;
     self.requestTargets(event.timestamp);
 }
 
@@ -632,7 +657,9 @@ fn discoverCurrentOwner(self: *Self) void {
     ) orelse return;
     defer std.c.free(reply);
     self.owner = reply.*.owner;
-    if (self.owner != c.XCB_WINDOW_NONE and self.owner != self.window) {
+    if (self.wayland_selection.supportsExternal() and
+        self.owner != c.XCB_WINDOW_NONE and self.owner != self.window)
+    {
         self.requestTargets(c.XCB_CURRENT_TIME);
     }
 }
