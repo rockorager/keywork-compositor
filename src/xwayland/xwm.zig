@@ -59,6 +59,22 @@ pub const WindowType = enum {
     combo,
     dnd,
     normal,
+
+    pub fn participatesInWindowManagement(self: WindowType) bool {
+        return switch (self) {
+            .normal, .dialog, .utility, .toolbar, .menu => true,
+            .desktop,
+            .dock,
+            .splash,
+            .dropdown_menu,
+            .popup_menu,
+            .tooltip,
+            .notification,
+            .combo,
+            .dnd,
+            => false,
+        };
+    }
 };
 
 pub const WindowInfo = struct {
@@ -79,6 +95,15 @@ pub const WindowInfo = struct {
     fullscreen: bool,
     maximized: bool,
     minimized: bool,
+
+    pub fn participatesInWindowManagement(self: WindowInfo) bool {
+        return self.mapped and !self.override_redirect and
+            self.window_type.participatesInWindowManagement();
+    }
+
+    pub fn appearsInForeignToplevelList(self: WindowInfo) bool {
+        return self.participatesInWindowManagement();
+    }
 };
 
 const Window = struct {
@@ -1774,4 +1799,16 @@ test "EWMH window type fallback follows transient and override-redirect rules" {
     try std.testing.expectEqual(WindowType.dialog, defaultWindowType(false, true));
     try std.testing.expectEqual(WindowType.normal, defaultWindowType(true, false));
     try std.testing.expectEqual(WindowType.normal, defaultWindowType(true, true));
+}
+
+test "EWMH auxiliary window types bypass toplevel policy" {
+    try std.testing.expect(WindowType.normal.participatesInWindowManagement());
+    try std.testing.expect(WindowType.dialog.participatesInWindowManagement());
+    try std.testing.expect(WindowType.utility.participatesInWindowManagement());
+    try std.testing.expect(!WindowType.desktop.participatesInWindowManagement());
+    try std.testing.expect(!WindowType.dock.participatesInWindowManagement());
+    try std.testing.expect(!WindowType.splash.participatesInWindowManagement());
+    try std.testing.expect(!WindowType.tooltip.participatesInWindowManagement());
+    try std.testing.expect(!WindowType.notification.participatesInWindowManagement());
+    try std.testing.expect(!WindowType.dnd.participatesInWindowManagement());
 }

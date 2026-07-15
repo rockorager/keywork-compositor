@@ -3395,8 +3395,9 @@ fn xwmWindowConfigured(
 fn xwmWindowMetadataChanged(context: *anyopaque, window_id: Xwm.WindowId) void {
     const self: *Self = @ptrCast(@alignCast(context));
     const info = self.xwm.windowInfo(window_id) orelse return;
-    log.debug("X11 window {d} metadata changed: app_id={?s} title={?s}", .{
+    log.debug("X11 window {d} metadata changed: type={s} app_id={?s} title={?s}", .{
         window_id,
+        @tagName(info.window_type),
         info.app_id,
         info.title,
     });
@@ -3404,7 +3405,10 @@ fn xwmWindowMetadataChanged(context: *anyopaque, window_id: Xwm.WindowId) void {
         self.window_manager.xwaylandWindowMetadataChanged(window_id);
     }
     if (self.foreign_toplevel_list_initialized) {
-        self.foreign_toplevel_list.xwaylandWindowMetadataChanged(window_id);
+        self.foreign_toplevel_list.xwaylandWindowMetadataChanged(window_id) catch {
+            log.err("failed to update X11 foreign-toplevel metadata", .{});
+            return self.terminate();
+        };
     }
 }
 

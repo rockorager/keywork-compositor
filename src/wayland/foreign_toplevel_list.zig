@@ -787,7 +787,7 @@ pub fn xwaylandWindowAssociated(
     surface_id: Surface.Id,
 ) error{OutOfMemory}!void {
     const info = self.xwayland.window_info(self.xwayland.context, window_id) orelse return;
-    if (!info.mapped or info.override_redirect or self.mappingForXwayland(window_id) != null) return;
+    if (!info.appearsInForeignToplevelList() or self.mappingForXwayland(window_id) != null) return;
     try self.addMapping(.{ .xwayland = window_id }, surface_id);
 }
 
@@ -807,7 +807,7 @@ pub fn xwaylandWindowMapped(
     }
     if (self.mappingForXwayland(window_id) != null) return;
     const info = self.xwayland.window_info(self.xwayland.context, window_id) orelse return;
-    if (info.override_redirect) return;
+    if (!info.appearsInForeignToplevelList()) return;
     try self.addMapping(.{ .xwayland = window_id }, surface_id orelse return);
 }
 
@@ -822,12 +822,25 @@ pub fn xwaylandWindowConfigured(
         return;
     }
     const info = self.xwayland.window_info(self.xwayland.context, window_id) orelse return;
-    if (!info.mapped or self.mappingForXwayland(window_id) != null) return;
+    if (!info.appearsInForeignToplevelList() or self.mappingForXwayland(window_id) != null) return;
     try self.addMapping(.{ .xwayland = window_id }, surface_id orelse return);
 }
 
-pub fn xwaylandWindowMetadataChanged(self: *Self, window_id: Xwm.WindowId) void {
-    self.sendMetadata(self.mappingForXwayland(window_id) orelse return);
+pub fn xwaylandWindowMetadataChanged(
+    self: *Self,
+    window_id: Xwm.WindowId,
+) error{OutOfMemory}!void {
+    const info = self.xwayland.window_info(self.xwayland.context, window_id) orelse return;
+    const mapping = self.mappingForXwayland(window_id);
+    if (!info.appearsInForeignToplevelList()) {
+        self.removeMapping(mapping orelse return);
+        return;
+    }
+    if (mapping) |id| {
+        self.sendMetadata(id);
+    } else {
+        try self.addMapping(.{ .xwayland = window_id }, info.surface_id orelse return);
+    }
 }
 
 pub fn xwaylandWindowStateChanged(self: *Self, window_id: Xwm.WindowId) void {

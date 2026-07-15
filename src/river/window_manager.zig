@@ -829,7 +829,7 @@ fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
     var xwayland_windows = self.known_xwayland_windows.iterator();
     while (xwayland_windows.next()) |entry| {
         const info = self.xwayland.window_info(self.xwayland.context, entry.key_ptr.*) orelse continue;
-        if (!info.mapped or info.override_redirect) continue;
+        if (!info.participatesInWindowManagement()) continue;
         const managed_id = self.ensureXwaylandWindow(entry.key_ptr.*) catch {
             resource.postNoMemory();
             return;
@@ -905,7 +905,7 @@ fn ensureXwaylandWindow(self: *Self, xwayland_id: Xwm.WindowId) error{OutOfMemor
     if (self.findXwaylandWindow(xwayland_id)) |id| return id;
     const known = self.known_xwayland_windows.get(xwayland_id) orelse unreachable;
     const info = self.xwayland.window_info(self.xwayland.context, xwayland_id) orelse unreachable;
-    std.debug.assert(info.mapped and !info.override_redirect);
+    std.debug.assert(info.participatesInWindowManagement());
     const identifier = self.next_window_identifier;
     self.next_window_identifier = std.math.add(u64, identifier, 1) catch unreachable;
     return self.windows.insert(self.allocator, .{
@@ -948,7 +948,7 @@ pub fn xwaylandWindowAssociated(
     });
     if (self.active == null) return;
     const info = self.xwayland.window_info(self.xwayland.context, xwayland_id) orelse return;
-    if (!info.mapped or info.override_redirect) return;
+    if (!info.participatesInWindowManagement()) return;
     const id = try self.ensureXwaylandWindow(xwayland_id);
     if (info.fullscreen) try self.appendXwaylandFullscreenRequest(id, true, null);
     if (info.maximized) try self.appendXwaylandMaximizeRequest(id, true);
@@ -972,7 +972,7 @@ pub fn xwaylandWindowMapped(self: *Self, xwayland_id: Xwm.WindowId, mapped: bool
     const manager = self.active orelse return;
     if (!self.known_xwayland_windows.contains(xwayland_id)) return;
     const info = self.xwayland.window_info(self.xwayland.context, xwayland_id) orelse return;
-    if (!info.mapped or info.override_redirect) return;
+    if (!info.participatesInWindowManagement()) return;
     const id = self.ensureXwaylandWindow(xwayland_id) catch {
         manager.postNoMemory();
         return;
@@ -1019,7 +1019,15 @@ pub fn xwaylandWindowConfigured(
 }
 
 pub fn xwaylandWindowMetadataChanged(self: *Self, xwayland_id: Xwm.WindowId) void {
-    const id = self.findXwaylandWindow(xwayland_id) orelse return;
+    const info = self.xwayland.window_info(self.xwayland.context, xwayland_id) orelse return;
+    if (!info.participatesInWindowManagement()) {
+        self.removeXwaylandWindow(xwayland_id);
+        return;
+    }
+    const id = self.findXwaylandWindow(xwayland_id) orelse {
+        self.xwaylandWindowMapped(xwayland_id, true);
+        return;
+    };
     const window = self.windows.get(id) orelse return;
     window.metadata_dirty = true;
     self.requestManage();
@@ -1033,7 +1041,7 @@ pub fn xwaylandWindowFullscreenRequested(
 ) void {
     const manager = self.active orelse return;
     const info = self.xwayland.window_info(self.xwayland.context, xwayland_id) orelse return;
-    if (!info.mapped or info.override_redirect or
+    if (!info.participatesInWindowManagement() or
         !self.known_xwayland_windows.contains(xwayland_id)) return;
     const id = self.ensureXwaylandWindow(xwayland_id) catch {
         manager.postNoMemory();
@@ -1065,7 +1073,7 @@ pub fn xwaylandWindowMaximizeRequested(
 ) void {
     const manager = self.active orelse return;
     const info = self.xwayland.window_info(self.xwayland.context, xwayland_id) orelse return;
-    if (!info.mapped or info.override_redirect or
+    if (!info.participatesInWindowManagement() or
         !self.known_xwayland_windows.contains(xwayland_id)) return;
     const id = self.ensureXwaylandWindow(xwayland_id) catch {
         manager.postNoMemory();
@@ -1096,7 +1104,7 @@ pub fn xwaylandWindowMinimizeRequested(
 ) void {
     const manager = self.active orelse return;
     const info = self.xwayland.window_info(self.xwayland.context, xwayland_id) orelse return;
-    if (!info.mapped or info.override_redirect or
+    if (!info.participatesInWindowManagement() or
         !self.known_xwayland_windows.contains(xwayland_id)) return;
     const id = self.ensureXwaylandWindow(xwayland_id) catch {
         manager.postNoMemory();
@@ -1126,7 +1134,7 @@ pub fn xwaylandWindowActivationRequested(
 ) void {
     const manager = self.active orelse return;
     const info = self.xwayland.window_info(self.xwayland.context, xwayland_id) orelse return;
-    if (!info.mapped or info.override_redirect or
+    if (!info.participatesInWindowManagement() or
         !self.known_xwayland_windows.contains(xwayland_id)) return;
     const id = self.ensureXwaylandWindow(xwayland_id) catch {
         manager.postNoMemory();
