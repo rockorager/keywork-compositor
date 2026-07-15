@@ -489,6 +489,12 @@ pub fn outputRemoved(self: *Self, output_id: OutputLayout.Id) void {
         output_resource.removed = true;
         output_resource.resource.sendRemoved();
     }
+    for (self.layer_bindings.items) |binding| {
+        for (binding.outputs.items) |output| {
+            const attached_id = output.output_id orelse continue;
+            if (std.meta.eql(attached_id, output_id)) output.output_id = null;
+        }
+    }
 
     const replacement = if (std.meta.eql(self.output_id, output_id)) null else self.output_id;
     var windows = self.windows.iterator();
@@ -1211,11 +1217,14 @@ fn requestManage(self: *Self) void {
 fn sendPendingState(self: *Self, manager: *river.WindowManagerV1) !void {
     self.layer_focus_sent = self.layer_focus;
     for (self.layer_bindings.items) |binding| if (binding.active()) {
-        if (binding.output) |output| if (output.sent_area == null or !std.meta.eql(output.sent_area.?, self.layer_area)) {
-            const area = self.layer_area;
-            output.resource.sendNonExclusiveArea(area.x, area.y, area.width, area.height);
-            output.sent_area = area;
-        };
+        for (binding.outputs.items) |output| {
+            const output_id = output.output_id orelse continue;
+            const area = self.layer_shell.usableAreaFor(output_id) orelse continue;
+            if (output.sent_area == null or !std.meta.eql(output.sent_area.?, area)) {
+                output.resource.sendNonExclusiveArea(area.x, area.y, area.width, area.height);
+                output.sent_area = area;
+            }
+        }
         if (binding.seat) |seat| if (seat.sent_focus == null or seat.sent_focus.? != self.layer_focus) {
             switch (self.layer_focus) {
                 .exclusive => seat.resource.sendFocusExclusive(),
@@ -1645,6 +1654,10 @@ fn finishRender(self: *Self, manager: *river.WindowManagerV1) void {
             self.windowFocusedByAnySeat(entry.id),
         );
         self.xdg_shell.setWindowFullscreen(xdg_id, entry.value.fullscreen_output != null);
+        self.scene.setEffects(
+            entry.value.scene_id,
+            windowEffects(entry.value.sent_configuration, entry.value.fullscreen_output != null),
+        );
         switch (entry.value.pending_borders) {
             .unchanged => {},
             .set => |borders| {
@@ -1787,6 +1800,10 @@ fn finishXwaylandWindowRender(
 
     self.scene.setFocused(window.scene_id, self.windowFocusedByAnySeat(id));
     self.scene.setFullscreen(window.scene_id, window.fullscreen_output != null);
+    self.scene.setEffects(
+        window.scene_id,
+        windowEffects(window.sent_configuration, window.fullscreen_output != null),
+    );
     if (window.resource != null) {
         self.xwayland.set_fullscreen(
             self.xwayland.context,
@@ -1841,6 +1858,12 @@ fn finishXwaylandWindowRender(
         self.scene.setContentClipBox(window.scene_id, window.content_clip_box);
     }
     self.xwayland.refresh_scene(self.xwayland.context, xwayland_id);
+}
+
+fn windowEffects(configuration: XdgShell.ToplevelConfigure, fullscreen: bool) Scene.Effects {
+    const tiled: u8 = @bitCast(configuration.tiled);
+    if (fullscreen or configuration.maximized or tiled != 0) return .{};
+    return Scene.default_effects;
 }
 
 fn xwaylandCoordinate(value: i32) i16 {
@@ -1967,15 +1990,32 @@ fn layerSupported(context: *anyopaque) bool {
 
 fn layerChanged(context: *anyopaque, area: LayerShell.Rect, focus: LayerShell.FocusClass) void {
     const self: *Self = @ptrCast(@alignCast(context));
-    if (std.meta.eql(self.layer_area, area) and self.layer_focus == focus) return;
+    var changed = !std.meta.eql(self.layer_area, area) or self.layer_focus != focus;
     self.layer_area = area;
     self.layer_focus = focus;
+    if (!changed) for (self.layer_bindings.items) |binding| {
+        if (!binding.active()) continue;
+        for (binding.outputs.items) |output| {
+            const output_id = output.output_id orelse continue;
+            const current = self.layer_shell.usableAreaFor(output_id) orelse continue;
+            if (output.sent_area == null or !std.meta.eql(output.sent_area.?, current)) {
+                changed = true;
+                break;
+            }
+        }
+        if (changed) break;
+    };
+    if (!changed) return;
     self.requestManage();
 }
 
-fn hasLayerOutput(self: *Self) bool {
+fn hasLayerOutput(self: *Self, output_id: OutputLayout.Id) bool {
     for (self.layer_bindings.items) |binding| {
-        if (binding.active() and binding.output != null) return true;
+        if (!binding.active()) continue;
+        for (binding.outputs.items) |output| {
+            const attached_id = output.output_id orelse continue;
+            if (std.meta.eql(attached_id, output_id)) return true;
+        }
     }
     return false;
 }
@@ -1991,7 +2031,7 @@ const LayerBinding = struct {
     manager: *Self,
     resource: *river.LayerShellV1,
     owner_generation: ?u64 = null,
-    output: ?*LayerOutput = null,
+    outputs: std.ArrayList(*LayerOutput) = .empty,
     seat: ?*LayerSeat = null,
 
     fn active(self: *LayerBinding) bool {
@@ -2000,9 +2040,9 @@ const LayerBinding = struct {
     }
 
     fn beginSession(self: *LayerBinding, generation: ?u64) void {
-        if (self.output) |child| child.binding = null;
+        for (self.outputs.items) |child| child.binding = null;
+        self.outputs.clearRetainingCapacity();
         if (self.seat) |child| child.binding = null;
-        self.output = null;
         self.seat = null;
         self.owner_generation = generation;
     }
@@ -2011,20 +2051,31 @@ const LayerBinding = struct {
         switch (request) {
             .destroy => resource.destroy(),
             .get_output => |get| {
-                if (self.output != null or (self.active() and self.manager.hasLayerOutput())) {
-                    resource.postError(.object_already_created, "layer shell output already created");
-                    return;
-                }
                 const child = LayerOutput.create(self, get.id) catch {
                     resource.postNoMemory();
                     return;
                 };
-                if (!self.active() or !validOutput(self, get.output)) {
+                if (!self.active()) {
                     child.binding = null;
                     return;
                 }
-                self.output = child;
-                child.attached = true;
+                const output_id = self.validOutput(get.output) orelse {
+                    child.binding = null;
+                    return;
+                };
+                if (self.manager.hasLayerOutput(output_id)) {
+                    child.binding = null;
+                    child.resource.destroy();
+                    resource.postError(.object_already_created, "layer shell output already created");
+                    return;
+                }
+                child.output_id = output_id;
+                self.outputs.append(self.manager.allocator, child) catch {
+                    child.binding = null;
+                    child.resource.destroy();
+                    resource.postNoMemory();
+                    return;
+                };
                 self.manager.requestManage();
             },
             .get_seat => |get| {
@@ -2047,11 +2098,13 @@ const LayerBinding = struct {
         }
     }
 
-    fn validOutput(self: *LayerBinding, resource: *river.OutputV1) bool {
-        const data = resource.getUserData() orelse return false;
+    fn validOutput(self: *LayerBinding, resource: *river.OutputV1) ?OutputLayout.Id {
+        const generation = self.owner_generation orelse return null;
+        const data = resource.getUserData() orelse return null;
         const output: *OutputResource = @ptrCast(@alignCast(data));
-        return output.manager == self.manager and output.owner_generation == self.owner_generation.? and
-            resource.getClient() == self.resource.getClient();
+        if (output.manager != self.manager or output.owner_generation != generation or output.removed or
+            resource.getClient() != self.resource.getClient()) return null;
+        return output.output_id;
     }
 
     fn validSeat(self: *LayerBinding, resource: *river.SeatV1) bool {
@@ -2063,7 +2116,8 @@ const LayerBinding = struct {
     }
 
     fn handleDestroy(_: *river.LayerShellV1, self: *LayerBinding) void {
-        if (self.output) |child| child.binding = null;
+        for (self.outputs.items) |child| child.binding = null;
+        self.outputs.deinit(self.manager.allocator);
         if (self.seat) |child| child.binding = null;
         for (self.manager.layer_bindings.items, 0..) |candidate, i| if (candidate == self) {
             _ = self.manager.layer_bindings.swapRemove(i);
@@ -2077,7 +2131,7 @@ const LayerOutput = struct {
     allocator: std.mem.Allocator,
     binding: ?*LayerBinding,
     resource: *river.LayerShellOutputV1,
-    attached: bool = false,
+    output_id: ?OutputLayout.Id = null,
     sent_area: ?LayerShell.Rect = null,
 
     fn create(binding: *LayerBinding, id: u32) !*LayerOutput {
@@ -2091,13 +2145,24 @@ const LayerOutput = struct {
     fn handleRequest(resource: *river.LayerShellOutputV1, request: river.LayerShellOutputV1.Request, self: *LayerOutput) void {
         switch (request) {
             .destroy => resource.destroy(),
-            .set_default => if (self.binding) |binding| if (binding.active() and binding.manager.sequence.state != .manage)
-                binding.manager.active.?.postError(.sequence_order, "set_default outside a manage sequence"),
+            .set_default => if (self.binding) |binding| if (binding.active()) {
+                if (binding.manager.sequence.state != .manage) {
+                    binding.manager.active.?.postError(.sequence_order, "set_default outside a manage sequence");
+                    return;
+                }
+                const output_id = self.output_id orelse return;
+                if (binding.manager.outputs.get(output_id) == null) return;
+                binding.manager.layer_shell.setDefaultOutput(output_id);
+            },
         }
     }
     fn handleDestroy(_: *river.LayerShellOutputV1, self: *LayerOutput) void {
         if (self.binding) |binding| {
-            if (self.attached and binding.output == self) binding.output = null;
+            for (binding.outputs.items, 0..) |output, index| {
+                if (output != self) continue;
+                _ = binding.outputs.swapRemove(index);
+                break;
+            }
         }
         self.allocator.destroy(self);
     }
@@ -3557,6 +3622,91 @@ test "removed River outputs stay inert until the client destroys them" {
     OutputResource.handleRequest(resource, .destroy, adapter);
     try std.testing.expect(client.getObject(resource_id) == null);
     try std.testing.expectEqual(@as(usize, 0), manager.output_resources.items.len);
+}
+
+test "River layer shell accepts one object for each output" {
+    const display = try wl.Server.create();
+    defer display.destroy();
+
+    var sockets: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.CLOEXEC, 0, &sockets),
+    );
+    defer _ = std.c.close(sockets[1]);
+    const client = wl.Client.create(display, sockets[0]) orelse return error.OutOfMemory;
+    defer client.destroy();
+
+    var manager: Self = undefined;
+    manager.allocator = std.testing.allocator;
+    manager.session_generation = 1;
+    manager.sequence = .{ .state = .manage };
+    manager.output_resources = .empty;
+    manager.layer_bindings = .empty;
+
+    const manager_resource = try river.WindowManagerV1.create(client, protocol_version, 0);
+    manager.active = manager_resource;
+    const layer_resource = try river.LayerShellV1.create(client, 1, 0);
+    const binding = try std.testing.allocator.create(LayerBinding);
+    binding.* = .{
+        .manager = &manager,
+        .resource = layer_resource,
+        .owner_generation = manager.session_generation,
+    };
+    try manager.layer_bindings.append(std.testing.allocator, binding);
+    layer_resource.setHandler(*LayerBinding, LayerBinding.handleRequest, LayerBinding.handleDestroy, binding);
+
+    const Test = struct {
+        fn addOutput(target: *Self, target_client: *wl.Client, output_id: OutputLayout.Id) !*OutputResource {
+            const resource = try river.OutputV1.create(target_client, protocol_version, 0);
+            errdefer resource.destroy();
+            const output = try std.testing.allocator.create(OutputResource);
+            errdefer std.testing.allocator.destroy(output);
+            output.* = .{
+                .allocator = std.testing.allocator,
+                .manager = target,
+                .owner_generation = target.session_generation,
+                .output_id = output_id,
+                .resource = resource,
+                .removed = false,
+            };
+            try target.output_resources.append(std.testing.allocator, output);
+            resource.setHandler(*OutputResource, OutputResource.handleRequest, OutputResource.handleDestroy, output);
+            return output;
+        }
+    };
+    const first = try Test.addOutput(&manager, client, .{ .index = 0, .generation = 1 });
+    const second = try Test.addOutput(&manager, client, .{ .index = 1, .generation = 1 });
+    defer {
+        while (binding.outputs.items.len > 0) {
+            binding.outputs.items[binding.outputs.items.len - 1].resource.destroy();
+        }
+        layer_resource.destroy();
+        while (manager.output_resources.items.len > 0) {
+            manager.output_resources.items[manager.output_resources.items.len - 1].resource.destroy();
+        }
+        manager.output_resources.deinit(std.testing.allocator);
+        manager.layer_bindings.deinit(std.testing.allocator);
+        manager_resource.destroy();
+    }
+
+    try std.testing.expect(binding.active());
+    try std.testing.expectEqual(first.output_id, binding.validOutput(first.resource).?);
+    try std.testing.expectEqual(second.output_id, binding.validOutput(second.resource).?);
+    LayerBinding.handleRequest(layer_resource, .{ .get_output = .{ .id = 0, .output = first.resource } }, binding);
+    LayerBinding.handleRequest(layer_resource, .{ .get_output = .{ .id = 0, .output = second.resource } }, binding);
+    try std.testing.expectEqual(@as(usize, 2), binding.outputs.items.len);
+    try std.testing.expect(!std.meta.eql(binding.outputs.items[0].output_id.?, binding.outputs.items[1].output_id.?));
+
+    LayerBinding.handleRequest(layer_resource, .{ .get_output = .{ .id = 0, .output = first.resource } }, binding);
+    try std.testing.expectEqual(@as(usize, 2), binding.outputs.items.len);
+}
+
+test "tiled and fullscreen windows omit floating effects" {
+    try std.testing.expectEqual(Scene.default_effects, windowEffects(.{}, false));
+    try std.testing.expectEqual(Scene.Effects{}, windowEffects(.{ .tiled = .{ .left = true } }, false));
+    try std.testing.expectEqual(Scene.Effects{}, windowEffects(.{ .maximized = true }, false));
+    try std.testing.expectEqual(Scene.Effects{}, windowEffects(.{}, true));
 }
 
 test "window management sequence preserves dirty work across render" {

@@ -100,6 +100,26 @@ pub fn usableArea(self: *const Self) Rect {
     return self.usable_area;
 }
 
+pub fn usableAreaFor(self: *Self, output_id: OutputLayout.Id) ?Rect {
+    const output = self.outputs.get(output_id) orelse return null;
+    var usable = outputBounds(output);
+    var it = self.states.iterator();
+    while (it.next()) |entry| {
+        const state = entry.value;
+        if (!std.meta.eql(state.output_id, output_id)) continue;
+        if (state.awaiting_initial_commit) continue;
+        if (!state.configured and state.adapter.surface.?.state().has_committed == false) continue;
+        if (state.current.zone <= 0) continue;
+        const edge = exclusiveEdge(state.current) orelse continue;
+        subtract(
+            &usable,
+            edge,
+            @as(i64, state.current.zone) + edgeMargin(state.current, edge),
+        );
+    }
+    return usable;
+}
+
 pub fn setDefaultOutput(self: *Self, output_id: OutputLayout.Id) void {
     std.debug.assert(self.outputs.get(output_id) != null);
     self.default_output_id = output_id;
