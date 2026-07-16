@@ -58,6 +58,8 @@ pub const State = struct {
     presentation_output: ?*anyopaque,
     commit_after_submission: bool,
     preferred_buffer_scale: ?i32,
+    source_cache_id: u64,
+    next_source_version: u64,
     current_buffer: ?BufferSnapshot,
     cached_buffer: ?BufferSnapshot,
     cached_attachment_changed: bool,
@@ -105,6 +107,8 @@ pub const State = struct {
             .presentation_output = null,
             .commit_after_submission = false,
             .preferred_buffer_scale = null,
+            .source_cache_id = render_types.allocateSourceCacheId(),
+            .next_source_version = 1,
             .current_buffer = null,
             .cached_buffer = null,
             .cached_attachment_changed = false,
@@ -993,8 +997,12 @@ fn snapshotPendingAttachment(
     reusable: ?*BufferSnapshot,
 ) BufferSnapshot.Error!?BufferSnapshot {
     const surface_state = self.state();
-    if (self.pending_attachment.shm) |shm_buffer| {
-        return try BufferSnapshot.copyShm(
+    const source_cache: render_types.SourceCache = .{
+        .id = surface_state.source_cache_id,
+        .version = surface_state.next_source_version,
+    };
+    const snapshot = if (self.pending_attachment.shm) |shm_buffer|
+        try BufferSnapshot.copyShm(
             self.allocator,
             shm_buffer,
             surface_state.pending_scale,
@@ -1003,28 +1011,31 @@ fn snapshotPendingAttachment(
             reusable,
             &surface_state.pending_surface_damage,
             &surface_state.pending_buffer_damage,
-        );
-    }
-    if (self.pending_attachment.dmabuf) |dmabuf_buffer| {
-        return try BufferSnapshot.copyDmabuf(
+            source_cache,
+        )
+    else if (self.pending_attachment.dmabuf) |dmabuf_buffer|
+        try BufferSnapshot.copyDmabuf(
             self.allocator,
             dmabuf_buffer,
             surface_state.pending_scale,
             surface_state.pending_transform,
             surface_state.pending_viewport,
-        );
-    }
-    if (self.pending_attachment.single_pixel) |pixel| {
-        return try BufferSnapshot.copySinglePixel(
+            source_cache,
+        )
+    else if (self.pending_attachment.single_pixel) |pixel|
+        try BufferSnapshot.copySinglePixel(
             self.allocator,
             pixel,
             surface_state.pending_scale,
             surface_state.pending_transform,
             surface_state.pending_viewport,
             reusable,
-        );
-    }
-    return null;
+            source_cache,
+        )
+    else
+        return null;
+    surface_state.next_source_version +%= 1;
+    return snapshot;
 }
 
 fn finishApplied(self: *Self, commit_info: CommitInfo) void {
@@ -1421,6 +1432,8 @@ pub const BufferSnapshot = struct {
     transform: wl.Output.Transform,
     source: ?render_types.SourceRect,
     pixels: []u32,
+    source_cache: render_types.SourceCache,
+    source_damage: ?[]const render_types.Rect,
 
     const Error = error{
         OutOfMemory,
@@ -1440,6 +1453,7 @@ pub const BufferSnapshot = struct {
         reusable: ?*BufferSnapshot,
         surface_damage: *const Region,
         buffer_damage: *const Region,
+        source_cache: render_types.SourceCache,
     ) Error!BufferSnapshot {
         const width = shm_buffer.getWidth();
         const height = shm_buffer.getHeight();
@@ -1474,6 +1488,13 @@ pub const BufferSnapshot = struct {
                 surface_damage.isEmpty()
         else
             false;
+        const source_damage = if (can_update_partially)
+            try copyBufferDamage(allocator, buffer_damage, buffer_size)
+        else
+            null;
+        errdefer if (source_damage) |damage| {
+            if (damage.len > 0) allocator.free(damage);
+        };
         const pixels = if (reusable) |snapshot|
             snapshot.takePixels(pixel_count) orelse
                 allocator.alloc(u32, pixel_count) catch return error.OutOfMemory
@@ -1498,6 +1519,8 @@ pub const BufferSnapshot = struct {
             .transform = transform,
             .source = geometry.source,
             .pixels = pixels,
+            .source_cache = source_cache,
+            .source_damage = source_damage,
         };
     }
 
@@ -1507,6 +1530,7 @@ pub const BufferSnapshot = struct {
         scale: i32,
         transform: wl.Output.Transform,
         viewport: ViewportState,
+        source_cache: render_types.SourceCache,
     ) Error!BufferSnapshot {
         const buffer_size = buffer.size();
         const geometry = try viewportGeometry(buffer_size, scale, transform, viewport);
@@ -1523,6 +1547,8 @@ pub const BufferSnapshot = struct {
             .transform = transform,
             .source = geometry.source,
             .pixels = pixels,
+            .source_cache = source_cache,
+            .source_damage = null,
         };
     }
 
@@ -1533,6 +1559,7 @@ pub const BufferSnapshot = struct {
         transform: wl.Output.Transform,
         viewport: ViewportState,
         reusable: ?*BufferSnapshot,
+        source_cache: render_types.SourceCache,
     ) Error!BufferSnapshot {
         const buffer_size: render_types.Size = .{ .width = 1, .height = 1 };
         const geometry = try viewportGeometry(buffer_size, scale, transform, viewport);
@@ -1550,6 +1577,8 @@ pub const BufferSnapshot = struct {
             .transform = transform,
             .source = geometry.source,
             .pixels = pixels,
+            .source_cache = source_cache,
+            .source_damage = null,
         };
     }
 
@@ -1575,6 +1604,9 @@ pub const BufferSnapshot = struct {
 
     pub fn deinit(self: *BufferSnapshot) void {
         if (self.pixels.len > 0) self.allocator.free(self.pixels);
+        if (self.source_damage) |damage| {
+            if (damage.len > 0) self.allocator.free(damage);
+        }
         self.* = undefined;
     }
 
@@ -1583,9 +1615,31 @@ pub const BufferSnapshot = struct {
             .size = self.buffer_size,
             .stride_pixels = self.buffer_size.width,
             .pixels = self.pixels,
+            .source_cache = self.source_cache,
+            .source_damage = self.source_damage,
         };
     }
 };
+
+fn copyBufferDamage(
+    allocator: std.mem.Allocator,
+    damage: *const Region,
+    size: render_types.Size,
+) error{OutOfMemory}![]const render_types.Rect {
+    var rectangles: std.ArrayList(render_types.Rect) = .empty;
+    defer rectangles.deinit(allocator);
+    var iterator = damage.rectangleIterator();
+    while (iterator.next()) |rectangle| {
+        const clipped = (render_types.Rect{
+            .x = rectangle.x,
+            .y = rectangle.y,
+            .width = rectangle.width,
+            .height = rectangle.height,
+        }).clipTo(size) orelse continue;
+        rectangles.append(allocator, clipped) catch return error.OutOfMemory;
+    }
+    return rectangles.toOwnedSlice(allocator) catch return error.OutOfMemory;
+}
 
 fn copyShmPixels(
     destination: []u32,
@@ -1796,6 +1850,7 @@ test "single pixel snapshots use viewporter destination without changing color" 
         .normal,
         .{ .destination = .{ .width = 320, .height = 180 } },
         null,
+        .{ .id = 1, .version = 1 },
     );
     defer snapshot.deinit();
 
@@ -1818,6 +1873,7 @@ test "same-size snapshots recycle pixel storage" {
         .normal,
         .{},
         null,
+        .{ .id = 1, .version = 1 },
     );
     defer first.deinit();
     const original_pointer = first.pixels.ptr;
@@ -1829,6 +1885,7 @@ test "same-size snapshots recycle pixel storage" {
         .normal,
         .{},
         &first,
+        .{ .id = 1, .version = 2 },
     );
     defer second.deinit();
 
@@ -1846,6 +1903,8 @@ test "buffer damage maps into logical surface coordinates" {
         .transform = .normal,
         .source = null,
         .pixels = &.{},
+        .source_cache = .{ .id = 1, .version = 1 },
+        .source_damage = null,
     };
     var buffer_damage = Region.init();
     defer buffer_damage.deinit();

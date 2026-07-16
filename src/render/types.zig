@@ -2,6 +2,21 @@
 
 const std = @import("std");
 
+var next_source_cache_id: std.atomic.Value(u64) = .init(1);
+var next_render_target_id: std.atomic.Value(u64) = .init(1);
+
+pub fn allocateSourceCacheId() u64 {
+    const id = next_source_cache_id.fetchAdd(1, .monotonic);
+    std.debug.assert(id != 0);
+    return id;
+}
+
+pub fn allocateRenderTargetId() u64 {
+    const id = next_render_target_id.fetchAdd(1, .monotonic);
+    std.debug.assert(id != 0);
+    return id;
+}
+
 pub const Size = struct {
     width: u32,
     height: u32,
@@ -210,6 +225,75 @@ pub const PixelBuffer = struct {
     size: Size,
     stride_pixels: u32,
     pixels: []u32,
+    /// Stable content identity for renderer texture caches. Anonymous buffers
+    /// leave this null and must be uploaded whenever they are rendered.
+    source_cache: ?SourceCache = null,
+    /// Changed pixels for this source-cache version, in buffer coordinates.
+    /// Null means the full buffer or unknown damage.
+    source_damage: ?[]const Rect = null,
+};
+
+pub const Target = union(enum) {
+    pixels: PixelBuffer,
+    offscreen: OffscreenTarget,
+    dmabuf: DmabufTarget,
+
+    pub fn size(self: Target) Size {
+        return switch (self) {
+            .pixels => |pixels| pixels.size,
+            .offscreen => |offscreen| offscreen.size,
+            .dmabuf => |dmabuf| dmabuf.size,
+        };
+    }
+};
+
+pub const OffscreenTarget = struct {
+    id: u64,
+    size: Size,
+};
+
+pub const DmabufTarget = struct {
+    id: u64,
+    size: Size,
+};
+
+pub const DmabufDescriptor = struct {
+    id: u64,
+    size: Size,
+    fd: std.posix.fd_t,
+    format: u32,
+    modifier: u64,
+    stride: u32,
+    offset: u32,
+};
+
+pub const DrmDeviceId = struct {
+    major: u32,
+    minor: u32,
+};
+
+/// Renderer operations borrowed by a DRM output for the lifetime of the
+/// renderer. Import duplicates the descriptor's borrowed file descriptor.
+pub const DmabufRenderer = struct {
+    context: *anyopaque,
+    modifiers: []const u64,
+    supports_target: *const fn (*anyopaque, Size, u64) bool,
+    import_target: *const fn (*anyopaque, DmabufDescriptor) anyerror!void,
+    release_target: *const fn (*anyopaque, u64) void,
+};
+
+/// Renderer-owned storage for outputs which have no display backend. The
+/// target remains GPU-resident unless a separate capture operation requests
+/// CPU-addressable pixels.
+pub const OffscreenRenderer = struct {
+    context: *anyopaque,
+    create_target: *const fn (*anyopaque, Size) anyerror!OffscreenTarget,
+    release_target: *const fn (*anyopaque, u64) void,
+};
+
+pub const SourceCache = struct {
+    id: u64,
+    version: u64,
 };
 
 test "color conversion premultiplies alpha" {

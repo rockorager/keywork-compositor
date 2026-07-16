@@ -6,6 +6,7 @@ const std = @import("std");
 const wayland = @import("wayland");
 const Seat = @import("seat.zig");
 const Tablet = @import("tablet.zig");
+const render = @import("../render/types.zig");
 
 const xcursor = @cImport({
     @cInclude("X11/Xcursor/Xcursor.h");
@@ -24,6 +25,7 @@ global: *wl.Global,
 tablet: *Tablet,
 listener: Listener,
 images: [shape_count]?*xcursor.XcursorImage,
+source_cache_ids: [shape_count]u64,
 theme: ?[*:0]u8,
 size: c_int,
 device_count: usize,
@@ -48,6 +50,7 @@ pub fn init(
         .tablet = tablet,
         .listener = listener,
         .images = @splat(null),
+        .source_cache_ids = @splat(0),
         .theme = std.c.getenv("XCURSOR_THEME"),
         .size = configuredSize(),
         .device_count = 0,
@@ -121,6 +124,7 @@ fn cursor(self: *Self, client: *wl.Client, shape: Shape) ?Seat.ShapeCursor {
         };
         const loaded_image: *xcursor.XcursorImage = @ptrCast(loaded_image_c);
         self.images[index] = loaded_image;
+        self.source_cache_ids[index] = render.allocateSourceCacheId();
         break :loaded loaded_image;
     };
     const pixel_count = std.math.mul(usize, image.width, image.height) catch return null;
@@ -131,6 +135,7 @@ fn cursor(self: *Self, client: *wl.Client, shape: Shape) ?Seat.ShapeCursor {
             .size = .{ .width = image.width, .height = image.height },
             .stride_pixels = image.width,
             .pixels = pixels[0..pixel_count],
+            .source_cache = .{ .id = self.source_cache_ids[index], .version = 1 },
         },
         .hotspot_x = @intCast(image.xhot),
         .hotspot_y = @intCast(image.yhot),

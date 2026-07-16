@@ -5,11 +5,14 @@ const Self = @This();
 const std = @import("std");
 const wayland = @import("wayland");
 const DrmOutput = @import("drm.zig");
+const Gbm = @import("gbm.zig");
 const Session = @import("session.zig");
+const render = @import("../render/types.zig");
 
 const c = @cImport({
     @cInclude("libudev.h");
     @cInclude("sys/stat.h");
+    @cInclude("sys/sysmacros.h");
     @cInclude("xf86drm.h");
     @cInclude("xf86drmMode.h");
 });
@@ -28,6 +31,7 @@ hotplug_source: ?*wl.EventSource,
 device_path: ?[:0]u8,
 device: ?Session.Device,
 device_number: ?c.dev_t,
+gbm_device: ?Gbm,
 active_outputs: std.ArrayList(*DrmOutput),
 retired_outputs: std.ArrayList(*DrmOutput),
 listener: ?Listener,
@@ -56,6 +60,7 @@ pub fn init(self: *Self, allocator: std.mem.Allocator, io: std.Io, event_loop: *
         .device_path = path,
         .device = null,
         .device_number = null,
+        .gbm_device = null,
         .active_outputs = .empty,
         .retired_outputs = .empty,
         .listener = null,
@@ -93,6 +98,14 @@ pub fn deinit(self: *Self) void {
 
 pub fn outputs(self: *Self) []const *DrmOutput {
     return self.active_outputs.items;
+}
+
+pub fn deviceId(self: *const Self) ?render.DrmDeviceId {
+    const number = self.device_number orelse return null;
+    return .{
+        .major = @intCast(c.major(number)),
+        .minor = @intCast(c.minor(number)),
+    };
 }
 
 pub fn setOutputEnabled(self: *Self, output: *DrmOutput, enabled: bool) !void {
@@ -154,7 +167,13 @@ pub fn clearListener(self: *Self) void {
 fn newOutput(self: *Self, fd: std.posix.fd_t, selection: DrmOutput.Selection) !*DrmOutput {
     const output = try self.allocator.create(DrmOutput);
     errdefer self.allocator.destroy(output);
-    output.init(self.allocator, self.io, .{ .context = self, .fd = accessFd, .active = accessActive, .fail = accessFail });
+    output.init(self.allocator, self.io, .{
+        .context = self,
+        .fd = accessFd,
+        .gbm = accessGbm,
+        .active = accessActive,
+        .fail = accessFail,
+    });
     errdefer output.deinit();
     try output.activate(fd, selection, self.device_path.?);
     return output;
@@ -171,6 +190,13 @@ fn activate(self: *Self) !void {
     self.device = device;
     errdefer self.deactivate();
     self.device_number = try deviceNumber(device.fd);
+    if (c.drmSetClientCap(device.fd, c.DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1) != 0) {
+        log.warn("universal DRM planes unavailable; using implicit scanout modifiers", .{});
+    }
+    self.gbm_device = Gbm.init(device.fd) catch |err| blk: {
+        log.warn("GBM unavailable, using CPU scanout buffers: {t}", .{err});
+        break :blk null;
+    };
     log.info("opened DRM device {s}", .{self.device_path.?});
     const selections = try DrmOutput.selectOutputs(
         self.allocator,
@@ -219,6 +245,8 @@ fn deactivate(self: *Self) void {
     }
     const device = self.device orelse return;
     for (self.active_outputs.items) |output| output.deactivate(device.fd);
+    if (self.gbm_device) |*gbm_device| gbm_device.deinit();
+    self.gbm_device = null;
     self.session.closeDevice(device) catch |err| log.err("failed to close DRM device: {t}", .{err});
     self.device = null;
     self.device_number = null;
@@ -441,6 +469,11 @@ fn deviceNumber(fd: std.posix.fd_t) !c.dev_t {
 fn accessFd(context: *anyopaque) ?std.posix.fd_t {
     const self: *Self = @ptrCast(@alignCast(context));
     return if (self.device) |device| device.fd else null;
+}
+
+fn accessGbm(context: *anyopaque) ?*Gbm {
+    const self: *Self = @ptrCast(@alignCast(context));
+    return if (self.gbm_device) |*device| device else null;
 }
 
 fn accessActive(context: *anyopaque) bool {

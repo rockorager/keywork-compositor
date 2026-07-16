@@ -6,14 +6,11 @@ const VulkanRenderer = @import("vulkan.zig");
 const headless = @import("../backend/headless.zig");
 const render_types = @import("types.zig");
 
-pub const Target = union(enum) {
-    cpu: render_types.PixelBuffer,
-    vulkan: VulkanRenderer.Target,
-};
-
-pub const Renderer = union(enum) {
-    cpu: CpuRenderer,
-    vulkan: VulkanRenderer,
+pub const Renderer = struct {
+    allocator: std.mem.Allocator,
+    backend: Backend,
+    commands: std.ArrayList(render_types.Command),
+    active_frame: ?ActiveFrame,
 
     pub const Kind = enum {
         cpu,
@@ -22,15 +19,42 @@ pub const Renderer = union(enum) {
 
     pub const Error = CpuRenderer.Error || VulkanRenderer.Error;
 
+    const Backend = union(enum) {
+        cpu: CpuRenderer,
+        vulkan: VulkanRenderer,
+    };
+
+    const ActiveFrame = struct {
+        target: render_types.Target,
+        damage: ?[]const render_types.Rect,
+        scale: render_types.Scale,
+        origin: render_types.Position,
+    };
+
     pub fn init(allocator: std.mem.Allocator, kind: Kind) VulkanRenderer.InitError!Renderer {
-        return switch (kind) {
-            .cpu => .{ .cpu = CpuRenderer.init(allocator) },
-            .vulkan => .{ .vulkan = try VulkanRenderer.init(allocator) },
+        return initForDevice(allocator, kind, null);
+    }
+
+    pub fn initForDevice(
+        allocator: std.mem.Allocator,
+        kind: Kind,
+        drm_device_id: ?render_types.DrmDeviceId,
+    ) VulkanRenderer.InitError!Renderer {
+        return .{
+            .allocator = allocator,
+            .backend = switch (kind) {
+                .cpu => .{ .cpu = CpuRenderer.init(allocator) },
+                .vulkan => .{ .vulkan = try VulkanRenderer.init(allocator, drm_device_id) },
+            },
+            .commands = .empty,
+            .active_frame = null,
         };
     }
 
     pub fn deinit(self: *Renderer) void {
-        switch (self.*) {
+        std.debug.assert(self.active_frame == null);
+        self.commands.deinit(self.allocator);
+        switch (self.backend) {
             .cpu => |*renderer| renderer.deinit(),
             .vulkan => |*renderer| renderer.deinit(),
         }
@@ -38,71 +62,133 @@ pub const Renderer = union(enum) {
     }
 
     pub fn supportsPartialDamage(self: *const Renderer) bool {
-        return switch (self.*) {
-            .cpu => true,
-            .vulkan => false,
+        return switch (self.backend) {
+            .cpu, .vulkan => true,
         };
     }
 
-    pub fn makeTarget(self: *Renderer, pixels: render_types.PixelBuffer) Target {
-        return switch (self.*) {
-            .cpu => .{ .cpu = pixels },
-            .vulkan => .{ .vulkan = .{ .readback = pixels } },
+    pub fn beginFrame(
+        self: *Renderer,
+        target: render_types.Target,
+        scale: render_types.Scale,
+        origin: render_types.Position,
+        damage: ?[]const render_types.Rect,
+    ) Error!void {
+        // Damage and buffers referenced by appended commands must remain valid through finishFrame.
+        std.debug.assert(self.active_frame == null);
+        std.debug.assert(self.commands.items.len == 0);
+        try validateTarget(target);
+        if (scale.numerator == 0 or scale.numerator > std.math.maxInt(i32)) {
+            return error.InvalidTarget;
+        }
+        self.active_frame = .{
+            .target = target,
+            .damage = damage,
+            .scale = scale,
+            .origin = origin,
         };
+    }
+
+    pub fn dmabufAccess(self: *Renderer) ?render_types.DmabufRenderer {
+        return switch (self.backend) {
+            .cpu => null,
+            .vulkan => |*renderer| renderer.dmabufAccess(),
+        };
+    }
+
+    pub fn offscreenAccess(self: *Renderer) ?render_types.OffscreenRenderer {
+        return switch (self.backend) {
+            .cpu => null,
+            .vulkan => |*renderer| renderer.offscreenAccess(),
+        };
+    }
+
+    pub fn append(self: *Renderer, commands: []const render_types.Command) Error!void {
+        const active = self.active_frame orelse unreachable;
+        const translated = active.origin.x != 0 or active.origin.y != 0;
+        const scaled = active.scale.numerator != render_types.Scale.denominator;
+        if (!translated and !scaled) {
+            try self.commands.appendSlice(self.allocator, commands);
+            return;
+        }
+
+        for (commands) |command| {
+            const local_command = translateCommand(command, active.origin);
+            try self.commands.append(self.allocator, if (scaled)
+                scaleCommand(local_command, active.scale)
+            else
+                local_command);
+        }
+    }
+
+    pub fn finishFrame(self: *Renderer) Error!void {
+        const active = self.active_frame orelse unreachable;
+        self.active_frame = null;
+        defer self.commands.clearRetainingCapacity();
+        try self.renderDirect(.{
+            .size = active.target.size(),
+            .commands = self.commands.items,
+            .damage = active.damage,
+        }, active.target);
+    }
+
+    pub fn cancelFrame(self: *Renderer) void {
+        std.debug.assert(self.active_frame != null);
+        self.active_frame = null;
+        self.commands.clearRetainingCapacity();
     }
 
     pub fn render(
         self: *Renderer,
         frame: render_types.Frame,
-        target: Target,
+        target: render_types.PixelBuffer,
     ) Error!void {
-        if (frame.scale.numerator == 0 or frame.scale.numerator > std.math.maxInt(i32)) {
-            return error.InvalidTarget;
-        }
-        const translated = frame.origin.x != 0 or frame.origin.y != 0;
-        const scaled = frame.scale.numerator != render_types.Scale.denominator;
-        if (!translated and !scaled) {
-            return self.renderDirect(frame, target);
-        }
-
-        const physical_size = targetSize(target);
-        for (frame.commands) |command| {
-            const local_command = translateCommand(command, frame.origin);
-            const commands = [_]render_types.Command{if (scaled)
-                scaleCommand(local_command, frame.scale)
-            else
-                local_command};
-            try self.renderDirect(.{
-                .size = physical_size,
-                .commands = &commands,
-                .damage = frame.damage,
-            }, target);
-        }
+        try self.beginFrame(.{ .pixels = target }, frame.scale, frame.origin, frame.damage);
+        var active = true;
+        errdefer if (active) self.cancelFrame();
+        try self.append(frame.commands);
+        active = false;
+        try self.finishFrame();
     }
 
     fn renderDirect(
         self: *Renderer,
         frame: render_types.Frame,
-        target: Target,
+        target: render_types.Target,
     ) Error!void {
-        return switch (self.*) {
+        return switch (self.backend) {
             .cpu => |*renderer| switch (target) {
-                .cpu => |cpu_target| renderer.render(frame, cpu_target),
-                .vulkan => error.InvalidTarget,
+                .pixels => |pixels| renderer.render(frame, pixels),
+                .offscreen, .dmabuf => error.InvalidTarget,
             },
-            .vulkan => |*renderer| switch (target) {
-                .cpu => error.InvalidTarget,
-                .vulkan => |vulkan_target| renderer.renderFrame(frame, vulkan_target),
-            },
+            .vulkan => |*renderer| renderer.renderFrame(frame, target),
         };
     }
 };
 
-fn targetSize(target: Target) render_types.Size {
-    return switch (target) {
-        .cpu => |buffer| buffer.size,
-        .vulkan => |vulkan| vulkan.readback.size,
+fn validateTarget(target: render_types.Target) Renderer.Error!void {
+    const size = target.size();
+    if (size.width == 0 or size.height == 0) return error.InvalidTarget;
+    const pixels = switch (target) {
+        .pixels => |pixels| pixels,
+        .offscreen => |offscreen| {
+            if (offscreen.id == 0) return error.InvalidTarget;
+            return;
+        },
+        .dmabuf => |dmabuf| {
+            if (dmabuf.id == 0) return error.InvalidTarget;
+            return;
+        },
     };
+    if (pixels.stride_pixels < pixels.size.width) return error.InvalidTarget;
+    const last_row = std.math.mul(
+        usize,
+        pixels.size.height - 1,
+        pixels.stride_pixels,
+    ) catch return error.InvalidTarget;
+    const required_pixels = std.math.add(usize, last_row, pixels.size.width) catch
+        return error.InvalidTarget;
+    if (pixels.pixels.len < required_pixels) return error.InvalidTarget;
 }
 
 fn translateCommand(
@@ -261,10 +347,48 @@ test "renderer dispatches to the selected implementation" {
     defer renderer.deinit();
     try renderer.render(
         .{ .size = size, .commands = &commands },
-        .{ .cpu = output.target() },
+        output.target(),
     );
 
     try std.testing.expectEqual(@as(u32, 0xff0a141e), output.pixel(1, 1));
+}
+
+test "renderer submits accumulated commands as one frame" {
+    const size: render_types.Size = .{ .width = 2, .height = 1 };
+    var output = try headless.init(std.testing.allocator, size);
+    defer output.deinit();
+    var renderer = try Renderer.init(std.testing.allocator, .cpu);
+    defer renderer.deinit();
+
+    try renderer.beginFrame(.{ .pixels = output.target() }, .{}, .{}, null);
+    try renderer.append(&.{.{ .clear = render_types.Color.rgba(10, 20, 30, 255) }});
+    try std.testing.expectEqual(@as(u32, 0), output.pixel(0, 0));
+    try renderer.append(&.{.{ .solid_rect = .{
+        .rect = .{ .x = 1, .y = 0, .width = 1, .height = 1 },
+        .color = render_types.Color.rgba(40, 50, 60, 255),
+    } }});
+    try renderer.finishFrame();
+
+    try std.testing.expectEqual(@as(u32, 0xff0a141e), output.pixel(0, 0));
+    try std.testing.expectEqual(@as(u32, 0xff28323c), output.pixel(1, 0));
+}
+
+test "cancelled renderer frame does not leak commands" {
+    const size: render_types.Size = .{ .width = 1, .height = 1 };
+    var output = try headless.init(std.testing.allocator, size);
+    defer output.deinit();
+    var renderer = try Renderer.init(std.testing.allocator, .cpu);
+    defer renderer.deinit();
+
+    try renderer.beginFrame(.{ .pixels = output.target() }, .{}, .{}, null);
+    try renderer.append(&.{.{ .clear = render_types.Color.rgba(255, 0, 0, 255) }});
+    renderer.cancelFrame();
+    try renderer.render(
+        .{ .size = size, .commands = &.{.{ .clear = render_types.Color.rgba(0, 0, 255, 255) }} },
+        output.target(),
+    );
+
+    try std.testing.expectEqual(@as(u32, 0xff0000ff), output.pixel(0, 0));
 }
 
 test "renderer scales logical commands into a physical target" {
@@ -283,7 +407,7 @@ test "renderer scales logical commands into a physical target" {
     defer renderer.deinit();
     try renderer.render(
         .{ .size = logical_size, .commands = &commands, .scale = .{ .numerator = 180 } },
-        .{ .cpu = output.target() },
+        output.target(),
     );
 
     try std.testing.expectEqual(@as(u32, 0xff000000), output.pixel(1, 1));
@@ -306,7 +430,7 @@ test "renderer fills a physical target when fractional logical size is truncated
             .commands = &commands,
             .scale = .{ .numerator = 156 },
         },
-        .{ .cpu = output.target() },
+        output.target(),
     );
 
     try std.testing.expectEqual(@as(u32, 0xff0a141e), output.pixel(9, 0));
@@ -336,7 +460,7 @@ test "renderer translates global commands into an output-local target" {
             .commands = &commands,
             .origin = .{ .x = 10, .y = -4 },
         },
-        .{ .cpu = output.target() },
+        output.target(),
     );
 
     try std.testing.expectEqual(@as(u32, 0xffff0000), output.pixel(0, 0));
@@ -372,7 +496,7 @@ test "fractional rendering preserves an exact-scale image" {
             .commands = &commands,
             .scale = .{ .numerator = 180 },
         },
-        .{ .cpu = output.target() },
+        output.target(),
     );
 
     try std.testing.expectEqualSlices(u32, &source_pixels, output.target().pixels);

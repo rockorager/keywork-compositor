@@ -3,6 +3,7 @@
 const Self = @This();
 
 const std = @import("std");
+const Gbm = @import("gbm.zig");
 const NestedOutput = @import("nested_wayland.zig");
 const presentation = @import("../presentation.zig");
 const Region = @import("../region.zig");
@@ -12,17 +13,20 @@ const c = @cImport({
     @cInclude("stdlib.h");
     @cInclude("libdisplay-info/info.h");
     @cInclude("libudev.h");
+    @cInclude("libdrm/drm_fourcc.h");
     @cInclude("xf86drm.h");
     @cInclude("xf86drmMode.h");
 });
 const log = std.log.scoped(.drm);
 const buffer_count = 2;
 const description_capacity = 512;
+const drm_format_mod_linear: u64 = 0;
 
 allocator: std.mem.Allocator,
 io: std.Io,
 device_access: DeviceAccess,
 listener: ?Listener,
+dmabuf_renderer: ?render.DmabufRenderer,
 old_crtc: ?*c.drmModeCrtc,
 buffers: [buffer_count]Buffer,
 shadow_pixels: []u32,
@@ -35,6 +39,9 @@ physical_size: render.Size,
 scale: render.Scale,
 connector_id: u32,
 crtc_id: u32,
+primary_plane_id: ?u32,
+scanout_modifiers: []u64,
+implicit_scanout: bool,
 connector_name: [32]u8,
 connector_name_length: usize,
 make_value: [*c]u8,
@@ -57,6 +64,8 @@ retired: bool,
 pub const Listener = NestedOutput.Listener;
 
 const Buffer = struct {
+    gbm: ?Gbm.Buffer = null,
+    render_target_id: ?u64 = null,
     handle: u32 = 0,
     framebuffer_id: u32 = 0,
     mapping: ?[]align(std.heap.page_size_min) u8 = null,
@@ -72,6 +81,15 @@ pub const Selection = struct {
     connector_type: u32,
     connector_type_id: u32,
     crtc_id: u32,
+    primary_plane_id: ?u32,
+    scanout_modifiers: []u64,
+    implicit_scanout: bool,
+};
+
+const PrimaryPlane = struct {
+    id: ?u32 = null,
+    modifiers: []u64 = &.{},
+    implicit: bool = true,
 };
 
 pub const Mode = struct {
@@ -93,6 +111,7 @@ pub const Mode = struct {
 pub const DeviceAccess = struct {
     context: *anyopaque,
     fd: *const fn (*anyopaque) ?std.posix.fd_t,
+    gbm: *const fn (*anyopaque) ?*Gbm = unavailableGbm,
     active: *const fn (*anyopaque) bool,
     fail: *const fn (*anyopaque, anyerror) void,
 };
@@ -116,6 +135,7 @@ pub fn init(
         .io = io,
         .device_access = device_access,
         .listener = null,
+        .dmabuf_renderer = null,
         .old_crtc = null,
         .buffers = .{ .{}, .{} },
         .shadow_pixels = &.{},
@@ -128,6 +148,9 @@ pub fn init(
         .scale = .{},
         .connector_id = 0,
         .crtc_id = 0,
+        .primary_plane_id = null,
+        .scanout_modifiers = &.{},
+        .implicit_scanout = true,
         .connector_name = undefined,
         .connector_name_length = 0,
         .make_value = null,
@@ -155,13 +178,33 @@ pub fn deinit(self: *Self) void {
     std.debug.assert(self.shadow_pixels.len == 0);
     self.clearIdentity();
     self.allocator.free(self.modes);
+    self.allocator.free(self.scanout_modifiers);
     for (&self.buffer_damage) |*damage| damage.deinit();
     self.* = undefined;
 }
 
-pub fn attach(self: *Self, listener: Listener) void {
+pub fn attach(self: *Self, listener: Listener, dmabuf_renderer: ?render.DmabufRenderer) void {
     std.debug.assert(self.listener == null);
+    std.debug.assert(dmabuf_renderer != null or self.buffers[0].render_target_id == null);
+    self.dmabuf_renderer = dmabuf_renderer;
     self.listener = listener;
+    if (dmabuf_renderer != null and self.buffers[0].render_target_id == null and
+        self.acquired == null and self.pending == null and self.displayed == null and
+        !self.mode_set and self.powered)
+    {
+        const fd = self.device_access.fd(self.device_access.context) orelse return;
+        var replacement = self.allocateGpuPair(fd, self.size) catch |err| {
+            log.warn("GPU scanout allocation failed, keeping CPU buffers: {t}", .{err});
+            return;
+        };
+        var old_buffers = self.buffers;
+        const old_shadow = self.shadow_pixels;
+        self.buffers = replacement.buffers;
+        self.shadow_pixels = replacement.shadow_pixels;
+        replacement = .{};
+        self.destroyPair(fd, &old_buffers, old_shadow);
+        self.resetBufferDamage(self.size);
+    }
 }
 
 pub fn detach(self: *Self) void {
@@ -215,18 +258,29 @@ pub fn ready(self: *const Self) bool {
     return self.availableBuffer() != null;
 }
 
-pub fn acquire(self: *Self) ?render.PixelBuffer {
+pub fn acquire(self: *Self) ?render.Target {
     std.debug.assert(self.acquired == null);
     if (!self.ready()) return null;
     const index = self.availableBuffer().?;
+    self.acquired = index;
+    if (self.buffers[index].render_target_id) |id| return .{ .dmabuf = .{
+        .id = id,
+        .size = self.size,
+    } };
     const pixel_count = self.size.pixelCount() catch unreachable;
     std.debug.assert(self.shadow_pixels.len == pixel_count);
-    self.acquired = index;
-    return .{
+    return .{ .pixels = .{
         .size = self.size,
         .stride_pixels = self.size.width,
         .pixels = self.shadow_pixels,
-    };
+    } };
+}
+
+pub fn repairDamage(self: *Self, damage: *Region) !void {
+    const index = self.acquired orelse unreachable;
+    if (self.buffers[index].render_target_id != null) {
+        try damage.unionWith(&self.buffer_damage[index]);
+    }
 }
 
 pub fn cancel(self: *Self) void {
@@ -239,7 +293,7 @@ pub fn present(self: *Self, frame_damage: *const Region) !?presentation.Info {
     if (!self.device_access.active(self.device_access.context)) return error.SessionInactive;
     const buffer = &self.buffers[index];
     for (&self.buffer_damage) |*damage| try damage.unionWith(frame_damage);
-    copyShadowDamage(
+    if (buffer.render_target_id == null) copyShadowDamage(
         buffer.pixels,
         buffer.stride_pixels,
         self.shadow_pixels,
@@ -290,19 +344,28 @@ pub fn activate(self: *Self, fd: std.posix.fd_t, selection: Selection, device_pa
     const selected_size = selected_mode.size();
     if (self.size.width != 0 and (!std.meta.eql(self.size, selected_size) or
         self.connector_id != selection.connector_id or
+        self.primary_plane_id != selection.primary_plane_id or
         !modeListsEqual(self.modes, selection.modes)))
     {
         return error.OutputChanged;
     }
     const modes = try self.allocator.dupe(Mode, selection.modes);
+    const scanout_modifiers = self.allocator.dupe(u64, selection.scanout_modifiers) catch |err| {
+        self.allocator.free(modes);
+        return err;
+    };
     self.allocator.free(self.modes);
+    self.allocator.free(self.scanout_modifiers);
     self.modes = modes;
+    self.scanout_modifiers = scanout_modifiers;
+    self.implicit_scanout = selection.implicit_scanout;
     self.mode_index = selection.mode_index;
     self.mode = selected_mode.value;
     self.size = selected_size;
     self.physical_size = selection.physical_size;
     self.connector_id = selection.connector_id;
     self.crtc_id = selection.crtc_id;
+    self.primary_plane_id = selection.primary_plane_id;
     self.retired = false;
     const connector_type = c.drmModeGetConnectorTypeName(selection.connector_type);
     const type_name = if (connector_type == null) "Unknown" else std.mem.span(connector_type);
@@ -351,18 +414,9 @@ pub fn activate(self: *Self, fd: std.posix.fd_t, selection: Selection, device_pa
             return error.DisableFailed;
         }
     } else {
-        log.info(
-            "allocating CPU shadow and scanout buffers for connector {s} at {d}x{d}",
-            .{ self.name(), self.size.width, self.size.height },
-        );
-        errdefer {
-            destroyShadowBuffer(self.allocator, &self.shadow_pixels);
-            for (&self.buffers) |*buffer| destroyBuffer(fd, buffer);
-        }
-        for (&self.buffers) |*buffer| {
-            try createBuffer(fd, self.size, buffer);
-        }
-        try createShadowBuffer(self.allocator, self.size, &self.shadow_pixels);
+        const pair = try self.allocatePair(fd, self.size);
+        self.buffers = pair.buffers;
+        self.shadow_pixels = pair.shadow_pixels;
         self.resetBufferDamage(self.size);
     }
     log.info(
@@ -437,8 +491,8 @@ fn release(self: *Self, fd: std.posix.fd_t) void {
     self.acquired = null;
     self.pending = null;
     self.displayed = null;
-    destroyShadowBuffer(self.allocator, &self.shadow_pixels);
-    for (&self.buffers) |*buffer| destroyBuffer(fd, buffer);
+    self.destroyPair(fd, &self.buffers, self.shadow_pixels);
+    self.shadow_pixels = &.{};
     for (&self.buffer_damage) |*damage| damage.clear();
     if (self.old_crtc) |old_crtc| {
         c.drmModeFreeCrtc(old_crtc);
@@ -465,12 +519,9 @@ pub fn setPowered(self: *Self, fd: std.posix.fd_t, powered: bool) !void {
     if (self.powered == powered) return;
     std.debug.assert(self.old_crtc != null);
     if (powered) {
-        errdefer {
-            destroyShadowBuffer(self.allocator, &self.shadow_pixels);
-            for (&self.buffers) |*buffer| destroyBuffer(fd, buffer);
-        }
-        for (&self.buffers) |*buffer| try createBuffer(fd, self.size, buffer);
-        try createShadowBuffer(self.allocator, self.size, &self.shadow_pixels);
+        const pair = try self.allocatePair(fd, self.size);
+        self.buffers = pair.buffers;
+        self.shadow_pixels = pair.shadow_pixels;
         self.resetBufferDamage(self.size);
         self.powered = true;
         self.mode_set = false;
@@ -489,8 +540,8 @@ pub fn setPowered(self: *Self, fd: std.posix.fd_t, powered: bool) !void {
     self.mode_set = false;
     self.displayed = null;
     self.notifyDeactivated();
-    destroyShadowBuffer(self.allocator, &self.shadow_pixels);
-    for (&self.buffers) |*buffer| destroyBuffer(fd, buffer);
+    self.destroyPair(fd, &self.buffers, self.shadow_pixels);
+    self.shadow_pixels = &.{};
     for (&self.buffer_damage) |*damage| damage.clear();
 }
 
@@ -502,26 +553,20 @@ pub fn setMode(self: *Self, fd: std.posix.fd_t, mode_index: usize) !void {
     const size = mode.size();
 
     if (self.powered) {
-        var buffers: [buffer_count]Buffer = .{ .{}, .{} };
-        var shadow_pixels: []u32 = &.{};
-        errdefer {
-            destroyShadowBuffer(self.allocator, &shadow_pixels);
-            for (&buffers) |*buffer| destroyBuffer(fd, buffer);
-        }
-        for (&buffers) |*buffer| try createBuffer(fd, size, buffer);
-        try createShadowBuffer(self.allocator, size, &shadow_pixels);
+        const pair = try self.allocatePair(fd, size);
         self.acquired = null;
         if (c.drmModeSetCrtc(fd, self.crtc_id, 0, 0, 0, null, 0, null) != 0) {
+            var failed_buffers = pair.buffers;
+            self.destroyPair(fd, &failed_buffers, pair.shadow_pixels);
             return error.DisableFailed;
         }
         self.notifyDeactivated();
         var old_buffers = self.buffers;
         const old_shadow_pixels = self.shadow_pixels;
-        self.buffers = buffers;
-        self.shadow_pixels = shadow_pixels;
+        self.buffers = pair.buffers;
+        self.shadow_pixels = pair.shadow_pixels;
         self.resetBufferDamage(size);
-        for (&old_buffers) |*buffer| destroyBuffer(fd, buffer);
-        self.allocator.free(old_shadow_pixels);
+        self.destroyPair(fd, &old_buffers, old_shadow_pixels);
         self.displayed = null;
         self.mode_set = false;
     }
@@ -601,10 +646,17 @@ pub fn selectOutputs(
     if (resources.*.count_crtcs <= 0) return error.NoCrtc;
     var selections: std.ArrayList(Selection) = .empty;
     errdefer {
-        for (selections.items) |selection| allocator.free(selection.modes);
+        for (selections.items) |selection| {
+            allocator.free(selection.modes);
+            allocator.free(selection.scanout_modifiers);
+        }
         selections.deinit(allocator);
     }
     var claimed: u32 = 0;
+    var claimed_primary_planes: std.ArrayList(u32) = .empty;
+    defer claimed_primary_planes.deinit(allocator);
+    var reserved_primary_planes: std.ArrayList(u32) = .empty;
+    defer reserved_primary_planes.deinit(allocator);
 
     // Reserve working routes before assigning CRTCs to newly connected heads.
     // Otherwise connector enumeration order can steal an active output's CRTC.
@@ -618,6 +670,11 @@ pub fn selectOutputs(
         const index = crtcIndex(resources, output.crtc_id) orelse continue;
         if (crtcIndexPossible(possible_crtcs, index)) {
             claimed |= @as(u32, 1) << @intCast(index);
+            if (output.primary_plane_id) |plane_id| {
+                if (std.mem.indexOfScalar(u32, reserved_primary_planes.items, plane_id) == null) {
+                    try reserved_primary_planes.append(allocator, plane_id);
+                }
+            }
         }
     }
 
@@ -656,9 +713,27 @@ pub fn selectOutputs(
         };
         claimed |= @as(u32, 1) << @intCast(crtc_index);
         const crtc_id = resources.*.crtcs[crtc_index];
+        const primary_plane = try primaryPlane(
+            fd,
+            crtc_id,
+            crtc_index,
+            if (existing_output) |output| output.primary_plane_id else null,
+            claimed_primary_planes.items,
+            reserved_primary_planes.items,
+            allocator,
+        );
+        if (primary_plane.id) |plane_id| {
+            claimed_primary_planes.append(allocator, plane_id) catch |err| {
+                allocator.free(primary_plane.modifiers);
+                return err;
+            };
+        }
         const mode_count: usize = @intCast(connector.*.count_modes);
         const connector_modes = connector.*.modes[0..mode_count];
-        const modes = try allocator.alloc(Mode, mode_count);
+        const modes = allocator.alloc(Mode, mode_count) catch |err| {
+            allocator.free(primary_plane.modifiers);
+            return err;
+        };
         for (connector_modes, modes) |mode, *stored| stored.* = .{
             .value = mode,
             .preferred = mode.type & c.DRM_MODE_TYPE_PREFERRED != 0,
@@ -678,8 +753,12 @@ pub fn selectOutputs(
             .connector_type = connector.*.connector_type,
             .connector_type_id = connector.*.connector_type_id,
             .crtc_id = crtc_id,
+            .primary_plane_id = primary_plane.id,
+            .scanout_modifiers = primary_plane.modifiers,
+            .implicit_scanout = primary_plane.implicit,
         }) catch |err| {
             allocator.free(modes);
+            allocator.free(primary_plane.modifiers);
             return err;
         };
     }
@@ -687,8 +766,103 @@ pub fn selectOutputs(
 }
 
 pub fn deinitSelections(allocator: std.mem.Allocator, selections: []Selection) void {
-    for (selections) |selection| allocator.free(selection.modes);
+    for (selections) |selection| {
+        allocator.free(selection.modes);
+        allocator.free(selection.scanout_modifiers);
+    }
     allocator.free(selections);
+}
+
+fn primaryPlane(
+    fd: std.posix.fd_t,
+    crtc_id: u32,
+    crtc_index: usize,
+    preferred_plane_id: ?u32,
+    claimed_planes: []const u32,
+    reserved_planes: []const u32,
+    allocator: std.mem.Allocator,
+) !PrimaryPlane {
+    const resources = c.drmModeGetPlaneResources(fd) orelse return .{};
+    defer c.drmModeFreePlaneResources(resources);
+    var selected: PrimaryPlane = .{};
+    errdefer allocator.free(selected.modifiers);
+    var selected_score: u8 = 0;
+    const plane_count: usize = @intCast(resources.*.count_planes);
+    for (resources.*.planes[0..plane_count]) |plane_id| {
+        const plane = c.drmModeGetPlane(fd, plane_id) orelse continue;
+        defer c.drmModeFreePlane(plane);
+        if (!crtcIndexPossible(plane.*.possible_crtcs, crtc_index) or
+            std.mem.indexOfScalar(u32, claimed_planes, plane_id) != null or
+            (preferred_plane_id != plane_id and
+                std.mem.indexOfScalar(u32, reserved_planes, plane_id) != null)) continue;
+
+        const properties = c.drmModeObjectGetProperties(
+            fd,
+            plane_id,
+            c.DRM_MODE_OBJECT_PLANE,
+        ) orelse continue;
+        defer c.drmModeFreeObjectProperties(properties);
+        var plane_type: ?u64 = null;
+        var formats_blob_id: ?u32 = null;
+        const property_count: usize = @intCast(properties.*.count_props);
+        for (0..property_count) |property_index| {
+            const property = c.drmModeGetProperty(
+                fd,
+                properties.*.props[property_index],
+            ) orelse continue;
+            defer c.drmModeFreeProperty(property);
+            const property_name = std.mem.sliceTo(property.*.name[0..], 0);
+            const value = properties.*.prop_values[property_index];
+            if (std.mem.eql(u8, property_name, "type")) {
+                plane_type = value;
+            } else if (std.mem.eql(u8, property_name, "IN_FORMATS") and
+                value > 0 and value <= std.math.maxInt(u32))
+            {
+                formats_blob_id = @intCast(value);
+            }
+        }
+        if (plane_type != c.DRM_PLANE_TYPE_PRIMARY) continue;
+        const score: u8 = if (preferred_plane_id == plane_id and
+            (plane.*.crtc_id == 0 or plane.*.crtc_id == crtc_id))
+            3
+        else if (plane.*.crtc_id == crtc_id)
+            2
+        else if (plane.*.crtc_id == 0)
+            1
+        else
+            0;
+        if (score <= selected_score) continue;
+
+        var implicit = false;
+        const format_count: usize = @intCast(plane.*.count_formats);
+        for (plane.*.formats[0..format_count]) |format| {
+            if (format == c.DRM_FORMAT_XRGB8888) {
+                implicit = true;
+                break;
+            }
+        }
+        var modifiers: std.ArrayList(u64) = .empty;
+        defer modifiers.deinit(allocator);
+        if (formats_blob_id) |blob_id| if (c.drmModeGetPropertyBlob(fd, blob_id)) |blob| {
+            defer c.drmModeFreePropertyBlob(blob);
+            var iterator = std.mem.zeroes(c.drmModeFormatModifierIterator);
+            while (c.drmModeFormatModifierBlobIterNext(blob, &iterator)) {
+                if (iterator.fmt != c.DRM_FORMAT_XRGB8888 or
+                    std.mem.indexOfScalar(u64, modifiers.items, iterator.mod) != null) continue;
+                try modifiers.append(allocator, iterator.mod);
+            }
+        };
+        const owned_modifiers = try modifiers.toOwnedSlice(allocator);
+        allocator.free(selected.modifiers);
+        selected = .{
+            .id = plane_id,
+            .modifiers = owned_modifiers,
+            .implicit = implicit,
+        };
+        selected_score = score;
+        if (score == 3) break;
+    }
+    return selected;
 }
 
 fn findOutput(outputs: []const *Self, connector_id: u32) ?*Self {
@@ -809,7 +983,115 @@ fn copyShadowDamage(
     }
 }
 
-fn createBuffer(fd: std.posix.fd_t, size: render.Size, buffer: *Buffer) !void {
+const BufferPair = struct {
+    buffers: [buffer_count]Buffer = .{ .{}, .{} },
+    shadow_pixels: []u32 = &.{},
+};
+
+fn allocatePair(self: *Self, fd: std.posix.fd_t, size: render.Size) !BufferPair {
+    if (self.allocateGpuPair(fd, size)) |pair| return pair else |err| {
+        if (self.dmabuf_renderer != null and
+            self.device_access.gbm(self.device_access.context) != null)
+        {
+            log.warn("GPU scanout allocation failed, using CPU buffers: {t}", .{err});
+        }
+    }
+    log.info("allocating CPU shadow and scanout buffers at {d}x{d}", .{ size.width, size.height });
+    var pair: BufferPair = .{};
+    errdefer self.destroyPair(fd, &pair.buffers, pair.shadow_pixels);
+    for (&pair.buffers) |*buffer| try self.createBuffer(fd, size, buffer);
+    try createShadowBuffer(self.allocator, size, &pair.shadow_pixels);
+    return pair;
+}
+
+fn allocateGpuPair(self: *Self, fd: std.posix.fd_t, size: render.Size) !BufferPair {
+    const renderer = self.dmabuf_renderer orelse return error.NoDmabufRenderer;
+    const gbm = self.device_access.gbm(self.device_access.context) orelse return error.NoGbmDevice;
+    var compatible_modifiers: std.ArrayList(u64) = .empty;
+    defer compatible_modifiers.deinit(self.allocator);
+    for (self.scanout_modifiers) |modifier| {
+        if (std.mem.indexOfScalar(u64, renderer.modifiers, modifier) != null and
+            renderer.supports_target(renderer.context, size, modifier))
+        {
+            try compatible_modifiers.append(self.allocator, modifier);
+        }
+    }
+    var last_error: anyerror = error.NoSupportedModifier;
+    if (compatible_modifiers.items.len > 0) {
+        var pair: BufferPair = .{};
+        createGpuPair(fd, gbm, renderer, size, compatible_modifiers.items, &pair) catch |err| {
+            last_error = err;
+            self.destroyPair(fd, &pair.buffers, pair.shadow_pixels);
+        };
+        if (pair.buffers[0].render_target_id != null) {
+            log.info(
+                "allocated GPU scanout buffers at {d}x{d}, modifier 0x{x}",
+                .{ size.width, size.height, pair.buffers[0].gbm.?.modifier },
+            );
+            return pair;
+        }
+    }
+    if (!self.implicit_scanout) return last_error;
+
+    var pair: BufferPair = .{};
+    createGpuPair(fd, gbm, renderer, size, null, &pair) catch |err| {
+        self.destroyPair(fd, &pair.buffers, pair.shadow_pixels);
+        return err;
+    };
+    log.info(
+        "allocated GPU scanout buffers at {d}x{d}, implicit modifier 0x{x}",
+        .{ size.width, size.height, pair.buffers[0].gbm.?.modifier },
+    );
+    return pair;
+}
+
+fn createGpuPair(
+    fd: std.posix.fd_t,
+    gbm: *Gbm,
+    renderer: render.DmabufRenderer,
+    size: render.Size,
+    modifiers: ?[]const u64,
+    pair: *BufferPair,
+) !void {
+    for (&pair.buffers) |*buffer| {
+        buffer.gbm = if (modifiers) |explicit|
+            try gbm.createBuffer(size, c.DRM_FORMAT_XRGB8888, explicit)
+        else
+            try gbm.createImplicitBuffer(size, c.DRM_FORMAT_XRGB8888);
+        const bo = &buffer.gbm.?;
+        if (std.mem.indexOfScalar(u64, renderer.modifiers, bo.modifier) == null) {
+            return error.UnsupportedRendererModifier;
+        }
+        var handles = [_]u32{ bo.handle, 0, 0, 0 };
+        var pitches = [_]u32{ bo.stride, 0, 0, 0 };
+        var offsets = [_]u32{ bo.offset, 0, 0, 0 };
+        const result = if (modifiers == null)
+            c.drmModeAddFB2(fd, size.width, size.height, c.DRM_FORMAT_XRGB8888, &handles, &pitches, &offsets, &buffer.framebuffer_id, 0)
+        else blk: {
+            var framebuffer_modifiers = [_]u64{ bo.modifier, 0, 0, 0 };
+            break :blk c.drmModeAddFB2WithModifiers(fd, size.width, size.height, c.DRM_FORMAT_XRGB8888, &handles, &pitches, &offsets, &framebuffer_modifiers, &buffer.framebuffer_id, c.DRM_MODE_FB_MODIFIERS);
+        };
+        if (result != 0) return error.AddFramebufferFailed;
+        const id = render.allocateRenderTargetId();
+        try renderer.import_target(renderer.context, .{
+            .id = id,
+            .size = size,
+            .fd = bo.fd,
+            .format = c.DRM_FORMAT_XRGB8888,
+            .modifier = bo.modifier,
+            .stride = bo.stride,
+            .offset = bo.offset,
+        });
+        buffer.render_target_id = id;
+    }
+}
+
+fn destroyPair(self: *Self, fd: std.posix.fd_t, buffers: *[buffer_count]Buffer, shadow: []u32) void {
+    for (buffers) |*buffer| self.destroyBuffer(fd, buffer);
+    self.allocator.free(shadow);
+}
+
+fn createBuffer(self: *Self, fd: std.posix.fd_t, size: render.Size, buffer: *Buffer) !void {
     var create = std.mem.zeroes(c.struct_drm_mode_create_dumb);
     create.width = size.width;
     create.height = size.height;
@@ -818,7 +1100,7 @@ fn createBuffer(fd: std.posix.fd_t, size: render.Size, buffer: *Buffer) !void {
         return error.CreateDumbBufferFailed;
     }
     buffer.handle = create.handle;
-    errdefer destroyBuffer(fd, buffer);
+    errdefer self.destroyBuffer(fd, buffer);
 
     if (c.drmModeAddFB(
         fd,
@@ -852,12 +1134,18 @@ fn createBuffer(fd: std.posix.fd_t, size: render.Size, buffer: *Buffer) !void {
     @memset(buffer.pixels, 0);
 }
 
-fn destroyBuffer(fd: std.posix.fd_t, buffer: *Buffer) void {
+fn destroyBuffer(self: *Self, fd: std.posix.fd_t, buffer: *Buffer) void {
+    if (buffer.render_target_id) |id| {
+        const renderer = self.dmabuf_renderer orelse unreachable;
+        renderer.release_target(renderer.context, id);
+    }
     if (buffer.mapping) |mapping| std.posix.munmap(mapping);
     if (buffer.framebuffer_id != 0 and c.drmModeRmFB(fd, buffer.framebuffer_id) != 0) {
         log.err("failed to remove DRM framebuffer {d}", .{buffer.framebuffer_id});
     }
-    if (buffer.handle != 0) {
+    if (buffer.gbm) |*gbm_buffer| {
+        gbm_buffer.deinit();
+    } else if (buffer.handle != 0) {
         var destroy = c.struct_drm_mode_destroy_dumb{ .handle = buffer.handle };
         if (c.drmIoctl(fd, c.DRM_IOCTL_MODE_DESTROY_DUMB, &destroy) != 0) {
             log.err("failed to destroy DRM dumb buffer {d}", .{buffer.handle});
@@ -913,6 +1201,14 @@ fn testDeviceFd(_: *anyopaque) ?std.posix.fd_t {
     return null;
 }
 
+fn unavailableGbm(_: *anyopaque) ?*Gbm {
+    return null;
+}
+
+fn testDeviceGbm(_: *anyopaque) ?*Gbm {
+    return null;
+}
+
 fn testDeviceActive(_: *anyopaque) bool {
     return false;
 }
@@ -952,12 +1248,86 @@ test "DRM mode refresh converts to presentation period" {
     try std.testing.expectEqual(presentation.nominal_refresh_nanoseconds, refreshNanoseconds(mode));
 }
 
+test "GBM Vulkan target is accepted as a DRM framebuffer" {
+    const fd = std.c.open("/dev/dri/card0", std.c.O{
+        .ACCMODE = .RDWR,
+        .CLOEXEC = true,
+    });
+    if (fd < 0) return error.SkipZigTest;
+    defer _ = std.c.close(fd);
+
+    const VulkanRenderer = @import("../render/vulkan.zig");
+    var renderer = VulkanRenderer.init(std.testing.allocator, .{ .major = 226, .minor = 0 }) catch |err| switch (err) {
+        error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+    const access = renderer.dmabufAccess() orelse return error.SkipZigTest;
+    var gbm = Gbm.init(fd) catch return error.SkipZigTest;
+    defer gbm.deinit();
+
+    const size: render.Size = .{ .width = 64, .height = 64 };
+    const Selected = struct {
+        buffer: Gbm.Buffer,
+        framebuffer_id: u32,
+        target_id: u64,
+    };
+    var selected: ?Selected = null;
+    for (access.modifiers) |modifier| {
+        var buffer = gbm.createBuffer(size, c.DRM_FORMAT_XRGB8888, &.{modifier}) catch continue;
+        var handles = [_]u32{ buffer.handle, 0, 0, 0 };
+        var pitches = [_]u32{ buffer.stride, 0, 0, 0 };
+        var offsets = [_]u32{ buffer.offset, 0, 0, 0 };
+        var framebuffer_id: u32 = 0;
+        const add_result = if (buffer.modifier == drm_format_mod_linear)
+            c.drmModeAddFB2(fd, size.width, size.height, c.DRM_FORMAT_XRGB8888, &handles, &pitches, &offsets, &framebuffer_id, 0)
+        else blk: {
+            var modifiers = [_]u64{ buffer.modifier, 0, 0, 0 };
+            break :blk c.drmModeAddFB2WithModifiers(fd, size.width, size.height, c.DRM_FORMAT_XRGB8888, &handles, &pitches, &offsets, &modifiers, &framebuffer_id, c.DRM_MODE_FB_MODIFIERS);
+        };
+        if (add_result != 0) {
+            buffer.deinit();
+            continue;
+        }
+        const target_id = render.allocateRenderTargetId();
+        access.import_target(access.context, .{
+            .id = target_id,
+            .size = size,
+            .fd = buffer.fd,
+            .format = c.DRM_FORMAT_XRGB8888,
+            .modifier = buffer.modifier,
+            .stride = buffer.stride,
+            .offset = buffer.offset,
+        }) catch {
+            _ = c.drmModeRmFB(fd, framebuffer_id);
+            buffer.deinit();
+            continue;
+        };
+        selected = .{
+            .buffer = buffer,
+            .framebuffer_id = framebuffer_id,
+            .target_id = target_id,
+        };
+        break;
+    }
+    if (selected == null) return error.SkipZigTest;
+    defer selected.?.buffer.deinit();
+    defer _ = c.drmModeRmFB(fd, selected.?.framebuffer_id);
+    defer access.release_target(access.context, selected.?.target_id);
+
+    try renderer.renderFrame(.{
+        .size = size,
+        .commands = &.{.{ .clear = render.Color.rgba(12, 34, 56, 255) }},
+    }, .{ .dmabuf = .{ .id = selected.?.target_id, .size = size } });
+}
+
 test "DRM scale preserves mode pixels and derives logical size" {
     var context: u8 = 0;
     var output: Self = undefined;
     output.init(std.testing.allocator, std.testing.io, .{
         .context = &context,
         .fd = testDeviceFd,
+        .gbm = testDeviceGbm,
         .active = testDeviceActive,
         .fail = testDeviceFail,
     });

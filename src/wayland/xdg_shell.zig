@@ -150,6 +150,7 @@ pub const WindowState = struct {
     decoration_preference: DecorationPreference = .only_csd,
     decoration_configure_requested: bool = false,
     configuration: ToplevelConfigure = .{},
+    committed_dimensions: ?Dimensions = null,
     mapped: bool = false,
     ready: bool = false,
 
@@ -179,6 +180,7 @@ pub const WindowState = struct {
         self.current_min_size = .{};
         self.current_max_size = .{};
         self.configuration = .{};
+        self.committed_dimensions = null;
         self.mapped = false;
         self.ready = false;
     }
@@ -188,6 +190,16 @@ pub const Dimensions = struct {
     width: i32,
     height: i32,
 };
+
+fn windowCommitNeedsNotification(
+    was_mapped: bool,
+    configure_serial: ?u32,
+    previous_dimensions: ?Dimensions,
+    dimensions: Dimensions,
+) bool {
+    return !was_mapped or configure_serial != null or previous_dimensions == null or
+        !std.meta.eql(previous_dimensions.?, dimensions);
+}
 
 pub const TiledEdges = packed struct(u8) {
     top: bool = false,
@@ -1681,9 +1693,16 @@ const XdgSurfaceResource = struct {
         }
 
         if (info.has_buffer) {
+            const geometry = self.shell.contentGeometry(state) orelse unreachable;
+            const dimensions: Dimensions = .{
+                .width = @intCast(geometry.size.width),
+                .height = @intCast(geometry.size.height),
+            };
+            const previous_dimensions = window.committed_dimensions;
+            window.committed_dimensions = dimensions;
             self.shell.scene.setContentGeometry(
                 window.scene_id,
-                self.shell.contentGeometry(state),
+                geometry,
             );
             const was_mapped = window.mapped;
             const configure_serial = state.last_acked_serial;
@@ -1693,11 +1712,20 @@ const XdgSurfaceResource = struct {
             }
             state.mapped = state.configured;
             window.mapped = state.mapped;
-            const externally_managed = self.shell.notifyWindowCommitted(
-                window_id,
+            if (windowCommitNeedsNotification(
+                was_mapped,
                 configure_serial,
-            );
-            if (!externally_managed) self.shell.scene.setMapped(window.scene_id, state.mapped);
+                previous_dimensions,
+                dimensions,
+            )) {
+                const externally_managed = self.shell.notifyWindowCommitted(
+                    window_id,
+                    configure_serial,
+                );
+                if (!externally_managed) {
+                    self.shell.scene.setMapped(window.scene_id, state.mapped);
+                }
+            }
             if (was_mapped and state.mapped) {
                 self.shell.scene.surfaceCommitted(window.scene_id);
             }
@@ -2651,6 +2679,20 @@ test "xdg resize edges translate to independent River edge flags" {
         ToplevelResource.resizeEdges(.bottom_right),
     );
     try std.testing.expectEqual(ResizeEdges{}, ToplevelResource.resizeEdges(.none));
+}
+
+test "xdg pixel-only window commits do not notify policy" {
+    const dimensions: Dimensions = .{ .width = 800, .height = 600 };
+
+    try std.testing.expect(windowCommitNeedsNotification(false, null, null, dimensions));
+    try std.testing.expect(windowCommitNeedsNotification(true, 42, dimensions, dimensions));
+    try std.testing.expect(windowCommitNeedsNotification(
+        true,
+        null,
+        dimensions,
+        .{ .width = 801, .height = 600 },
+    ));
+    try std.testing.expect(!windowCommitNeedsNotification(true, null, dimensions, dimensions));
 }
 
 test "xdg positioner derives popup geometry from anchor and gravity" {

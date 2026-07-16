@@ -36,18 +36,26 @@ pub fn init(
     io: std.Io,
     display: *wl.Server,
     output_size: render.Size,
+    output_scale: render.Scale,
     kind: Kind,
     drm_output: ?*DrmOutput,
     listener: Listener,
+    dmabuf_renderer: ?render.DmabufRenderer,
+    offscreen_renderer: ?render.OffscreenRenderer,
 ) !void {
     self.io = io;
     switch (kind) {
         .drm => {
             const output = drm_output orelse return error.MissingDrmOutput;
-            output.attach(listener);
+            output.attach(listener, dmabuf_renderer);
             self.backend = .{ .drm = output };
         },
-        .headless => self.backend = .{ .headless = try HeadlessOutput.init(allocator, output_size) },
+        .headless => self.backend = .{ .headless = try HeadlessOutput.initForRenderer(
+            allocator,
+            output_size,
+            output_scale,
+            offscreen_renderer,
+        ) },
         .nested => {
             self.backend = .{ .nested = undefined };
             try self.backend.nested.init(io, display, output_size, listener);
@@ -102,7 +110,7 @@ pub fn deinit(self: *Self) void {
 pub fn size(self: *const Self) render.Size {
     return switch (self.backend) {
         .drm => |output| output.logicalSize(),
-        .headless => |output| output.size,
+        .headless => |output| output.logicalSize(),
         .nested => |output| output.size,
     };
 }
@@ -140,7 +148,7 @@ pub fn physicalSize(self: *const Self) render.Size {
 pub fn renderScale(self: *const Self) render.Scale {
     return switch (self.backend) {
         .drm => |output| output.scale,
-        .headless => .{},
+        .headless => |output| output.scale,
         .nested => |output| output.render_scale,
     };
 }
@@ -148,7 +156,7 @@ pub fn renderScale(self: *const Self) render.Scale {
 pub fn clientScale(self: *const Self) u32 {
     return switch (self.backend) {
         .drm => |output| output.scale.ceil() catch unreachable,
-        .headless => 1,
+        .headless => |output| output.scale.ceil() catch unreachable,
         .nested => |output| output.client_scale,
     };
 }
@@ -192,12 +200,19 @@ pub fn presentationClockId(self: *const Self) u32 {
     };
 }
 
-pub fn acquire(self: *Self) ?render.PixelBuffer {
+pub fn acquire(self: *Self) ?render.Target {
     return switch (self.backend) {
         .drm => |output| output.acquire(),
-        .headless => |*output| output.target(),
-        .nested => |*output| output.acquire(),
+        .headless => |*output| output.renderTarget(),
+        .nested => |*output| if (output.acquire()) |target| .{ .pixels = target } else null,
     };
+}
+
+pub fn repairDamage(self: *Self, damage: *Region) !void {
+    switch (self.backend) {
+        .drm => |output| try output.repairDamage(damage),
+        .headless, .nested => {},
+    }
 }
 
 pub fn cancel(self: *Self) void {

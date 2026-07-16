@@ -228,6 +228,7 @@ const XwaylandWindow = struct {
 const RenderOutputConfig = struct {
     kind: OutputBackend.Kind,
     size: render.Size,
+    scale: render.Scale = .{},
     position: Output.Position = .{},
     name: []const u8,
     description: []const u8,
@@ -236,16 +237,16 @@ const RenderOutputConfig = struct {
     drm_output: ?*DrmOutput = null,
 };
 
+pub const VirtualOutputConfig = struct {
+    size: render.Size = .{ .width = 1280, .height = 720 },
+    scale: render.Scale = .{},
+};
+
 const OutputFrame = struct {
     render_output: *RenderOutput,
     output: *Output,
-    target: renderer_types.Target,
-    size: render.Size,
-    scale: render.Scale,
-    origin: render.Position,
     visible_rect: render.Rect,
     track_visibility: bool,
-    damage: ?[]const render.Rect = null,
     presentation_damage: ?*const Region = null,
 };
 
@@ -255,6 +256,24 @@ pub fn create(
     renderer_kind: renderer_types.Renderer.Kind,
     output_kind: OutputBackend.Kind,
     drm_device_path: ?[]const u8,
+) !*Self {
+    return createWithVirtualOutput(
+        allocator,
+        io,
+        renderer_kind,
+        output_kind,
+        drm_device_path,
+        .{},
+    );
+}
+
+pub fn createWithVirtualOutput(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    renderer_kind: renderer_types.Renderer.Kind,
+    output_kind: OutputBackend.Kind,
+    drm_device_path: ?[]const u8,
+    virtual_output: VirtualOutputConfig,
 ) !*Self {
     const self = try allocator.create(Self);
     errdefer allocator.destroy(self);
@@ -357,7 +376,7 @@ pub fn create(
         .viewporter = undefined,
         .window_manager = undefined,
         .window_manager_initialized = false,
-        .renderer = try renderer_types.Renderer.init(allocator, renderer_kind),
+        .renderer = undefined,
         .socket_buffer = undefined,
         .listening = false,
     };
@@ -369,7 +388,6 @@ pub fn create(
     errdefer self.render_outputs.deinit(allocator);
     errdefer self.xwayland_windows.deinit(allocator);
     errdefer self.xwayland_client_stack.deinit(allocator);
-    errdefer self.renderer.deinit();
     if (output_kind == .drm) {
         try self.session.init(allocator, display.getEventLoop());
         self.session_initialized = true;
@@ -382,8 +400,21 @@ pub fn create(
             drm_device_path,
         );
         self.drm_device_initialized = true;
-        errdefer self.drm_device.deinit();
     }
+    self.renderer = renderer_types.Renderer.initForDevice(
+        allocator,
+        renderer_kind,
+        if (output_kind == .drm) self.drm_device.deviceId() else null,
+    ) catch |err| {
+        if (output_kind == .drm) {
+            self.drm_device.deinit();
+            self.session.deinit();
+        }
+        return err;
+    };
+    errdefer if (output_kind == .drm) self.session.deinit();
+    errdefer self.renderer.deinit();
+    errdefer if (output_kind == .drm) self.drm_device.deinit();
     try self.compositor.init(allocator, display);
     errdefer self.compositor.deinit();
     try self.security_context.init(allocator, display);
@@ -411,7 +442,8 @@ pub fn create(
         }
     } else render_output_id = try self.addRenderOutput(io, .{
         .kind = output_kind,
-        .size = .{ .width = 1280, .height = 720 },
+        .size = virtual_output.size,
+        .scale = virtual_output.scale,
         .name = if (output_kind == .headless) "HEADLESS-1" else "NESTED-1",
         .description = if (output_kind == .headless) "Keywork headless output" else "Keywork nested output",
         .model = if (output_kind == .headless) "headless" else "nested-wayland",
@@ -1025,9 +1057,12 @@ fn addRenderOutput(
         io,
         self.display,
         config.size,
+        config.scale,
         config.kind,
         config.drm_output,
         backendListener(render_output),
+        self.renderer.dmabufAccess(),
+        self.renderer.offscreenAccess(),
     );
     errdefer render_output.backend.deinit();
     render_output.protocol_id = try self.outputs.add(.{
@@ -4204,19 +4239,25 @@ fn captureCursor(
         .toplevel => self.firstRenderOutput(),
     } orelse return error.InvalidTarget;
     const output = self.outputs.get(render_output.protocol_id) orelse return error.InvalidTarget;
+    try self.renderer.beginFrame(
+        .{ .pixels = pixel_buffer },
+        state.scale,
+        .{ .x = state.bounds.x, .y = state.bounds.y },
+        null,
+    );
+    var renderer_frame_active = true;
+    errdefer if (renderer_frame_active) self.renderer.cancelFrame();
     const frame: OutputFrame = .{
         .render_output = render_output,
         .output = output,
-        .target = self.renderer.makeTarget(pixel_buffer),
-        .size = pixel_buffer.size,
-        .scale = state.scale,
-        .origin = .{ .x = state.bounds.x, .y = state.bounds.y },
         .visible_rect = state.bounds,
         .track_visibility = false,
     };
     const clear_command = [_]render.Command{.{ .clear = render.Color.rgba(0, 0, 0, 0) }};
     try self.renderCommands(&frame, &clear_command);
     try self.renderCursor(&frame, state.cursor);
+    renderer_frame_active = false;
+    try self.renderer.finishFrame();
 }
 
 fn floorToI32(value: f64) i32 {
@@ -4353,13 +4394,17 @@ fn captureOutputRegion(
     const expected_size = render_output.backend.size();
     if (!std.meta.eql(pixel_buffer.size, expected_size)) return error.InvalidTarget;
     const visible_rect = output.logicalRect();
+    try self.renderer.beginFrame(
+        .{ .pixels = pixel_buffer },
+        scale,
+        .{ .x = visible_rect.x, .y = visible_rect.y },
+        null,
+    );
+    var renderer_frame_active = true;
+    errdefer if (renderer_frame_active) self.renderer.cancelFrame();
     const frame: OutputFrame = .{
         .render_output = render_output,
         .output = output,
-        .target = self.renderer.makeTarget(pixel_buffer),
-        .size = pixel_buffer.size,
-        .scale = scale,
-        .origin = .{ .x = visible_rect.x, .y = visible_rect.y },
         .visible_rect = visible_rect,
         .track_visibility = false,
     };
@@ -4373,6 +4418,8 @@ fn captureOutputRegion(
     } else {
         _ = try self.renderDesktopContents(&frame, paint_cursors);
     }
+    renderer_frame_active = false;
+    try self.renderer.finishFrame();
 }
 
 const ToplevelCaptureError = renderer_types.Renderer.Error || error{Stopped};
@@ -4393,13 +4440,17 @@ fn captureToplevel(
     })) return error.InvalidTarget;
     const render_output = self.firstRenderOutput() orelse return error.InvalidTarget;
     const output = self.outputs.get(render_output.protocol_id) orelse return error.InvalidTarget;
+    try self.renderer.beginFrame(
+        .{ .pixels = pixel_buffer },
+        .{},
+        .{ .x = bounds.x, .y = bounds.y },
+        null,
+    );
+    var renderer_frame_active = true;
+    errdefer if (renderer_frame_active) self.renderer.cancelFrame();
     const frame: OutputFrame = .{
         .render_output = render_output,
         .output = output,
-        .target = self.renderer.makeTarget(pixel_buffer),
-        .size = pixel_buffer.size,
-        .scale = .{},
-        .origin = .{ .x = bounds.x, .y = bounds.y },
         .visible_rect = bounds,
         .track_visibility = false,
     };
@@ -4413,6 +4464,8 @@ fn captureToplevel(
         null,
         null,
     );
+    renderer_frame_active = false;
+    try self.renderer.finishFrame();
 }
 
 fn renderOutputForProtocol(self: *Self, output_id: OutputLayout.Id) ?*RenderOutput {
@@ -4538,7 +4591,7 @@ fn outputHasBackdropBlur(self: *Self, visible_rect: render.Rect) bool {
 }
 
 fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Renderer.Error!void {
-    const pixel_target = render_output.backend.acquire() orelse {
+    const render_target = render_output.backend.acquire() orelse {
         render_output.repaint_needed = true;
         return;
     };
@@ -4555,21 +4608,25 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
     defer frame_damage.deinit();
     try frame_damage.copyFrom(&render_output.damage);
     render_output.damage.clear();
+    var render_damage = Region.init();
+    defer render_damage.deinit();
+    try render_damage.copyFrom(&frame_damage);
+    try render_output.backend.repairDamage(&render_damage);
     const damage = if (render_output.backend.persistentRenderTarget() and
         self.renderer.supportsPartialDamage())
-        try self.outputDamageRectangles(render_output, &frame_damage)
+        try self.outputDamageRectangles(render_output, &render_damage)
     else
         null;
+    const scale = render_output.backend.renderScale();
+    const origin: render.Position = .{ .x = position.x, .y = position.y };
+    try self.renderer.beginFrame(render_target, scale, origin, damage);
+    var renderer_frame_active = true;
+    errdefer if (renderer_frame_active) self.renderer.cancelFrame();
     const frame: OutputFrame = .{
         .render_output = render_output,
         .output = output,
-        .target = self.renderer.makeTarget(pixel_target),
-        .size = render_output.backend.size(),
-        .scale = render_output.backend.renderScale(),
-        .origin = .{ .x = position.x, .y = position.y },
         .visible_rect = output.logicalRect(),
         .track_visibility = true,
-        .damage = damage,
         .presentation_damage = &frame_damage,
     };
     const clear_command = [_]render.Command{.{ .clear = if (self.session_lock.isLocked())
@@ -4577,9 +4634,16 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
     else
         render.Color.rgba(24, 24, 27, 255) }};
     try self.renderCommands(&frame, &clear_command);
-    if (self.session_lock.isLocked()) return self.renderSessionLockFrame(&frame);
+    if (self.session_lock.isLocked()) {
+        try self.renderSessionLockContents(&frame, true);
+        renderer_frame_active = false;
+        try self.renderer.finishFrame();
+        return self.presentSessionLockFrame(&frame);
+    }
 
     const top_fullscreen = try self.renderDesktopContents(&frame, true);
+    renderer_frame_active = false;
+    try self.renderer.finishFrame();
 
     const presented = render_output.backend.present(&frame_damage) catch
         return error.InvalidTarget;
@@ -4696,12 +4760,10 @@ fn renderDesktopContents(
     return top_fullscreen;
 }
 
-fn renderSessionLockFrame(
+fn presentSessionLockFrame(
     self: *Self,
     frame: *const OutputFrame,
 ) renderer_types.Renderer.Error!void {
-    try self.renderSessionLockContents(frame, true);
-
     const lock_surface = self.session_lock.surfaceForOutput(frame.render_output.protocol_id);
     const presented = frame.render_output.backend.present(frame.presentation_damage.?) catch
         return error.InvalidTarget;
@@ -4970,13 +5032,8 @@ fn renderCommands(
     frame: *const OutputFrame,
     commands: []const render.Command,
 ) renderer_types.Renderer.Error!void {
-    try self.renderer.render(.{
-        .size = frame.size,
-        .commands = commands,
-        .damage = frame.damage,
-        .scale = frame.scale,
-        .origin = frame.origin,
-    }, frame.target);
+    _ = frame;
+    try self.renderer.append(commands);
 }
 
 fn renderWindow(

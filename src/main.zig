@@ -3,6 +3,7 @@
 const std = @import("std");
 const OutputBackend = @import("backend/output.zig");
 const Renderer = @import("render/renderer.zig").Renderer;
+const render = @import("render/types.zig");
 const Server = @import("server.zig");
 
 pub fn main(init: std.process.Init) !void {
@@ -14,12 +15,22 @@ pub fn main(init: std.process.Init) !void {
         std.meta.stringToEnum(OutputBackend.Kind, value) orelse return error.InvalidOutputBackend
     else
         .headless;
-    const server = try Server.create(
+    var virtual_output: Server.VirtualOutputConfig = .{};
+    if (output_kind == .headless) {
+        if (init.environ_map.get("KEYWORK_HEADLESS_SIZE")) |value| {
+            virtual_output.size = parseHeadlessSize(value) catch return error.InvalidHeadlessSize;
+        }
+        if (init.environ_map.get("KEYWORK_HEADLESS_SCALE")) |value| {
+            virtual_output.scale = parseHeadlessScale(value) catch return error.InvalidHeadlessScale;
+        }
+    }
+    const server = try Server.createWithVirtualOutput(
         init.gpa,
         init.io,
         renderer_kind,
         output_kind,
         init.environ_map.get("KEYWORK_DRM_DEVICE"),
+        virtual_output,
     );
     defer server.destroy();
 
@@ -57,6 +68,28 @@ pub fn main(init: std.process.Init) !void {
     server.run();
 }
 
+fn parseHeadlessSize(value: []const u8) !render.Size {
+    const separator = std.mem.indexOfScalar(u8, value, 'x') orelse
+        return error.InvalidHeadlessSize;
+    const width = std.fmt.parseInt(u32, value[0..separator], 10) catch
+        return error.InvalidHeadlessSize;
+    const height = std.fmt.parseInt(u32, value[separator + 1 ..], 10) catch
+        return error.InvalidHeadlessSize;
+    if (width == 0 or height == 0) return error.InvalidHeadlessSize;
+    return .{ .width = width, .height = height };
+}
+
+fn parseHeadlessScale(value: []const u8) !render.Scale {
+    const scale = std.fmt.parseFloat(f64, value) catch return error.InvalidHeadlessScale;
+    const scaled = @round(scale * render.Scale.denominator);
+    if (!std.math.isFinite(scaled) or scaled < 1 or
+        scaled > @as(f64, @floatFromInt(std.math.maxInt(u32))))
+    {
+        return error.InvalidHeadlessScale;
+    }
+    return .{ .numerator = @intFromFloat(scaled) };
+}
+
 fn terminate(_: c_int, server: *Server) c_int {
     server.terminate();
     return 0;
@@ -66,6 +99,16 @@ fn reapChildren(_: c_int, _: *Server) c_int {
     // Detached launchers and Xwayland deliberately transfer wait ownership here.
     while (std.c.waitpid(-1, null, std.os.linux.W.NOHANG) > 0) {}
     return 0;
+}
+
+test "headless output configuration parses physical size and fractional scale" {
+    try std.testing.expectEqual(
+        render.Size{ .width = 2880, .height = 1800 },
+        try parseHeadlessSize("2880x1800"),
+    );
+    try std.testing.expectEqual(@as(u32, 180), (try parseHeadlessScale("1.5")).numerator);
+    try std.testing.expectError(error.InvalidHeadlessSize, parseHeadlessSize("2880"));
+    try std.testing.expectError(error.InvalidHeadlessScale, parseHeadlessScale("0"));
 }
 
 test {
