@@ -60,6 +60,10 @@ pub const Buffer = struct {
     manager: *Self,
     pixel: u32,
 
+    // Optimized builds may merge identical wl_buffer request handlers, so the
+    // implementation address cannot also serve as the resource type identity.
+    var implementation_token: u8 = undefined;
+
     fn create(
         manager: *Self,
         client: *wl.Client,
@@ -71,7 +75,13 @@ pub const Buffer = struct {
         const self = try manager.allocator.create(Buffer);
         self.* = .{ .manager = manager, .pixel = pixel };
         manager.buffer_count += 1;
-        resource.setHandler(*Buffer, handleRequest, handleDestroy, self);
+        const raw_resource: *wl.Resource = @ptrCast(resource);
+        raw_resource.setDispatcher(
+            dispatchRequest,
+            &implementation_token,
+            self,
+            handleDestroy,
+        );
     }
 
     pub fn fromResource(resource: *wl.Buffer) ?*Buffer {
@@ -79,18 +89,27 @@ pub const Buffer = struct {
         if (wl_resource_instance_of(
             raw_resource,
             @ptrCast(wl.Buffer.interface),
-            @ptrCast(&handleRequest),
+            &implementation_token,
         ) == 0) return null;
         return @ptrCast(@alignCast(resource.getUserData().?));
     }
 
-    fn handleRequest(resource: *wl.Buffer, request: wl.Buffer.Request, _: *Buffer) void {
-        switch (request) {
-            .destroy => resource.destroy(),
+    fn dispatchRequest(
+        _: ?*const anyopaque,
+        resource: *wl.Resource,
+        opcode: u32,
+        _: *const wl.Message,
+        _: [*]wl.Argument,
+    ) callconv(.c) c_int {
+        switch (opcode) {
+            0 => resource.destroy(),
+            else => unreachable,
         }
+        return 0;
     }
 
-    fn handleDestroy(_: *wl.Buffer, self: *Buffer) void {
+    fn handleDestroy(resource: *wl.Resource) callconv(.c) void {
+        const self: *Buffer = @ptrCast(@alignCast(resource.getUserData().?));
         self.manager.buffer_count -= 1;
         self.manager.allocator.destroy(self);
     }

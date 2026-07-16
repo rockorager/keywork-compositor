@@ -569,6 +569,10 @@ pub const Buffer = struct {
     source_cache_id: u64,
     next_source_version: u64,
 
+    // Optimized builds may merge identical wl_buffer request handlers, so the
+    // implementation address cannot also serve as the resource type identity.
+    var implementation_token: u8 = undefined;
+
     pub const CopyError = error{
         OutOfMemory,
         ImportFailed,
@@ -593,7 +597,13 @@ pub const Buffer = struct {
             .next_source_version = 1,
         };
         manager.buffer_count += 1;
-        resource.setHandler(*Buffer, Buffer.handleRequest, Buffer.handleDestroy, self);
+        const raw_resource: *wl.Resource = @ptrCast(resource);
+        raw_resource.setDispatcher(
+            dispatchRequest,
+            &implementation_token,
+            self,
+            handleDestroy,
+        );
         return self;
     }
 
@@ -602,7 +612,7 @@ pub const Buffer = struct {
         if (wl_resource_instance_of(
             raw_resource,
             @ptrCast(wl.Buffer.interface),
-            @ptrCast(&Buffer.handleRequest),
+            &implementation_token,
         ) == 0) return null;
         return @ptrCast(@alignCast(resource.getUserData().?));
     }
@@ -786,13 +796,22 @@ pub const Buffer = struct {
         )) return error.ImportFailed;
     }
 
-    fn handleRequest(resource: *wl.Buffer, request: wl.Buffer.Request, _: *Buffer) void {
-        switch (request) {
-            .destroy => resource.destroy(),
+    fn dispatchRequest(
+        _: ?*const anyopaque,
+        resource: *wl.Resource,
+        opcode: u32,
+        _: *const wl.Message,
+        _: [*]wl.Argument,
+    ) callconv(.c) c_int {
+        switch (opcode) {
+            0 => resource.destroy(),
+            else => unreachable,
         }
+        return 0;
     }
 
-    fn handleDestroy(_: *wl.Buffer, self: *Buffer) void {
+    fn handleDestroy(resource: *wl.Resource) callconv(.c) void {
+        const self: *Buffer = @ptrCast(@alignCast(resource.getUserData().?));
         self.resource = null;
         self.unreference();
     }
