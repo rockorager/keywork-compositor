@@ -129,6 +129,7 @@ pub fn build(b: *std.Build) void {
     root_module.linkSystemLibrary("pixman-1", .{});
     root_module.linkSystemLibrary("xcursor", .{});
     root_module.linkSystemLibrary("libseat", .{});
+    root_module.linkSystemLibrary("libsystemd", .{});
     root_module.linkSystemLibrary("libudev", .{});
     root_module.linkSystemLibrary("wayland-client", .{});
     root_module.linkSystemLibrary("wayland-server", .{});
@@ -145,6 +146,23 @@ pub fn build(b: *std.Build) void {
     });
 
     b.installArtifact(exe);
+    b.installBinFile("resources/keywork-session", "keywork-session");
+    b.installFile(
+        "resources/keywork-compositor.service",
+        "share/systemd/user/keywork-compositor.service",
+    );
+    b.installFile(
+        "resources/keywork-session.target",
+        "share/systemd/user/keywork-session.target",
+    );
+    b.installFile(
+        "resources/keywork-shutdown.target",
+        "share/systemd/user/keywork-shutdown.target",
+    );
+    b.installFile(
+        "resources/keywork.desktop",
+        "share/wayland-sessions/keywork.desktop",
+    );
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());

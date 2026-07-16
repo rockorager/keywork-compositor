@@ -1,0 +1,5 @@
+[Unit]
+Description=Keywork graphical session
+BindsTo=keywork-compositor.service graphical-session.target
+After=keywork-compositor.service graphical-session.target
+Wants=keywork-shell.service

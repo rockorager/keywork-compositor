@@ -5,6 +5,9 @@ const OutputBackend = @import("backend/output.zig");
 const Renderer = @import("render/renderer.zig").Renderer;
 const render = @import("render/types.zig");
 const Server = @import("server.zig");
+const Systemd = @import("systemd.zig");
+
+const log = std.log.scoped(.main);
 
 pub fn main(init: std.process.Init) !void {
     const renderer_kind: Renderer.Kind = if (init.environ_map.get("KEYWORK_RENDERER")) |value|
@@ -63,13 +66,38 @@ pub fn main(init: std.process.Init) !void {
     const socket_name = try server.listen();
     try init.environ_map.put("WAYLAND_DISPLAY", socket_name);
     server.setLauncherEnvironment(init.environ_map);
+    var systemd: Systemd = .init(init.io, init.environ_map);
+    server.setXwaylandReadyListener(.{
+        .context = &systemd,
+        .ready = xwaylandReady,
+    });
+    server.setSessionExitListener(.{
+        .context = &systemd,
+        .requested = sessionExitRequested,
+    });
     var buffer: [4096]u8 = undefined;
     var writer = std.Io.File.stdout().writer(init.io, &buffer);
     try writer.interface.print("WAYLAND_DISPLAY={s}\n", .{socket_name});
     try writer.interface.flush();
     server.startXwayland(init.environ_map);
+    try systemd.ready(socket_name);
 
     server.run();
+}
+
+fn xwaylandReady(context: *anyopaque, display_name: []const u8) void {
+    const systemd: *Systemd = @ptrCast(@alignCast(context));
+    systemd.publishDisplay(display_name) catch |err| {
+        log.warn("failed to publish DISPLAY to the activation environment: {t}", .{err});
+    };
+}
+
+fn sessionExitRequested(context: *anyopaque) bool {
+    const systemd: *Systemd = @ptrCast(@alignCast(context));
+    return systemd.requestShutdown() catch |err| {
+        log.warn("failed to request an orderly graphical-session shutdown: {t}", .{err});
+        return false;
+    };
 }
 
 fn parseHeadlessSize(value: []const u8) !render.Size {

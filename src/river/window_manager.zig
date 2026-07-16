@@ -54,6 +54,7 @@ presentation_mode: river.OutputV1.PresentationMode,
 pending_presentation_mode: ?river.OutputV1.PresentationMode,
 pointer_bindings: std.ArrayList(*PointerBinding),
 router: PointerRouter,
+session: SessionController,
 
 const WindowStore = slot_map.SlotMap(ManagedWindow, enum { managed_window });
 const WindowId = WindowStore.Id;
@@ -245,6 +246,10 @@ pub const PointerRouter = struct {
     context: *anyopaque,
     route: *const fn (*anyopaque, f64, f64) PointerRoute,
 };
+pub const SessionController = struct {
+    context: *anyopaque,
+    exit: *const fn (*anyopaque) void,
+};
 
 fn operationDelta(operation: PointerOperation) Point {
     return .{
@@ -363,6 +368,7 @@ pub fn init(
     xwayland: XwaylandController,
     layer_shell: *LayerShell,
     router: PointerRouter,
+    session: SessionController,
 ) !void {
     const seat_state = try SeatState.create(allocator, seat);
     errdefer seat_state.destroy(allocator);
@@ -402,6 +408,7 @@ pub fn init(
         .pending_presentation_mode = null,
         .pointer_bindings = .empty,
         .router = router,
+        .session = session,
     };
     try self.seat_states.append(allocator, seat_state);
     errdefer self.seat_states.deinit(allocator);
@@ -904,7 +911,7 @@ fn handleRequest(
             Surface.fromResource(get.surface),
             get.id,
         ) catch resource.postNoMemory(),
-        .exit_session => self.display.terminate(),
+        .exit_session => self.session.exit(self.session.context),
     }
 }
 

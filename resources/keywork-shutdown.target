@@ -1,0 +1,10 @@
+[Unit]
+Description=Shutdown the running Keywork session
+DefaultDependencies=no
+StopWhenUnneeded=true
+
+Conflicts=graphical-session.target graphical-session-pre.target
+After=graphical-session.target graphical-session-pre.target
+
+Conflicts=keywork-session.target
+After=keywork-session.target

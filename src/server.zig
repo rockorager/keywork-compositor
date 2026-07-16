@@ -161,6 +161,17 @@ window_manager_initialized: bool,
 renderer: renderer_types.Renderer,
 socket_buffer: [11]u8,
 listening: bool,
+xwayland_ready_listener: ?XwaylandReadyListener,
+session_exit_listener: ?SessionExitListener,
+
+pub const XwaylandReadyListener = struct {
+    context: *anyopaque,
+    ready: *const fn (*anyopaque, []const u8) void,
+};
+pub const SessionExitListener = struct {
+    context: *anyopaque,
+    requested: *const fn (*anyopaque) bool,
+};
 
 const RenderOutput = struct {
     server: *Self,
@@ -379,6 +390,8 @@ pub fn createWithVirtualOutput(
         .renderer = undefined,
         .socket_buffer = undefined,
         .listening = false,
+        .xwayland_ready_listener = null,
+        .session_exit_listener = null,
     };
     errdefer self.routed_touches.deinit(allocator);
     errdefer self.routed_gestures.deinit(allocator);
@@ -684,6 +697,7 @@ pub fn createWithVirtualOutput(
         },
         &self.layer_shell,
         .{ .context = self, .route = routePointer },
+        .{ .context = self, .exit = riverExitSession },
     );
     self.window_manager_initialized = true;
     errdefer {
@@ -1735,6 +1749,14 @@ pub fn setLauncherEnvironment(
     if (self.native_input_initialized) self.native_input.setEnvironMap(environ_map);
 }
 
+pub fn setXwaylandReadyListener(self: *Self, listener: XwaylandReadyListener) void {
+    self.xwayland_ready_listener = listener;
+}
+
+pub fn setSessionExitListener(self: *Self, listener: SessionExitListener) void {
+    self.session_exit_listener = listener;
+}
+
 pub fn setFloatingBlurRadius(self: *Self, radius: u32) void {
     var effects = Scene.default_effects;
     effects.blur = if (radius == 0) null else .{ .radius = radius };
@@ -1761,6 +1783,14 @@ pub fn run(self: *Self) void {
 
 pub fn terminate(self: *Self) void {
     self.display.terminate();
+}
+
+fn riverExitSession(context: *anyopaque) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    if (self.session_exit_listener) |listener| {
+        if (listener.requested(listener.context)) return;
+    }
+    self.terminate();
 }
 
 fn requestRepaint(context: *anyopaque) void {
@@ -3554,6 +3584,9 @@ fn xwaylandReady(
     };
     self.xwm_initialized = true;
     log.info("X11 clients may use DISPLAY={s}", .{display_name});
+    if (self.xwayland_ready_listener) |listener| {
+        listener.ready(listener.context, display_name);
+    }
     return true;
 }
 

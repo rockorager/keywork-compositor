@@ -1,0 +1,59 @@
+#!/bin/sh
+
+# An external session manager such as UWSM owns lifecycle and environment setup.
+if [ -n "${MANAGERPID:-}" ] && [ "${SYSTEMD_EXEC_PID:-}" = "$$" ]; then
+    case "$(ps -p "$MANAGERPID" -o cmd=)" in
+    *systemd*--user*)
+        : "${KEYWORK_OUTPUT:=drm}"
+        : "${KEYWORK_RENDERER:=vulkan}"
+        export KEYWORK_OUTPUT KEYWORK_RENDERER KEYWORK_SYSTEMD_SESSION=1
+        exec keywork_compositor
+        ;;
+    esac
+fi
+
+if [ -n "${SHELL:-}" ] &&
+    grep -qFx "$SHELL" /etc/shells &&
+    ! printf '%s\n' "$SHELL" | grep -Eq '(false|nologin)$'; then
+    if [ "${1:-}" != "-l" ]; then
+        exec bash -c "exec -l '$SHELL' -c 'exec $0 -l $*'"
+    fi
+    shift
+fi
+
+if ! command -v systemctl >/dev/null 2>&1; then
+    echo "Keywork requires a systemd user manager." >&2
+    exit 1
+fi
+
+if systemctl --user --quiet is-active keywork-compositor.service; then
+    echo "A Keywork session is already running." >&2
+    exit 1
+fi
+
+unset WAYLAND_DISPLAY DISPLAY
+export XDG_CURRENT_DESKTOP=keywork
+export XDG_SESSION_DESKTOP=keywork
+export XDG_SESSION_TYPE=wayland
+
+systemctl --user reset-failed
+systemctl --user unset-environment WAYLAND_DISPLAY DISPLAY
+systemctl --user import-environment
+if command -v dbus-update-activation-environment >/dev/null 2>&1; then
+    dbus-update-activation-environment --all
+    dbus-update-activation-environment WAYLAND_DISPLAY= DISPLAY=
+fi
+
+systemctl --user --wait start keywork-compositor.service
+status=$?
+
+systemctl --user start --job-mode=replace-irreversibly keywork-shutdown.target
+
+systemctl --user unset-environment \
+    WAYLAND_DISPLAY DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP XDG_SESSION_TYPE
+if command -v dbus-update-activation-environment >/dev/null 2>&1; then
+    dbus-update-activation-environment \
+        WAYLAND_DISPLAY= DISPLAY= XDG_CURRENT_DESKTOP= XDG_SESSION_DESKTOP= XDG_SESSION_TYPE=
+fi
+
+exit "$status"
