@@ -46,6 +46,7 @@ touch_points: std.ArrayList(TouchPoint),
 touch_frame_resources: std.ArrayList(*wl.Touch),
 latest_pointer_enter: ?UserAction,
 active_cursor: ?ActiveCursor,
+default_cursor: ?CursorImage,
 cursor_controller: ?CursorController,
 drag_cursor_client: ?*wl.Client,
 cursor_surface_count: usize,
@@ -144,6 +145,7 @@ const ActiveCursor = union(enum) {
 const CursorController = struct {
     client: *wl.Client,
     cursor: ?ActiveCursor,
+    configured: bool,
 };
 
 pub const PointerFocus = struct {
@@ -173,6 +175,12 @@ pub const PointerBinding = struct {
 
 pub const ShapeCursor = struct {
     client: *wl.Client,
+    buffer: render.PixelBuffer,
+    hotspot_x: i32,
+    hotspot_y: i32,
+};
+
+pub const CursorImage = struct {
     buffer: render.PixelBuffer,
     hotspot_x: i32,
     hotspot_y: i32,
@@ -258,6 +266,7 @@ pub fn init(
         .touch_frame_resources = .empty,
         .latest_pointer_enter = null,
         .active_cursor = null,
+        .default_cursor = null,
         .cursor_controller = null,
         .drag_cursor_client = null,
         .cursor_surface_count = 0,
@@ -575,7 +584,7 @@ pub fn setUnfocusedCursorController(self: *Self, client: ?*wl.Client) void {
     if (client == null) {
         self.cursor_controller = null;
     } else if (self.cursor_controller == null or self.cursor_controller.?.client != client.?) {
-        self.cursor_controller = .{ .client = client.?, .cursor = null };
+        self.cursor_controller = .{ .client = client.?, .cursor = null, .configured = false };
     }
     if (self.pointer_focus == null) self.restoreControllerCursor();
 }
@@ -613,8 +622,17 @@ pub fn keyboardFocusedSurface(self: *const Self) ?Surface.Id {
 }
 
 pub fn cursorInfo(self: *const Self) ?CursorInfo {
-    const cursor = self.active_cursor orelse return null;
     const position = self.pointer_position orelse return null;
+    const cursor = self.active_cursor orelse {
+        if (self.pointer_focus != null or self.drag_cursor_client != null) return null;
+        if (self.cursor_controller) |controller| if (controller.configured) return null;
+        const fallback = self.default_cursor orelse return null;
+        return .{ .shape = .{
+            .buffer = fallback.buffer,
+            .x = cursorCoordinate(position.x, fallback.hotspot_x),
+            .y = cursorCoordinate(position.y, fallback.hotspot_y),
+        } };
+    };
     return switch (cursor) {
         .surface => |surface| .{ .surface = .{
             .surface_id = surface.surface_id,
@@ -627,6 +645,11 @@ pub fn cursorInfo(self: *const Self) ?CursorInfo {
             .y = cursorCoordinate(position.y, shape.hotspot_y),
         } },
     };
+}
+
+pub fn setDefaultCursor(self: *Self, cursor: ?CursorImage) void {
+    self.default_cursor = cursor;
+    self.requestRepaint();
 }
 
 pub fn setKeyboardAvailable(self: *Self, available: bool) void {
@@ -963,11 +986,13 @@ pub fn pointerMotion(self: *Self, time: u32, x: f64, y: f64, focus: ?PointerFocu
 }
 
 pub fn pointerLeave(self: *Self) void {
+    const fallback_visible = self.active_cursor == null and self.cursorInfo() != null;
     self.clearCursor();
     self.sendPointerLeave();
     self.pointer_focus = null;
     self.pointer_position = null;
     self.latest_pointer_enter = null;
+    if (fallback_visible) self.requestRepaint();
 }
 
 pub fn pointerButton(
@@ -1762,6 +1787,7 @@ fn setCursor(
     } } else null;
     if (manager_controller and !drag_controller) {
         self.cursor_controller.?.cursor = requested;
+        self.cursor_controller.?.configured = true;
         if (self.pointer_focus) |focus| {
             const focused_surface = self.surface_store.get(focus.surface_id);
             if (focused_surface == null or focused_surface.?.resource.getClient() != pointer.getClient()) return;
@@ -1795,6 +1821,7 @@ pub fn setCursorShape(
     const requested: ActiveCursor = .{ .shape = shape };
     if (manager_controller and !drag_controller) {
         self.cursor_controller.?.cursor = requested;
+        self.cursor_controller.?.configured = true;
         if (self.pointer_focus) |focus| {
             const focused_surface = self.surface_store.get(focus.surface_id);
             if (focused_surface == null or focused_surface.?.resource.getClient() != client) return;
@@ -1805,6 +1832,7 @@ pub fn setCursorShape(
 }
 
 pub fn clearCursorShapes(self: *Self) void {
+    self.default_cursor = null;
     if (self.active_cursor) |cursor| switch (cursor) {
         .surface => {},
         .shape => self.clearCursor(),

@@ -119,6 +119,15 @@ const AtomicPlaneProperties = struct {
     }
 };
 
+const AtomicPlaneDisableProperties = struct {
+    fb_id: u32 = 0,
+    crtc_id: u32 = 0,
+
+    fn complete(self: AtomicPlaneDisableProperties) bool {
+        return self.fb_id != 0 and self.crtc_id != 0;
+    }
+};
+
 pub const DirectScanoutResult = struct {
     accepted: bool = false,
 };
@@ -517,6 +526,7 @@ pub fn activate(self: *Self, fd: std.posix.fd_t, selection: Selection, device_pa
         self.shadow_pixels = pair.shadow_pixels;
         self.resetBufferDamage(self.size);
     }
+    self.clearInheritedCursor(fd);
     log.info(
         "activated connector {s} ({d}) on {s} at {d}x{d}, CRTC {d}, enabled={}, powered={}: {s}",
         .{ self.name(), self.connector_id, device_path, self.size.width, self.size.height, self.crtc_id, self.enabled, self.powered, self.description() },
@@ -1255,6 +1265,75 @@ fn queuePageFlip(
         c.DRM_MODE_ATOMIC_NONBLOCK | c.DRM_MODE_PAGE_FLIP_EVENT,
         self,
     ) == 0;
+}
+
+fn clearInheritedCursor(self: *Self, fd: std.posix.fd_t) void {
+    if (self.device_access.atomic(self.device_access.context) and
+        disableAtomicCursorPlanes(fd, self.crtc_id))
+    {
+        return;
+    }
+    if (c.drmModeSetCursor(fd, self.crtc_id, 0, 0, 0) != 0) {
+        log.warn("failed to clear inherited cursor on CRTC {d}", .{self.crtc_id});
+    }
+}
+
+fn disableAtomicCursorPlanes(fd: std.posix.fd_t, crtc_id: u32) bool {
+    const resources = c.drmModeGetPlaneResources(fd) orelse return false;
+    defer c.drmModeFreePlaneResources(resources);
+    const request = c.drmModeAtomicAlloc() orelse return false;
+    defer c.drmModeAtomicFree(request);
+
+    var found = false;
+    const plane_count: usize = @intCast(resources.*.count_planes);
+    for (resources.*.planes[0..plane_count]) |plane_id| {
+        const plane = c.drmModeGetPlane(fd, plane_id) orelse continue;
+        defer c.drmModeFreePlane(plane);
+        if (plane.*.crtc_id != crtc_id) continue;
+        const info = loadAtomicPlaneDisableInfo(fd, plane_id) orelse return false;
+        if (info.plane_type != c.DRM_PLANE_TYPE_CURSOR) continue;
+        found = true;
+        if (!addAtomicProperty(request, plane_id, info.properties.fb_id, 0) or
+            !addAtomicProperty(request, plane_id, info.properties.crtc_id, 0))
+        {
+            return false;
+        }
+    }
+    if (!found) return true;
+    return c.drmModeAtomicCommit(fd, request, 0, null) == 0;
+}
+
+fn loadAtomicPlaneDisableInfo(fd: std.posix.fd_t, plane_id: u32) ?struct {
+    plane_type: u64,
+    properties: AtomicPlaneDisableProperties,
+} {
+    const properties = c.drmModeObjectGetProperties(
+        fd,
+        plane_id,
+        c.DRM_MODE_OBJECT_PLANE,
+    ) orelse return null;
+    defer c.drmModeFreeObjectProperties(properties);
+
+    var plane_type: ?u64 = null;
+    var result: AtomicPlaneDisableProperties = .{};
+    const property_count: usize = @intCast(properties.*.count_props);
+    for (0..property_count) |index| {
+        const property_id = properties.*.props[index];
+        const property = c.drmModeGetProperty(fd, property_id) orelse continue;
+        defer c.drmModeFreeProperty(property);
+        const property_name = std.mem.sliceTo(property.*.name[0..], 0);
+        if (std.mem.eql(u8, property_name, "type")) {
+            plane_type = properties.*.prop_values[index];
+        } else if (std.mem.eql(u8, property_name, "FB_ID")) {
+            result.fb_id = property_id;
+        } else if (std.mem.eql(u8, property_name, "CRTC_ID")) {
+            result.crtc_id = property_id;
+        }
+    }
+    return .{
+        .plane_type = plane_type orelse return null,
+        .properties = if (result.complete()) result else return null,
+    };
 }
 
 fn addAtomicProperty(

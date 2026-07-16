@@ -106,7 +106,26 @@ fn handleManagerRequest(
     }
 }
 
+pub fn defaultCursor(self: *Self) ?Seat.CursorImage {
+    const cursor_image = self.cursorImage(.default) orelse return null;
+    return .{
+        .buffer = cursor_image.buffer,
+        .hotspot_x = cursor_image.hotspot_x,
+        .hotspot_y = cursor_image.hotspot_y,
+    };
+}
+
 fn cursor(self: *Self, client: *wl.Client, shape: Shape) ?Seat.ShapeCursor {
+    const cursor_image = self.cursorImage(shape) orelse return null;
+    return .{
+        .client = client,
+        .buffer = cursor_image.buffer,
+        .hotspot_x = cursor_image.hotspot_x,
+        .hotspot_y = cursor_image.hotspot_y,
+    };
+}
+
+fn cursorImage(self: *Self, shape: Shape) ?Seat.CursorImage {
     const index = shapeIndex(shape);
     const image = self.images[index] orelse loaded: {
         const name = shapeName(shape);
@@ -130,7 +149,6 @@ fn cursor(self: *Self, client: *wl.Client, shape: Shape) ?Seat.ShapeCursor {
     const pixel_count = std.math.mul(usize, image.width, image.height) catch return null;
     const pixels: [*]u32 = @ptrCast(image.pixels);
     return .{
-        .client = client,
         .buffer = .{
             .size = .{ .width = image.width, .height = image.height },
             .stride_pixels = image.width,

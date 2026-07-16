@@ -537,6 +537,7 @@ pub fn createWithVirtualOutput(
         .clear_shapes = clearCursorShapes,
     });
     errdefer self.cursor_shape.deinit();
+    self.seat.setDefaultCursor(self.cursor_shape.defaultCursor());
     try self.relative_pointer.init(allocator, display, &self.seat);
     errdefer self.relative_pointer.deinit();
     try self.pointer_gestures.init(allocator, display);
@@ -1232,6 +1233,7 @@ fn inputSeatCreated(context: *anyopaque, name: [:0]const u8) error{OutOfMemory}!
         .cursor_moved = cursorMoved,
     });
     errdefer entry.seat.clearRepaintListener();
+    entry.seat.setDefaultCursor(self.cursor_shape.defaultCursor());
     try self.window_manager.seatAdded(&entry.seat);
     errdefer self.window_manager.seatRemoved(&entry.seat);
     try self.data_control.addSeat(&entry.seat);
