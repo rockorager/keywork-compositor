@@ -240,38 +240,20 @@ fn drawBackdropBlur(
     blur: render_types.BackdropBlur,
     damage: ?[]const render_types.Rect,
 ) Error!void {
-    if (damage) |rectangles| {
-        for (rectangles) |rectangle| {
-            var damaged_blur = blur;
-            damaged_blur.clip = if (blur.clip) |clip|
-                clip.intersection(rectangle) orelse continue
-            else
-                rectangle;
-            try self.drawBackdropBlurArea(target, damaged_blur);
-        }
-        return;
-    }
-    try self.drawBackdropBlurArea(target, blur);
-}
-
-fn drawBackdropBlurArea(
-    self: *Self,
-    target: render_types.PixelBuffer,
-    blur: render_types.BackdropBlur,
-) Error!void {
     if (blur.radius == 0 or blur.rect.width == 0 or blur.rect.height == 0) return;
     var clipped = blur.rect.clipTo(target.size) orelse return;
     if (blur.clip) |clip| clipped = clipped.intersection(clip) orelse return;
+    const bounds = damageBounds(damage, clipped) orelse return;
 
     const radius: i64 = blur.radius;
-    const sample_left: u32 = @intCast(@max(@as(i64, clipped.x) - radius, 0));
-    const sample_top: u32 = @intCast(@max(@as(i64, clipped.y) - radius, 0));
+    const sample_left: u32 = @intCast(@max(@as(i64, bounds.x) - radius, 0));
+    const sample_top: u32 = @intCast(@max(@as(i64, bounds.y) - radius, 0));
     const sample_right: u32 = @intCast(@min(
-        @as(i64, clipped.x) + clipped.width + radius,
+        @as(i64, bounds.x) + bounds.width + radius,
         target.size.width,
     ));
     const sample_bottom: u32 = @intCast(@min(
-        @as(i64, clipped.y) + clipped.height + radius,
+        @as(i64, bounds.y) + bounds.height + radius,
         target.size.height,
     ));
     const sample_width = sample_right - sample_left;
@@ -294,6 +276,41 @@ fn drawBackdropBlurArea(
     }
     blurArgb(pixels, temporary, sample_width, sample_height, blur.radius);
 
+    if (damage) |rectangles| {
+        for (rectangles) |rectangle| {
+            const composite_rect = clipped.intersection(rectangle) orelse continue;
+            compositeBackdropBlur(
+                target,
+                blur,
+                composite_rect,
+                pixels,
+                sample_left,
+                sample_top,
+                sample_width,
+            );
+        }
+    } else {
+        compositeBackdropBlur(
+            target,
+            blur,
+            clipped,
+            pixels,
+            sample_left,
+            sample_top,
+            sample_width,
+        );
+    }
+}
+
+fn compositeBackdropBlur(
+    target: render_types.PixelBuffer,
+    blur: render_types.BackdropBlur,
+    clipped: render_types.Rect,
+    pixels: []const u32,
+    sample_left: u32,
+    sample_top: u32,
+    sample_width: u32,
+) void {
     const requested_corner_radius = @min(
         blur.corner_radius,
         @min(blur.rect.width, blur.rect.height) / 2,
@@ -324,6 +341,32 @@ fn drawBackdropBlurArea(
             );
         }
     }
+}
+
+fn damageBounds(
+    damage: ?[]const render_types.Rect,
+    visible: render_types.Rect,
+) ?render_types.Rect {
+    const rectangles = damage orelse return visible;
+    var bounds: ?render_types.Rect = null;
+    for (rectangles) |rectangle| {
+        const clipped = visible.intersection(rectangle) orelse continue;
+        bounds = if (bounds) |current| unionRect(current, clipped) else clipped;
+    }
+    return bounds;
+}
+
+fn unionRect(a: render_types.Rect, b: render_types.Rect) render_types.Rect {
+    const left = @min(a.x, b.x);
+    const top = @min(a.y, b.y);
+    const right = @max(@as(i64, a.x) + a.width, @as(i64, b.x) + b.width);
+    const bottom = @max(@as(i64, a.y) + a.height, @as(i64, b.y) + b.height);
+    return .{
+        .x = left,
+        .y = top,
+        .width = @intCast(right - left),
+        .height = @intCast(bottom - top),
+    };
 }
 
 fn blurArgb(
@@ -959,6 +1002,40 @@ test "CPU renderer blurs the backdrop inside a window region" {
     try std.testing.expectEqual(@as(u32, 0xff555555), output.pixel(2, 0));
     try std.testing.expectEqual(@as(u32, 0xff000000), output.pixel(3, 0));
     try std.testing.expectEqual(@as(u32, 0xff000000), output.pixel(4, 0));
+}
+
+test "CPU backdrop blur snapshots disjoint damage before compositing" {
+    const size: render_types.Size = .{ .width = 5, .height = 1 };
+    var output = try headless.init(std.testing.allocator, size);
+    defer output.deinit();
+
+    const target = output.target();
+    @memcpy(target.pixels[0..5], &[_]u32{
+        0xff000000,
+        0xff000000,
+        0xffffffff,
+        0xff000000,
+        0xff000000,
+    });
+    const commands = [_]render_types.Command{
+        .{ .backdrop_blur = .{
+            .rect = .{ .x = 0, .y = 0, .width = 5, .height = 1 },
+            .corner_radius = 0,
+            .radius = 1,
+        } },
+    };
+    const damage = [_]render_types.Rect{
+        .{ .x = 1, .y = 0, .width = 1, .height = 1 },
+        .{ .x = 2, .y = 0, .width = 1, .height = 1 },
+    };
+
+    var renderer = Self.init(std.testing.allocator);
+    defer renderer.deinit();
+    try renderer.render(.{ .size = size, .commands = &commands, .damage = &damage }, target);
+
+    try std.testing.expectEqual(@as(u32, 0xff555555), output.pixel(1, 0));
+    try std.testing.expectEqual(@as(u32, 0xff555555), output.pixel(2, 0));
+    try std.testing.expectEqual(@as(u32, 0xff000000), output.pixel(3, 0));
 }
 
 test "CPU renderer clips writes to frame damage and preserves stride padding" {

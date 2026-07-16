@@ -33,6 +33,10 @@ pub fn main(init: std.process.Init) !void {
         virtual_output,
     );
     defer server.destroy();
+    if (init.environ_map.get("KEYWORK_BLUR_RADIUS")) |value| {
+        server.setFloatingBlurRadius(parseBlurRadius(value) catch
+            return error.InvalidBlurRadius);
+    }
 
     const interrupt = try server.eventLoop().addSignal(
         *Server,
@@ -90,6 +94,12 @@ fn parseHeadlessScale(value: []const u8) !render.Scale {
     return .{ .numerator = @intFromFloat(scaled) };
 }
 
+fn parseBlurRadius(value: []const u8) !u32 {
+    const radius = std.fmt.parseInt(u32, value, 10) catch return error.InvalidBlurRadius;
+    if (radius > 256) return error.InvalidBlurRadius;
+    return radius;
+}
+
 fn terminate(_: c_int, server: *Server) c_int {
     server.terminate();
     return 0;
@@ -109,6 +119,12 @@ test "headless output configuration parses physical size and fractional scale" {
     try std.testing.expectEqual(@as(u32, 180), (try parseHeadlessScale("1.5")).numerator);
     try std.testing.expectError(error.InvalidHeadlessSize, parseHeadlessSize("2880"));
     try std.testing.expectError(error.InvalidHeadlessScale, parseHeadlessScale("0"));
+}
+
+test "floating blur radius is bounded" {
+    try std.testing.expectEqual(@as(u32, 0), try parseBlurRadius("0"));
+    try std.testing.expectEqual(@as(u32, 24), try parseBlurRadius("24"));
+    try std.testing.expectError(error.InvalidBlurRadius, parseBlurRadius("257"));
 }
 
 test {

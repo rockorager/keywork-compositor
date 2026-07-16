@@ -1735,6 +1735,12 @@ pub fn setLauncherEnvironment(
     if (self.native_input_initialized) self.native_input.setEnvironMap(environ_map);
 }
 
+pub fn setFloatingBlurRadius(self: *Self, radius: u32) void {
+    var effects = Scene.default_effects;
+    effects.blur = if (radius == 0) null else .{ .radius = radius };
+    self.window_manager.setFloatingEffects(effects);
+}
+
 pub fn startXwayland(
     self: *Self,
     environ_map: *std.process.Environ.Map,
@@ -4579,22 +4585,146 @@ fn handleRenderTimer(output_context: *RenderOutput) c_int {
     return 0;
 }
 
-fn outputHasBackdropBlur(self: *Self, visible_rect: render.Rect) bool {
-    var windows = self.scene.iterator();
-    while (windows.next()) |entry| {
-        const window = entry.window;
-        if (!window.mapped or window.effects.blur == null) continue;
-        const buffer = Surface.currentBuffer(
-            self.compositor.surfaceStore(),
-            window.surface_id,
-        ) orelse continue;
-        const geometry = window.content_geometry orelse Scene.ContentGeometry{
-            .size = buffer.logical_size,
-        };
-        const content_rect = windowContentRect(window, geometry.size) orelse continue;
-        if (content_rect.intersection(visible_rect) != null) return true;
+const BackdropBlurArea = struct {
+    rect: render.Rect,
+    radius: u32,
+};
+
+fn windowBackdropBlurArea(
+    self: *Self,
+    render_output: *const RenderOutput,
+    output: *const Output,
+    window: *const Scene.Window,
+) ?BackdropBlurArea {
+    if (!window.mapped) return null;
+    const blur = window.effects.blur orelse return null;
+    const buffer = Surface.currentBuffer(
+        self.compositor.surfaceStore(),
+        window.surface_id,
+    ) orelse return null;
+    const geometry = window.content_geometry orelse Scene.ContentGeometry{
+        .size = buffer.logical_size,
+    };
+    var logical = windowContentRect(window, geometry.size) orelse return null;
+    if (window.clip_box) |clip_box| {
+        logical = logical.intersection(
+            clip_box.translated(window.position.x, window.position.y),
+        ) orelse return null;
     }
-    return false;
+    const output_rect = output.logicalRect();
+    logical = logical.intersection(output_rect) orelse return null;
+    const physical = scaleDamageRect(.{
+        .x = logical.x -| output_rect.x,
+        .y = logical.y -| output_rect.y,
+        .width = logical.width,
+        .height = logical.height,
+    }, render_output.backend.renderScale(), render_output.backend.modeSize()) orelse return null;
+    const scale = render_output.backend.renderScale();
+    const scaled_radius = (@as(u64, blur.radius) * scale.numerator +
+        render.Scale.denominator / 2) / render.Scale.denominator;
+    if (scaled_radius == 0) return null;
+    return .{ .rect = physical, .radius = @intCast(scaled_radius) };
+}
+
+fn addBackdropBlurDamage(
+    damage: *Region,
+    blur: BackdropBlurArea,
+    output_size: render.Size,
+    footprint: u32,
+) Region.Error!bool {
+    const output_rect: render.Rect = .{ .x = 0, .y = 0, .width = output_size.width, .height = output_size.height };
+    const affected = expandDamageRect(blur.rect, footprint).intersection(output_rect) orelse return false;
+    var rectangles = damage.rectangleIterator();
+    while (rectangles.next()) |rectangle| {
+        if (affected.intersection(.{
+            .x = rectangle.x,
+            .y = rectangle.y,
+            .width = rectangle.width,
+            .height = rectangle.height,
+        }) != null) break;
+    } else return false;
+    if (damage.coversRectangle(affected.x, affected.y, affected.width, affected.height)) {
+        return false;
+    }
+    try damage.add(affected.x, affected.y, @intCast(affected.width), @intCast(affected.height));
+    return true;
+}
+
+fn expandDamageRect(rectangle: anytype, amount: u32) render.Rect {
+    const left = @as(i64, rectangle.x) - amount;
+    const top = @as(i64, rectangle.y) - amount;
+    const right = @as(i64, rectangle.x) + rectangle.width + amount;
+    const bottom = @as(i64, rectangle.y) + rectangle.height + amount;
+    return .{
+        .x = @intCast(std.math.clamp(left, std.math.minInt(i32), std.math.maxInt(i32))),
+        .y = @intCast(std.math.clamp(top, std.math.minInt(i32), std.math.maxInt(i32))),
+        .width = @intCast(@min(right - left, std.math.maxInt(u32))),
+        .height = @intCast(@min(bottom - top, std.math.maxInt(u32))),
+    };
+}
+
+fn expandBackdropBlurDamage(
+    self: *Self,
+    render_output: *const RenderOutput,
+    output: *const Output,
+    damage: *Region,
+) Region.Error!void {
+    var changed = true;
+    while (changed) {
+        changed = false;
+        var nodes = self.scene.nodeIterator();
+        while (nodes.next()) |entry| switch (entry) {
+            .window => |window_entry| {
+                const blur = self.windowBackdropBlurArea(render_output, output, window_entry.window) orelse continue;
+                const footprint = self.renderer.backdropBlurFootprint(blur.radius);
+                changed = try addBackdropBlurDamage(
+                    damage,
+                    blur,
+                    render_output.backend.modeSize(),
+                    footprint,
+                ) or changed;
+            },
+            .shell_surface => {},
+        };
+    }
+}
+
+test "backdrop blur damage includes the whole blur and sample area" {
+    var damage = Region.init();
+    defer damage.deinit();
+    damage.setRectangle(10, 10, 2, 2);
+    const blur: BackdropBlurArea = .{
+        .rect = .{ .x = 8, .y = 8, .width = 10, .height = 10 },
+        .radius = 4,
+    };
+
+    try std.testing.expect(try addBackdropBlurDamage(&damage, blur, .{ .width = 20, .height = 20 }, 4));
+    try std.testing.expect(damage.coversRectangle(4, 4, 16, 16));
+    try std.testing.expect(!try addBackdropBlurDamage(&damage, blur, .{ .width = 20, .height = 20 }, 4));
+
+    var distant = Region.init();
+    defer distant.deinit();
+    distant.setRectangle(0, 0, 2, 2);
+    try std.testing.expect(!try addBackdropBlurDamage(&distant, blur, .{ .width = 20, .height = 20 }, 4));
+}
+
+test "backdrop blur damage expands transitively across overlapping effects" {
+    var damage = Region.init();
+    defer damage.deinit();
+    damage.setRectangle(5, 5, 1, 1);
+    const blurs = [_]BackdropBlurArea{
+        .{ .rect = .{ .x = 5, .y = 4, .width = 8, .height = 8 }, .radius = 2 },
+        .{ .rect = .{ .x = 14, .y = 4, .width = 8, .height = 8 }, .radius = 2 },
+    };
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (blurs) |blur| {
+            changed = try addBackdropBlurDamage(&damage, blur, .{ .width = 30, .height = 20 }, 2) or changed;
+        }
+    }
+    try std.testing.expect(damage.coversRectangle(3, 2, 12, 12));
+    try std.testing.expect(damage.coversRectangle(12, 2, 12, 12));
 }
 
 fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Renderer.Error!void {
@@ -4607,21 +4737,15 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
     output.beginFrame();
     errdefer output.cancelFrame();
     const position = output.logicalPosition();
-    if (self.outputHasBackdropBlur(output.logicalRect())) {
-        const size = render_output.backend.modeSize();
-        render_output.damage.setRectangle(0, 0, size.width, size.height);
-    }
     var frame_damage = Region.init();
     defer frame_damage.deinit();
     try frame_damage.copyFrom(&render_output.damage);
     render_output.damage.clear();
-    var render_damage = Region.init();
-    defer render_damage.deinit();
-    try render_damage.copyFrom(&frame_damage);
-    try render_output.backend.repairDamage(&render_damage);
+    try render_output.backend.repairDamage(&frame_damage);
+    try self.expandBackdropBlurDamage(render_output, output, &frame_damage);
     const damage = if (render_output.backend.persistentRenderTarget() and
         self.renderer.supportsPartialDamage())
-        try self.outputDamageRectangles(render_output, &render_damage)
+        try self.outputDamageRectangles(render_output, &frame_damage)
     else
         null;
     const scale = render_output.backend.renderScale();

@@ -67,6 +67,13 @@ pub const Renderer = struct {
         };
     }
 
+    pub fn backdropBlurFootprint(self: *const Renderer, radius: u32) u32 {
+        return switch (self.backend) {
+            .cpu => radius,
+            .vulkan => VulkanRenderer.backdropBlurFootprint(radius),
+        };
+    }
+
     pub fn beginFrame(
         self: *Renderer,
         target: render_types.Target,
