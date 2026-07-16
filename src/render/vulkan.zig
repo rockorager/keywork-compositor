@@ -3516,6 +3516,10 @@ test "Vulkan renderer samples a GBM dmabuf without a CPU upload" {
     defer source_buffer.deinit();
 
     const NoopSync = struct {
+        fn retain(_: *anyopaque) void {}
+
+        fn release(_: *anyopaque) void {}
+
         fn begin(_: *anyopaque) bool {
             return true;
         }
@@ -3551,6 +3555,8 @@ test "Vulkan renderer samples a GBM dmabuf without a CPU upload" {
                     ),
                     .y_inverted = false,
                     .force_opaque = false,
+                    .retain = NoopSync.retain,
+                    .release = NoopSync.release,
                     .begin_cpu_read = NoopSync.begin,
                     .end_cpu_read = NoopSync.end,
                     .export_read_fence = NoopSync.exportFence,

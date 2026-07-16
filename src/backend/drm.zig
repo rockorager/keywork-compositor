@@ -40,6 +40,7 @@ scale: render.Scale,
 connector_id: u32,
 crtc_id: u32,
 primary_plane_id: ?u32,
+atomic_plane: ?AtomicPlaneProperties,
 scanout_modifiers: []u64,
 implicit_scanout: bool,
 connector_name: [32]u8,
@@ -56,6 +57,11 @@ presentation_clock_id: u32,
 acquired: ?usize,
 pending: ?usize,
 displayed: ?usize,
+direct_pending: ?DirectScanout,
+direct_displayed: ?DirectScanout,
+direct_framebuffers: std.AutoHashMapUnmanaged(u64, DirectFramebuffer),
+direct_frame_number: u64,
+direct_scanout_active: bool,
 enabled: bool,
 powered: bool,
 mode_set: bool,
@@ -72,6 +78,52 @@ const Buffer = struct {
     pixels: []u32 = &.{},
     stride_pixels: u32 = 0,
 };
+
+const DirectFramebuffer = struct {
+    framebuffer_id: u32,
+    size: render.Size,
+    format: u32,
+    modifier: u64,
+    stride: u32,
+    offset: u32,
+    last_used: u64,
+};
+
+const DirectScanout = struct {
+    source: render.DmabufSource,
+    cache_id: u64,
+
+    fn release(self: DirectScanout) void {
+        self.source.release(self.source.context);
+    }
+};
+
+const AtomicPlaneProperties = struct {
+    fb_id: u32 = 0,
+    crtc_id: u32 = 0,
+    src_x: u32 = 0,
+    src_y: u32 = 0,
+    src_w: u32 = 0,
+    src_h: u32 = 0,
+    crtc_x: u32 = 0,
+    crtc_y: u32 = 0,
+    crtc_w: u32 = 0,
+    crtc_h: u32 = 0,
+    in_fence_fd: u32 = 0,
+
+    fn complete(self: AtomicPlaneProperties) bool {
+        return self.fb_id != 0 and self.crtc_id != 0 and
+            self.src_x != 0 and self.src_y != 0 and self.src_w != 0 and self.src_h != 0 and
+            self.crtc_x != 0 and self.crtc_y != 0 and
+            self.crtc_w != 0 and self.crtc_h != 0;
+    }
+};
+
+pub const DirectScanoutResult = struct {
+    accepted: bool = false,
+};
+
+const max_direct_framebuffers = 8;
 
 pub const Selection = struct {
     modes: []Mode,
@@ -112,6 +164,7 @@ pub const DeviceAccess = struct {
     context: *anyopaque,
     fd: *const fn (*anyopaque) ?std.posix.fd_t,
     gbm: *const fn (*anyopaque) ?*Gbm = unavailableGbm,
+    atomic: *const fn (*anyopaque) bool = unavailableAtomic,
     active: *const fn (*anyopaque) bool,
     fail: *const fn (*anyopaque, anyerror) void,
 };
@@ -149,6 +202,7 @@ pub fn init(
         .connector_id = 0,
         .crtc_id = 0,
         .primary_plane_id = null,
+        .atomic_plane = null,
         .scanout_modifiers = &.{},
         .implicit_scanout = true,
         .connector_name = undefined,
@@ -165,6 +219,11 @@ pub fn init(
         .acquired = null,
         .pending = null,
         .displayed = null,
+        .direct_pending = null,
+        .direct_displayed = null,
+        .direct_framebuffers = .empty,
+        .direct_frame_number = 0,
+        .direct_scanout_active = false,
         .enabled = true,
         .powered = true,
         .mode_set = false,
@@ -176,6 +235,9 @@ pub fn deinit(self: *Self) void {
     std.debug.assert(self.listener == null);
     std.debug.assert(self.old_crtc == null);
     std.debug.assert(self.shadow_pixels.len == 0);
+    std.debug.assert(self.direct_pending == null and self.direct_displayed == null);
+    std.debug.assert(self.direct_framebuffers.count() == 0);
+    self.direct_framebuffers.deinit(self.allocator);
     self.clearIdentity();
     self.allocator.free(self.modes);
     self.allocator.free(self.scanout_modifiers);
@@ -210,6 +272,10 @@ pub fn attach(self: *Self, listener: Listener, dmabuf_renderer: ?render.DmabufRe
 pub fn detach(self: *Self) void {
     std.debug.assert(self.listener != null);
     self.listener = null;
+}
+
+pub fn releaseClientBuffers(self: *Self) void {
+    self.releaseDirectScanouts();
 }
 
 pub fn name(self: *const Self) []const u8 {
@@ -254,7 +320,7 @@ pub fn logicalSize(self: *const Self) render.Size {
 
 pub fn ready(self: *const Self) bool {
     if (!self.enabled or !self.powered or !self.device_access.active(self.device_access.context) or
-        self.acquired != null or self.pending != null) return false;
+        self.acquired != null or self.pending != null or self.direct_pending != null) return false;
     return self.availableBuffer() != null;
 }
 
@@ -317,6 +383,7 @@ pub fn present(self: *Self, frame_damage: *const Region) !?presentation.Info {
         self.mode_set = true;
         self.displayed = index;
         self.acquired = null;
+        self.setDirectScanoutActive(false);
         const clock: std.Io.Clock = if (self.presentation_clock_id ==
             presentation.monotonic_clock_id) .awake else .real;
         return .{
@@ -325,16 +392,40 @@ pub fn present(self: *Self, frame_damage: *const Region) !?presentation.Info {
         };
     }
 
-    if (c.drmModePageFlip(
-        fd,
-        self.crtc_id,
-        buffer.framebuffer_id,
-        c.DRM_MODE_PAGE_FLIP_EVENT,
-        self,
-    ) != 0) return error.PageFlipFailed;
+    if (!self.queuePageFlip(fd, buffer.framebuffer_id, null)) return error.PageFlipFailed;
     self.pending = index;
     self.acquired = null;
     return null;
+}
+
+pub fn tryDirectScanout(self: *Self, buffer: render.PixelBuffer) DirectScanoutResult {
+    const source = buffer.dmabuf orelse return .{};
+    const source_cache = buffer.source_cache orelse return .{};
+    if (!self.mode_set or self.acquired == null or self.pending != null or
+        self.direct_pending != null or !std.meta.eql(buffer.size, self.size) or
+        source.y_inverted or
+        (source.format != c.DRM_FORMAT_ARGB8888 and source.format != c.DRM_FORMAT_XRGB8888) or
+        (self.atomic_plane == null and !self.legacyFramebufferLayoutMatches(buffer)))
+    {
+        return .{};
+    }
+    const fd = self.device_access.fd(self.device_access.context) orelse
+        return .{};
+    if (!self.device_access.active(self.device_access.context)) return .{};
+    const framebuffer = self.directFramebuffer(fd, buffer) catch return .{};
+
+    source.retain(source.context);
+    if (!self.queuePageFlip(fd, framebuffer.framebuffer_id, source)) {
+        source.release(source.context);
+        return .{};
+    }
+    self.direct_pending = .{
+        .source = source,
+        .cache_id = source_cache.id,
+    };
+    self.acquired = null;
+    self.resetBufferDamage(self.size);
+    return .{ .accepted = true };
 }
 
 pub fn activate(self: *Self, fd: std.posix.fd_t, selection: Selection, device_path: []const u8) !void {
@@ -366,6 +457,13 @@ pub fn activate(self: *Self, fd: std.posix.fd_t, selection: Selection, device_pa
     self.connector_id = selection.connector_id;
     self.crtc_id = selection.crtc_id;
     self.primary_plane_id = selection.primary_plane_id;
+    self.atomic_plane = if (self.device_access.atomic(self.device_access.context))
+        loadAtomicPlaneProperties(fd, self.primary_plane_id orelse 0)
+    else
+        null;
+    if (self.device_access.atomic(self.device_access.context) and self.atomic_plane == null) {
+        log.warn("primary plane lacks required atomic properties; using legacy frame commits", .{});
+    }
     self.retired = false;
     const connector_type = c.drmModeGetConnectorTypeName(selection.connector_type);
     const type_name = if (connector_type == null) "Unknown" else std.mem.span(connector_type);
@@ -488,9 +586,12 @@ pub fn disconnect(self: *Self, fd: std.posix.fd_t) void {
 
 fn release(self: *Self, fd: std.posix.fd_t) void {
     self.mode_set = false;
+    self.atomic_plane = null;
     self.acquired = null;
     self.pending = null;
     self.displayed = null;
+    self.releaseDirectScanouts();
+    self.destroyDirectFramebuffers(fd);
     self.destroyPair(fd, &self.buffers, self.shadow_pixels);
     self.shadow_pixels = &.{};
     for (&self.buffer_damage) |*damage| damage.clear();
@@ -531,7 +632,7 @@ pub fn setPowered(self: *Self, fd: std.posix.fd_t, powered: bool) !void {
     // Destroying a framebuffer queued for a page flip is not safe. Output
     // configuration is infrequent, so reject a busy head and let the client
     // retry rather than complicating the page-flip lifetime.
-    if (self.pending != null) return error.OutputBusy;
+    if (self.pending != null or self.direct_pending != null) return error.OutputBusy;
     self.acquired = null;
     if (c.drmModeSetCrtc(fd, self.crtc_id, 0, 0, 0, null, 0, null) != 0) {
         return error.DisableFailed;
@@ -539,6 +640,8 @@ pub fn setPowered(self: *Self, fd: std.posix.fd_t, powered: bool) !void {
     self.powered = false;
     self.mode_set = false;
     self.displayed = null;
+    self.releaseDirectScanouts();
+    self.destroyDirectFramebuffers(fd);
     self.notifyDeactivated();
     self.destroyPair(fd, &self.buffers, self.shadow_pixels);
     self.shadow_pixels = &.{};
@@ -548,7 +651,7 @@ pub fn setPowered(self: *Self, fd: std.posix.fd_t, powered: bool) !void {
 pub fn setMode(self: *Self, fd: std.posix.fd_t, mode_index: usize) !void {
     if (mode_index >= self.modes.len) return error.InvalidMode;
     if (mode_index == self.mode_index) return;
-    if (self.pending != null) return error.OutputBusy;
+    if (self.pending != null or self.direct_pending != null) return error.OutputBusy;
     const mode = self.modes[mode_index];
     const size = mode.size();
 
@@ -568,6 +671,8 @@ pub fn setMode(self: *Self, fd: std.posix.fd_t, mode_index: usize) !void {
         self.resetBufferDamage(size);
         self.destroyPair(fd, &old_buffers, old_shadow_pixels);
         self.displayed = null;
+        self.releaseDirectScanouts();
+        self.destroyDirectFramebuffers(fd);
         self.mode_set = false;
     }
 
@@ -612,13 +717,24 @@ fn handlePageFlip(
     data: ?*anyopaque,
 ) callconv(.c) void {
     const self: *Self = @ptrCast(@alignCast(data.?));
-    const pending = self.pending orelse {
+    if (self.pending == null and self.direct_pending == null) {
         if (self.retired) return;
         self.device_access.fail(self.device_access.context, error.UnexpectedPageFlip);
         return;
-    };
-    self.displayed = pending;
-    self.pending = null;
+    }
+    if (self.direct_pending) |direct| {
+        if (self.direct_displayed) |displayed| displayed.release();
+        self.direct_displayed = direct;
+        self.direct_pending = null;
+        self.displayed = null;
+        self.setDirectScanoutActive(true);
+    } else {
+        if (self.direct_displayed) |displayed| displayed.release();
+        self.direct_displayed = null;
+        self.displayed = self.pending.?;
+        self.pending = null;
+        self.setDirectScanoutActive(false);
+    }
     const listener = self.listener orelse return;
     listener.presented(listener.context, .{
         .timestamp = .{
@@ -981,6 +1097,258 @@ fn copyShadowDamage(
             );
         }
     }
+}
+
+fn directFramebuffer(
+    self: *Self,
+    fd: std.posix.fd_t,
+    buffer: render.PixelBuffer,
+) !*DirectFramebuffer {
+    const source = buffer.dmabuf orelse return error.InvalidBuffer;
+    const cache_id = buffer.source_cache.?.id;
+    self.direct_frame_number +%= 1;
+    if (self.direct_frame_number == 0) self.direct_frame_number = 1;
+    if (self.direct_framebuffers.getPtr(cache_id)) |framebuffer| {
+        if (!std.meta.eql(framebuffer.size, buffer.size) or
+            framebuffer.format != source.format or framebuffer.modifier != source.modifier or
+            framebuffer.stride != source.stride or framebuffer.offset != source.offset)
+        {
+            return error.CacheIdentityMismatch;
+        }
+        framebuffer.last_used = self.direct_frame_number;
+        return framebuffer;
+    }
+    try self.makeDirectFramebufferRoom(fd);
+
+    const modifier_supported = std.mem.indexOfScalar(
+        u64,
+        self.scanout_modifiers,
+        source.modifier,
+    ) != null;
+    if (!modifier_supported and !(self.implicit_scanout and
+        source.modifier == drm_format_mod_linear)) return error.UnsupportedModifier;
+
+    var handle: u32 = 0;
+    if (c.drmPrimeFDToHandle(fd, source.fd, &handle) != 0) return error.ImportHandleFailed;
+    defer if (c.drmCloseBufferHandle(fd, handle) != 0) {
+        log.err("failed to close imported DRM buffer handle {d}", .{handle});
+    };
+    var handles = [_]u32{ handle, 0, 0, 0 };
+    var pitches = [_]u32{ source.stride, 0, 0, 0 };
+    var offsets = [_]u32{ source.offset, 0, 0, 0 };
+    const framebuffer_format = if (source.format == c.DRM_FORMAT_ARGB8888)
+        c.DRM_FORMAT_XRGB8888
+    else
+        source.format;
+    var framebuffer_id: u32 = 0;
+    var add_result: c_int = -1;
+    if (modifier_supported) {
+        var modifiers = [_]u64{ source.modifier, 0, 0, 0 };
+        add_result = c.drmModeAddFB2WithModifiers(
+            fd,
+            buffer.size.width,
+            buffer.size.height,
+            framebuffer_format,
+            &handles,
+            &pitches,
+            &offsets,
+            &modifiers,
+            &framebuffer_id,
+            c.DRM_MODE_FB_MODIFIERS,
+        );
+    }
+    if (add_result != 0 and source.modifier == drm_format_mod_linear and self.implicit_scanout) {
+        add_result = c.drmModeAddFB2(
+            fd,
+            buffer.size.width,
+            buffer.size.height,
+            framebuffer_format,
+            &handles,
+            &pitches,
+            &offsets,
+            &framebuffer_id,
+            0,
+        );
+    }
+    if (add_result != 0) return error.AddFramebufferFailed;
+    errdefer _ = c.drmModeRmFB(fd, framebuffer_id);
+
+    try self.direct_framebuffers.put(self.allocator, cache_id, .{
+        .framebuffer_id = framebuffer_id,
+        .size = buffer.size,
+        .format = source.format,
+        .modifier = source.modifier,
+        .stride = source.stride,
+        .offset = source.offset,
+        .last_used = self.direct_frame_number,
+    });
+    return self.direct_framebuffers.getPtr(cache_id).?;
+}
+
+fn legacyFramebufferLayoutMatches(self: *const Self, buffer: render.PixelBuffer) bool {
+    const source = buffer.dmabuf orelse return false;
+    if (source.format != c.DRM_FORMAT_XRGB8888) return false;
+    if (self.direct_displayed) |displayed| {
+        const current = self.direct_framebuffers.get(displayed.cache_id) orelse return false;
+        return std.meta.eql(current.size, buffer.size) and
+            current.modifier == source.modifier and
+            current.stride == source.stride and
+            current.offset == source.offset;
+    }
+
+    const index = self.displayed orelse return false;
+    const current = self.buffers[index].gbm orelse return false;
+    // Legacy KMS only guarantees page flips between framebuffers allocated
+    // with identical layouts. Enforcing this here also guarantees that the
+    // compositor-owned framebuffer can be restored after direct scan-out.
+    return current.modifier == source.modifier and
+        current.stride == source.stride and
+        current.offset == source.offset;
+}
+
+fn queuePageFlip(
+    self: *Self,
+    fd: std.posix.fd_t,
+    framebuffer_id: u32,
+    source: ?render.DmabufSource,
+) bool {
+    const properties = self.atomic_plane orelse return c.drmModePageFlip(
+        fd,
+        self.crtc_id,
+        framebuffer_id,
+        c.DRM_MODE_PAGE_FLIP_EVENT,
+        self,
+    ) == 0;
+    const request = c.drmModeAtomicAlloc() orelse return false;
+    defer c.drmModeAtomicFree(request);
+
+    const plane_id = self.primary_plane_id orelse return false;
+    if (!addAtomicProperty(request, plane_id, properties.fb_id, framebuffer_id) or
+        !addAtomicProperty(request, plane_id, properties.crtc_id, self.crtc_id) or
+        !addAtomicProperty(request, plane_id, properties.src_x, 0) or
+        !addAtomicProperty(request, plane_id, properties.src_y, 0) or
+        !addAtomicProperty(request, plane_id, properties.src_w, @as(u64, self.size.width) << 16) or
+        !addAtomicProperty(request, plane_id, properties.src_h, @as(u64, self.size.height) << 16) or
+        !addAtomicProperty(request, plane_id, properties.crtc_x, 0) or
+        !addAtomicProperty(request, plane_id, properties.crtc_y, 0) or
+        !addAtomicProperty(request, plane_id, properties.crtc_w, self.size.width) or
+        !addAtomicProperty(request, plane_id, properties.crtc_h, self.size.height))
+    {
+        return false;
+    }
+
+    const fence_fd = if (properties.in_fence_fd != 0 and source != null)
+        source.?.export_read_fence(source.?.context)
+    else
+        null;
+    defer {
+        if (fence_fd) |value| _ = std.c.close(value);
+    }
+    if (fence_fd) |value| {
+        if (!addAtomicProperty(request, plane_id, properties.in_fence_fd, @bitCast(@as(i64, value)))) {
+            return false;
+        }
+    }
+    return c.drmModeAtomicCommit(
+        fd,
+        request,
+        c.DRM_MODE_ATOMIC_NONBLOCK | c.DRM_MODE_PAGE_FLIP_EVENT,
+        self,
+    ) == 0;
+}
+
+fn addAtomicProperty(
+    request: *c.drmModeAtomicReq,
+    object_id: u32,
+    property_id: u32,
+    value: u64,
+) bool {
+    return c.drmModeAtomicAddProperty(request, object_id, property_id, value) >= 0;
+}
+
+fn loadAtomicPlaneProperties(fd: std.posix.fd_t, plane_id: u32) ?AtomicPlaneProperties {
+    if (plane_id == 0) return null;
+    const properties = c.drmModeObjectGetProperties(
+        fd,
+        plane_id,
+        c.DRM_MODE_OBJECT_PLANE,
+    ) orelse return null;
+    defer c.drmModeFreeObjectProperties(properties);
+
+    var result: AtomicPlaneProperties = .{};
+    const property_count: usize = @intCast(properties.*.count_props);
+    for (properties.*.props[0..property_count]) |property_id| {
+        const property = c.drmModeGetProperty(fd, property_id) orelse continue;
+        defer c.drmModeFreeProperty(property);
+        const property_name = std.mem.sliceTo(property.*.name[0..], 0);
+        inline for (.{
+            .{ "FB_ID", "fb_id" },
+            .{ "CRTC_ID", "crtc_id" },
+            .{ "SRC_X", "src_x" },
+            .{ "SRC_Y", "src_y" },
+            .{ "SRC_W", "src_w" },
+            .{ "SRC_H", "src_h" },
+            .{ "CRTC_X", "crtc_x" },
+            .{ "CRTC_Y", "crtc_y" },
+            .{ "CRTC_W", "crtc_w" },
+            .{ "CRTC_H", "crtc_h" },
+            .{ "IN_FENCE_FD", "in_fence_fd" },
+        }) |mapping| {
+            if (std.mem.eql(u8, property_name, mapping[0])) {
+                @field(result, mapping[1]) = property_id;
+            }
+        }
+    }
+    return if (result.complete()) result else null;
+}
+
+fn makeDirectFramebufferRoom(self: *Self, fd: std.posix.fd_t) !void {
+    if (self.direct_framebuffers.count() < max_direct_framebuffers) return;
+    var oldest_id: ?u64 = null;
+    var oldest_frame: u64 = std.math.maxInt(u64);
+    var iterator = self.direct_framebuffers.iterator();
+    while (iterator.next()) |entry| {
+        const id = entry.key_ptr.*;
+        if ((self.direct_pending != null and self.direct_pending.?.cache_id == id) or
+            (self.direct_displayed != null and self.direct_displayed.?.cache_id == id) or
+            entry.value_ptr.last_used >= oldest_frame) continue;
+        oldest_id = id;
+        oldest_frame = entry.value_ptr.last_used;
+    }
+    const id = oldest_id orelse return error.CacheFull;
+    const framebuffer = self.direct_framebuffers.fetchRemove(id).?.value;
+    if (c.drmModeRmFB(fd, framebuffer.framebuffer_id) != 0) {
+        log.err("failed to remove direct-scanout framebuffer {d}", .{framebuffer.framebuffer_id});
+    }
+}
+
+fn releaseDirectScanouts(self: *Self) void {
+    if (self.direct_pending) |scanout| scanout.release();
+    if (self.direct_displayed) |scanout| scanout.release();
+    self.direct_pending = null;
+    self.direct_displayed = null;
+    self.setDirectScanoutActive(false);
+}
+
+fn destroyDirectFramebuffers(self: *Self, fd: std.posix.fd_t) void {
+    while (self.direct_framebuffers.count() > 0) {
+        var iterator = self.direct_framebuffers.iterator();
+        const id = iterator.next().?.key_ptr.*;
+        const framebuffer = self.direct_framebuffers.fetchRemove(id).?.value;
+        if (c.drmModeRmFB(fd, framebuffer.framebuffer_id) != 0) {
+            log.err("failed to remove direct-scanout framebuffer {d}", .{framebuffer.framebuffer_id});
+        }
+    }
+}
+
+fn setDirectScanoutActive(self: *Self, active: bool) void {
+    if (self.direct_scanout_active == active) return;
+    self.direct_scanout_active = active;
+    log.info("Direct scan-out {s}", .{if (active) "enabled" else "disabled"});
+}
+
+fn unavailableAtomic(_: *anyopaque) bool {
+    return false;
 }
 
 const BufferPair = struct {

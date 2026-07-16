@@ -51,8 +51,13 @@ pub fn init(
     io: std.Io,
     display: *wl.Server,
     renderer_device_id: ?render.DrmDeviceId,
+    scanout_device_id: ?render.DrmDeviceId,
 ) !void {
-    const feedback_state = FeedbackState.init(io, renderer_device_id) catch |err| unavailable: {
+    const feedback_state = FeedbackState.init(
+        io,
+        renderer_device_id,
+        scanout_device_id,
+    ) catch |err| unavailable: {
         log.info("DMA-BUF feedback unavailable: {t}", .{err});
         break :unavailable null;
     };
@@ -94,7 +99,9 @@ fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
         return;
     };
     resource.setHandler(*Self, handleRequest, null, self);
-    if (version >= zwp.LinuxDmabufV1.modifier_since_version) {
+    if (version >= zwp.LinuxDmabufV1.Request.get_default_feedback_since_version) {
+        return;
+    } else if (version >= zwp.LinuxDmabufV1.modifier_since_version) {
         resource.sendModifier(argb8888, 0, @intCast(linear_modifier));
         resource.sendModifier(xrgb8888, 0, @intCast(linear_modifier));
     } else {
@@ -129,13 +136,22 @@ const FormatTableEntry = extern struct {
 
 const FeedbackState = struct {
     device: linux.dev_t,
+    scanout_device: ?linux.dev_t,
     file: std.Io.File,
 
-    fn init(io: std.Io, renderer_device_id: ?render.DrmDeviceId) !FeedbackState {
+    fn init(
+        io: std.Io,
+        renderer_device_id: ?render.DrmDeviceId,
+        scanout_device_id: ?render.DrmDeviceId,
+    ) !FeedbackState {
         const device = if (renderer_device_id) |id|
             linux.makedev(id.major, id.minor)
         else
             findRenderDevice() orelse return error.NoRenderDevice;
+        const scanout_device = if (scanout_device_id) |id|
+            linux.makedev(id.major, id.minor)
+        else
+            null;
         const entries = [_]FormatTableEntry{
             .{ .format = argb8888, .padding = 0, .modifier = linear_modifier },
             .{ .format = xrgb8888, .padding = 0, .modifier = linear_modifier },
@@ -158,7 +174,11 @@ const FeedbackState = struct {
             std.os.linux.F.SEAL_WRITE | std.os.linux.F.SEAL_SEAL;
         const seal_result = std.os.linux.fcntl(fd, std.os.linux.F.ADD_SEALS, seals);
         if (std.posix.errno(seal_result) != .SUCCESS) return error.SealFailed;
-        return .{ .device = device, .file = file };
+        return .{
+            .device = device,
+            .scanout_device = scanout_device,
+            .file = file,
+        };
     }
 };
 
@@ -215,6 +235,18 @@ const Feedback = struct {
         };
         resource.sendFormatTable(state.file.handle, 2 * @sizeOf(FormatTableEntry));
         if (resource.getVersion() < 6) resource.sendMainDevice(&device_array);
+        if (state.scanout_device) |scanout_device| {
+            var scanout_device_value = scanout_device;
+            var scanout_device_array: wl.Array = .{
+                .size = @sizeOf(linux.dev_t),
+                .alloc = @sizeOf(linux.dev_t),
+                .data = @ptrCast(&scanout_device_value),
+            };
+            resource.sendTrancheTargetDevice(&scanout_device_array);
+            resource.sendTrancheFlags(.{ .scanout = true });
+            resource.sendTrancheFormats(&indices_array);
+            resource.sendTrancheDone();
+        }
         resource.sendTrancheTargetDevice(&device_array);
         resource.sendTrancheFlags(if (resource.getVersion() >= 6)
             .{ .sampling = true }
@@ -393,7 +425,10 @@ const Params = struct {
             return;
         };
         if (self.sampling_device) |device| {
-            if (device != self.manager.feedback_state.?.device) {
+            const feedback = self.manager.feedback_state.?;
+            if (device != feedback.device and
+                (feedback.scanout_device == null or device != feedback.scanout_device.?))
+            {
                 self.importFailed(immediate_id);
                 return;
             }
@@ -638,6 +673,8 @@ pub const Buffer = struct {
             .required_bytes = descriptor.required_bytes,
             .y_inverted = descriptor.y_inverted,
             .force_opaque = descriptor.format == xrgb8888,
+            .retain = retainSourceCallback,
+            .release = releaseSourceCallback,
             .begin_cpu_read = beginCpuReadCallback,
             .end_cpu_read = endCpuReadCallback,
             .export_read_fence = exportReadFenceCallback,
@@ -763,6 +800,16 @@ pub const Buffer = struct {
     fn beginCpuReadCallback(context: *anyopaque) bool {
         const self: *Buffer = @ptrCast(@alignCast(context));
         return syncDmaBuf(self.descriptor.plane.fd, linux.DMA_BUF_SYNC_READ);
+    }
+
+    fn retainSourceCallback(context: *anyopaque) void {
+        const self: *Buffer = @ptrCast(@alignCast(context));
+        self.reference();
+    }
+
+    fn releaseSourceCallback(context: *anyopaque) void {
+        const self: *Buffer = @ptrCast(@alignCast(context));
+        self.unreference();
     }
 
     fn endCpuReadCallback(context: *anyopaque) bool {

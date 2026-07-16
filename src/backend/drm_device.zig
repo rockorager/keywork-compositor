@@ -32,6 +32,7 @@ device_path: ?[:0]u8,
 device: ?Session.Device,
 device_number: ?c.dev_t,
 gbm_device: ?Gbm,
+atomic: bool,
 active_outputs: std.ArrayList(*DrmOutput),
 retired_outputs: std.ArrayList(*DrmOutput),
 listener: ?Listener,
@@ -61,6 +62,7 @@ pub fn init(self: *Self, allocator: std.mem.Allocator, io: std.Io, event_loop: *
         .device = null,
         .device_number = null,
         .gbm_device = null,
+        .atomic = false,
         .active_outputs = .empty,
         .retired_outputs = .empty,
         .listener = null,
@@ -138,7 +140,7 @@ pub fn setOutputMode(self: *Self, output: *DrmOutput, mode_index: usize) !void {
 fn waitOutputIdle(self: *Self, output: *DrmOutput) !void {
     const fd = self.device.?.fd;
     var attempts: u8 = 0;
-    while (output.pending != null) : (attempts += 1) {
+    while (output.pending != null or output.direct_pending != null) : (attempts += 1) {
         if (attempts == 4) return error.PageFlipTimeout;
         var poll_fds = [_]std.posix.pollfd{.{
             .fd = fd,
@@ -164,6 +166,11 @@ pub fn clearListener(self: *Self) void {
     self.listener = null;
 }
 
+pub fn releaseClientBuffers(self: *Self) void {
+    for (self.active_outputs.items) |output| output.releaseClientBuffers();
+    for (self.retired_outputs.items) |output| output.releaseClientBuffers();
+}
+
 fn newOutput(self: *Self, fd: std.posix.fd_t, selection: DrmOutput.Selection) !*DrmOutput {
     const output = try self.allocator.create(DrmOutput);
     errdefer self.allocator.destroy(output);
@@ -171,6 +178,7 @@ fn newOutput(self: *Self, fd: std.posix.fd_t, selection: DrmOutput.Selection) !*
         .context = self,
         .fd = accessFd,
         .gbm = accessGbm,
+        .atomic = accessAtomic,
         .active = accessActive,
         .fail = accessFail,
     });
@@ -192,6 +200,12 @@ fn activate(self: *Self) !void {
     self.device_number = try deviceNumber(device.fd);
     if (c.drmSetClientCap(device.fd, c.DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1) != 0) {
         log.warn("universal DRM planes unavailable; using implicit scanout modifiers", .{});
+    }
+    self.atomic = c.drmSetClientCap(device.fd, c.DRM_CLIENT_CAP_ATOMIC, 1) == 0;
+    if (self.atomic) {
+        log.info("atomic DRM frame commits enabled", .{});
+    } else {
+        log.warn("atomic DRM unavailable; using legacy frame commits", .{});
     }
     self.gbm_device = Gbm.init(device.fd) catch |err| blk: {
         log.warn("GBM unavailable, using CPU scanout buffers: {t}", .{err});
@@ -250,6 +264,7 @@ fn deactivate(self: *Self) void {
     self.session.closeDevice(device) catch |err| log.err("failed to close DRM device: {t}", .{err});
     self.device = null;
     self.device_number = null;
+    self.atomic = false;
     self.destroyList(&self.retired_outputs);
 }
 
@@ -474,6 +489,11 @@ fn accessFd(context: *anyopaque) ?std.posix.fd_t {
 fn accessGbm(context: *anyopaque) ?*Gbm {
     const self: *Self = @ptrCast(@alignCast(context));
     return if (self.gbm_device) |*device| device else null;
+}
+
+fn accessAtomic(context: *anyopaque) bool {
+    const self: *Self = @ptrCast(@alignCast(context));
+    return self.atomic;
 }
 
 fn accessActive(context: *anyopaque) bool {

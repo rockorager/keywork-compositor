@@ -29,6 +29,7 @@ pub const Kind = enum {
 };
 
 pub const Listener = NestedOutput.Listener;
+pub const DirectScanoutResult = DrmOutput.DirectScanoutResult;
 
 pub fn init(
     self: *Self,
@@ -231,5 +232,15 @@ pub fn present(self: *Self, damage: *const Region) !?presentation.Info {
             try output.present();
             break :blk null;
         },
+    };
+}
+
+pub fn tryDirectScanout(
+    self: *Self,
+    buffer: render.PixelBuffer,
+) DirectScanoutResult {
+    return switch (self.backend) {
+        .drm => |output| output.tryDirectScanout(buffer),
+        .headless, .nested => .{},
     };
 }

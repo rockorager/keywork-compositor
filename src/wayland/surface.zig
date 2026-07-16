@@ -483,6 +483,17 @@ pub fn currentBuffer(store: *Store, id: Id) ?*BufferSnapshot {
     return if (surface_state.current_buffer) |*buffer| buffer else null;
 }
 
+pub fn currentOpaqueCoversBuffer(store: *Store, id: Id) bool {
+    const surface_state = store.get(id) orelse return false;
+    const buffer = if (surface_state.current_buffer) |*current| current else return false;
+    return surface_state.current_opaque.coversRectangle(
+        0,
+        0,
+        buffer.logical_size.width,
+        buffer.logical_size.height,
+    );
+}
+
 /// The returned region is borrowed until the surface's next applied commit or
 /// any store insertion that reallocates its slots.
 pub fn currentDamage(store: *Store, id: Id) ?*const Region {
@@ -1045,9 +1056,7 @@ fn snapshotPendingAttachment(
         for (surface_state.release_callbacks.items) |callback| {
             if (callback.generation == null) callback.generation = generation;
         }
-        snapshot.release_store = self.store;
-        snapshot.release_surface_id = self.id;
-        snapshot.release_generation = generation;
+        snapshot.dmabuf.?.setRelease(self.store, self.id, generation);
     } else {
         surface_state.next_source_version +%= 1;
     }
@@ -1453,6 +1462,88 @@ fn addBufferDamage(
     return true;
 }
 
+const DmabufUse = struct {
+    allocator: std.mem.Allocator,
+    reference_count: usize,
+    buffer: *LinuxDmabuf.Buffer,
+    release_store: ?*Store = null,
+    release_surface_id: Id = undefined,
+    release_generation: u64 = 0,
+
+    fn create(buffer: *LinuxDmabuf.Buffer) error{OutOfMemory}!*DmabufUse {
+        const self = buffer.manager.allocator.create(DmabufUse) catch return error.OutOfMemory;
+        buffer.retainSnapshot();
+        self.* = .{
+            .allocator = buffer.manager.allocator,
+            .reference_count = 1,
+            .buffer = buffer,
+        };
+        return self;
+    }
+
+    fn setRelease(self: *DmabufUse, store: *Store, surface_id: Id, generation: u64) void {
+        std.debug.assert(self.release_store == null);
+        self.release_store = store;
+        self.release_surface_id = surface_id;
+        self.release_generation = generation;
+    }
+
+    fn reference(self: *DmabufUse) void {
+        std.debug.assert(self.reference_count > 0);
+        self.reference_count += 1;
+    }
+
+    fn unreference(self: *DmabufUse) void {
+        std.debug.assert(self.reference_count > 0);
+        self.reference_count -= 1;
+        if (self.reference_count != 0) return;
+        self.buffer.releaseSnapshot();
+        if (self.release_store) |store| {
+            finishBufferReleaseCallbacks(store, self.release_surface_id, self.release_generation);
+        }
+        self.allocator.destroy(self);
+    }
+
+    fn renderSource(self: *DmabufUse) render_types.DmabufSource {
+        var source = self.buffer.renderSource();
+        source.context = self;
+        source.retain = retainCallback;
+        source.release = releaseCallback;
+        source.begin_cpu_read = beginCpuReadCallback;
+        source.end_cpu_read = endCpuReadCallback;
+        source.export_read_fence = exportReadFenceCallback;
+        return source;
+    }
+
+    fn retainCallback(context: *anyopaque) void {
+        const self: *DmabufUse = @ptrCast(@alignCast(context));
+        self.reference();
+    }
+
+    fn releaseCallback(context: *anyopaque) void {
+        const self: *DmabufUse = @ptrCast(@alignCast(context));
+        self.unreference();
+    }
+
+    fn beginCpuReadCallback(context: *anyopaque) bool {
+        const self: *DmabufUse = @ptrCast(@alignCast(context));
+        const source = self.buffer.renderSource();
+        return source.begin_cpu_read(source.context);
+    }
+
+    fn endCpuReadCallback(context: *anyopaque) bool {
+        const self: *DmabufUse = @ptrCast(@alignCast(context));
+        const source = self.buffer.renderSource();
+        return source.end_cpu_read(source.context);
+    }
+
+    fn exportReadFenceCallback(context: *anyopaque) ?std.posix.fd_t {
+        const self: *DmabufUse = @ptrCast(@alignCast(context));
+        const source = self.buffer.renderSource();
+        return source.export_read_fence(source.context);
+    }
+};
+
 pub const BufferSnapshot = struct {
     allocator: std.mem.Allocator,
     buffer_size: render_types.Size,
@@ -1461,12 +1552,9 @@ pub const BufferSnapshot = struct {
     transform: wl.Output.Transform,
     source: ?render_types.SourceRect,
     pixels: []u32,
-    dmabuf: ?*LinuxDmabuf.Buffer = null,
+    dmabuf: ?*DmabufUse = null,
     source_cache: render_types.SourceCache,
     source_damage: ?[]const render_types.Rect,
-    release_store: ?*Store = null,
-    release_surface_id: Id = undefined,
-    release_generation: u64 = 0,
 
     const Error = error{
         OutOfMemory,
@@ -1566,7 +1654,7 @@ pub const BufferSnapshot = struct {
     ) Error!BufferSnapshot {
         const buffer_size = buffer.size();
         const geometry = try viewportGeometry(buffer_size, scale, transform, viewport);
-        buffer.retainSnapshot();
+        const dmabuf = try DmabufUse.create(buffer);
 
         return .{
             .allocator = buffer.manager.allocator,
@@ -1576,7 +1664,7 @@ pub const BufferSnapshot = struct {
             .transform = transform,
             .source = geometry.source,
             .pixels = &.{},
-            .dmabuf = buffer,
+            .dmabuf = dmabuf,
             .source_cache = buffer.acquireSourceCache(),
             .source_damage = null,
         };
@@ -1638,12 +1726,7 @@ pub const BufferSnapshot = struct {
         if (self.source_damage) |damage| {
             if (damage.len > 0) self.allocator.free(damage);
         }
-        if (self.dmabuf) |buffer| {
-            buffer.releaseSnapshot();
-            if (self.release_store) |store| {
-                finishBufferReleaseCallbacks(store, self.release_surface_id, self.release_generation);
-            }
-        }
+        if (self.dmabuf) |dmabuf| dmabuf.unreference();
         self.* = undefined;
     }
 
@@ -1654,12 +1737,12 @@ pub const BufferSnapshot = struct {
     pub fn pixelBuffer(self: *BufferSnapshot) render_types.PixelBuffer {
         return .{
             .size = self.buffer_size,
-            .stride_pixels = if (self.dmabuf) |buffer|
-                buffer.renderSource().stride / @sizeOf(u32)
+            .stride_pixels = if (self.dmabuf) |dmabuf|
+                dmabuf.renderSource().stride / @sizeOf(u32)
             else
                 self.buffer_size.width,
             .pixels = self.pixels,
-            .dmabuf = if (self.dmabuf) |buffer| buffer.renderSource() else null,
+            .dmabuf = if (self.dmabuf) |dmabuf| dmabuf.renderSource() else null,
             .source_cache = self.source_cache,
             .source_damage = self.source_damage,
         };

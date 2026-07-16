@@ -139,6 +139,27 @@ pub const Renderer = struct {
         }, active.target);
     }
 
+    pub fn directScanoutCandidate(self: *Renderer) ?render_types.PixelBuffer {
+        const active = self.active_frame orelse return null;
+        if (self.commands.items.len != 2) return null;
+        switch (self.commands.items[0]) {
+            .clear => {},
+            else => return null,
+        }
+        const image = switch (self.commands.items[1]) {
+            .image => |image| image,
+            else => return null,
+        };
+        if (!image.is_opaque) return null;
+        if (image.x != 0 or image.y != 0) return null;
+        if (!std.meta.eql(image.size, active.target.size())) return null;
+        if (!std.meta.eql(image.buffer.size, active.target.size())) return null;
+        if (image.source != null or image.rounded_clip != null or image.clip != null) return null;
+        if (image.buffer.dmabuf == null or image.buffer.dmabuf.?.y_inverted) return null;
+        if (image.buffer.source_cache == null) return null;
+        return image.buffer;
+    }
+
     pub fn cancelFrame(self: *Renderer) void {
         std.debug.assert(self.active_frame != null);
         self.active_frame = null;
@@ -230,6 +251,7 @@ fn translateCommand(
             .size = image.size,
             .buffer = image.buffer,
             .source = image.source,
+            .is_opaque = image.is_opaque,
             .rounded_clip = if (image.rounded_clip) |clip| .{
                 .rect = translateRect(clip.rect, origin),
                 .radius = clip.radius,
@@ -292,6 +314,7 @@ fn scaleCommand(command: render_types.Command, scale: render_types.Scale) render
                 .size = .{ .width = rect.width, .height = rect.height },
                 .buffer = image.buffer,
                 .source = image.source,
+                .is_opaque = image.is_opaque,
                 .rounded_clip = if (image.rounded_clip) |clip| .{
                     .rect = scaleRect(clip.rect, scale),
                     .radius = scaleUnsigned(clip.radius, scale),
@@ -397,6 +420,88 @@ test "cancelled renderer frame does not leak commands" {
     );
 
     try std.testing.expectEqual(@as(u32, 0xff0000ff), output.pixel(0, 0));
+}
+
+test "direct scanout candidate requires one exact opaque DMA-BUF image" {
+    const NoopSource = struct {
+        fn retain(_: *anyopaque) void {}
+        fn release(_: *anyopaque) void {}
+        fn begin(_: *anyopaque) bool {
+            return true;
+        }
+        fn end(_: *anyopaque) bool {
+            return true;
+        }
+        fn exportFence(_: *anyopaque) ?std.posix.fd_t {
+            return null;
+        }
+    };
+
+    const size: render_types.Size = .{ .width = 2, .height = 2 };
+    var target_pixels = [_]u32{0} ** 4;
+    var source_context: u8 = 0;
+    const source_buffer: render_types.PixelBuffer = .{
+        .size = size,
+        .stride_pixels = size.width,
+        .dmabuf = .{
+            .context = &source_context,
+            .fd = -1,
+            .format = 0,
+            .modifier = 0,
+            .stride = size.width * @sizeOf(u32),
+            .offset = 0,
+            .required_bytes = target_pixels.len * @sizeOf(u32),
+            .y_inverted = false,
+            .force_opaque = true,
+            .retain = NoopSource.retain,
+            .release = NoopSource.release,
+            .begin_cpu_read = NoopSource.begin,
+            .end_cpu_read = NoopSource.end,
+            .export_read_fence = NoopSource.exportFence,
+        },
+        .source_cache = .{ .id = 1, .version = 1 },
+    };
+    const target: render_types.Target = .{ .pixels = .{
+        .size = size,
+        .stride_pixels = size.width,
+        .pixels = &target_pixels,
+    } };
+    const direct_commands = [_]render_types.Command{
+        .{ .clear = render_types.Color.rgba(0, 0, 0, 255) },
+        .{ .image = .{
+            .x = 0,
+            .y = 0,
+            .size = size,
+            .buffer = source_buffer,
+            .is_opaque = true,
+        } },
+    };
+
+    var renderer = try Renderer.init(std.testing.allocator, .cpu);
+    defer renderer.deinit();
+    try renderer.beginFrame(target, .{}, .{}, null);
+    try renderer.append(&direct_commands);
+    try std.testing.expect(renderer.directScanoutCandidate() != null);
+    renderer.cancelFrame();
+
+    var transparent_commands = direct_commands;
+    transparent_commands[1].image.is_opaque = false;
+    try renderer.beginFrame(target, .{}, .{}, null);
+    try renderer.append(&transparent_commands);
+    try std.testing.expectEqual(
+        @as(?render_types.PixelBuffer, null),
+        renderer.directScanoutCandidate(),
+    );
+    renderer.cancelFrame();
+
+    try renderer.beginFrame(target, .{}, .{}, null);
+    try renderer.append(&direct_commands);
+    try renderer.append(&.{.{ .solid_rect = .{
+        .rect = .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+        .color = render_types.Color.rgba(255, 255, 255, 255),
+    } }});
+    try std.testing.expectEqual(@as(?render_types.PixelBuffer, null), renderer.directScanoutCandidate());
+    renderer.cancelFrame();
 }
 
 test "renderer scales logical commands into a physical target" {

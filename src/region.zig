@@ -133,6 +133,21 @@ pub fn contains(self: *const Self, x: i32, y: i32) bool {
     return pixman.pixman_region32_contains_point(&self.region, x, y, null) != 0;
 }
 
+pub fn coversRectangle(self: *const Self, x: i32, y: i32, width: u32, height: u32) bool {
+    if (width == 0 or height == 0 or
+        width > std.math.maxInt(i32) or height > std.math.maxInt(i32)) return false;
+    var box: pixman.pixman_box32_t = .{
+        .x1 = x,
+        .y1 = y,
+        .x2 = x +| @as(i32, @intCast(width)),
+        .y2 = y +| @as(i32, @intCast(height)),
+    };
+    return pixman.pixman_region32_contains_rectangle(
+        @constCast(&self.region),
+        &box,
+    ) == pixman.PIXMAN_REGION_IN;
+}
+
 pub const Point = struct {
     x: f64,
     y: f64,
@@ -333,6 +348,17 @@ test "empty and translated regions expose current state" {
         Rectangle{ .x = -2, .y = -3, .width = 7, .height = 8 },
         iterator.next().?,
     );
+}
+
+test "rectangle coverage can span multiple region boxes" {
+    var region = Self.init();
+    defer region.deinit();
+    try region.add(0, 0, 4, 2);
+    try region.add(0, 2, 4, 2);
+
+    try std.testing.expect(region.coversRectangle(0, 0, 4, 4));
+    try std.testing.expect(!region.coversRectangle(0, 0, 5, 4));
+    try std.testing.expect(!region.coversRectangle(0, 0, 0, 4));
 }
 
 test "region confinement stops at a rectangular edge" {

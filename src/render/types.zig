@@ -184,6 +184,7 @@ pub const Image = struct {
     source: ?SourceRect = null,
     rounded_clip: ?RoundedClip = null,
     clip: ?Rect = null,
+    is_opaque: bool = false,
 };
 
 pub const Shadow = struct {
@@ -246,6 +247,8 @@ pub const DmabufSource = struct {
     required_bytes: usize,
     y_inverted: bool,
     force_opaque: bool,
+    retain: *const fn (*anyopaque) void,
+    release: *const fn (*anyopaque) void,
     begin_cpu_read: *const fn (*anyopaque) bool,
     end_cpu_read: *const fn (*anyopaque) bool,
     export_read_fence: *const fn (*anyopaque) ?std.posix.fd_t,

@@ -560,7 +560,13 @@ pub fn createWithVirtualOutput(
     errdefer self.fractional_scale.deinit();
     try self.fixes.init(display);
     errdefer self.fixes.deinit();
-    try self.linux_dmabuf.init(allocator, io, display, self.renderer.dmabufDeviceId());
+    try self.linux_dmabuf.init(
+        allocator,
+        io,
+        display,
+        self.renderer.dmabufDeviceId(),
+        if (output_kind == .drm) self.drm_device.deviceId() else null,
+    );
     errdefer self.linux_dmabuf.deinit();
     try self.subcompositor.init(allocator, display, self.compositor.surfaceStore());
     errdefer self.subcompositor.deinit();
@@ -929,6 +935,7 @@ pub fn destroy(self: *Self) void {
     var render_outputs = self.render_outputs.iterator();
     while (render_outputs.next()) |entry| stopRenderOutput(entry.value.*);
     self.display.destroyClients();
+    if (self.drm_device_initialized) self.drm_device.releaseClientBuffers();
     if (self.xkb_bindings_initialized) {
         self.xkb_bindings.deinit();
         self.xkb_bindings_initialized = false;
@@ -4642,11 +4649,22 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
     }
 
     const top_fullscreen = try self.renderDesktopContents(&frame, true);
-    renderer_frame_active = false;
-    try self.renderer.finishFrame();
-
-    const presented = render_output.backend.present(&frame_damage) catch
-        return error.InvalidTarget;
+    var presented: ?presentation.Info = null;
+    var direct_scanout = false;
+    if (self.renderer.directScanoutCandidate()) |candidate| {
+        const result = render_output.backend.tryDirectScanout(candidate);
+        if (result.accepted) {
+            self.renderer.cancelFrame();
+            renderer_frame_active = false;
+            direct_scanout = true;
+        }
+    }
+    if (!direct_scanout) {
+        renderer_frame_active = false;
+        try self.renderer.finishFrame();
+        presented = render_output.backend.present(&frame_damage) catch
+            return error.InvalidTarget;
+    }
     output.endFrame();
     self.foreign_toplevel_list.syncOutput(render_output.protocol_id);
 
@@ -5172,15 +5190,22 @@ fn renderSurfaceTree(
             }
             if (frame.track_visibility) try frame.output.markSurfaceVisible(surface_id);
             if (buffer.transform != .normal) continue;
+            const pixel_buffer = buffer.pixelBuffer();
             const image_command = [_]render.Command{
                 .{ .image = .{
                     .x = x,
                     .y = y,
                     .size = buffer.logical_size,
-                    .buffer = buffer.pixelBuffer(),
+                    .buffer = pixel_buffer,
                     .source = buffer.source,
                     .rounded_clip = rounded_clip,
                     .clip = clip,
+                    .is_opaque = (pixel_buffer.dmabuf != null and
+                        pixel_buffer.dmabuf.?.force_opaque) or
+                        Surface.currentOpaqueCoversBuffer(
+                            self.compositor.surfaceStore(),
+                            surface_id,
+                        ),
                 } },
             };
             try self.renderCommands(frame, &image_command);
