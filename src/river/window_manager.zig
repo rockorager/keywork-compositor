@@ -2535,12 +2535,14 @@ const WindowResource = struct {
             },
             .hide => {
                 if (!self.requireRendering(manager_resource)) return;
+                if (!window.requested_visible and window.requested_configuration.suspended) return;
                 window.requested_visible = false;
                 window.requested_configuration.suspended = true;
                 self.manager.requestManage();
             },
             .show => {
                 if (!self.requireRendering(manager_resource)) return;
+                if (window.requested_visible and !window.requested_configuration.suspended) return;
                 window.requested_visible = true;
                 window.requested_configuration.suspended = false;
                 self.manager.requestManage();
