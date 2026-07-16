@@ -16,6 +16,7 @@ const linux = @cImport({
     @cInclude("linux/memfd.h");
     @cInclude("sys/ioctl.h");
     @cInclude("sys/stat.h");
+    @cInclude("sys/sysmacros.h");
 });
 
 const max_planes = 4;
@@ -49,8 +50,9 @@ pub fn init(
     allocator: std.mem.Allocator,
     io: std.Io,
     display: *wl.Server,
+    renderer_device_id: ?render.DrmDeviceId,
 ) !void {
-    const feedback_state = FeedbackState.init(io) catch |err| unavailable: {
+    const feedback_state = FeedbackState.init(io, renderer_device_id) catch |err| unavailable: {
         log.info("DMA-BUF feedback unavailable: {t}", .{err});
         break :unavailable null;
     };
@@ -129,8 +131,11 @@ const FeedbackState = struct {
     device: linux.dev_t,
     file: std.Io.File,
 
-    fn init(io: std.Io) !FeedbackState {
-        const device = findRenderDevice() orelse return error.NoRenderDevice;
+    fn init(io: std.Io, renderer_device_id: ?render.DrmDeviceId) !FeedbackState {
+        const device = if (renderer_device_id) |id|
+            linux.makedev(id.major, id.minor)
+        else
+            findRenderDevice() orelse return error.NoRenderDevice;
         const entries = [_]FormatTableEntry{
             .{ .format = argb8888, .padding = 0, .modifier = linear_modifier },
             .{ .format = xrgb8888, .padding = 0, .modifier = linear_modifier },
@@ -407,7 +412,7 @@ const Params = struct {
             return;
         };
         self.planes[0] = null;
-        if (immediate_id == null) self.resource.sendCreated(buffer.resource);
+        if (immediate_id == null) self.resource.sendCreated(buffer.resource.?);
     }
 
     fn importFailed(self: *Params, immediate_id: ?u32) void {
@@ -480,7 +485,8 @@ fn validateDescriptor(
     };
     const row_bytes = std.math.mul(u64, size.width, @sizeOf(u32)) catch
         return error.OutOfBounds;
-    if (plane.stride < row_bytes) return error.OutOfBounds;
+    if (plane.stride < row_bytes or plane.stride % @sizeOf(u32) != 0 or
+        plane.offset % @alignOf(u32) != 0) return error.OutOfBounds;
     const row_offset = std.math.mul(u64, size.height - 1, plane.stride) catch
         return error.OutOfBounds;
     const required_bytes_u64 = std.math.add(u64, plane.offset, row_offset) catch
@@ -521,8 +527,12 @@ fn validateDescriptor(
 
 pub const Buffer = struct {
     manager: *Self,
-    resource: *wl.Buffer,
+    resource: ?*wl.Buffer,
     descriptor: Descriptor,
+    reference_count: usize,
+    snapshot_count: usize,
+    source_cache_id: u64,
+    next_source_version: u64,
 
     pub const CopyError = error{
         OutOfMemory,
@@ -542,6 +552,10 @@ pub const Buffer = struct {
             .manager = manager,
             .resource = resource,
             .descriptor = descriptor,
+            .reference_count = 1,
+            .snapshot_count = 0,
+            .source_cache_id = render.allocateSourceCacheId(),
+            .next_source_version = 1,
         };
         manager.buffer_count += 1;
         resource.setHandler(*Buffer, Buffer.handleRequest, Buffer.handleDestroy, self);
@@ -568,6 +582,66 @@ pub const Buffer = struct {
 
     pub fn yInverted(self: *const Buffer) bool {
         return self.descriptor.y_inverted;
+    }
+
+    pub fn reference(self: *Buffer) void {
+        std.debug.assert(self.reference_count > 0);
+        self.reference_count += 1;
+    }
+
+    pub fn unreference(self: *Buffer) void {
+        std.debug.assert(self.reference_count > 0);
+        self.reference_count -= 1;
+        if (self.reference_count != 0) return;
+        self.descriptor.plane.close();
+        self.manager.buffer_count -= 1;
+        self.manager.allocator.destroy(self);
+    }
+
+    pub fn sendRelease(self: *Buffer) void {
+        if (self.resource) |resource| resource.sendRelease();
+    }
+
+    pub fn retainSnapshot(self: *Buffer) void {
+        self.reference();
+        self.snapshot_count += 1;
+    }
+
+    pub fn releaseSnapshot(self: *Buffer) void {
+        std.debug.assert(self.snapshot_count > 0);
+        self.snapshot_count -= 1;
+        if (self.snapshot_count == 0) self.sendRelease();
+        self.unreference();
+    }
+
+    pub fn acquireSourceCache(self: *Buffer) render.SourceCache {
+        const source_cache: render.SourceCache = .{
+            .id = self.source_cache_id,
+            .version = self.next_source_version,
+        };
+        self.next_source_version +%= 1;
+        return source_cache;
+    }
+
+    pub fn renderSource(self: *Buffer) render.DmabufSource {
+        const descriptor = self.descriptor;
+        return .{
+            .context = self,
+            .fd = descriptor.plane.fd,
+            .format = descriptor.format,
+            .modifier = if (descriptor.plane.modifier == invalid_modifier)
+                linear_modifier
+            else
+                descriptor.plane.modifier,
+            .stride = descriptor.plane.stride,
+            .offset = descriptor.plane.offset,
+            .required_bytes = descriptor.required_bytes,
+            .y_inverted = descriptor.y_inverted,
+            .force_opaque = descriptor.format == xrgb8888,
+            .begin_cpu_read = beginCpuReadCallback,
+            .end_cpu_read = endCpuReadCallback,
+            .export_read_fence = exportReadFenceCallback,
+        };
     }
 
     pub fn copyPixels(
@@ -682,9 +756,41 @@ pub const Buffer = struct {
     }
 
     fn handleDestroy(_: *wl.Buffer, self: *Buffer) void {
-        self.descriptor.plane.close();
-        self.manager.buffer_count -= 1;
-        self.manager.allocator.destroy(self);
+        self.resource = null;
+        self.unreference();
+    }
+
+    fn beginCpuReadCallback(context: *anyopaque) bool {
+        const self: *Buffer = @ptrCast(@alignCast(context));
+        return syncDmaBuf(self.descriptor.plane.fd, linux.DMA_BUF_SYNC_READ);
+    }
+
+    fn endCpuReadCallback(context: *anyopaque) bool {
+        const self: *Buffer = @ptrCast(@alignCast(context));
+        return syncDmaBuf(
+            self.descriptor.plane.fd,
+            linux.DMA_BUF_SYNC_READ | linux.DMA_BUF_SYNC_END,
+        );
+    }
+
+    fn exportReadFenceCallback(context: *anyopaque) ?std.posix.fd_t {
+        const self: *Buffer = @ptrCast(@alignCast(context));
+        var export_sync_file: linux.dma_buf_export_sync_file = .{
+            .flags = linux.DMA_BUF_SYNC_READ,
+            .fd = -1,
+        };
+        while (true) {
+            const result = linux.ioctl(
+                self.descriptor.plane.fd,
+                linux.DMA_BUF_IOCTL_EXPORT_SYNC_FILE,
+                &export_sync_file,
+            );
+            if (result >= 0) return export_sync_file.fd;
+            switch (std.posix.errno(result)) {
+                .INTR, .AGAIN => continue,
+                else => return null,
+            }
+        }
     }
 };
 

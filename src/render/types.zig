@@ -220,17 +220,35 @@ pub const Frame = struct {
     origin: Position = .{},
 };
 
-/// A CPU-addressable ARGB8888 target. Rows may contain padding.
+/// A CPU-addressable ARGB8888 target or a retained DMA-BUF image source.
+/// Render targets are always CPU-addressable. Image sources may instead set
+/// `dmabuf` and leave `pixels` empty so GPU renderers can sample them directly.
 pub const PixelBuffer = struct {
     size: Size,
     stride_pixels: u32,
-    pixels: []u32,
+    pixels: []u32 = &.{},
+    dmabuf: ?DmabufSource = null,
     /// Stable content identity for renderer texture caches. Anonymous buffers
     /// leave this null and must be uploaded whenever they are rendered.
     source_cache: ?SourceCache = null,
     /// Changed pixels for this source-cache version, in buffer coordinates.
     /// Null means the full buffer or unknown damage.
     source_damage: ?[]const Rect = null,
+};
+
+pub const DmabufSource = struct {
+    context: *anyopaque,
+    fd: std.posix.fd_t,
+    format: u32,
+    modifier: u64,
+    stride: u32,
+    offset: u32,
+    required_bytes: usize,
+    y_inverted: bool,
+    force_opaque: bool,
+    begin_cpu_read: *const fn (*anyopaque) bool,
+    end_cpu_read: *const fn (*anyopaque) bool,
+    export_read_fence: *const fn (*anyopaque) ?std.posix.fd_t,
 };
 
 pub const Target = union(enum) {

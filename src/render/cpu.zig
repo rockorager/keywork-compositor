@@ -83,10 +83,11 @@ fn createDestination(
 ) Error!*pixman.pixman_image_t {
     if (frame.size.width == 0 or frame.size.height == 0) return error.InvalidTarget;
     if (!std.meta.eql(frame.size, target.size)) return error.InvalidTarget;
-    return createImage(target);
+    if (target.dmabuf != null) return error.InvalidTarget;
+    return createImage(target, false);
 }
 
-fn createImage(buffer: render_types.PixelBuffer) Error!*pixman.pixman_image_t {
+fn createImage(buffer: render_types.PixelBuffer, force_opaque: bool) Error!*pixman.pixman_image_t {
     if (buffer.size.width == 0 or buffer.size.height == 0) return error.InvalidTarget;
     if (buffer.stride_pixels < buffer.size.width) return error.InvalidTarget;
 
@@ -106,7 +107,7 @@ fn createImage(buffer: render_types.PixelBuffer) Error!*pixman.pixman_image_t {
     if (buffer.pixels.len < required_pixels) return error.InvalidTarget;
 
     return pixman.pixman_image_create_bits(
-        pixman.PIXMAN_a8r8g8b8,
+        if (force_opaque) pixman.PIXMAN_x8r8g8b8 else pixman.PIXMAN_a8r8g8b8,
         @intCast(buffer.size.width),
         @intCast(buffer.size.height),
         buffer.pixels.ptr,
@@ -475,7 +476,44 @@ fn composite(
     destination_size: render_types.Size,
     image: render_types.Image,
 ) Error!void {
-    const source = try createImage(image.buffer);
+    const dmabuf = image.buffer.dmabuf orelse
+        return compositePixels(destination, destination_size, image, false, false);
+    if (dmabuf.offset % @alignOf(u32) != 0 or dmabuf.stride % @sizeOf(u32) != 0) {
+        return error.InvalidTarget;
+    }
+    const mapping = std.posix.mmap(
+        null,
+        dmabuf.required_bytes,
+        .{ .READ = true },
+        .{ .TYPE = .SHARED },
+        dmabuf.fd,
+        0,
+    ) catch return error.InvalidTarget;
+    defer std.posix.munmap(mapping);
+    if (!(dmabuf.begin_cpu_read)(dmabuf.context)) return error.InvalidTarget;
+    defer _ = (dmabuf.end_cpu_read)(dmabuf.context);
+    const source_bytes = mapping[dmabuf.offset..];
+    const source_pixels: [*]u32 = @ptrCast(@alignCast(source_bytes.ptr));
+    var mapped_image = image;
+    mapped_image.buffer.pixels = source_pixels[0 .. source_bytes.len / @sizeOf(u32)];
+    mapped_image.buffer.dmabuf = null;
+    return compositePixels(
+        destination,
+        destination_size,
+        mapped_image,
+        dmabuf.y_inverted,
+        dmabuf.force_opaque,
+    );
+}
+
+fn compositePixels(
+    destination: *pixman.pixman_image_t,
+    destination_size: render_types.Size,
+    image: render_types.Image,
+    y_inverted: bool,
+    force_opaque: bool,
+) Error!void {
+    const source = try createImage(image.buffer, force_opaque);
     defer _ = pixman.pixman_image_unref(source);
     if (image.size.width == 0 or image.size.height == 0) return error.InvalidTarget;
     const source_rect = image.source orelse render_types.SourceRect{
@@ -485,13 +523,21 @@ fn composite(
         .height = @floatFromInt(image.buffer.size.height),
     };
     if (!validSourceRect(source_rect, image.buffer.size)) return error.InvalidTarget;
-    if (image.source != null or
+    if (y_inverted or image.source != null or
         source_rect.width != @as(f64, @floatFromInt(image.size.width)) or
         source_rect.height != @as(f64, @floatFromInt(image.size.height)))
     {
+        const source_scale_y = source_rect.height / @as(f64, @floatFromInt(image.size.height));
         const floating_transform: pixman.pixman_f_transform_t = .{ .m = .{
             .{ source_rect.width / @as(f64, @floatFromInt(image.size.width)), 0, source_rect.x },
-            .{ 0, source_rect.height / @as(f64, @floatFromInt(image.size.height)), source_rect.y },
+            .{
+                0,
+                if (y_inverted) -source_scale_y else source_scale_y,
+                if (y_inverted)
+                    @as(f64, @floatFromInt(image.buffer.size.height)) - source_rect.y
+                else
+                    source_rect.y,
+            },
             .{ 0, 0, 1 },
         } };
         var transform: pixman.pixman_transform_t = undefined;

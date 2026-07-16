@@ -96,6 +96,13 @@ pub const Renderer = struct {
         };
     }
 
+    pub fn dmabufDeviceId(self: *const Renderer) ?render_types.DrmDeviceId {
+        return switch (self.backend) {
+            .cpu => null,
+            .vulkan => |*renderer| renderer.dmabufDeviceId(),
+        };
+    }
+
     pub fn offscreenAccess(self: *Renderer) ?render_types.OffscreenRenderer {
         return switch (self.backend) {
             .cpu => null,
@@ -180,6 +187,7 @@ fn validateTarget(target: render_types.Target) Renderer.Error!void {
             return;
         },
     };
+    if (pixels.dmabuf != null) return error.InvalidTarget;
     if (pixels.stride_pixels < pixels.size.width) return error.InvalidTarget;
     const last_row = std.math.mul(
         usize,

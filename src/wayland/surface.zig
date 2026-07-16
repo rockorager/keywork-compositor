@@ -60,6 +60,7 @@ pub const State = struct {
     preferred_buffer_scale: ?i32,
     source_cache_id: u64,
     next_source_version: u64,
+    next_release_generation: u64,
     current_buffer: ?BufferSnapshot,
     cached_buffer: ?BufferSnapshot,
     cached_attachment_changed: bool,
@@ -109,6 +110,7 @@ pub const State = struct {
             .preferred_buffer_scale = null,
             .source_cache_id = render_types.allocateSourceCacheId(),
             .next_source_version = 1,
+            .next_release_generation = 1,
             .current_buffer = null,
             .cached_buffer = null,
             .cached_attachment_changed = false,
@@ -688,7 +690,10 @@ fn handleRequest(resource: *wl.Surface, request: wl.Surface.Request, self: *Self
 
 fn commit(self: *Self) void {
     const surface_state = self.state();
-    if (surface_state.release_callbacks.items.len > 0 and
+    const has_unassociated_release = for (surface_state.release_callbacks.items) |callback| {
+        if (callback.generation == null) break true;
+    } else false;
+    if (has_unassociated_release and
         (!self.has_pending_attachment or !self.pending_attachment.hasBuffer()))
     {
         self.resource.postError(
@@ -763,10 +768,11 @@ fn applyPending(self: *Self, commit_info: CommitInfo) void {
             },
         };
 
+        const retains_client_buffer = if (snapshot) |value| value.retainsClientBuffer() else false;
         if (surface_state.current_buffer) |*current| current.deinit();
         surface_state.current_buffer = snapshot;
 
-        releasePendingAttachment(self);
+        releasePendingAttachment(self, retains_client_buffer);
     } else if (surface_state.current_buffer) |*current| {
         current.updateGeometry(
             surface_state.pending_scale,
@@ -866,12 +872,13 @@ fn cachePending(self: *Self) bool {
 
     if (self.has_pending_attachment) {
         discardCommitFeedbacks(surface_state, .cached);
+        const retains_client_buffer = if (snapshot) |value| value.retainsClientBuffer() else false;
         if (surface_state.cached_buffer) |*cached| cached.deinit();
         surface_state.cached_buffer = snapshot;
         snapshot = null;
         surface_state.cached_attachment_changed = true;
 
-        releasePendingAttachment(self);
+        releasePendingAttachment(self, retains_client_buffer);
     }
 
     surface_state.cached_scale = surface_state.pending_scale;
@@ -1001,7 +1008,7 @@ fn snapshotPendingAttachment(
         .id = surface_state.source_cache_id,
         .version = surface_state.next_source_version,
     };
-    const snapshot = if (self.pending_attachment.shm) |shm_buffer|
+    var snapshot = if (self.pending_attachment.shm) |shm_buffer|
         try BufferSnapshot.copyShm(
             self.allocator,
             shm_buffer,
@@ -1014,13 +1021,11 @@ fn snapshotPendingAttachment(
             source_cache,
         )
     else if (self.pending_attachment.dmabuf) |dmabuf_buffer|
-        try BufferSnapshot.copyDmabuf(
-            self.allocator,
+        try BufferSnapshot.retainDmabuf(
             dmabuf_buffer,
             surface_state.pending_scale,
             surface_state.pending_transform,
             surface_state.pending_viewport,
-            source_cache,
         )
     else if (self.pending_attachment.single_pixel) |pixel|
         try BufferSnapshot.copySinglePixel(
@@ -1034,7 +1039,18 @@ fn snapshotPendingAttachment(
         )
     else
         return null;
-    surface_state.next_source_version +%= 1;
+    if (snapshot.retainsClientBuffer()) {
+        const generation = surface_state.next_release_generation;
+        surface_state.next_release_generation +%= 1;
+        for (surface_state.release_callbacks.items) |callback| {
+            if (callback.generation == null) callback.generation = generation;
+        }
+        snapshot.release_store = self.store;
+        snapshot.release_surface_id = self.id;
+        snapshot.release_generation = generation;
+    } else {
+        surface_state.next_source_version +%= 1;
+    }
     return snapshot;
 }
 
@@ -1044,17 +1060,29 @@ fn finishApplied(self: *Self, commit_info: CommitInfo) void {
     for (self.commit_listeners.items) |listener| listener.applied(listener.context);
 }
 
-fn releasePendingAttachment(self: *Self) void {
+fn releasePendingAttachment(self: *Self, retained: bool) void {
     std.debug.assert(self.has_pending_attachment);
-    // SHM storage is no longer used once its pixels have been copied, even
-    // when the resulting content update remains cached by a synchronized role.
-    if (self.pending_attachment.resource) |buffer| buffer.sendRelease();
+    if (!retained) {
+        // SHM storage is no longer used once its pixels have been copied, even
+        // when the resulting content update remains cached by a synchronized role.
+        if (self.pending_attachment.resource) |buffer| buffer.sendRelease();
+    }
     self.pending_attachment.clear();
     self.has_pending_attachment = false;
 
-    const surface_state = self.state();
-    while (surface_state.release_callbacks.items.len > 0) {
-        surface_state.release_callbacks.items[0].resource.destroySendDone(0);
+    if (!retained) finishBufferReleaseCallbacks(self.store, self.id, null);
+}
+
+fn finishBufferReleaseCallbacks(store: *Store, surface_id: Id, generation: ?u64) void {
+    const surface_state = store.get(surface_id) orelse return;
+    var index: usize = 0;
+    while (index < surface_state.release_callbacks.items.len) {
+        const callback = surface_state.release_callbacks.items[index];
+        if (callback.generation != generation) {
+            index += 1;
+            continue;
+        }
+        callback.resource.destroySendDone(0);
     }
 }
 
@@ -1278,6 +1306,7 @@ const Attachment = struct {
         self.resource = buffer;
         self.shm = if (shm_buffer) |shm| wl_shm_buffer_ref(shm) else null;
         self.dmabuf = dmabuf_buffer;
+        if (dmabuf_buffer) |dmabuf| dmabuf.reference();
         self.single_pixel = if (single_pixel_buffer) |single| single.pixel else null;
         self.destroy_listener = wl.Listener(*wl.Resource).init(handleResourceDestroy);
         @as(*wl.Resource, @ptrCast(buffer)).addDestroyListener(&self.destroy_listener);
@@ -1286,6 +1315,7 @@ const Attachment = struct {
     fn clear(self: *Attachment) void {
         if (self.resource != null) self.destroy_listener.link.remove();
         if (self.shm) |buffer| wl_shm_buffer_unref(buffer);
+        if (self.dmabuf) |buffer| buffer.unreference();
         self.resource = null;
         self.shm = null;
         self.dmabuf = null;
@@ -1303,7 +1333,6 @@ const Attachment = struct {
         const self: *Attachment = @fieldParentPtr("destroy_listener", listener);
         listener.link.remove();
         self.resource = null;
-        self.dmabuf = null;
     }
 };
 
@@ -1432,8 +1461,12 @@ pub const BufferSnapshot = struct {
     transform: wl.Output.Transform,
     source: ?render_types.SourceRect,
     pixels: []u32,
+    dmabuf: ?*LinuxDmabuf.Buffer = null,
     source_cache: render_types.SourceCache,
     source_damage: ?[]const render_types.Rect,
+    release_store: ?*Store = null,
+    release_surface_id: Id = undefined,
+    release_generation: u64 = 0,
 
     const Error = error{
         OutOfMemory,
@@ -1519,35 +1552,32 @@ pub const BufferSnapshot = struct {
             .transform = transform,
             .source = geometry.source,
             .pixels = pixels,
+            .dmabuf = null,
             .source_cache = source_cache,
             .source_damage = source_damage,
         };
     }
 
-    fn copyDmabuf(
-        allocator: std.mem.Allocator,
+    fn retainDmabuf(
         buffer: *LinuxDmabuf.Buffer,
         scale: i32,
         transform: wl.Output.Transform,
         viewport: ViewportState,
-        source_cache: render_types.SourceCache,
     ) Error!BufferSnapshot {
         const buffer_size = buffer.size();
         const geometry = try viewportGeometry(buffer_size, scale, transform, viewport);
-        const pixels = buffer.copyPixels(allocator) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.ImportFailed => return error.ImportFailed,
-        };
+        buffer.retainSnapshot();
 
         return .{
-            .allocator = allocator,
+            .allocator = buffer.manager.allocator,
             .buffer_size = buffer_size,
             .logical_size = geometry.logical_size,
             .scale = scale,
             .transform = transform,
             .source = geometry.source,
-            .pixels = pixels,
-            .source_cache = source_cache,
+            .pixels = &.{},
+            .dmabuf = buffer,
+            .source_cache = buffer.acquireSourceCache(),
             .source_damage = null,
         };
     }
@@ -1577,6 +1607,7 @@ pub const BufferSnapshot = struct {
             .transform = transform,
             .source = geometry.source,
             .pixels = pixels,
+            .dmabuf = null,
             .source_cache = source_cache,
             .source_damage = null,
         };
@@ -1607,14 +1638,28 @@ pub const BufferSnapshot = struct {
         if (self.source_damage) |damage| {
             if (damage.len > 0) self.allocator.free(damage);
         }
+        if (self.dmabuf) |buffer| {
+            buffer.releaseSnapshot();
+            if (self.release_store) |store| {
+                finishBufferReleaseCallbacks(store, self.release_surface_id, self.release_generation);
+            }
+        }
         self.* = undefined;
+    }
+
+    fn retainsClientBuffer(self: *const BufferSnapshot) bool {
+        return self.dmabuf != null;
     }
 
     pub fn pixelBuffer(self: *BufferSnapshot) render_types.PixelBuffer {
         return .{
             .size = self.buffer_size,
-            .stride_pixels = self.buffer_size.width,
+            .stride_pixels = if (self.dmabuf) |buffer|
+                buffer.renderSource().stride / @sizeOf(u32)
+            else
+                self.buffer_size.width,
             .pixels = self.pixels,
+            .dmabuf = if (self.dmabuf) |buffer| buffer.renderSource() else null,
             .source_cache = self.source_cache,
             .source_damage = self.source_damage,
         };
@@ -1728,6 +1773,7 @@ const BufferReleaseCallback = struct {
     store: *Store,
     surface_id: Id,
     resource: *wl.Callback,
+    generation: ?u64,
 
     fn handleDestroy(resource: *wl.Resource) callconv(.c) void {
         const self: *BufferReleaseCallback = @ptrCast(@alignCast(resource.getUserData().?));
@@ -1773,6 +1819,7 @@ fn createBufferReleaseCallback(self: *Self, id: u32) error{OutOfMemory}!void {
         .store = self.store,
         .surface_id = self.id,
         .resource = resource,
+        .generation = null,
     };
     try self.state().release_callbacks.append(self.allocator, callback);
 

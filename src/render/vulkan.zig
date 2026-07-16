@@ -45,6 +45,8 @@ instances: std.ArrayList(Instance) = .empty,
 draw_runs: std.ArrayList(DrawRun) = .empty,
 prepared_images: std.ArrayList(PreparedImage) = .empty,
 dmabuf_modifiers: []u64,
+dmabuf_source_modifiers: []u64,
+dmabuf_device_id: ?render.DrmDeviceId,
 outputs: std.AutoHashMapUnmanaged(TargetKey, Output) = .empty,
 textures: std.AutoHashMapUnmanaged(u64, Texture) = .empty,
 frame_number: u64,
@@ -53,6 +55,8 @@ fallback: CpuRenderer,
 
 const max_cached_textures = 4096;
 const stale_frame_count = 120;
+const drm_format_argb8888: u32 = 0x34325241;
+const drm_format_xrgb8888: u32 = 0x34325258;
 
 const TargetKey = union(enum) {
     pixels: struct {
@@ -92,6 +96,7 @@ const Texture = struct {
     size: render.Size,
     version: u64 = 0,
     initialized: bool = false,
+    imported: bool = false,
     last_used: u64,
 };
 
@@ -526,6 +531,7 @@ fn destroyGraphics(wrapper: vk.DeviceWrapper, device: vk.Device, graphics: Graph
 const instance_extensions = [_][*:0]const u8{
     "VK_KHR_get_physical_device_properties2",
     "VK_KHR_external_memory_capabilities",
+    "VK_KHR_external_semaphore_capabilities",
 };
 const dmabuf_device_extensions = [_][*:0]const u8{
     "VK_EXT_physical_device_drm",
@@ -536,6 +542,8 @@ const dmabuf_device_extensions = [_][*:0]const u8{
     "VK_KHR_image_format_list",
     "VK_KHR_external_memory",
     "VK_KHR_external_memory_fd",
+    "VK_KHR_external_semaphore",
+    "VK_KHR_external_semaphore_fd",
     "VK_EXT_external_memory_dma_buf",
     "VK_KHR_dedicated_allocation",
     "VK_EXT_queue_family_foreign",
@@ -570,10 +578,11 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
         allocator,
     ) catch return error.VulkanUnavailable;
     defer allocator.free(available_instance_extensions);
-    const drm_instance_capable = drm_device_id != null and
+    const dmabuf_instance_capable =
         hasExtension(available_instance_extensions, std.mem.span(instance_extensions[0])) and
-        hasExtension(available_instance_extensions, std.mem.span(instance_extensions[1]));
-    const enabled_instance_extensions: []const [*:0]const u8 = if (drm_instance_capable)
+        hasExtension(available_instance_extensions, std.mem.span(instance_extensions[1])) and
+        hasExtension(available_instance_extensions, std.mem.span(instance_extensions[2]));
+    const enabled_instance_extensions: []const [*:0]const u8 = if (dmabuf_instance_capable)
         &instance_extensions
     else
         &.{};
@@ -605,7 +614,8 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
     if (physical_devices.len == 0) return error.NoPhysicalDevice;
     var physical_device = physical_devices[0];
     var dmabuf_capable = false;
-    if (drm_instance_capable) find: for (physical_devices) |candidate| {
+    var dmabuf_device_id: ?render.DrmDeviceId = null;
+    if (dmabuf_instance_capable) find: for (physical_devices) |candidate| {
         const extensions = instance_wrapper.enumerateDeviceExtensionPropertiesAlloc(
             candidate,
             null,
@@ -621,16 +631,28 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
         var properties: vk.PhysicalDeviceProperties2 = .{ .properties = undefined };
         properties.p_next = &drm_properties;
         instance_wrapper.getPhysicalDeviceProperties2KHR(candidate, &properties);
-        const wanted = drm_device_id.?;
-        const primary_matches = drm_properties.has_primary == .true and
-            drm_properties.primary_major == wanted.major and
-            drm_properties.primary_minor == wanted.minor;
-        const render_matches = drm_properties.has_render == .true and
-            drm_properties.render_major == wanted.major and
-            drm_properties.render_minor == wanted.minor;
-        if (!primary_matches and !render_matches) continue;
+        if (drm_device_id) |wanted| {
+            const primary_matches = drm_properties.has_primary == .true and
+                drm_properties.primary_major == wanted.major and
+                drm_properties.primary_minor == wanted.minor;
+            const render_matches = drm_properties.has_render == .true and
+                drm_properties.render_major == wanted.major and
+                drm_properties.render_minor == wanted.minor;
+            if (!primary_matches and !render_matches) continue;
+        } else if (drm_properties.has_render != .true) {
+            // Headless rendering needs an unprivileged render node to identify
+            // the same device to DMA-BUF clients.
+            continue;
+        }
         physical_device = candidate;
         dmabuf_capable = true;
+        dmabuf_device_id = if (drm_properties.has_render == .true) .{
+            .major = @intCast(drm_properties.render_major),
+            .minor = @intCast(drm_properties.render_minor),
+        } else .{
+            .major = @intCast(drm_properties.primary_major),
+            .minor = @intCast(drm_properties.primary_minor),
+        };
         break;
     };
 
@@ -691,8 +713,12 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
 
     const format = chooseFormat(instance_wrapper, physical_device) orelse
         return error.VulkanUnavailable;
-    if (format != .b8g8r8a8_unorm) dmabuf_capable = false;
+    if (format != .b8g8r8a8_unorm) {
+        dmabuf_capable = false;
+        dmabuf_device_id = null;
+    }
     var dmabuf_modifiers: []u64 = &.{};
+    var dmabuf_source_modifiers: []u64 = &.{};
     if (dmabuf_capable) {
         var modifier_list: vk.DrmFormatModifierPropertiesListEXT = .{};
         var format_properties: vk.FormatProperties2 = .{ .format_properties = undefined };
@@ -715,6 +741,8 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
         );
         var modifiers: std.ArrayList(u64) = .empty;
         defer modifiers.deinit(allocator);
+        var source_modifiers: std.ArrayList(u64) = .empty;
+        defer source_modifiers.deinit(allocator);
         for (properties) |property| {
             const features = property.drm_format_modifier_tiling_features;
             if (property.drm_format_modifier_plane_count == 1 and
@@ -724,11 +752,20 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
                 modifiers.append(allocator, property.drm_format_modifier) catch
                     return error.OutOfMemory;
             }
+            if (property.drm_format_modifier_plane_count == 1 and
+                features.sampled_image_bit and features.sampled_image_filter_linear_bit)
+            {
+                source_modifiers.append(allocator, property.drm_format_modifier) catch
+                    return error.OutOfMemory;
+            }
         }
         dmabuf_modifiers = modifiers.toOwnedSlice(allocator) catch return error.OutOfMemory;
-        if (dmabuf_modifiers.len == 0) dmabuf_capable = false;
+        errdefer if (dmabuf_modifiers.len != 0) allocator.free(dmabuf_modifiers);
+        dmabuf_source_modifiers = source_modifiers.toOwnedSlice(allocator) catch
+            return error.OutOfMemory;
     }
     errdefer if (dmabuf_modifiers.len != 0) allocator.free(dmabuf_modifiers);
+    errdefer if (dmabuf_source_modifiers.len != 0) allocator.free(dmabuf_source_modifiers);
     const graphics = initGraphics(device_wrapper, device, format) catch |err| {
         log.err("failed to initialize Vulkan graphics pipelines: {t}", .{err});
         return error.VulkanUnavailable;
@@ -769,6 +806,8 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
         .instance_mapped = null,
         .instance_capacity = 0,
         .dmabuf_modifiers = if (dmabuf_capable) dmabuf_modifiers else &.{},
+        .dmabuf_source_modifiers = if (dmabuf_capable) dmabuf_source_modifiers else &.{},
+        .dmabuf_device_id = dmabuf_device_id,
         .frame_number = 0,
         .resource_epoch = 1,
         .fallback = CpuRenderer.init(allocator),
@@ -781,6 +820,7 @@ pub fn deinit(self: *Self) void {
     self.fallback.deinit();
     self.destroyCachedResources();
     if (self.dmabuf_modifiers.len != 0) self.allocator.free(self.dmabuf_modifiers);
+    if (self.dmabuf_source_modifiers.len != 0) self.allocator.free(self.dmabuf_source_modifiers);
     self.instances.deinit(self.allocator);
     self.draw_runs.deinit(self.allocator);
     self.prepared_images.deinit(self.allocator);
@@ -814,6 +854,11 @@ pub fn dmabufAccess(self: *Self) ?render.DmabufRenderer {
         .import_target = importTargetCallback,
         .release_target = releaseTargetCallback,
     };
+}
+
+pub fn dmabufDeviceId(self: *const Self) ?render.DrmDeviceId {
+    if (self.dmabuf_source_modifiers.len == 0) return null;
+    return self.dmabuf_device_id;
 }
 
 pub fn offscreenAccess(self: *Self) render.OffscreenRenderer {
@@ -1015,6 +1060,46 @@ fn supportsDmabufTarget(self: *Self, size: render.Size, modifier: u64) bool {
         size.width <= maximum.width and size.height <= maximum.height;
 }
 
+fn supportsDmabufSource(self: *Self, size: render.Size, source: render.DmabufSource) bool {
+    if (size.width == 0 or size.height == 0 or
+        (source.format != drm_format_argb8888 and source.format != drm_format_xrgb8888) or
+        std.mem.indexOfScalar(u64, self.dmabuf_source_modifiers, source.modifier) == null)
+    {
+        return false;
+    }
+
+    const modifier_info: vk.PhysicalDeviceImageDrmFormatModifierInfoEXT = .{
+        .drm_format_modifier = source.modifier,
+        .sharing_mode = .exclusive,
+    };
+    const external_info: vk.PhysicalDeviceExternalImageFormatInfo = .{
+        .p_next = &modifier_info,
+        .handle_type = .{ .dma_buf_bit_ext = true },
+    };
+    const format_info: vk.PhysicalDeviceImageFormatInfo2 = .{
+        .p_next = &external_info,
+        .format = .b8g8r8a8_unorm,
+        .type = .@"2d",
+        .tiling = .drm_format_modifier_ext,
+        .usage = .{ .sampled_bit = true },
+    };
+    var external_properties: vk.ExternalImageFormatProperties = .{
+        .external_memory_properties = undefined,
+    };
+    var format_properties: vk.ImageFormatProperties2 = .{
+        .p_next = &external_properties,
+        .image_format_properties = undefined,
+    };
+    self.instance_wrapper.getPhysicalDeviceImageFormatProperties2KHR(
+        self.physical_device,
+        &format_info,
+        &format_properties,
+    ) catch return false;
+    const maximum = format_properties.image_format_properties.max_extent;
+    return external_properties.external_memory_properties.external_memory_features.importable_bit and
+        size.width <= maximum.width and size.height <= maximum.height;
+}
+
 fn releaseTarget(self: *Self, id: u64) void {
     self.releaseOutput(.{ .dmabuf = id });
 }
@@ -1112,7 +1197,7 @@ pub fn renderFrame(self: *Self, frame: render.Frame, target: render.Target) Erro
             const prepared = &self.prepared_images.items[prepared_index];
             prepared_index += 1;
             if (prepared.upload_offset) |offset| {
-                copyPixelsToMapped(
+                try copySourceToMapped(
                     self.work_mapped.?,
                     offset,
                     image.buffer,
@@ -1195,6 +1280,12 @@ pub fn renderFrame(self: *Self, frame: render.Frame, target: render.Target) Erro
                     .{ .color_attachment_output_bit = true },
                 );
             }
+        }
+
+        for (self.prepared_images.items, 0..) |prepared, index| {
+            if (!prepared.texture.imported or
+                !isFirstImportedTexture(self.prepared_images.items, index)) continue;
+            self.transitionExternalSourceToSample(command_buffer, prepared.texture.image);
         }
 
         for (self.prepared_images.items) |prepared| {
@@ -1325,6 +1416,12 @@ pub fn renderFrame(self: *Self, frame: render.Frame, target: render.Target) Erro
         }
         self.device_wrapper.cmdEndRenderPass(command_buffer);
 
+        for (self.prepared_images.items, 0..) |prepared, index| {
+            if (!prepared.texture.imported or
+                !isFirstImportedTexture(self.prepared_images.items, index)) continue;
+            self.transitionSampleToExternal(command_buffer, prepared.texture.image);
+        }
+
         if (output.kind == .dmabuf) self.transitionRenderToExternal(command_buffer, output.image);
 
         if (output.kind == .pixels) self.transitionImage(
@@ -1362,9 +1459,56 @@ pub fn renderFrame(self: *Self, frame: render.Frame, target: render.Target) Erro
         );
     }
 
+    var wait_semaphores: std.ArrayList(vk.Semaphore) = .empty;
+    defer {
+        for (wait_semaphores.items) |semaphore| {
+            self.device_wrapper.destroySemaphore(self.device, semaphore, null);
+        }
+        wait_semaphores.deinit(self.allocator);
+    }
+    var wait_stages: std.ArrayList(vk.PipelineStageFlags) = .empty;
+    defer wait_stages.deinit(self.allocator);
+    wait_semaphores.ensureTotalCapacity(self.allocator, self.prepared_images.items.len) catch
+        return error.OutOfMemory;
+    wait_stages.ensureTotalCapacity(self.allocator, self.prepared_images.items.len) catch
+        return error.OutOfMemory;
+    for (self.prepared_images.items, 0..) |prepared, index| {
+        if (!prepared.texture.imported or
+            !isFirstImportedTexture(self.prepared_images.items, index)) continue;
+        const source = prepared.buffer.dmabuf.?;
+        const sync_fd = (source.export_read_fence)(source.context) orelse {
+            if (!(source.begin_cpu_read)(source.context)) return error.VulkanFailure;
+            if (!(source.end_cpu_read)(source.context)) return error.VulkanFailure;
+            continue;
+        };
+        const semaphore = self.device_wrapper.createSemaphore(self.device, &.{}, null) catch {
+            _ = std.c.close(sync_fd);
+            if (!(source.begin_cpu_read)(source.context)) return error.VulkanFailure;
+            if (!(source.end_cpu_read)(source.context)) return error.VulkanFailure;
+            continue;
+        };
+        self.device_wrapper.importSemaphoreFdKHR(self.device, &.{
+            .semaphore = semaphore,
+            .flags = .{ .temporary_bit = true },
+            .handle_type = .{ .sync_fd_bit = true },
+            .fd = sync_fd,
+        }) catch {
+            _ = std.c.close(sync_fd);
+            self.device_wrapper.destroySemaphore(self.device, semaphore, null);
+            if (!(source.begin_cpu_read)(source.context)) return error.VulkanFailure;
+            if (!(source.end_cpu_read)(source.context)) return error.VulkanFailure;
+            continue;
+        };
+        wait_semaphores.appendAssumeCapacity(semaphore);
+        wait_stages.appendAssumeCapacity(.{ .all_commands_bit = true });
+    }
+
     // Queue submission makes prior coherent mapped writes visible to every
     // device access in the submission; no host pipeline barrier is needed.
     const submit_info: vk.SubmitInfo = .{
+        .wait_semaphore_count = @intCast(wait_semaphores.items.len),
+        .p_wait_semaphores = wait_semaphores.items.ptr,
+        .p_wait_dst_stage_mask = wait_stages.items.ptr,
         .command_buffer_count = 1,
         .p_command_buffers = @ptrCast(&command_buffer),
     };
@@ -1397,6 +1541,14 @@ pub fn renderFrame(self: *Self, frame: render.Frame, target: render.Target) Erro
     }
     frame_succeeded = true;
     if (output.kind == .pixels) copyDamageToTarget(frame, target.pixels, self.work_mapped.?);
+}
+
+fn isFirstImportedTexture(prepared_images: []const PreparedImage, index: usize) bool {
+    const image = prepared_images[index].texture.image;
+    for (prepared_images[0..index]) |prepared| {
+        if (prepared.texture.imported and prepared.texture.image == image) return false;
+    }
+    return true;
 }
 
 fn supports(commands: []const render.Command) bool {
@@ -1532,6 +1684,7 @@ fn validateTarget(frame: render.Frame, target: render.Target) Error!usize {
         .pixels => |pixels| pixels,
     };
     if (pixels.stride_pixels < pixels.size.width) return error.InvalidTarget;
+    if (pixels.dmabuf != null) return error.InvalidTarget;
     const last_row = std.math.mul(
         usize,
         pixels.size.height - 1,
@@ -1581,6 +1734,23 @@ fn requiredBufferPixels(buffer: render.PixelBuffer) Error!usize {
     ) catch return error.InvalidTarget;
     const required = std.math.add(usize, last_row, buffer.size.width) catch
         return error.InvalidTarget;
+    if (buffer.dmabuf) |dmabuf| {
+        const stride_bytes = std.math.mul(u64, buffer.stride_pixels, @sizeOf(u32)) catch
+            return error.InvalidTarget;
+        const last_row_bytes = std.math.mul(u64, buffer.size.height - 1, stride_bytes) catch
+            return error.InvalidTarget;
+        const required_bytes = std.math.add(
+            u64,
+            std.math.add(u64, dmabuf.offset, last_row_bytes) catch return error.InvalidTarget,
+            @as(u64, buffer.size.width) * @sizeOf(u32),
+        ) catch return error.InvalidTarget;
+        if (dmabuf.stride != stride_bytes or required_bytes > dmabuf.required_bytes or
+            dmabuf.offset % @alignOf(u32) != 0)
+        {
+            return error.InvalidTarget;
+        }
+        return required;
+    }
     if (buffer.pixels.len < required) return error.InvalidTarget;
     return required;
 }
@@ -1738,6 +1908,16 @@ fn prepareTexture(
     const required_pixels = try requiredBufferPixels(buffer);
     const byte_size = std.math.mul(usize, required_pixels, @sizeOf(u32)) catch
         return error.InvalidTarget;
+    if (buffer.dmabuf) |dmabuf| {
+        if (self.supportsDmabufSource(buffer.size, dmabuf)) {
+            const imported = self.prepareImportedTexture(buffer, previously_prepared) catch |err| blk: {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                log.warn("Vulkan DMA-BUF source import failed; using CPU upload fallback: {t}", .{err});
+                break :blk null;
+            };
+            if (imported) |prepared| return prepared;
+        }
+    }
     if (buffer.source_cache) |source| {
         for (previously_prepared) |prepared| {
             if (prepared.cache_id == source.id) {
@@ -1753,7 +1933,7 @@ fn prepareTexture(
             }
         }
         if (self.textures.get(source.id)) |existing| {
-            if (!std.meta.eql(existing.size, buffer.size)) {
+            if (existing.imported or !std.meta.eql(existing.size, buffer.size)) {
                 const removed = self.textures.fetchRemove(source.id).?;
                 self.destroyTexture(removed.value);
             }
@@ -1803,6 +1983,57 @@ fn prepareTexture(
         .upload_damage = null,
         .cache_id = null,
         .desired_version = 0,
+    };
+}
+
+fn prepareImportedTexture(
+    self: *Self,
+    buffer: render.PixelBuffer,
+    previously_prepared: []const PreparedImage,
+) Error!PreparedImage {
+    const source = buffer.source_cache orelse return error.InvalidTarget;
+    for (previously_prepared) |prepared| {
+        if (prepared.cache_id == source.id) {
+            if (!prepared.texture.imported) return error.InvalidTarget;
+            return .{
+                .texture = prepared.texture,
+                .buffer = buffer,
+                .upload_offset = null,
+                .upload_damage = null,
+                .cache_id = source.id,
+                .desired_version = source.version,
+            };
+        }
+    }
+    if (self.textures.get(source.id)) |existing| {
+        if (!existing.imported or !std.meta.eql(existing.size, buffer.size)) {
+            const removed = self.textures.fetchRemove(source.id).?;
+            self.destroyTexture(removed.value);
+        }
+    }
+    if (self.textures.getPtr(source.id)) |texture| {
+        texture.last_used = self.frame_number;
+        return .{
+            .texture = texture.*,
+            .buffer = buffer,
+            .upload_offset = null,
+            .upload_damage = null,
+            .cache_id = source.id,
+            .desired_version = source.version,
+        };
+    }
+
+    self.makeTextureRoom() catch return error.VulkanFailure;
+    const texture = try self.createImportedTexture(buffer.size, buffer.dmabuf.?);
+    errdefer self.destroyTexture(texture);
+    self.textures.put(self.allocator, source.id, texture) catch return error.OutOfMemory;
+    return .{
+        .texture = texture,
+        .buffer = buffer,
+        .upload_offset = null,
+        .upload_damage = null,
+        .cache_id = source.id,
+        .desired_version = source.version,
     };
 }
 
@@ -1958,6 +2189,127 @@ fn createTexture(self: *Self, size: render.Size) Error!Texture {
         .view = allocation.view,
         .descriptor_set = descriptor_set,
         .size = size,
+        .last_used = self.frame_number,
+    };
+    self.advanceResourceEpoch();
+    return texture;
+}
+
+fn createImportedTexture(
+    self: *Self,
+    size: render.Size,
+    source: render.DmabufSource,
+) Error!Texture {
+    if (!self.supportsDmabufSource(size, source)) return error.InvalidTarget;
+    const duplicate_fd = std.c.dup(source.fd);
+    if (duplicate_fd < 0) return error.VulkanFailure;
+    var fd_owned = true;
+    defer if (fd_owned) {
+        _ = std.c.close(duplicate_fd);
+    };
+    const plane: vk.SubresourceLayout = .{
+        .offset = source.offset,
+        .size = 0,
+        .row_pitch = source.stride,
+        .array_pitch = 0,
+        .depth_pitch = 0,
+    };
+    const modifier_info: vk.ImageDrmFormatModifierExplicitCreateInfoEXT = .{
+        .drm_format_modifier = source.modifier,
+        .drm_format_modifier_plane_count = 1,
+        .p_plane_layouts = @ptrCast(&plane),
+    };
+    const external_info: vk.ExternalMemoryImageCreateInfo = .{
+        .p_next = &modifier_info,
+        .handle_types = .{ .dma_buf_bit_ext = true },
+    };
+    const image = self.device_wrapper.createImage(self.device, &.{
+        .p_next = &external_info,
+        .image_type = .@"2d",
+        .format = .b8g8r8a8_unorm,
+        .extent = extent(size),
+        .mip_levels = 1,
+        .array_layers = 1,
+        .samples = .{ .@"1_bit" = true },
+        .tiling = .drm_format_modifier_ext,
+        .usage = .{ .sampled_bit = true },
+        .sharing_mode = .exclusive,
+        .initial_layout = .undefined,
+    }, null) catch return error.VulkanFailure;
+    errdefer self.device_wrapper.destroyImage(self.device, image, null);
+    const requirements = self.device_wrapper.getImageMemoryRequirements(self.device, image);
+    var fd_properties: vk.MemoryFdPropertiesKHR = .{ .memory_type_bits = 0 };
+    self.device_wrapper.getMemoryFdPropertiesKHR(
+        self.device,
+        .{ .dma_buf_bit_ext = true },
+        duplicate_fd,
+        &fd_properties,
+    ) catch return error.VulkanFailure;
+    const memory_type = self.deviceMemoryType(
+        requirements.memory_type_bits & fd_properties.memory_type_bits,
+    ) orelse return error.VulkanFailure;
+    const dedicated: vk.MemoryDedicatedAllocateInfo = .{ .image = image };
+    const import_info: vk.ImportMemoryFdInfoKHR = .{
+        .p_next = &dedicated,
+        .handle_type = .{ .dma_buf_bit_ext = true },
+        .fd = duplicate_fd,
+    };
+    const memory = self.device_wrapper.allocateMemory(self.device, &.{
+        .p_next = &import_info,
+        .allocation_size = requirements.size,
+        .memory_type_index = memory_type,
+    }, null) catch return error.VulkanFailure;
+    fd_owned = false;
+    errdefer self.device_wrapper.freeMemory(self.device, memory, null);
+    self.device_wrapper.bindImageMemory(self.device, image, memory, 0) catch
+        return error.VulkanFailure;
+    const view = self.device_wrapper.createImageView(self.device, &.{
+        .image = image,
+        .view_type = .@"2d",
+        .format = .b8g8r8a8_unorm,
+        .components = .{
+            .r = .identity,
+            .g = .identity,
+            .b = .identity,
+            .a = if (source.force_opaque) .one else .identity,
+        },
+        .subresource_range = colorSubresourceRange(),
+    }, null) catch return error.VulkanFailure;
+    errdefer self.device_wrapper.destroyImageView(self.device, view, null);
+    var descriptor_set: vk.DescriptorSet = undefined;
+    self.device_wrapper.allocateDescriptorSets(self.device, &.{
+        .descriptor_pool = self.descriptor_pool,
+        .descriptor_set_count = 1,
+        .p_set_layouts = @ptrCast(&self.descriptor_set_layout),
+    }, @ptrCast(&descriptor_set)) catch return error.VulkanFailure;
+    errdefer self.device_wrapper.freeDescriptorSets(
+        self.device,
+        self.descriptor_pool,
+        &.{descriptor_set},
+    ) catch {};
+    const image_info: vk.DescriptorImageInfo = .{
+        .sampler = self.sampler,
+        .image_view = view,
+        .image_layout = .shader_read_only_optimal,
+    };
+    self.device_wrapper.updateDescriptorSets(self.device, &.{.{
+        .dst_set = descriptor_set,
+        .dst_binding = 0,
+        .dst_array_element = 0,
+        .descriptor_count = 1,
+        .descriptor_type = .combined_image_sampler,
+        .p_image_info = @ptrCast(&image_info),
+        .p_buffer_info = undefined,
+        .p_texel_buffer_view = undefined,
+    }}, null);
+    const texture: Texture = .{
+        .image = image,
+        .memory = memory,
+        .view = view,
+        .descriptor_set = descriptor_set,
+        .size = size,
+        .initialized = true,
+        .imported = true,
         .last_used = self.frame_number,
     };
     self.advanceResourceEpoch();
@@ -2258,6 +2610,15 @@ fn compileDrawRuns(
                 .radius = 0,
             };
             const radius = @min(rounded.radius, @min(rounded.rect.width, rounded.rect.height) / 2);
+            const dmabuf = image.buffer.dmabuf;
+            const source_y = if (dmabuf != null and dmabuf.?.y_inverted)
+                @as(f64, @floatFromInt(image.buffer.size.height)) - source.y
+            else
+                source.y;
+            const source_height = if (dmabuf != null and dmabuf.?.y_inverted)
+                -source.height
+            else
+                source.height;
             try self.emitDamaged(
                 frame,
                 clipped,
@@ -2268,14 +2629,19 @@ fn compileDrawRuns(
                     .destination = rectFloats(destination),
                     .source = .{
                         @floatCast(source.x),
-                        @floatCast(source.y),
+                        @floatCast(source_y),
                         @floatCast(source.width),
-                        @floatCast(source.height),
+                        @floatCast(source_height),
                     },
                     .clip = undefined,
                     .color = .{ 1, 1, 1, 1 },
                     .rounded = rectFloats(rounded.rect),
-                    .parameters = .{ @floatFromInt(radius), 0, 0, 0 },
+                    .parameters = .{
+                        @floatFromInt(radius),
+                        0,
+                        0,
+                        0,
+                    },
                 },
             );
         },
@@ -2479,6 +2845,74 @@ fn copyTextureRect(
     );
 }
 
+fn copySourceToMapped(
+    mapped: [*]u8,
+    base_offset: usize,
+    buffer: render.PixelBuffer,
+    damage: ?[]const render.Rect,
+) Error!void {
+    const dmabuf = buffer.dmabuf orelse {
+        copyPixelsToMapped(mapped, base_offset, buffer, damage);
+        return;
+    };
+    const mapping = std.posix.mmap(
+        null,
+        dmabuf.required_bytes,
+        .{ .READ = true },
+        .{ .TYPE = .SHARED },
+        dmabuf.fd,
+        0,
+    ) catch return error.VulkanFailure;
+    defer std.posix.munmap(mapping);
+    if (!(dmabuf.begin_cpu_read)(dmabuf.context)) return error.VulkanFailure;
+    defer _ = (dmabuf.end_cpu_read)(dmabuf.context);
+
+    if (damage) |rectangles| {
+        for (rectangles) |rect| copyDmabufRectToMapped(
+            mapped,
+            base_offset,
+            buffer,
+            dmabuf,
+            mapping,
+            rect,
+        );
+        return;
+    }
+    copyDmabufRectToMapped(mapped, base_offset, buffer, dmabuf, mapping, .{
+        .x = 0,
+        .y = 0,
+        .width = buffer.size.width,
+        .height = buffer.size.height,
+    });
+}
+
+fn copyDmabufRectToMapped(
+    mapped: [*]u8,
+    base_offset: usize,
+    buffer: render.PixelBuffer,
+    dmabuf: render.DmabufSource,
+    mapping: []align(std.heap.page_size_min) const u8,
+    rect: render.Rect,
+) void {
+    std.debug.assert(rect.x >= 0 and rect.y >= 0);
+    const x_bytes = @as(usize, @intCast(rect.x)) * @sizeOf(u32);
+    const copy_bytes = @as(usize, rect.width) * @sizeOf(u32);
+    const stride_bytes = @as(usize, buffer.stride_pixels) * @sizeOf(u32);
+    for (0..rect.height) |row| {
+        const row_offset = (@as(usize, @intCast(rect.y)) + row) * stride_bytes + x_bytes;
+        @memcpy(
+            mapped[base_offset + row_offset ..][0..copy_bytes],
+            mapping[@as(usize, dmabuf.offset) + row_offset ..][0..copy_bytes],
+        );
+        if (dmabuf.force_opaque) {
+            const row_pixels: [*]u32 = @ptrCast(@alignCast(
+                mapped + base_offset + row_offset,
+            ));
+            for (row_pixels[0..rect.width]) |*pixel| pixel.* |= 0xff00_0000;
+        }
+    }
+}
+
 fn copyPixelsToMapped(
     mapped: [*]u8,
     base_offset: usize,
@@ -2610,6 +3044,60 @@ fn transitionRenderToExternal(
         .{ .color_attachment_write_bit = true },
         .{},
         .{ .color_attachment_output_bit = true },
+        .{ .bottom_of_pipe_bit = true },
+    );
+}
+
+fn transitionExternalSourceToSample(
+    self: *Self,
+    command_buffer: vk.CommandBuffer,
+    image: vk.Image,
+) void {
+    const output: Output = .{
+        .image = image,
+        .memory = .null_handle,
+        .view = .null_handle,
+        .framebuffer = .null_handle,
+        .size = .{ .width = 0, .height = 0 },
+        .last_used = 0,
+    };
+    self.transitionExternal(
+        command_buffer,
+        output,
+        .general,
+        .shader_read_only_optimal,
+        vk.QUEUE_FAMILY_FOREIGN_EXT,
+        self.queue_family_index,
+        .{},
+        .{ .shader_read_bit = true },
+        .{ .all_commands_bit = true },
+        .{ .fragment_shader_bit = true },
+    );
+}
+
+fn transitionSampleToExternal(
+    self: *Self,
+    command_buffer: vk.CommandBuffer,
+    image: vk.Image,
+) void {
+    const output: Output = .{
+        .image = image,
+        .memory = .null_handle,
+        .view = .null_handle,
+        .framebuffer = .null_handle,
+        .size = .{ .width = 0, .height = 0 },
+        .last_used = 0,
+    };
+    self.transitionExternal(
+        command_buffer,
+        output,
+        .shader_read_only_optimal,
+        .general,
+        self.queue_family_index,
+        vk.QUEUE_FAMILY_FOREIGN_EXT,
+        .{ .shader_read_bit = true },
+        .{},
+        .{ .fragment_shader_bit = true },
         .{ .bottom_of_pipe_bit = true },
     );
 }
@@ -3000,6 +3488,83 @@ test "Vulkan renderer imports and renders directly to a GBM dmabuf" {
         .size = size,
         .commands = &.{.{ .clear = render.Color.rgba(12, 34, 56, 255) }},
     }, .{ .dmabuf = .{ .id = id, .size = size } });
+}
+
+test "Vulkan renderer samples a GBM dmabuf without a CPU upload" {
+    const fd = std.c.open("/dev/dri/renderD128", std.c.O{
+        .ACCMODE = .RDWR,
+        .CLOEXEC = true,
+    });
+    if (fd < 0) return error.SkipZigTest;
+    defer _ = std.c.close(fd);
+
+    var renderer = Self.init(std.testing.allocator, .{ .major = 226, .minor = 128 }) catch |err| switch (err) {
+        error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+    if (std.mem.indexOfScalar(u64, renderer.dmabuf_source_modifiers, 0) == null) {
+        return error.SkipZigTest;
+    }
+    const Gbm = @import("../backend/gbm.zig");
+    var gbm = Gbm.init(fd) catch return error.SkipZigTest;
+    defer gbm.deinit();
+
+    const size: render.Size = .{ .width = 64, .height = 64 };
+    var source_buffer = gbm.createBuffer(size, drm_format_argb8888, &.{0}) catch
+        return error.SkipZigTest;
+    defer source_buffer.deinit();
+
+    const NoopSync = struct {
+        fn begin(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn end(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn exportFence(_: *anyopaque) ?std.posix.fd_t {
+            return null;
+        }
+    };
+    const cache_id = render.allocateSourceCacheId();
+    var target_pixels = [_]u32{0} ** (64 * 64);
+    try renderer.renderFrame(.{
+        .size = size,
+        .commands = &.{.{ .image = .{
+            .x = 0,
+            .y = 0,
+            .size = size,
+            .buffer = .{
+                .size = size,
+                .stride_pixels = source_buffer.stride / @sizeOf(u32),
+                .dmabuf = .{
+                    .context = &source_buffer,
+                    .fd = source_buffer.fd,
+                    .format = drm_format_argb8888,
+                    .modifier = source_buffer.modifier,
+                    .stride = source_buffer.stride,
+                    .offset = source_buffer.offset,
+                    .required_bytes = @intCast(
+                        source_buffer.offset + source_buffer.stride * size.height,
+                    ),
+                    .y_inverted = false,
+                    .force_opaque = false,
+                    .begin_cpu_read = NoopSync.begin,
+                    .end_cpu_read = NoopSync.end,
+                    .export_read_fence = NoopSync.exportFence,
+                },
+                .source_cache = .{ .id = cache_id, .version = 1 },
+            },
+        } }},
+    }, .{ .pixels = .{
+        .size = size,
+        .stride_pixels = size.width,
+        .pixels = &target_pixels,
+    } });
+
+    try std.testing.expect(renderer.textures.get(cache_id).?.imported);
 }
 
 test "Vulkan renderer blends premultiplied alpha" {
