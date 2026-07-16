@@ -8,6 +8,7 @@ const Server = @import("server.zig");
 const Systemd = @import("systemd.zig");
 
 const log = std.log.scoped(.main);
+const default_cursor_size = "24";
 
 pub fn main(init: std.process.Init) !void {
     const renderer_kind: Renderer.Kind = if (init.environ_map.get("KEYWORK_RENDERER")) |value|
@@ -26,6 +27,9 @@ pub fn main(init: std.process.Init) !void {
         if (init.environ_map.get("KEYWORK_HEADLESS_SCALE")) |value| {
             virtual_output.scale = parseHeadlessScale(value) catch return error.InvalidHeadlessScale;
         }
+    }
+    if (init.environ_map.get("XCURSOR_SIZE") == null) {
+        try init.environ_map.put("XCURSOR_SIZE", default_cursor_size);
     }
     const server = try Server.createWithVirtualOutput(
         init.gpa,
@@ -80,7 +84,7 @@ pub fn main(init: std.process.Init) !void {
     try writer.interface.print("WAYLAND_DISPLAY={s}\n", .{socket_name});
     try writer.interface.flush();
     server.startXwayland(init.environ_map);
-    try systemd.ready(socket_name);
+    try systemd.ready(socket_name, init.environ_map.get("XCURSOR_SIZE").?);
 
     server.run();
 }

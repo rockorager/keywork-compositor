@@ -12,7 +12,7 @@ const log = std.log.scoped(.systemd);
 const current_desktop = "XDG_CURRENT_DESKTOP=keywork";
 const session_desktop = "XDG_SESSION_DESKTOP=keywork";
 const session_type = "XDG_SESSION_TYPE=wayland";
-const max_assignments = 4;
+const max_assignments = 5;
 
 io: std.Io,
 notify_enabled: bool,
@@ -31,7 +31,11 @@ pub fn init(io: std.Io, environ_map: *const std.process.Environ.Map) Self {
     };
 }
 
-pub fn ready(self: *const Self, wayland_display: []const u8) !void {
+pub fn ready(
+    self: *const Self,
+    wayland_display: []const u8,
+    cursor_size: []const u8,
+) !void {
     if (self.session_enabled) {
         var display_buffer: [64]u8 = undefined;
         const display = try std.fmt.bufPrint(
@@ -39,11 +43,18 @@ pub fn ready(self: *const Self, wayland_display: []const u8) !void {
             "WAYLAND_DISPLAY={s}",
             .{wayland_display},
         );
+        var cursor_size_buffer: [64]u8 = undefined;
+        const cursor_size_assignment = try std.fmt.bufPrint(
+            &cursor_size_buffer,
+            "XCURSOR_SIZE={s}",
+            .{cursor_size},
+        );
         try self.updateActivationEnvironment(&.{
             display,
             current_desktop,
             session_desktop,
             session_type,
+            cursor_size_assignment,
         });
     }
 
