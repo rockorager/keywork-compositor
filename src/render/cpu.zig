@@ -559,30 +559,19 @@ fn compositePixels(
     const source = try createImage(image.buffer, force_opaque);
     defer _ = pixman.pixman_image_unref(source);
     if (image.size.width == 0 or image.size.height == 0) return error.InvalidTarget;
+    const transformed_size = image.transform.applyToSize(image.buffer.size);
     const source_rect = image.source orelse render_types.SourceRect{
         .x = 0,
         .y = 0,
-        .width = @floatFromInt(image.buffer.size.width),
-        .height = @floatFromInt(image.buffer.size.height),
+        .width = @floatFromInt(transformed_size.width),
+        .height = @floatFromInt(transformed_size.height),
     };
-    if (!validSourceRect(source_rect, image.buffer.size)) return error.InvalidTarget;
-    if (y_inverted or image.source != null or
+    if (!validSourceRect(source_rect, transformed_size)) return error.InvalidTarget;
+    if (y_inverted or image.transform != .normal or image.source != null or
         source_rect.width != @as(f64, @floatFromInt(image.size.width)) or
         source_rect.height != @as(f64, @floatFromInt(image.size.height)))
     {
-        const source_scale_y = source_rect.height / @as(f64, @floatFromInt(image.size.height));
-        const floating_transform: pixman.pixman_f_transform_t = .{ .m = .{
-            .{ source_rect.width / @as(f64, @floatFromInt(image.size.width)), 0, source_rect.x },
-            .{
-                0,
-                if (y_inverted) -source_scale_y else source_scale_y,
-                if (y_inverted)
-                    @as(f64, @floatFromInt(image.buffer.size.height)) - source_rect.y
-                else
-                    source_rect.y,
-            },
-            .{ 0, 0, 1 },
-        } };
+        const floating_transform = sourceTransform(image, source_rect, y_inverted);
         var transform: pixman.pixman_transform_t = undefined;
         if (pixman.pixman_transform_from_pixman_f_transform(
             &transform,
@@ -629,6 +618,65 @@ fn compositePixels(
         @intCast(clipped.width),
         @intCast(clipped.height),
     );
+}
+
+fn sourceTransform(
+    image: render_types.Image,
+    source: render_types.SourceRect,
+    y_inverted: bool,
+) pixman.pixman_f_transform_t {
+    const scale_x = source.width / @as(f64, @floatFromInt(image.size.width));
+    const scale_y = source.height / @as(f64, @floatFromInt(image.size.height));
+    const buffer_width: f64 = @floatFromInt(image.buffer.size.width);
+    const buffer_height: f64 = @floatFromInt(image.buffer.size.height);
+    var matrix: [3][3]f64 = switch (image.transform) {
+        .normal => .{
+            .{ scale_x, 0, source.x },
+            .{ 0, scale_y, source.y },
+            .{ 0, 0, 1 },
+        },
+        .rotate_90 => .{
+            .{ 0, scale_y, source.y },
+            .{ -scale_x, 0, buffer_height - source.x },
+            .{ 0, 0, 1 },
+        },
+        .rotate_180 => .{
+            .{ -scale_x, 0, buffer_width - source.x },
+            .{ 0, -scale_y, buffer_height - source.y },
+            .{ 0, 0, 1 },
+        },
+        .rotate_270 => .{
+            .{ 0, -scale_y, buffer_width - source.y },
+            .{ scale_x, 0, source.x },
+            .{ 0, 0, 1 },
+        },
+        .flipped => .{
+            .{ -scale_x, 0, buffer_width - source.x },
+            .{ 0, scale_y, source.y },
+            .{ 0, 0, 1 },
+        },
+        .flipped_90 => .{
+            .{ 0, -scale_y, buffer_width - source.y },
+            .{ -scale_x, 0, buffer_height - source.x },
+            .{ 0, 0, 1 },
+        },
+        .flipped_180 => .{
+            .{ scale_x, 0, source.x },
+            .{ 0, -scale_y, buffer_height - source.y },
+            .{ 0, 0, 1 },
+        },
+        .flipped_270 => .{
+            .{ 0, scale_y, source.y },
+            .{ scale_x, 0, source.x },
+            .{ 0, 0, 1 },
+        },
+    };
+    if (y_inverted) {
+        matrix[1][0] = -matrix[1][0];
+        matrix[1][1] = -matrix[1][1];
+        matrix[1][2] = buffer_height - matrix[1][2];
+    }
+    return .{ .m = matrix };
 }
 
 fn validSourceRect(source: render_types.SourceRect, buffer_size: render_types.Size) bool {
@@ -818,6 +866,112 @@ test "CPU renderer scales images to logical size" {
     }, output.target());
 
     try std.testing.expectEqual(@as(u32, 0xff336699), output.pixel(0, 0));
+}
+
+test "CPU renderer applies every buffer transform" {
+    var source_pixels = [_]u32{
+        0xff010101, 0xff020202,
+        0xff030303, 0xff040404,
+        0xff050505, 0xff060606,
+    };
+    const Case = struct {
+        transform: render_types.BufferTransform,
+        size: render_types.Size,
+        expected: []const u32,
+    };
+    const cases = [_]Case{
+        .{ .transform = .normal, .size = .{ .width = 2, .height = 3 }, .expected = &.{
+            0xff010101, 0xff020202,
+            0xff030303, 0xff040404,
+            0xff050505, 0xff060606,
+        } },
+        .{ .transform = .rotate_90, .size = .{ .width = 3, .height = 2 }, .expected = &.{
+            0xff050505, 0xff030303, 0xff010101,
+            0xff060606, 0xff040404, 0xff020202,
+        } },
+        .{ .transform = .rotate_180, .size = .{ .width = 2, .height = 3 }, .expected = &.{
+            0xff060606, 0xff050505,
+            0xff040404, 0xff030303,
+            0xff020202, 0xff010101,
+        } },
+        .{ .transform = .rotate_270, .size = .{ .width = 3, .height = 2 }, .expected = &.{
+            0xff020202, 0xff040404, 0xff060606,
+            0xff010101, 0xff030303, 0xff050505,
+        } },
+        .{ .transform = .flipped, .size = .{ .width = 2, .height = 3 }, .expected = &.{
+            0xff020202, 0xff010101,
+            0xff040404, 0xff030303,
+            0xff060606, 0xff050505,
+        } },
+        .{ .transform = .flipped_90, .size = .{ .width = 3, .height = 2 }, .expected = &.{
+            0xff060606, 0xff040404, 0xff020202,
+            0xff050505, 0xff030303, 0xff010101,
+        } },
+        .{ .transform = .flipped_180, .size = .{ .width = 2, .height = 3 }, .expected = &.{
+            0xff050505, 0xff060606,
+            0xff030303, 0xff040404,
+            0xff010101, 0xff020202,
+        } },
+        .{ .transform = .flipped_270, .size = .{ .width = 3, .height = 2 }, .expected = &.{
+            0xff010101, 0xff030303, 0xff050505,
+            0xff020202, 0xff040404, 0xff060606,
+        } },
+    };
+
+    var renderer = Self.init(std.testing.allocator);
+    defer renderer.deinit();
+    var output_pixels: [source_pixels.len]u32 = undefined;
+    for (cases) |case| {
+        @memset(&output_pixels, 0);
+        const command = [_]render_types.Command{.{ .image = .{
+            .x = 0,
+            .y = 0,
+            .size = case.size,
+            .buffer = .{
+                .size = .{ .width = 2, .height = 3 },
+                .stride_pixels = 2,
+                .pixels = &source_pixels,
+            },
+            .transform = case.transform,
+        } }};
+        try renderer.render(.{ .size = case.size, .commands = &command }, .{
+            .size = case.size,
+            .stride_pixels = case.size.width,
+            .pixels = &output_pixels,
+        });
+        try std.testing.expectEqualSlices(u32, case.expected, &output_pixels);
+    }
+}
+
+test "CPU renderer crops in post-transform coordinates" {
+    var source_pixels = [_]u32{
+        0xff010101, 0xff020202,
+        0xff030303, 0xff040404,
+        0xff050505, 0xff060606,
+    };
+    var output_pixels: [2]u32 = undefined;
+    const size: render_types.Size = .{ .width = 2, .height = 1 };
+    const command = [_]render_types.Command{.{ .image = .{
+        .x = 0,
+        .y = 0,
+        .size = size,
+        .buffer = .{
+            .size = .{ .width = 2, .height = 3 },
+            .stride_pixels = 2,
+            .pixels = &source_pixels,
+        },
+        .source = .{ .x = 1, .y = 0, .width = 2, .height = 1 },
+        .transform = .rotate_90,
+    } }};
+    var renderer = Self.init(std.testing.allocator);
+    defer renderer.deinit();
+    try renderer.render(.{ .size = size, .commands = &command }, .{
+        .size = size,
+        .stride_pixels = size.width,
+        .pixels = &output_pixels,
+    });
+
+    try std.testing.expectEqualSlices(u32, &.{ 0xff030303, 0xff010101 }, &output_pixels);
 }
 
 test "CPU renderer crops an image source rectangle" {

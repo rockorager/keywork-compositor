@@ -9,6 +9,7 @@ const Scene = @import("../scene.zig");
 const Seat = @import("seat.zig");
 const slot_map = @import("../slot_map.zig");
 const Surface = @import("surface.zig");
+const Subcompositor = @import("subcompositor.zig");
 const OutputLayout = @import("output_layout.zig");
 
 const wl = wayland.server.wl;
@@ -18,6 +19,7 @@ const zxdg = wayland.server.zxdg;
 allocator: std.mem.Allocator,
 display: *wl.Server,
 surface_store: *Surface.Store,
+subcompositor: *Subcompositor,
 scene: *Scene,
 seat: *Seat,
 outputs: *OutputLayout,
@@ -98,6 +100,7 @@ const XdgSurfaceState = struct {
     surface_id: Surface.Id,
     role: ?XdgRole = null,
     pending_geometry: ?Geometry = null,
+    pending_geometry_changed: bool = false,
     current_geometry: ?Geometry = null,
     configure_serials: std.ArrayList(u32) = .empty,
     last_acked_serial: ?u32 = null,
@@ -331,6 +334,7 @@ pub fn init(
     allocator: std.mem.Allocator,
     display: *wl.Server,
     surface_store: *Surface.Store,
+    subcompositor: *Subcompositor,
     scene: *Scene,
     seat: *Seat,
     outputs: *OutputLayout,
@@ -340,6 +344,7 @@ pub fn init(
         .allocator = allocator,
         .display = display,
         .surface_store = surface_store,
+        .subcompositor = subcompositor,
         .scene = scene,
         .seat = seat,
         .outputs = outputs,
@@ -517,10 +522,32 @@ fn contentGeometry(self: *Self, state: *const XdgSurfaceState) ?Scene.ContentGeo
             },
         };
     }
-    const buffer = Surface.currentBuffer(self.surface_store, state.surface_id) orelse return null;
-    if (buffer.logical_size.width > std.math.maxInt(i32) or
-        buffer.logical_size.height > std.math.maxInt(i32)) return null;
-    return .{ .size = buffer.logical_size };
+    const bounds = self.subcompositor.treeBounds(state.surface_id) orelse return null;
+    return .{
+        .offset = .{ .x = bounds.x, .y = bounds.y },
+        .size = .{ .width = bounds.width, .height = bounds.height },
+    };
+}
+
+fn effectiveGeometry(self: *Self, surface_id: Surface.Id, requested: Geometry) Geometry {
+    const bounds = self.subcompositor.treeBounds(surface_id) orelse return requested;
+    const left = @max(@as(i64, requested.x), @as(i64, bounds.x));
+    const top = @max(@as(i64, requested.y), @as(i64, bounds.y));
+    const right = @min(
+        @as(i64, requested.x) + requested.width,
+        @as(i64, bounds.x) + bounds.width,
+    );
+    const bottom = @min(
+        @as(i64, requested.y) + requested.height,
+        @as(i64, bounds.y) + bounds.height,
+    );
+    if (right <= left or bottom <= top) return requested;
+    return .{
+        .x = @intCast(left),
+        .y = @intCast(top),
+        .width = @intCast(right - left),
+        .height = @intCast(bottom - top),
+    };
 }
 
 fn appendEnum(values: anytype, count: *usize, value: anytype) void {
@@ -1483,7 +1510,8 @@ const XdgSurfaceResource = struct {
         surface.reserveRole(.xdg_toplevel, .{
             .context = self,
             .before_commit = beforeSurfaceCommit,
-            .after_commit = afterSurfaceCommit,
+            .after_commit = afterSurfaceStateCommit,
+            .tree_applied = afterSurfaceCommit,
             .surface_destroyed = surfaceDestroyed,
         }) catch {
             wm_base_resource.postError(.role, "wl_surface is not available for an xdg role");
@@ -1544,6 +1572,7 @@ const XdgSurfaceResource = struct {
                     .width = set.width,
                     .height = set.height,
                 };
+                state.pending_geometry_changed = true;
             },
             .ack_configure => |ack| {
                 if (!self.requireRole()) return;
@@ -1649,10 +1678,18 @@ const XdgSurfaceResource = struct {
         return .apply;
     }
 
+    fn afterSurfaceStateCommit(_: *anyopaque, _: Surface.CommitInfo) void {}
+
     fn afterSurfaceCommit(context: *anyopaque, info: Surface.CommitInfo) void {
         const self: *XdgSurfaceResource = @ptrCast(@alignCast(context));
         const state = self.shell.xdg_surfaces.get(self.id) orelse return;
-        state.current_geometry = state.pending_geometry;
+        if (state.pending_geometry_changed) {
+            state.current_geometry = self.shell.effectiveGeometry(
+                state.surface_id,
+                state.pending_geometry orelse unreachable,
+            );
+            state.pending_geometry_changed = false;
+        }
 
         const role = state.role orelse return;
         switch (role) {
@@ -1982,6 +2019,10 @@ const PopupResource = struct {
             .grab => |grab| {
                 if (popup.mapped) {
                     resource.postError(.invalid_grab, "cannot grab a mapped xdg_popup");
+                    return;
+                }
+                if (popup.grabbed) {
+                    self.shell.dismissPopup(self.id);
                     return;
                 }
                 const parent_role: ?XdgRole = switch (popup.parent) {

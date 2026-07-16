@@ -176,12 +176,38 @@ pub const RoundedClip = struct {
     radius: u32,
 };
 
+pub const BufferTransform = enum(u8) {
+    normal,
+    rotate_90,
+    rotate_180,
+    rotate_270,
+    flipped,
+    flipped_90,
+    flipped_180,
+    flipped_270,
+
+    pub fn swapsAxes(self: BufferTransform) bool {
+        return switch (self) {
+            .rotate_90, .rotate_270, .flipped_90, .flipped_270 => true,
+            .normal, .rotate_180, .flipped, .flipped_180 => false,
+        };
+    }
+
+    pub fn applyToSize(self: BufferTransform, size: Size) Size {
+        return if (self.swapsAxes())
+            .{ .width = size.height, .height = size.width }
+        else
+            size;
+    }
+};
+
 pub const Image = struct {
     x: i32,
     y: i32,
     size: Size,
     buffer: PixelBuffer,
     source: ?SourceRect = null,
+    transform: BufferTransform = .normal,
     rounded_clip: ?RoundedClip = null,
     clip: ?Rect = null,
     is_opaque: bool = false,

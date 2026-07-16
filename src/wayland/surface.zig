@@ -62,19 +62,8 @@ pub const State = struct {
     next_source_version: u64,
     next_release_generation: u64,
     current_buffer: ?BufferSnapshot,
-    cached_buffer: ?BufferSnapshot,
-    cached_attachment_changed: bool,
-    cached_offset_x: i32,
-    cached_offset_y: i32,
-    cached_scale: i32,
-    cached_transform: wl.Output.Transform,
-    cached_viewport: ViewportState,
-    cached_content_type: ContentType,
-    cached_surface_damage: Region,
-    cached_buffer_damage: Region,
-    cached_opaque: Region,
-    cached_input: InputRegion,
-    has_cached_state: bool,
+    cached_commits: std.ArrayList(CachedCommit),
+    next_cached_sequence: u64,
     role: ?Role,
     has_committed: bool,
     has_committed_buffer: bool,
@@ -112,19 +101,8 @@ pub const State = struct {
             .next_source_version = 1,
             .next_release_generation = 1,
             .current_buffer = null,
-            .cached_buffer = null,
-            .cached_attachment_changed = false,
-            .cached_offset_x = 0,
-            .cached_offset_y = 0,
-            .cached_scale = 1,
-            .cached_transform = .normal,
-            .cached_viewport = .{},
-            .cached_content_type = .none,
-            .cached_surface_damage = Region.init(),
-            .cached_buffer_damage = Region.init(),
-            .cached_opaque = Region.init(),
-            .cached_input = InputRegion.init(),
-            .has_cached_state = false,
+            .cached_commits = .empty,
+            .next_cached_sequence = 1,
             .role = null,
             .has_committed = false,
             .has_committed_buffer = false,
@@ -139,18 +117,15 @@ pub const State = struct {
         self.release_callbacks.deinit(allocator);
         self.commit_feedbacks.deinit(allocator);
         if (self.current_buffer) |*current| current.deinit();
-        if (self.cached_buffer) |*cached| cached.deinit();
+        for (self.cached_commits.items) |*cached| cached.deinit();
+        self.cached_commits.deinit(allocator);
         self.pending_surface_damage.deinit();
         self.pending_buffer_damage.deinit();
         self.current_damage.deinit();
-        self.cached_surface_damage.deinit();
-        self.cached_buffer_damage.deinit();
         self.pending_opaque.deinit();
         self.current_opaque.deinit();
-        self.cached_opaque.deinit();
         self.pending_input.deinit();
         self.current_input.deinit();
-        self.cached_input.deinit();
         self.* = undefined;
     }
 };
@@ -316,6 +291,32 @@ pub const CommitInfo = struct {
     offset_y: i32,
 };
 
+const CachedCommit = struct {
+    sequence: u64,
+    buffer: ?BufferSnapshot,
+    attachment_changed: bool,
+    has_buffer: bool,
+    offset_x: i32,
+    offset_y: i32,
+    scale: i32,
+    transform: wl.Output.Transform,
+    viewport: ViewportState,
+    content_type: ContentType,
+    surface_damage: Region,
+    buffer_damage: Region,
+    opaque_region: Region,
+    input: InputRegion,
+
+    fn deinit(self: *CachedCommit) void {
+        if (self.buffer) |*buffer| buffer.deinit();
+        self.surface_damage.deinit();
+        self.buffer_damage.deinit();
+        self.opaque_region.deinit();
+        self.input.deinit();
+        self.* = undefined;
+    }
+};
+
 pub const CommitAction = enum {
     apply,
     cache,
@@ -327,6 +328,7 @@ pub const RoleHandler = struct {
     context: *anyopaque,
     before_commit: *const fn (*anyopaque, CommitInfo) CommitAction,
     after_commit: *const fn (*anyopaque, CommitInfo) void,
+    tree_applied: ?*const fn (*anyopaque, CommitInfo) void = null,
     surface_destroyed: *const fn (*anyopaque) void,
     role_tag: ?RoleTag = null,
 };
@@ -343,6 +345,8 @@ pub const RoleIdentity = struct {
 
 pub const CommitListener = struct {
     context: *anyopaque,
+    committed: ?*const fn (*anyopaque) void = null,
+    discarded: ?*const fn (*anyopaque) void = null,
     applied: *const fn (*anyopaque) void,
     surface_destroyed: *const fn (*anyopaque) void,
 };
@@ -353,6 +357,7 @@ pub const CommitFeedback = struct {
     presented: *const fn (*anyopaque, presentation.Info) void,
     discarded: *const fn (*anyopaque) void,
     state: Status = .pending,
+    cached_sequence: ?u64 = null,
 
     pub const Status = enum {
         pending,
@@ -383,7 +388,6 @@ pub fn assignReservedRole(self: *Self, role: Role, context: *anyopaque) RoleErro
     if (role == .cursor) {
         surface_state.pending_input.setEmpty();
         surface_state.current_input.setEmpty();
-        surface_state.cached_input.setEmpty();
     }
 }
 
@@ -429,6 +433,7 @@ pub fn removeCommitListener(self: *Self, listener: *CommitListener) void {
 
 pub fn addCommitFeedback(self: *Self, feedback: *CommitFeedback) error{OutOfMemory}!void {
     feedback.state = .pending;
+    feedback.cached_sequence = null;
     try self.state().commit_feedbacks.append(self.allocator, feedback);
 }
 
@@ -444,24 +449,47 @@ pub fn removeCommitFeedback(store: *Store, id: Id, feedback: *CommitFeedback) vo
 }
 
 pub fn applyCachedCommit(self: *Self) void {
-    if (!self.state().has_cached_state) return;
-    applyCached(self);
+    applyCachedUpTo(self, std.math.maxInt(u64));
+}
+
+pub fn applyCachedUpTo(self: *Self, sequence: u64) void {
+    const surface_state = self.state();
+    var accumulated_damage = Region.init();
+    defer accumulated_damage.deinit();
+    var applied = false;
+    while (surface_state.cached_commits.items.len > 0 and
+        surface_state.cached_commits.items[0].sequence <= sequence)
+    {
+        var cached = surface_state.cached_commits.orderedRemove(0);
+        applyCached(self, &cached);
+        cached.deinit();
+        accumulated_damage.unionWith(&surface_state.current_damage) catch {
+            self.resource.postNoMemory();
+            return;
+        };
+        applied = true;
+    }
+    if (applied) surface_state.current_damage.copyFrom(&accumulated_damage) catch
+        self.resource.postNoMemory();
 }
 
 pub fn hasCachedCommit(self: *Self) bool {
-    return self.state().has_cached_state;
+    return self.state().cached_commits.items.len > 0;
+}
+
+pub fn latestCachedSequence(self: *Self) ?u64 {
+    const cached = self.state().cached_commits.items;
+    return if (cached.len == 0) null else cached[cached.len - 1].sequence;
 }
 
 pub fn discardCachedCommit(self: *Self) void {
     const surface_state = self.state();
-    if (surface_state.cached_buffer) |*cached| cached.deinit();
-    surface_state.cached_buffer = null;
-    surface_state.cached_attachment_changed = false;
-    surface_state.cached_offset_x = 0;
-    surface_state.cached_offset_y = 0;
-    surface_state.cached_surface_damage.clear();
-    surface_state.cached_buffer_damage.clear();
-    surface_state.has_cached_state = false;
+    for (surface_state.cached_commits.items) |*cached| cached.deinit();
+    surface_state.cached_commits.clearRetainingCapacity();
+
+    for (self.commit_listeners.items) |listener| {
+        if (listener.discarded) |discarded| discarded(listener.context);
+    }
 
     var index = surface_state.callbacks.items.len;
     while (index > 0) {
@@ -722,14 +750,24 @@ fn commit(self: *Self) void {
 
     switch (action) {
         .apply => {
-            std.debug.assert(!self.state().has_cached_state);
+            std.debug.assert(!self.hasCachedCommit());
+            notifyCommitted(self);
             applyPending(self, commit_info);
         },
-        .cache => _ = cachePending(self),
+        .cache => if (cachePending(self)) notifyCommitted(self),
         .apply_cached => {
-            if (cachePending(self)) applyCached(self);
+            if (cachePending(self)) {
+                notifyCommitted(self);
+                applyCachedCommit(self);
+            }
         },
         .reject => discardCommitFeedbacks(self.state(), .pending),
+    }
+}
+
+fn notifyCommitted(self: *Self) void {
+    for (self.commit_listeners.items) |listener| {
+        if (listener.committed) |committed| committed(listener.context);
     }
 }
 
@@ -740,8 +778,8 @@ fn pendingCommitInfo(self: *Self) CommitInfo {
         .had_buffer = surface_state.current_buffer != null,
         .has_buffer = if (self.has_pending_attachment)
             self.pending_attachment.hasBuffer()
-        else if (surface_state.cached_attachment_changed)
-            surface_state.cached_buffer != null
+        else if (surface_state.cached_commits.getLastOrNull()) |cached|
+            cached.has_buffer
         else
             surface_state.current_buffer != null,
         .offset_x = surface_state.pending_offset_x,
@@ -845,12 +883,7 @@ fn cachePending(self: *Self) bool {
             },
         };
     } else {
-        const buffer = if (surface_state.cached_attachment_changed)
-            if (surface_state.cached_buffer) |*cached| cached else null
-        else if (surface_state.current_buffer) |*current|
-            current
-        else
-            null;
+        const buffer = latestEffectiveBuffer(surface_state);
         if (buffer) |existing| {
             _ = viewportGeometry(
                 existing.buffer_size,
@@ -864,125 +897,145 @@ fn cachePending(self: *Self) bool {
         }
     }
 
-    surface_state.cached_opaque.copyFrom(&surface_state.pending_opaque) catch {
+    const sequence = surface_state.next_cached_sequence;
+    var cached: CachedCommit = .{
+        .sequence = sequence,
+        .buffer = snapshot,
+        .attachment_changed = self.has_pending_attachment,
+        .has_buffer = if (self.has_pending_attachment)
+            snapshot != null
+        else if (surface_state.cached_commits.getLastOrNull()) |previous|
+            previous.has_buffer
+        else
+            surface_state.current_buffer != null,
+        .offset_x = surface_state.pending_offset_x,
+        .offset_y = surface_state.pending_offset_y,
+        .scale = surface_state.pending_scale,
+        .transform = surface_state.pending_transform,
+        .viewport = surface_state.pending_viewport,
+        .content_type = surface_state.pending_content_type,
+        .surface_damage = Region.init(),
+        .buffer_damage = Region.init(),
+        .opaque_region = Region.init(),
+        .input = InputRegion.init(),
+    };
+    snapshot = null;
+    var cached_owned = false;
+    defer if (!cached_owned) cached.deinit();
+
+    cached.opaque_region.copyFrom(&surface_state.pending_opaque) catch {
         self.resource.postNoMemory();
         return false;
     };
-    surface_state.cached_input.copyFrom(&surface_state.pending_input) catch {
+    cached.input.copyFrom(&surface_state.pending_input) catch {
         self.resource.postNoMemory();
         return false;
     };
-    surface_state.cached_surface_damage.unionWith(&surface_state.pending_surface_damage) catch {
+    cached.surface_damage.copyFrom(&surface_state.pending_surface_damage) catch {
         self.resource.postNoMemory();
         return false;
     };
-    surface_state.cached_buffer_damage.unionWith(&surface_state.pending_buffer_damage) catch {
+    cached.buffer_damage.copyFrom(&surface_state.pending_buffer_damage) catch {
         self.resource.postNoMemory();
         return false;
     };
+    surface_state.cached_commits.append(self.allocator, cached) catch {
+        self.resource.postNoMemory();
+        return false;
+    };
+    cached_owned = true;
+    surface_state.next_cached_sequence +%= 1;
 
     if (self.has_pending_attachment) {
-        discardCommitFeedbacks(surface_state, .cached);
-        const retains_client_buffer = if (snapshot) |value| value.retainsClientBuffer() else false;
-        if (surface_state.cached_buffer) |*cached| cached.deinit();
-        surface_state.cached_buffer = snapshot;
-        snapshot = null;
-        surface_state.cached_attachment_changed = true;
-
+        const retains_client_buffer = if (cached.buffer) |value| value.retainsClientBuffer() else false;
         releasePendingAttachment(self, retains_client_buffer);
     }
 
-    surface_state.cached_scale = surface_state.pending_scale;
-    surface_state.cached_transform = surface_state.pending_transform;
-    surface_state.cached_viewport = surface_state.pending_viewport;
-    surface_state.cached_content_type = surface_state.pending_content_type;
-    surface_state.cached_offset_x +|= surface_state.pending_offset_x;
-    surface_state.cached_offset_y +|= surface_state.pending_offset_y;
     surface_state.pending_offset_x = 0;
     surface_state.pending_offset_y = 0;
     surface_state.pending_surface_damage.clear();
     surface_state.pending_buffer_damage.clear();
-    surface_state.has_cached_state = true;
     surface_state.has_committed = true;
-    const cached_has_buffer = if (surface_state.cached_attachment_changed)
-        surface_state.cached_buffer != null
-    else
-        surface_state.current_buffer != null;
-    if (cached_has_buffer) surface_state.has_committed_buffer = true;
+    if (cached.has_buffer) surface_state.has_committed_buffer = true;
     for (surface_state.callbacks.items) |callback| {
-        if (callback.state == .pending) callback.state = .cached;
+        if (callback.state == .pending) {
+            callback.state = .cached;
+            callback.cached_sequence = sequence;
+        }
     }
-    setCommitFeedbackState(surface_state, .pending, .cached);
+    setCommitFeedbackCached(surface_state, sequence);
     return true;
 }
 
-fn applyCached(self: *Self) void {
+fn latestEffectiveBuffer(surface_state: *State) ?*BufferSnapshot {
+    var index = surface_state.cached_commits.items.len;
+    while (index > 0) {
+        index -= 1;
+        const cached = &surface_state.cached_commits.items[index];
+        if (cached.attachment_changed) return if (cached.buffer) |*buffer| buffer else null;
+    }
+    return if (surface_state.current_buffer) |*buffer| buffer else null;
+}
+
+fn applyCached(self: *Self, cached: *CachedCommit) void {
     const surface_state = self.state();
-    std.debug.assert(surface_state.has_cached_state);
     const previous_geometry = currentBufferGeometry(surface_state);
-    const offset_changed = surface_state.cached_offset_x != 0 or
-        surface_state.cached_offset_y != 0;
+    const offset_changed = cached.offset_x != 0 or cached.offset_y != 0;
     const commit_info: CommitInfo = .{
-        .attachment_changed = surface_state.cached_attachment_changed,
+        .attachment_changed = cached.attachment_changed,
         .had_buffer = surface_state.current_buffer != null,
-        .has_buffer = if (surface_state.cached_attachment_changed)
-            surface_state.cached_buffer != null
-        else
-            surface_state.current_buffer != null,
-        .offset_x = surface_state.cached_offset_x,
-        .offset_y = surface_state.cached_offset_y,
+        .has_buffer = cached.has_buffer,
+        .offset_x = cached.offset_x,
+        .offset_y = cached.offset_y,
     };
 
-    surface_state.current_opaque.copyFrom(&surface_state.cached_opaque) catch {
+    surface_state.current_opaque.copyFrom(&cached.opaque_region) catch {
         self.resource.postNoMemory();
         return;
     };
-    surface_state.current_input.copyFrom(&surface_state.cached_input) catch {
+    surface_state.current_input.copyFrom(&cached.input) catch {
         self.resource.postNoMemory();
         return;
     };
 
-    if (surface_state.cached_attachment_changed) {
+    if (cached.attachment_changed) {
         if (surface_state.current_buffer) |*current| current.deinit();
-        surface_state.current_buffer = surface_state.cached_buffer;
-        surface_state.cached_buffer = null;
-        surface_state.cached_attachment_changed = false;
+        surface_state.current_buffer = cached.buffer;
+        cached.buffer = null;
     }
     if (surface_state.current_buffer) |*current| {
         current.updateGeometry(
-            surface_state.cached_scale,
-            surface_state.cached_transform,
-            surface_state.cached_viewport,
+            cached.scale,
+            cached.transform,
+            cached.viewport,
         ) catch unreachable;
     }
 
-    surface_state.current_scale = surface_state.cached_scale;
-    surface_state.current_transform = surface_state.cached_transform;
-    surface_state.current_viewport = surface_state.cached_viewport;
-    surface_state.current_content_type = surface_state.cached_content_type;
-    surface_state.current_offset_x = surface_state.cached_offset_x;
-    surface_state.current_offset_y = surface_state.cached_offset_y;
+    surface_state.current_scale = cached.scale;
+    surface_state.current_transform = cached.transform;
+    surface_state.current_viewport = cached.viewport;
+    surface_state.current_content_type = cached.content_type;
+    surface_state.current_offset_x = cached.offset_x;
+    surface_state.current_offset_y = cached.offset_y;
     updateCurrentDamage(
         surface_state,
         previous_geometry,
-        &surface_state.cached_surface_damage,
-        &surface_state.cached_buffer_damage,
+        &cached.surface_damage,
+        &cached.buffer_damage,
         offset_changed,
     );
-    surface_state.cached_offset_x = 0;
-    surface_state.cached_offset_y = 0;
-    surface_state.cached_surface_damage.clear();
-    surface_state.cached_buffer_damage.clear();
-    surface_state.has_cached_state = false;
     if (surface_state.presentation_output != null) surface_state.commit_after_submission = true;
     discardCommitFeedbacks(surface_state, .active);
     for (surface_state.callbacks.items) |callback| {
-        if (callback.state == .cached) callback.state = .active;
+        if (callback.state == .cached and callback.cached_sequence == cached.sequence) {
+            callback.state = .active;
+            callback.cached_sequence = null;
+        }
     }
     if (commit_info.has_buffer) {
-        setCommitFeedbackState(surface_state, .cached, .active);
+        activateCommitFeedbacksForSequence(surface_state, cached.sequence);
     } else {
-        discardCommitFeedbacks(surface_state, .cached);
+        discardCommitFeedbacksForSequence(surface_state, cached.sequence);
     }
 
     finishApplied(self, commit_info);
@@ -1067,6 +1120,10 @@ fn finishApplied(self: *Self, commit_info: CommitInfo) void {
     if (self.role_handler) |handler| handler.after_commit(handler.context, commit_info);
 
     for (self.commit_listeners.items) |listener| listener.applied(listener.context);
+
+    if (self.role_handler) |handler| {
+        if (handler.tree_applied) |tree_applied| tree_applied(handler.context, commit_info);
+    }
 }
 
 fn releasePendingAttachment(self: *Self, retained: bool) void {
@@ -1117,7 +1174,37 @@ fn setCommitFeedbackState(
     to: CommitFeedback.Status,
 ) void {
     for (surface_state.commit_feedbacks.items) |feedback| {
-        if (feedback.state == from) feedback.state = to;
+        if (feedback.state == from) {
+            feedback.state = to;
+            if (to != .cached) feedback.cached_sequence = null;
+        }
+    }
+}
+
+fn setCommitFeedbackCached(surface_state: *State, sequence: u64) void {
+    for (surface_state.commit_feedbacks.items) |feedback| {
+        if (feedback.state != .pending) continue;
+        feedback.state = .cached;
+        feedback.cached_sequence = sequence;
+    }
+}
+
+fn activateCommitFeedbacksForSequence(surface_state: *State, sequence: u64) void {
+    for (surface_state.commit_feedbacks.items) |feedback| {
+        if (feedback.state != .cached or feedback.cached_sequence != sequence) continue;
+        feedback.state = .active;
+        feedback.cached_sequence = null;
+    }
+}
+
+fn discardCommitFeedbacksForSequence(surface_state: *State, sequence: u64) void {
+    while (true) {
+        const feedback = for (surface_state.commit_feedbacks.items) |candidate| {
+            if (candidate.state == .cached and candidate.cached_sequence == sequence) {
+                break candidate;
+            }
+        } else return;
+        feedback.discarded(feedback.context);
     }
 }
 
@@ -1239,8 +1326,8 @@ fn viewportGeometry(
         };
         break :size source_size;
     };
-    // Rendering currently skips transformed buffers. When transform rendering is
-    // added, this post-transform source rectangle must be mapped back to buffer pixels.
+    // Viewport source coordinates are post-transform, so preserve that coordinate
+    // space for the renderer to map back to buffer pixels.
     const buffer_scale: f64 = @floatFromInt(scale);
     return .{
         .logical_size = logical_size,
@@ -1843,6 +1930,7 @@ const FrameCallback = struct {
     surface_id: Id,
     resource: *wl.Callback,
     state: enum { pending, cached, active, submitted },
+    cached_sequence: ?u64,
 
     fn handleDestroy(resource: *wl.Resource) callconv(.c) void {
         const self: *FrameCallback = @ptrCast(@alignCast(resource.getUserData().?));
@@ -1878,6 +1966,7 @@ fn createFrameCallback(self: *Self, id: u32) error{OutOfMemory}!void {
         .surface_id = self.id,
         .resource = resource,
         .state = .pending,
+        .cached_sequence = null,
     };
     try self.state().callbacks.append(self.allocator, callback);
 

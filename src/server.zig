@@ -599,6 +599,7 @@ pub fn createWithVirtualOutput(
         allocator,
         display,
         self.compositor.surfaceStore(),
+        &self.subcompositor,
         &self.scene,
         &self.seat,
         &self.outputs,
@@ -3350,7 +3351,6 @@ fn hitTestWindow(
             self.compositor.surfaceStore(),
             popup.surface_id,
         ) orelse continue;
-        if (buffer.transform != .normal) continue;
         const content_geometry = popup.content_geometry orelse Scene.ContentGeometry{
             .size = buffer.logical_size,
         };
@@ -3381,7 +3381,7 @@ fn hitTestWindow(
     const content_geometry = window.content_geometry orelse Scene.ContentGeometry{
         .size = root_buffer.logical_size,
     };
-    var test_content = root_buffer.transform == .normal;
+    var test_content = true;
     if (window.content_clip_box) |clip_box| {
         const content_rect: render.Rect = .{
             .x = window.position.x,
@@ -5348,7 +5348,6 @@ fn renderSurfaceTree(
                 if (visible_rect.intersection(clip_rect) == null) continue;
             }
             if (frame.track_visibility) try frame.output.markSurfaceVisible(surface_id);
-            if (buffer.transform != .normal) continue;
             const pixel_buffer = buffer.pixelBuffer();
             const image_command = [_]render.Command{
                 .{ .image = .{
@@ -5357,6 +5356,7 @@ fn renderSurfaceTree(
                     .size = buffer.logical_size,
                     .buffer = pixel_buffer,
                     .source = buffer.source,
+                    .transform = renderBufferTransform(buffer.transform),
                     .rounded_clip = rounded_clip,
                     .clip = clip,
                     .is_opaque = (pixel_buffer.dmabuf != null and
@@ -5377,6 +5377,20 @@ fn renderSurfaceTree(
             rounded_clip,
             clip,
         ),
+    };
+}
+
+fn renderBufferTransform(transform: wl.Output.Transform) render.BufferTransform {
+    return switch (transform) {
+        .normal => .normal,
+        .@"90" => .rotate_90,
+        .@"180" => .rotate_180,
+        .@"270" => .rotate_270,
+        .flipped => .flipped,
+        .flipped_90 => .flipped_90,
+        .flipped_180 => .flipped_180,
+        .flipped_270 => .flipped_270,
+        else => unreachable,
     };
 }
 

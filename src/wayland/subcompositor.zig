@@ -26,6 +26,13 @@ pub const Point = struct {
     y: i32 = 0,
 };
 
+pub const TreeBounds = struct {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+};
+
 pub const RepaintListener = struct {
     context: *anyopaque,
     request: *const fn (*anyopaque) void,
@@ -191,6 +198,64 @@ pub fn surfaceOffset(self: *Self, surface_id: Surface.Id) Point {
     return offset;
 }
 
+pub fn treeBounds(self: *Self, surface_id: Surface.Id) ?TreeBounds {
+    var bounds: ?AccumulatedBounds = null;
+    self.addTreeBounds(surface_id, 0, 0, &bounds);
+    const result = bounds orelse return null;
+    const width = result.right - result.left;
+    const height = result.bottom - result.top;
+    if (result.left < std.math.minInt(i32) or result.left > std.math.maxInt(i32) or
+        result.top < std.math.minInt(i32) or result.top > std.math.maxInt(i32) or
+        width <= 0 or width > std.math.maxInt(u32) or
+        height <= 0 or height > std.math.maxInt(u32)) return null;
+    return .{
+        .x = @intCast(result.left),
+        .y = @intCast(result.top),
+        .width = @intCast(width),
+        .height = @intCast(height),
+    };
+}
+
+const AccumulatedBounds = struct {
+    left: i64,
+    top: i64,
+    right: i64,
+    bottom: i64,
+};
+
+fn addTreeBounds(
+    self: *Self,
+    surface_id: Surface.Id,
+    x: i64,
+    y: i64,
+    bounds: *?AccumulatedBounds,
+) void {
+    const buffer = Surface.currentBuffer(self.surface_store, surface_id) orelse return;
+    const surface_bounds: AccumulatedBounds = .{
+        .left = x,
+        .top = y,
+        .right = x + buffer.logical_size.width,
+        .bottom = y + buffer.logical_size.height,
+    };
+    bounds.* = if (bounds.*) |current| .{
+        .left = @min(current.left, surface_bounds.left),
+        .top = @min(current.top, surface_bounds.top),
+        .right = @max(current.right, surface_bounds.right),
+        .bottom = @max(current.bottom, surface_bounds.bottom),
+    } else surface_bounds;
+
+    var stack = self.stackIterator(surface_id);
+    while (stack.next()) |entry| switch (entry) {
+        .parent => {},
+        .child => |child| self.addTreeBounds(
+            child.surface_id,
+            x + child.position.x,
+            y + child.position.y,
+            bounds,
+        ),
+    };
+}
+
 fn requestRepaint(self: *Self) void {
     if (self.repaint_listener) |listener| listener.request(listener.context);
 }
@@ -240,6 +305,39 @@ fn effectivelySynchronized(self: *Self, id: Id) bool {
 
 fn applyParent(self: *Self, parent: *Parent) void {
     if (parent.surface == null) return;
+    if (parent.commits.items.len == 0) {
+        self.applyLiveParentState(parent);
+        return;
+    }
+    var commit = parent.commits.orderedRemove(0);
+    defer commit.deinit(parent.allocator);
+    parent.current.clearRetainingCapacity();
+    for (commit.nodes) |node| parent.current.appendAssumeCapacity(switch (node) {
+        .parent => .{ .parent = {} },
+        .child => |child| .{ .child = child.id },
+    });
+
+    for (commit.nodes) |node| switch (node) {
+        .parent => {},
+        .child => |child| {
+            const state = self.subsurfaces.get(child.id) orelse continue;
+            state.current_position = child.position;
+            state.active = true;
+        },
+    };
+
+    for (commit.nodes) |node| switch (node) {
+        .parent => {},
+        .child => |child| {
+            const sequence = child.cached_sequence orelse continue;
+            const adapter = self.adapters.get(child.id) orelse continue;
+            const surface = adapter.surface orelse continue;
+            surface.applyCachedUpTo(sequence);
+        },
+    };
+}
+
+fn applyLiveParentState(self: *Self, parent: *Parent) void {
     parent.current.clearRetainingCapacity();
     parent.current.appendSliceAssumeCapacity(parent.pending.items);
 
@@ -258,9 +356,7 @@ fn applyParent(self: *Self, parent: *Parent) void {
             if (!self.effectivelySynchronized(id)) continue;
             const adapter = self.adapters.get(id) orelse continue;
             const surface = adapter.surface orelse continue;
-            if (surface.hasCachedCommit()) {
-                surface.applyCachedCommit();
-            }
+            surface.applyCachedCommit();
         },
     };
 }
@@ -285,6 +381,24 @@ const Parent = struct {
         child: Id,
     };
 
+    const CommitNode = union(enum) {
+        parent: void,
+        child: struct {
+            id: Id,
+            position: Point,
+            cached_sequence: ?u64,
+        },
+    };
+
+    const Commit = struct {
+        nodes: []CommitNode,
+
+        fn deinit(self: *Commit, allocator: std.mem.Allocator) void {
+            allocator.free(self.nodes);
+            self.* = undefined;
+        }
+    };
+
     allocator: std.mem.Allocator,
     shell: *Self,
     surface_id: Surface.Id,
@@ -292,6 +406,7 @@ const Parent = struct {
     listener: Surface.CommitListener,
     pending: std.ArrayList(Node),
     current: std.ArrayList(Node),
+    commits: std.ArrayList(Commit),
     child_count: usize,
 
     fn create(shell: *Self, surface: *Surface) error{OutOfMemory}!*Parent {
@@ -306,15 +421,19 @@ const Parent = struct {
             .listener = undefined,
             .pending = .empty,
             .current = .empty,
+            .commits = .empty,
             .child_count = 0,
         };
         errdefer self.pending.deinit(shell.allocator);
         errdefer self.current.deinit(shell.allocator);
+        errdefer self.commits.deinit(shell.allocator);
         try self.pending.append(shell.allocator, .{ .parent = {} });
         try self.current.append(shell.allocator, .{ .parent = {} });
 
         self.listener = .{
             .context = self,
+            .committed = handleCommitted,
+            .discarded = handleDiscarded,
             .applied = handleApplied,
             .surface_destroyed = handleSurfaceDestroyed,
         };
@@ -333,7 +452,40 @@ const Parent = struct {
         }
         self.pending.deinit(self.allocator);
         self.current.deinit(self.allocator);
+        self.clearCommits();
+        self.commits.deinit(self.allocator);
         self.allocator.destroy(self);
+    }
+
+    fn captureCommit(self: *Parent) error{OutOfMemory}!void {
+        const nodes = try self.allocator.alloc(CommitNode, self.pending.items.len);
+        errdefer self.allocator.free(nodes);
+        for (self.pending.items, nodes) |node, *destination| destination.* = switch (node) {
+            .parent => .{ .parent = {} },
+            .child => |id| child: {
+                const state = self.shell.subsurfaces.get(id) orelse break :child .{ .child = .{
+                    .id = id,
+                    .position = .{},
+                    .cached_sequence = null,
+                } };
+                const sequence = if (self.shell.effectivelySynchronized(id)) sequence: {
+                    const adapter = self.shell.adapters.get(id) orelse break :sequence null;
+                    const surface = adapter.surface orelse break :sequence null;
+                    break :sequence surface.latestCachedSequence();
+                } else null;
+                break :child .{ .child = .{
+                    .id = id,
+                    .position = state.pending_position,
+                    .cached_sequence = sequence,
+                } };
+            },
+        };
+        try self.commits.append(self.allocator, .{ .nodes = nodes });
+    }
+
+    fn clearCommits(self: *Parent) void {
+        for (self.commits.items) |*commit| commit.deinit(self.allocator);
+        self.commits.clearRetainingCapacity();
     }
 
     fn addChild(self: *Parent, id: Id) error{OutOfMemory}!void {
@@ -399,6 +551,18 @@ const Parent = struct {
     fn handleApplied(context: *anyopaque) void {
         const self: *Parent = @ptrCast(@alignCast(context));
         self.shell.applyParent(self);
+    }
+
+    fn handleCommitted(context: *anyopaque) void {
+        const self: *Parent = @ptrCast(@alignCast(context));
+        self.captureCommit() catch {
+            if (self.surface) |surface| surface.waylandResource().postNoMemory();
+        };
+    }
+
+    fn handleDiscarded(context: *anyopaque) void {
+        const self: *Parent = @ptrCast(@alignCast(context));
+        self.clearCommits();
     }
 
     fn handleSurfaceDestroyed(context: *anyopaque) void {

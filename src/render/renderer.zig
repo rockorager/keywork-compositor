@@ -161,7 +161,8 @@ pub const Renderer = struct {
         if (image.x != 0 or image.y != 0) return null;
         if (!std.meta.eql(image.size, active.target.size())) return null;
         if (!std.meta.eql(image.buffer.size, active.target.size())) return null;
-        if (image.source != null or image.rounded_clip != null or image.clip != null) return null;
+        if (image.source != null or image.transform != .normal or
+            image.rounded_clip != null or image.clip != null) return null;
         if (image.buffer.dmabuf == null or image.buffer.dmabuf.?.y_inverted) return null;
         if (image.buffer.source_cache == null) return null;
         return image.buffer;
@@ -258,6 +259,7 @@ fn translateCommand(
             .size = image.size,
             .buffer = image.buffer,
             .source = image.source,
+            .transform = image.transform,
             .is_opaque = image.is_opaque,
             .rounded_clip = if (image.rounded_clip) |clip| .{
                 .rect = translateRect(clip.rect, origin),
@@ -321,6 +323,7 @@ fn scaleCommand(command: render_types.Command, scale: render_types.Scale) render
                 .size = .{ .width = rect.width, .height = rect.height },
                 .buffer = image.buffer,
                 .source = image.source,
+                .transform = image.transform,
                 .is_opaque = image.is_opaque,
                 .rounded_clip = if (image.rounded_clip) |clip| .{
                     .rect = scaleRect(clip.rect, scale),

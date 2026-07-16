@@ -1961,17 +1961,18 @@ fn validateImage(image: render.Image) Error!void {
             if (!std.meta.eql(rect, clipped)) return error.InvalidTarget;
         }
     }
+    const transformed_size = image.transform.applyToSize(image.buffer.size);
     const source = image.source orelse render.SourceRect{
         .x = 0,
         .y = 0,
-        .width = @floatFromInt(image.buffer.size.width),
-        .height = @floatFromInt(image.buffer.size.height),
+        .width = @floatFromInt(transformed_size.width),
+        .height = @floatFromInt(transformed_size.height),
     };
     if (!std.math.isFinite(source.x) or !std.math.isFinite(source.y) or
         !std.math.isFinite(source.width) or !std.math.isFinite(source.height) or
         source.x < 0 or source.y < 0 or source.width <= 0 or source.height <= 0 or
-        source.x + source.width > @as(f64, @floatFromInt(image.buffer.size.width)) or
-        source.y + source.height > @as(f64, @floatFromInt(image.buffer.size.height)))
+        source.x + source.width > @as(f64, @floatFromInt(transformed_size.width)) or
+        source.y + source.height > @as(f64, @floatFromInt(transformed_size.height)))
     {
         return error.InvalidTarget;
     }
@@ -2938,11 +2939,12 @@ fn compileDrawRuns(
             if (image.rounded_clip) |rounded_clip| {
                 clipped = clipped.intersection(rounded_clip.rect) orelse continue;
             }
+            const transformed_size = image.transform.applyToSize(image.buffer.size);
             const source = image.source orelse render.SourceRect{
                 .x = 0,
                 .y = 0,
-                .width = @floatFromInt(image.buffer.size.width),
-                .height = @floatFromInt(image.buffer.size.height),
+                .width = @floatFromInt(transformed_size.width),
+                .height = @floatFromInt(transformed_size.height),
             };
             const rounded = image.rounded_clip orelse render.RoundedClip{
                 .rect = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
@@ -2950,14 +2952,6 @@ fn compileDrawRuns(
             };
             const radius = @min(rounded.radius, @min(rounded.rect.width, rounded.rect.height) / 2);
             const dmabuf = image.buffer.dmabuf;
-            const source_y = if (dmabuf != null and dmabuf.?.y_inverted)
-                @as(f64, @floatFromInt(image.buffer.size.height)) - source.y
-            else
-                source.y;
-            const source_height = if (dmabuf != null and dmabuf.?.y_inverted)
-                -source.height
-            else
-                source.height;
             try self.emitDamaged(
                 frame,
                 clipped,
@@ -2968,17 +2962,17 @@ fn compileDrawRuns(
                     .destination = rectFloats(destination),
                     .source = .{
                         @floatCast(source.x),
-                        @floatCast(source_y),
+                        @floatCast(source.y),
                         @floatCast(source.width),
-                        @floatCast(source_height),
+                        @floatCast(source.height),
                     },
                     .clip = undefined,
                     .color = .{ 1, 1, 1, 1 },
                     .rounded = rectFloats(rounded.rect),
                     .parameters = .{
                         @floatFromInt(radius),
-                        0,
-                        0,
+                        @floatFromInt(@intFromEnum(image.transform)),
+                        @floatFromInt(@intFromBool(dmabuf != null and dmabuf.?.y_inverted)),
                         0,
                     },
                 },
