@@ -887,7 +887,10 @@ fn keyWithGrab(
         if (grab.surface) |surface_id| {
             const surface = Surface.resourceFor(self.surface_store, surface_id) orelse return;
             const serial = self.display.nextSerial();
-            if (state == .pressed) self.recordUserAction(surface.getClient(), serial);
+            if (state == .pressed)
+                self.recordUserAction(surface.getClient(), serial)
+            else
+                self.recordSelectionSerial(surface.getClient(), serial);
             for (self.keyboard_resources.items) |entry| {
                 if (!self.keyboardResourceActive(entry)) continue;
                 const resource = entry.resource;
@@ -903,7 +906,10 @@ fn keyWithGrab(
     }
     const surface = self.focusedSurface() orelse return;
     const serial = self.display.nextSerial();
-    if (state == .pressed) self.recordUserAction(surface.getClient(), serial);
+    if (state == .pressed)
+        self.recordUserAction(surface.getClient(), serial)
+    else
+        self.recordSelectionSerial(surface.getClient(), serial);
     for (self.keyboard_resources.items) |entry| {
         if (!self.keyboardResourceActive(entry)) continue;
         const resource = entry.resource;
@@ -1037,6 +1043,7 @@ pub fn pointerButton(
     const grab_ended = self.pressed_pointer_buttons.items.len == 0;
     const surface = self.pointerSurface() orelse return grab_ended;
     const serial = self.display.nextSerial();
+    self.recordSelectionSerial(surface.getClient(), serial);
     for (self.pointer_resources.items) |entry| {
         if (!self.pointerResourceActive(entry)) continue;
         const resource = entry.resource;
@@ -1195,6 +1202,7 @@ pub fn touchUp(self: *Self, time: u32, id: i32) error{OutOfMemory}!void {
     const point = self.touch_points.items[index];
     if (point.target) |target| {
         const serial = self.display.nextSerial();
+        self.recordSelectionSerial(target.client, serial);
         for (self.touch_resources.items) |entry| {
             if (!self.touchResourceActive(entry)) continue;
             const resource = entry.resource;
