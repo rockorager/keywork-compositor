@@ -345,6 +345,16 @@ pub const DeviceInfo = struct {
     physical_id: PhysicalDeviceId,
     device_type: DeviceType,
     name: [:0]const u8,
+    vendor: u32,
+    product: u32,
+};
+
+pub const DeviceCapabilities = struct {
+    keyboard: bool,
+    pointer: bool,
+    touch: bool,
+    tablet: bool,
+    tablet_pad: bool,
 };
 
 pub const TabletInfo = struct {
@@ -771,6 +781,10 @@ pub fn setDeviceRepeatInfo(self: *Self, id: DeviceId, rate: i32, delay: i32) voi
     const device = self.findInputDeviceById(id) orelse return;
     if (device.info.device_type != .keyboard) return;
     device.repeat_info = .{ .rate = rate, .delay = delay };
+    if (self.active_keyboard == id and !std.meta.eql(self.active_repeat_info, device.repeat_info)) {
+        self.active_repeat_info = device.repeat_info;
+        self.listener.keyboard_repeat_info(self.listener.context, id, rate, delay);
+    }
 }
 
 pub fn setDeviceScrollFactor(self: *Self, id: DeviceId, factor: f64) void {
@@ -794,6 +808,17 @@ pub fn createAccelConfig(profile: AccelProfile) ?AccelConfig {
         @as(c.enum_libinput_config_accel_profile, @intFromEnum(profile)),
     ) orelse return null;
     return .{ .native = native };
+}
+
+pub fn deviceCapabilities(self: *Self, id: DeviceId) ?DeviceCapabilities {
+    const device = (self.findInputDeviceById(id) orelse return null).libinput_device;
+    return .{
+        .keyboard = c.libinput_device_has_capability(device, c.LIBINPUT_DEVICE_CAP_KEYBOARD) != 0,
+        .pointer = c.libinput_device_has_capability(device, c.LIBINPUT_DEVICE_CAP_POINTER) != 0,
+        .touch = c.libinput_device_has_capability(device, c.LIBINPUT_DEVICE_CAP_TOUCH) != 0,
+        .tablet = c.libinput_device_has_capability(device, c.LIBINPUT_DEVICE_CAP_TABLET_TOOL) != 0,
+        .tablet_pad = c.libinput_device_has_capability(device, c.LIBINPUT_DEVICE_CAP_TABLET_PAD) != 0,
+    };
 }
 
 pub fn deviceConfig(self: *Self, id: DeviceId) ?DeviceConfig {
@@ -1197,6 +1222,8 @@ fn addInputDevice(
             .physical_id = physicalId(libinput_device),
             .device_type = device_type,
             .name = name_copy,
+            .vendor = c.libinput_device_get_id_vendor(libinput_device),
+            .product = c.libinput_device_get_id_product(libinput_device),
         },
         .libinput_device = libinput_device,
         .keyboard = keyboard,

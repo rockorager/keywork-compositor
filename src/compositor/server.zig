@@ -1146,6 +1146,9 @@ fn nativeInputListener(render_output: *RenderOutput) NativeInput.Listener {
 
 fn inputDeviceAdded(context: *anyopaque, device: *InputManager.Device) void {
     const self: *Self = @ptrCast(@alignCast(context));
+    if (self.configuration) |*configuration| {
+        self.applyPhysicalInputConfiguration(device.physical_id, configuration.snapshot.input_rules);
+    }
     const seat = &self.seat;
     if (device.device_type == .tablet) {
         const info = self.native_input.tabletInfo(device.id) orelse return;
@@ -1222,9 +1225,6 @@ fn prepareSeatKeyboard(self: *Self, seat: *Seat, id: NativeInput.DeviceId) void 
         return self.terminate();
     } orelse return;
     seat.setKeymap(.xkb_v1, fd, state.keymap.size);
-    if (self.native_input.deviceRepeatInfo(id)) |repeat| {
-        seat.setRepeatInfo(repeat.rate, repeat.delay);
-    }
     if (self.native_input.deviceModifiers(id)) |modifiers| {
         seat.setModifiers(
             modifiers.depressed,
@@ -1610,6 +1610,7 @@ pub fn setConfiguration(self: *Self, configuration: *Config.Store) void {
     std.debug.assert(self.configuration == null);
     self.configuration = configuration.*;
     configuration.* = undefined;
+    self.applyInputConfiguration(self.configuration.?.snapshot.input_rules);
     if (self.builtin_keybindings_initialized) {
         self.builtin_keybindings.setConfiguredBindings(self.configuration.?.snapshot.bindings);
     }
@@ -1619,6 +1620,7 @@ pub fn reloadConfiguration(self: *Self) !void {
     const configuration = if (self.configuration) |*value| value else return error.ConfigurationUnavailable;
     var replacement = try configuration.loadSnapshot();
     errdefer replacement.deinit();
+    self.applyInputConfiguration(replacement.input_rules);
     if (self.builtin_keybindings_initialized) {
         self.builtin_keybindings.setConfiguredBindings(replacement.bindings);
     }
@@ -1626,6 +1628,230 @@ pub fn reloadConfiguration(self: *Self) !void {
     configuration.snapshot = replacement;
     previous.deinit();
     log.info("configuration reloaded", .{});
+}
+
+const EffectiveInputSettings = struct {
+    send_events: NativeInput.SendEventsModes,
+    tap: ?NativeInput.Toggle,
+    tap_button_map: ?NativeInput.TapButtonMap,
+    drag: ?NativeInput.Toggle,
+    drag_lock: ?NativeInput.DragLock,
+    three_finger_drag: ?NativeInput.ThreeFingerDrag,
+    accel_profile: ?NativeInput.AccelProfile,
+    accel_speed: ?f64,
+    natural_scroll: ?NativeInput.Toggle,
+    left_handed: ?NativeInput.Toggle,
+    click_method: ?NativeInput.ClickMethod,
+    clickfinger_button_map: ?NativeInput.ClickfingerButtonMap,
+    middle_emulation: ?NativeInput.Toggle,
+    scroll_method: ?NativeInput.ScrollMethod,
+    scroll_button: ?u32,
+    scroll_button_lock: ?NativeInput.Toggle,
+    disable_while_typing: ?NativeInput.Toggle,
+    disable_while_trackpointing: ?NativeInput.Toggle,
+    rotation: ?u32,
+    scroll_factor: f64 = 1,
+    repeat_rate: i32 = 25,
+    repeat_delay: i32 = 600,
+
+    fn init(defaults: NativeInput.DeviceConfig) EffectiveInputSettings {
+        return .{
+            .send_events = defaults.send_events.default,
+            .tap = settingDefault(NativeInput.Toggle, defaults.tap),
+            .tap_button_map = settingDefault(NativeInput.TapButtonMap, defaults.tap_button_map),
+            .drag = settingDefault(NativeInput.Toggle, defaults.drag),
+            .drag_lock = settingDefault(NativeInput.DragLock, defaults.drag_lock),
+            .three_finger_drag = settingDefault(NativeInput.ThreeFingerDrag, defaults.three_finger_drag),
+            .accel_profile = if (defaults.accel_profiles) |setting| setting.default else null,
+            .accel_speed = if (defaults.accel_profiles) |setting| setting.speed.default else null,
+            .natural_scroll = settingDefault(NativeInput.Toggle, defaults.natural_scroll),
+            .left_handed = settingDefault(NativeInput.Toggle, defaults.left_handed),
+            .click_method = if (defaults.click_method) |setting| setting.default else null,
+            .clickfinger_button_map = settingDefault(NativeInput.ClickfingerButtonMap, defaults.clickfinger_button_map),
+            .middle_emulation = settingDefault(NativeInput.Toggle, defaults.middle_emulation),
+            .scroll_method = if (defaults.scroll_method) |setting| setting.default else null,
+            .scroll_button = settingDefault(u32, defaults.scroll_button),
+            .scroll_button_lock = settingDefault(NativeInput.Toggle, defaults.scroll_button_lock),
+            .disable_while_typing = settingDefault(NativeInput.Toggle, defaults.dwt),
+            .disable_while_trackpointing = settingDefault(NativeInput.Toggle, defaults.dwtp),
+            .rotation = settingDefault(u32, defaults.rotation),
+        };
+    }
+};
+
+fn settingDefault(comptime T: type, setting: ?NativeInput.Setting(T)) ?T {
+    return if (setting) |value| value.default else null;
+}
+
+fn applyInputConfiguration(self: *Self, rules: []const Config.InputRule) void {
+    if (!self.native_input_initialized or !self.input_manager_initialized) return;
+    var devices = self.input_manager.deviceIterator();
+    while (devices.next()) |device| {
+        var earlier = false;
+        var candidates = self.input_manager.deviceIterator();
+        while (candidates.next()) |candidate| {
+            if (candidate.physical_id == device.physical_id and candidate.id < device.id) {
+                earlier = true;
+                break;
+            }
+        }
+        if (!earlier) self.applyPhysicalInputConfiguration(device.physical_id, rules);
+    }
+}
+
+fn applyPhysicalInputConfiguration(
+    self: *Self,
+    physical_id: NativeInput.PhysicalDeviceId,
+    rules: []const Config.InputRule,
+) void {
+    if (!self.native_input_initialized or !self.input_manager_initialized) return;
+    var representative: ?*InputManager.Device = null;
+    var devices = self.input_manager.deviceIterator();
+    while (devices.next()) |device| {
+        if (device.physical_id != physical_id) continue;
+        representative = device;
+        break;
+    }
+    const device = representative orelse return;
+    const capabilities = self.native_input.deviceCapabilities(device.id) orelse return;
+    const defaults = self.native_input.deviceConfig(device.id) orelse return;
+    const matched_device: Config.InputDeviceMatch = .{
+        .name = device.name,
+        .vendor = device.vendor,
+        .product = device.product,
+        .keyboard = capabilities.keyboard,
+        .pointer = capabilities.pointer,
+        .touchpad = capabilities.pointer and defaults.tap_finger_count > 0,
+        .touch = capabilities.touch,
+        .tablet = capabilities.tablet,
+        .tablet_pad = capabilities.tablet_pad,
+    };
+    var effective: EffectiveInputSettings = .init(defaults);
+    for (rules) |rule| {
+        if (!rule.matcher.matches(matched_device)) continue;
+        overlayInputSettings(&effective, defaults, matched_device, rule.settings);
+    }
+    self.applyEffectiveInputSettings(device, effective);
+}
+
+fn overlayInputSettings(
+    effective: *EffectiveInputSettings,
+    defaults: NativeInput.DeviceConfig,
+    device: Config.InputDeviceMatch,
+    settings: Config.InputSettings,
+) void {
+    if (settings.send_events) |configured| {
+        effective.send_events = switch (configured) {
+            .use_default => defaults.send_events.default,
+            .value => |value| switch (value) {
+                .enabled => .{},
+                .disabled => .{ .disabled = true },
+                .disabled_on_external_mouse => .{ .disabled_on_external_mouse = true },
+            },
+        };
+    }
+    overlayNativeSetting(NativeInput.Toggle, &effective.tap, settingDefault(NativeInput.Toggle, defaults.tap), settings.tap, device.name, "tap");
+    overlayNativeSetting(NativeInput.TapButtonMap, &effective.tap_button_map, settingDefault(NativeInput.TapButtonMap, defaults.tap_button_map), settings.tap_button_map, device.name, "tap-button-map");
+    overlayNativeSetting(NativeInput.Toggle, &effective.drag, settingDefault(NativeInput.Toggle, defaults.drag), settings.drag, device.name, "drag");
+    overlayNativeSetting(NativeInput.DragLock, &effective.drag_lock, settingDefault(NativeInput.DragLock, defaults.drag_lock), settings.drag_lock, device.name, "drag-lock");
+    overlayNativeSetting(NativeInput.ThreeFingerDrag, &effective.three_finger_drag, settingDefault(NativeInput.ThreeFingerDrag, defaults.three_finger_drag), settings.three_finger_drag, device.name, "three-finger-drag");
+    overlayNativeSetting(NativeInput.AccelProfile, &effective.accel_profile, if (defaults.accel_profiles) |setting| setting.default else null, settings.accel_profile, device.name, "accel-profile");
+    overlayNativeSetting(f64, &effective.accel_speed, if (defaults.accel_profiles) |setting| setting.speed.default else null, settings.accel_speed, device.name, "accel-speed");
+    overlayNativeSetting(NativeInput.Toggle, &effective.natural_scroll, settingDefault(NativeInput.Toggle, defaults.natural_scroll), settings.natural_scroll, device.name, "natural-scroll");
+    overlayNativeSetting(NativeInput.Toggle, &effective.left_handed, settingDefault(NativeInput.Toggle, defaults.left_handed), settings.left_handed, device.name, "left-handed");
+    overlayNativeSetting(NativeInput.ClickMethod, &effective.click_method, if (defaults.click_method) |setting| setting.default else null, settings.click_method, device.name, "click-method");
+    overlayNativeSetting(NativeInput.ClickfingerButtonMap, &effective.clickfinger_button_map, settingDefault(NativeInput.ClickfingerButtonMap, defaults.clickfinger_button_map), settings.clickfinger_button_map, device.name, "clickfinger-button-map");
+    overlayNativeSetting(NativeInput.Toggle, &effective.middle_emulation, settingDefault(NativeInput.Toggle, defaults.middle_emulation), settings.middle_emulation, device.name, "middle-emulation");
+    overlayNativeSetting(NativeInput.ScrollMethod, &effective.scroll_method, if (defaults.scroll_method) |setting| setting.default else null, settings.scroll_method, device.name, "scroll-method");
+    overlayNativeSetting(u32, &effective.scroll_button, settingDefault(u32, defaults.scroll_button), settings.scroll_button, device.name, "scroll-button");
+    overlayNativeSetting(NativeInput.Toggle, &effective.scroll_button_lock, settingDefault(NativeInput.Toggle, defaults.scroll_button_lock), settings.scroll_button_lock, device.name, "scroll-button-lock");
+    overlayNativeSetting(NativeInput.Toggle, &effective.disable_while_typing, settingDefault(NativeInput.Toggle, defaults.dwt), settings.disable_while_typing, device.name, "disable-while-typing");
+    overlayNativeSetting(NativeInput.Toggle, &effective.disable_while_trackpointing, settingDefault(NativeInput.Toggle, defaults.dwtp), settings.disable_while_trackpointing, device.name, "disable-while-trackpointing");
+    overlayNativeSetting(u32, &effective.rotation, settingDefault(u32, defaults.rotation), settings.rotation, device.name, "rotation");
+    overlayDeviceSetting(f64, &effective.scroll_factor, 1, settings.scroll_factor, device.pointer, device.name, "scroll-factor");
+    overlayDeviceSetting(i32, &effective.repeat_rate, 25, settings.repeat_rate, device.keyboard, device.name, "repeat-rate");
+    overlayDeviceSetting(i32, &effective.repeat_delay, 600, settings.repeat_delay, device.keyboard, device.name, "repeat-delay");
+}
+
+fn overlayNativeSetting(
+    comptime T: type,
+    effective: *?T,
+    default_value: ?T,
+    configured: ?Config.InputValue(T),
+    device_name: []const u8,
+    setting_name: []const u8,
+) void {
+    const value = configured orelse return;
+    const default = default_value orelse {
+        log.warn("input setting {s} is unsupported by {s}", .{ setting_name, device_name });
+        return;
+    };
+    effective.* = value.resolve(default);
+}
+
+fn overlayDeviceSetting(
+    comptime T: type,
+    effective: *T,
+    default_value: T,
+    configured: ?Config.InputValue(T),
+    supported: bool,
+    device_name: []const u8,
+    setting_name: []const u8,
+) void {
+    const value = configured orelse return;
+    if (!supported) {
+        log.warn("input setting {s} is unsupported by {s}", .{ setting_name, device_name });
+        return;
+    }
+    effective.* = value.resolve(default_value);
+}
+
+fn applyEffectiveInputSettings(
+    self: *Self,
+    device: *InputManager.Device,
+    settings: EffectiveInputSettings,
+) void {
+    reportInputStatus(device.name, "send-events", self.native_input.setSendEvents(device.id, settings.send_events));
+    if (settings.tap) |value| reportInputStatus(device.name, "tap", self.native_input.setTap(device.id, value));
+    if (settings.tap_button_map) |value| reportInputStatus(device.name, "tap-button-map", self.native_input.setTapButtonMap(device.id, value));
+    if (settings.drag) |value| reportInputStatus(device.name, "drag", self.native_input.setDrag(device.id, value));
+    if (settings.drag_lock) |value| reportInputStatus(device.name, "drag-lock", self.native_input.setDragLock(device.id, value));
+    if (settings.three_finger_drag) |value| reportInputStatus(device.name, "three-finger-drag", self.native_input.setThreeFingerDrag(device.id, value));
+    if (settings.accel_profile) |value| reportInputStatus(device.name, "accel-profile", self.native_input.setAccelProfile(device.id, value));
+    if (settings.accel_speed) |value| reportInputStatus(device.name, "accel-speed", self.native_input.setAccelSpeed(device.id, value));
+    if (settings.natural_scroll) |value| reportInputStatus(device.name, "natural-scroll", self.native_input.setNaturalScroll(device.id, value));
+    if (settings.left_handed) |value| reportInputStatus(device.name, "left-handed", self.native_input.setLeftHanded(device.id, value));
+    if (settings.click_method) |value| reportInputStatus(device.name, "click-method", self.native_input.setClickMethod(device.id, value));
+    if (settings.clickfinger_button_map) |value| reportInputStatus(device.name, "clickfinger-button-map", self.native_input.setClickfingerButtonMap(device.id, value));
+    if (settings.middle_emulation) |value| reportInputStatus(device.name, "middle-emulation", self.native_input.setMiddleEmulation(device.id, value));
+    if (settings.scroll_method) |value| reportInputStatus(device.name, "scroll-method", self.native_input.setScrollMethod(device.id, value));
+    if (settings.scroll_button) |value| reportInputStatus(device.name, "scroll-button", self.native_input.setScrollButton(device.id, value));
+    if (settings.scroll_button_lock) |value| reportInputStatus(device.name, "scroll-button-lock", self.native_input.setScrollButtonLock(device.id, value));
+    if (settings.disable_while_typing) |value| reportInputStatus(device.name, "disable-while-typing", self.native_input.setDwt(device.id, value));
+    if (settings.disable_while_trackpointing) |value| reportInputStatus(device.name, "disable-while-trackpointing", self.native_input.setDwtp(device.id, value));
+    if (settings.rotation) |value| reportInputStatus(device.name, "rotation", self.native_input.setRotation(device.id, value));
+
+    var devices = self.input_manager.deviceIterator();
+    while (devices.next()) |logical_device| {
+        if (logical_device.physical_id != device.physical_id) continue;
+        switch (logical_device.device_type) {
+            .keyboard => self.native_input.setDeviceRepeatInfo(logical_device.id, settings.repeat_rate, settings.repeat_delay),
+            .pointer => self.native_input.setDeviceScrollFactor(logical_device.id, settings.scroll_factor),
+            .touch, .tablet, .tablet_pad => {},
+        }
+    }
+}
+
+fn reportInputStatus(device_name: []const u8, setting_name: []const u8, status: ?NativeInput.Status) void {
+    const result = status orelse {
+        log.warn("input device {s} disappeared while applying {s}", .{ device_name, setting_name });
+        return;
+    };
+    switch (result) {
+        .success => {},
+        .unsupported => log.warn("input setting {s} is unsupported by {s}", .{ setting_name, device_name }),
+        .invalid => log.warn("input setting {s} was rejected by {s}", .{ setting_name, device_name }),
+    }
 }
 
 pub fn setXwaylandReadyListener(self: *Self, listener: XwaylandReadyListener) void {
@@ -5499,4 +5725,65 @@ test "rounded window corners reject points outside visible content" {
     try std.testing.expect(pointInRoundedRect(14.5, 24.5, rect, 8));
     try std.testing.expect(pointInRoundedRect(20, 20.5, rect, 8));
     try std.testing.expect(!pointInRoundedRect(30, 30, rect, 8));
+}
+
+test "input settings overlay in order and can restore defaults" {
+    const defaults: NativeInput.DeviceConfig = .{
+        .physical_id = 1,
+        .send_events = .{ .supported = .{ .disabled = true }, .default = .{}, .current = .{} },
+        .tap_finger_count = 2,
+        .tap = .{ .default = .disabled, .current = .disabled },
+        .tap_button_map = null,
+        .drag = null,
+        .drag_lock = null,
+        .three_finger_drag_count = 0,
+        .three_finger_drag = null,
+        .calibration_matrix = null,
+        .accel_profiles = .{
+            .supported = .{ .adaptive = true },
+            .default = .adaptive,
+            .current = .adaptive,
+            .speed = .{ .default = 0, .current = 0 },
+        },
+        .natural_scroll = .{ .default = .disabled, .current = .disabled },
+        .left_handed = null,
+        .click_method = null,
+        .clickfinger_button_map = null,
+        .middle_emulation = null,
+        .scroll_method = null,
+        .scroll_button = null,
+        .scroll_button_lock = null,
+        .dwt = null,
+        .dwtp = null,
+        .rotation = null,
+    };
+    const device: Config.InputDeviceMatch = .{
+        .name = "Test Touchpad",
+        .vendor = 1,
+        .product = 2,
+        .keyboard = true,
+        .pointer = true,
+        .touchpad = true,
+    };
+    var effective: EffectiveInputSettings = .init(defaults);
+    overlayInputSettings(&effective, defaults, device, .{
+        .send_events = .{ .value = .disabled },
+        .tap = .{ .value = .enabled },
+        .accel_speed = .{ .value = 0.5 },
+        .natural_scroll = .{ .value = .enabled },
+        .scroll_factor = .{ .value = 0.75 },
+        .repeat_rate = .{ .value = 30 },
+    });
+    overlayInputSettings(&effective, defaults, device, .{
+        .tap = .use_default,
+        .natural_scroll = .use_default,
+        .scroll_factor = .use_default,
+    });
+
+    try std.testing.expect(effective.send_events.disabled);
+    try std.testing.expectEqual(NativeInput.Toggle.disabled, effective.tap.?);
+    try std.testing.expectEqual(@as(f64, 0.5), effective.accel_speed.?);
+    try std.testing.expectEqual(NativeInput.Toggle.disabled, effective.natural_scroll.?);
+    try std.testing.expectEqual(@as(f64, 1), effective.scroll_factor);
+    try std.testing.expectEqual(@as(i32, 30), effective.repeat_rate);
 }

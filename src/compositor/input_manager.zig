@@ -18,6 +18,8 @@ pub const Device = struct {
     physical_id: NativeInput.PhysicalDeviceId,
     device_type: NativeInput.DeviceType,
     name: [:0]u8,
+    vendor: u32,
+    product: u32,
     seat_name: [:0]const u8 = default_seat_name,
 };
 
@@ -108,6 +110,8 @@ fn deviceAdded(context: *anyopaque, info: NativeInput.DeviceInfo) void {
         .physical_id = info.physical_id,
         .device_type = info.device_type,
         .name = name,
+        .vendor = info.vendor,
+        .product = info.product,
     };
     self.devices.append(self.allocator, device) catch {
         self.allocator.destroy(device);
