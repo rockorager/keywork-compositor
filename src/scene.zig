@@ -81,6 +81,7 @@ pub const Effects = struct {
 
 pub const default_effects: Effects = .{
     .corner_radius = 12,
+    .blur = .{ .radius = 16 },
     .shadow = .{
         .offset = .{ .y = 8 },
         .blur_radius = 16,

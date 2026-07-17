@@ -1760,10 +1760,10 @@ pub fn setSessionExitListener(self: *Self, listener: SessionExitListener) void {
     self.session_exit_listener = listener;
 }
 
-pub fn setFloatingBlurRadius(self: *Self, radius: u32) void {
+pub fn setWindowBlurRadius(self: *Self, radius: u32) void {
     var effects = Scene.default_effects;
     effects.blur = if (radius == 0) null else .{ .radius = radius };
-    self.window_manager.setFloatingEffects(effects);
+    self.window_manager.setWindowEffects(effects);
 }
 
 pub fn startXwayland(

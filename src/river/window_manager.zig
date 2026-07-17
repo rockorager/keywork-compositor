@@ -30,7 +30,7 @@ output_id: OutputLayout.Id,
 seat_states: std.ArrayList(*SeatState),
 default_seat_state: *SeatState,
 scene: *Scene,
-floating_effects: Scene.Effects,
+window_effects: Scene.Effects,
 xdg_shell: *XdgShell,
 xwayland: XwaylandController,
 layer_shell: *LayerShell,
@@ -384,7 +384,7 @@ pub fn init(
         .seat_states = .empty,
         .default_seat_state = seat_state,
         .scene = scene,
-        .floating_effects = Scene.default_effects,
+        .window_effects = Scene.default_effects,
         .xdg_shell = xdg_shell,
         .xwayland = xwayland,
         .layer_shell = layer_shell,
@@ -451,18 +451,14 @@ pub fn init(
     });
 }
 
-pub fn setFloatingEffects(self: *Self, effects: Scene.Effects) void {
-    if (std.meta.eql(self.floating_effects, effects)) return;
-    self.floating_effects = effects;
+pub fn setWindowEffects(self: *Self, effects: Scene.Effects) void {
+    if (std.meta.eql(self.window_effects, effects)) return;
+    self.window_effects = effects;
     var windows = self.windows.iterator();
     while (windows.next()) |entry| {
         self.scene.setEffects(
             entry.value.scene_id,
-            windowEffects(
-                effects,
-                entry.value.sent_configuration,
-                entry.value.fullscreen_output != null,
-            ),
+            windowEffects(effects, entry.value.fullscreen_output != null),
         );
     }
 }
@@ -1681,11 +1677,7 @@ fn finishRender(self: *Self, manager: *river.WindowManagerV1) void {
         self.xdg_shell.setWindowFullscreen(xdg_id, entry.value.fullscreen_output != null);
         self.scene.setEffects(
             entry.value.scene_id,
-            windowEffects(
-                self.floating_effects,
-                entry.value.sent_configuration,
-                entry.value.fullscreen_output != null,
-            ),
+            windowEffects(self.window_effects, entry.value.fullscreen_output != null),
         );
         switch (entry.value.pending_borders) {
             .unchanged => {},
@@ -1831,11 +1823,7 @@ fn finishXwaylandWindowRender(
     self.scene.setFullscreen(window.scene_id, window.fullscreen_output != null);
     self.scene.setEffects(
         window.scene_id,
-        windowEffects(
-            self.floating_effects,
-            window.sent_configuration,
-            window.fullscreen_output != null,
-        ),
+        windowEffects(self.window_effects, window.fullscreen_output != null),
     );
     if (window.resource != null) {
         self.xwayland.set_fullscreen(
@@ -1893,14 +1881,8 @@ fn finishXwaylandWindowRender(
     self.xwayland.refresh_scene(self.xwayland.context, xwayland_id);
 }
 
-fn windowEffects(
-    floating_effects: Scene.Effects,
-    configuration: XdgShell.ToplevelConfigure,
-    fullscreen: bool,
-) Scene.Effects {
-    const tiled: u8 = @bitCast(configuration.tiled);
-    if (fullscreen or configuration.maximized or tiled != 0) return .{};
-    return floating_effects;
+fn windowEffects(effects: Scene.Effects, fullscreen: bool) Scene.Effects {
+    return if (fullscreen) .{} else effects;
 }
 
 fn xwaylandCoordinate(value: i32) i16 {
@@ -3741,22 +3723,14 @@ test "River layer shell accepts one object for each output" {
     try std.testing.expectEqual(@as(usize, 2), binding.outputs.items.len);
 }
 
-test "tiled and fullscreen windows omit floating effects" {
+test "window effects apply unless fullscreen" {
     try std.testing.expectEqual(
         Scene.default_effects,
-        windowEffects(Scene.default_effects, .{}, false),
+        windowEffects(Scene.default_effects, false),
     );
     try std.testing.expectEqual(
         Scene.Effects{},
-        windowEffects(Scene.default_effects, .{ .tiled = .{ .left = true } }, false),
-    );
-    try std.testing.expectEqual(
-        Scene.Effects{},
-        windowEffects(Scene.default_effects, .{ .maximized = true }, false),
-    );
-    try std.testing.expectEqual(
-        Scene.Effects{},
-        windowEffects(Scene.default_effects, .{}, true),
+        windowEffects(Scene.default_effects, true),
     );
 }
 

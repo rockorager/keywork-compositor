@@ -41,7 +41,7 @@ pub fn main(init: std.process.Init) !void {
     );
     defer server.destroy();
     if (init.environ_map.get("KEYWORK_BLUR_RADIUS")) |value| {
-        server.setFloatingBlurRadius(parseBlurRadius(value) catch
+        server.setWindowBlurRadius(parseBlurRadius(value) catch
             return error.InvalidBlurRadius);
     }
 
@@ -153,7 +153,7 @@ test "headless output configuration parses physical size and fractional scale" {
     try std.testing.expectError(error.InvalidHeadlessScale, parseHeadlessScale("0"));
 }
 
-test "floating blur radius is bounded" {
+test "window blur radius is bounded" {
     try std.testing.expectEqual(@as(u32, 0), try parseBlurRadius("0"));
     try std.testing.expectEqual(@as(u32, 24), try parseBlurRadius("24"));
     try std.testing.expectError(error.InvalidBlurRadius, parseBlurRadius("257"));
