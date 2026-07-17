@@ -65,7 +65,10 @@ pub const Client = struct {
         var stream_reader = self.stream.reader(self.io, read_buffer);
         const message = try stream_reader.interface.takeSentinel(0);
         if (message.len == 0) return error.InvalidFrame;
-        return std.json.parseFromSlice(Reply, self.allocator, message, .{ .ignore_unknown_fields = true });
+        return std.json.parseFromSlice(Reply, self.allocator, message, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+        });
     }
 };
 

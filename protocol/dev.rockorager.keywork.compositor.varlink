@@ -22,5 +22,11 @@ method SwitchWorkspace (workspace: int) -> ()
 # Move the focused window to a numbered workspace on the focused output.
 method MoveFocusedToWorkspace (workspace: int) -> ()
 
+# Parse and atomically apply the selected configuration.
+method ReloadConfiguration () -> ()
+
 # The requested workspace number is outside Keywork's supported range.
 error InvalidWorkspace (workspace: int)
+
+# The selected configuration could not be read or validated.
+error ConfigurationReloadFailed ()

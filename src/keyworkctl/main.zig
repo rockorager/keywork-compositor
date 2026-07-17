@@ -3,12 +3,14 @@
 const std = @import("std");
 const control = @import("keywork-control");
 const varlink = @import("varlink");
+const Empty = struct {};
 
 const usage =
-    \\usage: keyworkctl COMMAND ARGUMENT
+    \\usage: keyworkctl COMMAND [ARGUMENT]
     \\
     \\commands: focus DIRECTION | move-focused DIRECTION | set-layout LAYOUT
     \\          switch-workspace WORKSPACE | move-focused-to-workspace WORKSPACE
+    \\          reload
     \\directions: next, previous, left, down, up, right
     \\layouts: master-stack, dwindle, scrolling
     \\
@@ -20,6 +22,7 @@ const Command = union(enum) {
     set_layout: control.Layout,
     switch_workspace: i64,
     move_to_workspace: i64,
+    reload,
 };
 
 pub fn main(init: std.process.Init) void {
@@ -70,6 +73,7 @@ fn run(init: std.process.Init) !void {
         .set_layout => |layout| try client.call(control.set_layout_method, .{ .layout = layout }),
         .switch_workspace => |workspace| try client.call(control.switch_workspace_method, .{ .workspace = workspace }),
         .move_to_workspace => |workspace| try client.call(control.move_focused_to_workspace_method, .{ .workspace = workspace }),
+        .reload => try client.call(control.reload_configuration_method, Empty{}),
     };
     defer reply.deinit();
     if (reply.value.@"error") |name| {
@@ -91,6 +95,7 @@ fn printUsage(io: std.Io, err: anyerror) anyerror {
 }
 
 fn parse(arguments: []const []const u8) !Command {
+    if (arguments.len == 1 and std.mem.eql(u8, arguments[0], "reload")) return .reload;
     if (arguments.len != 2) return error.InvalidArguments;
     const name = arguments[0];
     const value = arguments[1];
@@ -125,7 +130,23 @@ test "CLI parsing maps wire values and validates workspaces" {
     try std.testing.expectEqual(control.Direction.left, (try parse(&.{ "focus", "left" })).focus);
     try std.testing.expectEqual(control.Layout.master_stack, (try parse(&.{ "set-layout", "master-stack" })).set_layout);
     try std.testing.expectEqual(@as(i64, 10), (try parse(&.{ "switch-workspace", "10" })).switch_workspace);
+    try std.testing.expectEqual(Command.reload, try parse(&.{"reload"}));
     try std.testing.expectError(error.InvalidWorkspace, parse(&.{ "switch-workspace", "11" }));
     try std.testing.expectError(error.InvalidDirection, parse(&.{ "focus", "sideways" }));
     try std.testing.expectError(error.UnknownCommand, parse(&.{ "unknown", "value" }));
+}
+
+test "reload parameters encode as an empty object" {
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(std.testing.allocator);
+    try varlink.encode(
+        std.testing.allocator,
+        &output,
+        .{ .method = control.reload_configuration_method, .parameters = Empty{} },
+        1024,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"method\":\"dev.rockorager.keywork.compositor.ReloadConfiguration\",\"parameters\":{}}\x00",
+        output.items,
+    );
 }

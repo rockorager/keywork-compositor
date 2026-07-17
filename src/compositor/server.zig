@@ -76,6 +76,7 @@ io: std.Io,
 display: *wl.Server,
 control: Control,
 control_initialized: bool,
+configuration: ?Config.Store,
 session: Session,
 session_initialized: bool,
 drm_device: DrmDevice,
@@ -292,6 +293,7 @@ pub fn createWithVirtualOutput(
         .display = display,
         .control = undefined,
         .control_initialized = false,
+        .configuration = null,
         .session = undefined,
         .session_initialized = false,
         .drm_device = undefined,
@@ -902,6 +904,10 @@ pub fn destroy(self: *Self) void {
     if (self.builtin_keybindings_initialized) {
         self.builtin_keybindings.deinit();
         self.builtin_keybindings_initialized = false;
+    }
+    if (self.configuration) |*configuration| {
+        configuration.deinit();
+        self.configuration = null;
     }
     if (self.input_manager_initialized) {
         self.input_manager.deinit();
@@ -1575,7 +1581,11 @@ pub fn listenControl(self: *Self, runtime_directory: []const u8) ![]const u8 {
         self.allocator,
         self.io,
         self.eventLoop(),
-        .{ .context = self, .execute = executeControlCommand },
+        .{
+            .context = self,
+            .execute = executeControlCommand,
+            .reload = reloadControlConfiguration,
+        },
         runtime_directory,
     );
     self.control_initialized = true;
@@ -1587,12 +1597,35 @@ fn executeControlCommand(context: *anyopaque, command: Command) void {
     self.window_manager.execute(command);
 }
 
+fn reloadControlConfiguration(context: *anyopaque) !void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    try self.reloadConfiguration();
+}
+
 pub fn setLauncher(self: *Self, launcher: *Launcher) void {
     if (self.builtin_keybindings_initialized) self.builtin_keybindings.setLauncher(launcher);
 }
 
-pub fn setConfiguredBindings(self: *Self, bindings: []const Config.Binding) void {
-    if (self.builtin_keybindings_initialized) self.builtin_keybindings.setConfiguredBindings(bindings);
+pub fn setConfiguration(self: *Self, configuration: *Config.Store) void {
+    std.debug.assert(self.configuration == null);
+    self.configuration = configuration.*;
+    configuration.* = undefined;
+    if (self.builtin_keybindings_initialized) {
+        self.builtin_keybindings.setConfiguredBindings(self.configuration.?.snapshot.bindings);
+    }
+}
+
+pub fn reloadConfiguration(self: *Self) !void {
+    const configuration = if (self.configuration) |*value| value else return error.ConfigurationUnavailable;
+    var replacement = try configuration.loadSnapshot();
+    errdefer replacement.deinit();
+    if (self.builtin_keybindings_initialized) {
+        self.builtin_keybindings.setConfiguredBindings(replacement.bindings);
+    }
+    var previous = configuration.snapshot;
+    configuration.snapshot = replacement;
+    previous.deinit();
+    log.info("configuration reloaded", .{});
 }
 
 pub fn setXwaylandReadyListener(self: *Self, listener: XwaylandReadyListener) void {
@@ -1620,6 +1653,7 @@ pub fn eventLoop(self: *Self) *wl.EventLoop {
 
 pub fn run(self: *Self) void {
     std.debug.assert(self.listening);
+    std.debug.assert(self.configuration != null);
     self.display.run();
 }
 

@@ -40,6 +40,7 @@ clients: std.ArrayList(*Client),
 pub const Executor = struct {
     context: *anyopaque,
     execute: *const fn (*anyopaque, command.Command) void,
+    reload: *const fn (*anyopaque) anyerror!void,
 };
 
 const Direction = control.Direction;
@@ -432,6 +433,18 @@ fn handleMessage(
         if (!call.oneway) try writeSuccess(allocator, output);
         return;
     }
+    if (std.mem.eql(u8, call.method, control.reload_configuration_method)) {
+        if (!emptyParameters(call.parameters)) {
+            if (!call.oneway) try writeInvalidParameter(allocator, output, "parameters");
+            return;
+        }
+        executor.reload(executor.context) catch {
+            if (!call.oneway) try writeConfigurationReloadFailed(allocator, output);
+            return;
+        };
+        if (!call.oneway) try writeSuccess(allocator, output);
+        return;
+    }
 
     if (!call.oneway) try writeMessage(allocator, output, .{
         .@"error" = service_interface_name ++ ".MethodNotFound",
@@ -503,6 +516,16 @@ fn writeInvalidWorkspace(
     });
 }
 
+fn writeConfigurationReloadFailed(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+) !void {
+    try writeMessage(allocator, output, .{
+        .@"error" = interface_name ++ ".ConfigurationReloadFailed",
+        .parameters = Empty{},
+    });
+}
+
 fn writeMessage(
     allocator: std.mem.Allocator,
     output: *std.ArrayList(u8),
@@ -513,18 +536,26 @@ fn writeMessage(
 
 const Recorder = struct {
     commands: std.ArrayList(command.Command) = .empty,
+    reload_count: usize = 0,
+    reload_error: ?anyerror = null,
 
     fn deinit(self: *Recorder) void {
         self.commands.deinit(std.testing.allocator);
     }
 
     fn executor(self: *Recorder) Executor {
-        return .{ .context = self, .execute = execute };
+        return .{ .context = self, .execute = execute, .reload = reload };
     }
 
     fn execute(context: *anyopaque, value: command.Command) void {
         const self: *Recorder = @ptrCast(@alignCast(context));
         self.commands.append(std.testing.allocator, value) catch unreachable;
+    }
+
+    fn reload(context: *anyopaque) !void {
+        const self: *Recorder = @ptrCast(@alignCast(context));
+        self.reload_count += 1;
+        if (self.reload_error) |err| return err;
     }
 };
 
@@ -590,6 +621,29 @@ test "oneway calls suppress replies and invalid workspaces return typed errors" 
     try std.testing.expectEqual(@as(usize, 1), recorder.commands.items.len);
     try std.testing.expectEqualStrings(
         "{\"error\":\"dev.rockorager.keywork.compositor.InvalidWorkspace\",\"parameters\":{\"workspace\":0}}\x00",
+        output.items,
+    );
+}
+
+test "configuration reload returns success or a typed failure" {
+    var recorder: Recorder = .{};
+    defer recorder.deinit();
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(std.testing.allocator);
+
+    const call =
+        \\{"method":"dev.rockorager.keywork.compositor.ReloadConfiguration","parameters":{}}
+    ;
+    try handleMessage(std.testing.allocator, recorder.executor(), call, &output);
+    try std.testing.expectEqual(@as(usize, 1), recorder.reload_count);
+    try std.testing.expectEqualStrings("{\"parameters\":{}}\x00", output.items);
+
+    output.clearRetainingCapacity();
+    recorder.reload_error = error.InvalidConfiguration;
+    try handleMessage(std.testing.allocator, recorder.executor(), call, &output);
+    try std.testing.expectEqual(@as(usize, 2), recorder.reload_count);
+    try std.testing.expectEqualStrings(
+        "{\"error\":\"dev.rockorager.keywork.compositor.ConfigurationReloadFailed\",\"parameters\":{}}\x00",
         output.items,
     );
 }

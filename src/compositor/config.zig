@@ -88,56 +88,77 @@ const BindingError = error{
 
 const LoadAttempt = union(enum) {
     not_found,
-    rejected,
     snapshot: Snapshot,
 };
 
-pub fn load(
+pub const Store = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     environ_map: *const std.process.Environ.Map,
-    explicit_path: ?[]const u8,
-) !Snapshot {
-    if (explicit_path) |path| return switch (try loadPath(allocator, io, path)) {
-        .snapshot => |snapshot| snapshot,
-        .not_found => fallback: {
-            log.info("no configuration found at {s}; using built-in defaults", .{path});
-            break :fallback try defaultSnapshot(allocator);
-        },
-        .rejected => try defaultSnapshot(allocator),
-    };
+    explicit_path: ?[]u8,
+    snapshot: Snapshot,
 
-    if (environ_map.get("XDG_CONFIG_HOME")) |directory| {
-        if (std.fs.path.isAbsolute(directory)) {
-            if (try loadBelow(allocator, io, directory)) |attempt| return switch (attempt) {
-                .snapshot => |snapshot| snapshot,
-                .rejected => try defaultSnapshot(allocator),
-                .not_found => unreachable,
-            };
+    pub fn init(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        environ_map: *const std.process.Environ.Map,
+        explicit_path: ?[]const u8,
+    ) !Store {
+        const owned_path = if (explicit_path) |path| try allocator.dupe(u8, path) else null;
+        errdefer if (owned_path) |path| allocator.free(path);
+        var self: Store = .{
+            .allocator = allocator,
+            .io = io,
+            .environ_map = environ_map,
+            .explicit_path = owned_path,
+            .snapshot = undefined,
+        };
+        self.snapshot = self.loadSnapshot() catch |err| switch (err) {
+            error.InvalidConfiguration, error.ConfigurationReadFailed => fallback: {
+                log.warn("initial configuration failed; using built-in defaults", .{});
+                break :fallback try defaultSnapshot(allocator);
+            },
+            else => return err,
+        };
+        return self;
+    }
+
+    pub fn deinit(self: *Store) void {
+        self.snapshot.deinit();
+        if (self.explicit_path) |path| self.allocator.free(path);
+        self.* = undefined;
+    }
+
+    /// Returns a completely parsed replacement without changing active state.
+    pub fn loadSnapshot(self: *const Store) !Snapshot {
+        if (self.explicit_path) |path| return switch (try loadPath(self.allocator, self.io, path)) {
+            .snapshot => |snapshot| snapshot,
+            .not_found => fallback: {
+                log.info("no configuration found at {s}; using built-in defaults", .{path});
+                break :fallback try defaultSnapshot(self.allocator);
+            },
+        };
+
+        if (self.environ_map.get("XDG_CONFIG_HOME")) |directory| {
+            if (std.fs.path.isAbsolute(directory)) {
+                if (try loadBelow(self.allocator, self.io, directory)) |snapshot| return snapshot;
+            }
+        } else if (self.environ_map.get("HOME")) |home| {
+            const directory = try std.fs.path.join(self.allocator, &.{ home, ".config" });
+            defer self.allocator.free(directory);
+            if (try loadBelow(self.allocator, self.io, directory)) |snapshot| return snapshot;
         }
-    } else if (environ_map.get("HOME")) |home| {
-        const directory = try std.fs.path.join(allocator, &.{ home, ".config" });
-        defer allocator.free(directory);
-        if (try loadBelow(allocator, io, directory)) |attempt| return switch (attempt) {
-            .snapshot => |snapshot| snapshot,
-            .rejected => try defaultSnapshot(allocator),
-            .not_found => unreachable,
-        };
-    }
 
-    const config_directories = environ_map.get("XDG_CONFIG_DIRS") orelse "/etc/xdg";
-    var iterator = std.mem.splitScalar(u8, config_directories, ':');
-    while (iterator.next()) |directory| {
-        if (directory.len == 0 or !std.fs.path.isAbsolute(directory)) continue;
-        if (try loadBelow(allocator, io, directory)) |attempt| return switch (attempt) {
-            .snapshot => |snapshot| snapshot,
-            .rejected => try defaultSnapshot(allocator),
-            .not_found => unreachable,
-        };
+        const config_directories = self.environ_map.get("XDG_CONFIG_DIRS") orelse "/etc/xdg";
+        var iterator = std.mem.splitScalar(u8, config_directories, ':');
+        while (iterator.next()) |directory| {
+            if (directory.len == 0 or !std.fs.path.isAbsolute(directory)) continue;
+            if (try loadBelow(self.allocator, self.io, directory)) |snapshot| return snapshot;
+        }
+        log.info("no configuration found; using built-in defaults", .{});
+        return defaultSnapshot(self.allocator);
     }
-    log.info("no configuration found; using built-in defaults", .{});
-    return defaultSnapshot(allocator);
-}
+};
 
 fn defaultSnapshot(allocator: std.mem.Allocator) !Snapshot {
     return switch (try parse(allocator, default_source)) {
@@ -152,13 +173,12 @@ fn defaultSnapshot(allocator: std.mem.Allocator) !Snapshot {
     };
 }
 
-fn loadBelow(allocator: std.mem.Allocator, io: std.Io, directory: []const u8) !?LoadAttempt {
+fn loadBelow(allocator: std.mem.Allocator, io: std.Io, directory: []const u8) !?Snapshot {
     const path = try std.fs.path.join(allocator, &.{ directory, "keywork", "config" });
     defer allocator.free(path);
-    const attempt = try loadPath(allocator, io, path);
-    return switch (attempt) {
+    return switch (try loadPath(allocator, io, path)) {
         .not_found => null,
-        else => attempt,
+        .snapshot => |snapshot| snapshot,
     };
 }
 
@@ -172,8 +192,8 @@ fn loadPath(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !LoadAtt
         error.FileNotFound, error.NotDir => return .not_found,
         error.OutOfMemory => return error.OutOfMemory,
         else => {
-            log.err("could not read {s}: {t}; using built-in defaults", .{ path, err });
-            return .rejected;
+            log.err("could not read {s}: {t}", .{ path, err });
+            return error.ConfigurationReadFailed;
         },
     };
     defer allocator.free(source);
@@ -183,12 +203,12 @@ fn loadPath(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !LoadAtt
             log.info("loaded configuration from {s}", .{path});
             break :loaded .{ .snapshot = snapshot };
         },
-        .diagnostic => |diagnostic| rejected: {
+        .diagnostic => |diagnostic| {
             log.err(
-                "{s}:{d}: {s}; using built-in defaults",
+                "{s}:{d}: {s}",
                 .{ path, diagnostic.line, problemMessage(diagnostic.problem) },
             );
-            break :rejected .rejected;
+            return error.InvalidConfiguration;
         },
     };
 }

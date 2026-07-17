@@ -17,8 +17,6 @@ pub fn main(init: std.process.Init) !void {
     defer arguments.deinit();
     _ = arguments.next();
     const explicit_config = try parseArguments(&arguments);
-    var configuration = try Config.load(init.gpa, init.io, init.environ_map, explicit_config);
-    defer configuration.deinit();
     var launcher: Launcher = .init(init.gpa, init.io, init.environ_map);
     defer launcher.deinit();
     const renderer_kind: Renderer.Kind = if (init.environ_map.get("KEYWORK_RENDERER")) |value|
@@ -50,6 +48,13 @@ pub fn main(init: std.process.Init) !void {
         virtual_output,
     );
     defer server.destroy();
+    var configuration = try Config.Store.init(
+        init.gpa,
+        init.io,
+        init.environ_map,
+        explicit_config,
+    );
+    server.setConfiguration(&configuration);
     if (init.environ_map.get("KEYWORK_BLUR_RADIUS")) |value| {
         server.setWindowBlurRadius(parseBlurRadius(value) catch
             return error.InvalidBlurRadius);
@@ -69,6 +74,13 @@ pub fn main(init: std.process.Init) !void {
         server,
     );
     defer terminate_signal.remove();
+    const reload_signal = try server.eventLoop().addSignal(
+        *Server,
+        @intFromEnum(std.posix.SIG.HUP),
+        reloadConfiguration,
+        server,
+    );
+    defer reload_signal.remove();
     const child_signal = try server.eventLoop().addSignal(
         *Server,
         @intFromEnum(std.posix.SIG.CHLD),
@@ -84,7 +96,6 @@ pub fn main(init: std.process.Init) !void {
     );
     try init.environ_map.put("KEYWORK_CONTROL", control_address);
     server.setLauncher(&launcher);
-    server.setConfiguredBindings(configuration.bindings);
     var systemd: Systemd = .init(init.io, init.environ_map);
     server.setXwaylandReadyListener(.{
         .context = &systemd,
@@ -148,6 +159,13 @@ fn parseBlurRadius(value: []const u8) !u32 {
 
 fn terminate(_: c_int, server: *Server) c_int {
     server.terminate();
+    return 0;
+}
+
+fn reloadConfiguration(_: c_int, server: *Server) c_int {
+    server.reloadConfiguration() catch |err| {
+        log.warn("configuration reload failed: {t}", .{err});
+    };
     return 0;
 }
 

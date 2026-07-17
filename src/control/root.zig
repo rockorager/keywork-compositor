@@ -13,6 +13,7 @@ pub const move_focused_method = interface_name ++ ".MoveFocused";
 pub const set_layout_method = interface_name ++ ".SetLayout";
 pub const switch_workspace_method = interface_name ++ ".SwitchWorkspace";
 pub const move_focused_to_workspace_method = interface_name ++ ".MoveFocusedToWorkspace";
+pub const reload_configuration_method = interface_name ++ ".ReloadConfiguration";
 
 pub const minimum_workspace = 1;
 pub const maximum_workspace = 10;
