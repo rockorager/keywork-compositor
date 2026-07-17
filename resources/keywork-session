@@ -31,6 +31,31 @@ if systemctl --user --quiet is-active keywork-compositor.service; then
     exit 1
 fi
 
+session_started=
+cleanup() {
+    status=$?
+    trap - EXIT HUP INT TERM
+
+    # The compositor lives in the persistent user manager rather than this
+    # logind session. Queue its shutdown before a display manager tears down
+    # the session scope and kills this wrapper.
+    if [ -n "$session_started" ]; then
+        systemctl --user --no-block start \
+            --job-mode=replace-irreversibly keywork-shutdown.target || :
+    fi
+
+    systemctl --user unset-environment \
+        WAYLAND_DISPLAY DISPLAY KEYWORK_CONTROL XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP XDG_SESSION_TYPE
+    if command -v dbus-update-activation-environment >/dev/null 2>&1; then
+        dbus-update-activation-environment \
+            WAYLAND_DISPLAY= DISPLAY= KEYWORK_CONTROL= XDG_CURRENT_DESKTOP= XDG_SESSION_DESKTOP= XDG_SESSION_TYPE=
+    fi
+
+    exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+
 unset WAYLAND_DISPLAY DISPLAY KEYWORK_CONTROL
 export XDG_CURRENT_DESKTOP=keywork
 export XDG_SESSION_DESKTOP=keywork
@@ -44,16 +69,6 @@ if command -v dbus-update-activation-environment >/dev/null 2>&1; then
     dbus-update-activation-environment WAYLAND_DISPLAY= DISPLAY= KEYWORK_CONTROL=
 fi
 
+session_started=1
 systemctl --user --wait start keywork-compositor.service
-status=$?
-
-systemctl --user start --job-mode=replace-irreversibly keywork-shutdown.target
-
-systemctl --user unset-environment \
-    WAYLAND_DISPLAY DISPLAY KEYWORK_CONTROL XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP XDG_SESSION_TYPE
-if command -v dbus-update-activation-environment >/dev/null 2>&1; then
-    dbus-update-activation-environment \
-        WAYLAND_DISPLAY= DISPLAY= KEYWORK_CONTROL= XDG_CURRENT_DESKTOP= XDG_SESSION_DESKTOP= XDG_SESSION_TYPE=
-fi
-
-exit "$status"
+exit $?
