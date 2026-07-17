@@ -581,6 +581,7 @@ pub const Scrolling = struct {
                 .rect = rect,
                 .visible = clip != null,
                 .clip = clip,
+                .shadow_clip = area,
             });
             cursor +|= width +| self.inner_gap;
         }
@@ -836,4 +837,9 @@ test "scrolling outer gap insets its viewport" {
         .size = types.Size.init(60, 40),
     }, plans.items[0].rect);
     try std.testing.expectEqual(plans.items[0].rect, plans.items[0].clip.?);
+    try std.testing.expectEqual(types.Rect{
+        .x = 15,
+        .y = 25,
+        .size = types.Size.init(90, 40),
+    }, plans.items[0].shadow_clip.?);
 }

@@ -4964,6 +4964,10 @@ fn renderWindow(
         clip_box.translated(window.position.x, window.position.y)
     else
         null;
+    const shadow_clip = if (window.shadow_clip_box orelse window.clip_box) |clip_box|
+        clip_box.translated(window.position.x, window.position.y)
+    else
+        null;
     if (window.effects.blur) |blur| {
         const blur_command = [_]render.Command{
             .{ .backdrop_blur = .{
@@ -4992,7 +4996,7 @@ fn renderWindow(
                     .rect = content_rect,
                     .radius = window.effects.corner_radius,
                 },
-                .clip = window_clip,
+                .clip = shadow_clip,
             } },
         };
         try self.renderCommands(frame, &shadow_command);

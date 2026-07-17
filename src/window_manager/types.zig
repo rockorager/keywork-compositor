@@ -54,6 +54,7 @@ pub const LayoutPlan = struct {
     rect: Rect,
     visible: bool,
     clip: ?Rect = null,
+    shadow_clip: ?Rect = null,
     tiled_edges: TiledEdges = .{},
 };
 

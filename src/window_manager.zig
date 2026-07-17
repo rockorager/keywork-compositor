@@ -761,6 +761,16 @@ fn publish(self: *Self) void {
             } else null
         else
             null;
+        const shadow_clip_box: ?Scene.ClipBox = if (plan) |placement|
+            if (placement.shadow_clip) |clip| .{
+                .x = clip.x -| placement.rect.x,
+                .y = clip.y -| placement.rect.y,
+                .width = clip.size.width,
+                .height = clip.size.height,
+            } else null
+        else
+            null;
+        self.scene.setShadowClipBox(window.scene_id, shadow_clip_box);
         switch (window.backend) {
             .xdg => |id| {
                 self.xdg_shell.setWindowClipBox(id, clip_box);

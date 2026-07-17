@@ -83,9 +83,10 @@ pub const default_effects: Effects = .{
     .corner_radius = 12,
     .blur = .{ .radius = 16 },
     .shadow = .{
-        .offset = .{ .y = 8 },
-        .blur_radius = 16,
-        .color = render.Color.rgba(0, 0, 0, 96),
+        .offset = .{ .y = 10 },
+        .blur_radius = 24,
+        .spread = 3,
+        .color = render.Color.rgba(0, 0, 0, 160),
     },
 };
 
@@ -98,6 +99,7 @@ pub const Window = struct {
     effects: Effects = default_effects,
     borders: ?Borders = null,
     clip_box: ?ClipBox = null,
+    shadow_clip_box: ?ClipBox = null,
     content_clip_box: ?ClipBox = null,
     content_geometry: ?ContentGeometry = null,
 };
@@ -749,11 +751,15 @@ pub fn setBorders(self: *Self, id: Id, borders: ?Borders) void {
 }
 
 pub fn setClipBox(self: *Self, id: Id, clip_box: ?ClipBox) void {
-    setWindowClipBox(self, id, clip_box, false);
+    setWindowClipBox(self, id, clip_box, .window);
+}
+
+pub fn setShadowClipBox(self: *Self, id: Id, clip_box: ?ClipBox) void {
+    setWindowClipBox(self, id, clip_box, .shadow);
 }
 
 pub fn setContentClipBox(self: *Self, id: Id, clip_box: ?ClipBox) void {
-    setWindowClipBox(self, id, clip_box, true);
+    setWindowClipBox(self, id, clip_box, .content);
 }
 
 pub fn setContentGeometry(self: *Self, id: Id, geometry: ?ContentGeometry) void {
@@ -1069,7 +1075,12 @@ fn popupGlobalPosition(self: *Self, id: PopupId) ?Position {
     return null;
 }
 
-fn setWindowClipBox(self: *Self, id: Id, clip_box: ?ClipBox, content_only: bool) void {
+fn setWindowClipBox(
+    self: *Self,
+    id: Id,
+    clip_box: ?ClipBox,
+    target: enum { window, shadow, content },
+) void {
     if (clip_box) |box| {
         std.debug.assert(box.width > 0);
         std.debug.assert(box.height > 0);
@@ -1077,7 +1088,11 @@ fn setWindowClipBox(self: *Self, id: Id, clip_box: ?ClipBox, content_only: bool)
         std.debug.assert(box.height <= std.math.maxInt(i32));
     }
     const window = self.windows.get(id) orelse return;
-    const destination = if (content_only) &window.content_clip_box else &window.clip_box;
+    const destination = switch (target) {
+        .window => &window.clip_box,
+        .shadow => &window.shadow_clip_box,
+        .content => &window.content_clip_box,
+    };
     if (std.meta.eql(destination.*, clip_box)) return;
     destination.* = clip_box;
     if (window.mapped) self.requestRepaint();
@@ -1128,6 +1143,7 @@ test "scene keeps visual state behind generational handles" {
         .color = render.Color.rgba(0x80, 0x40, 0x20, 0xff),
     });
     scene.setClipBox(id, .{ .x = -4, .y = 2, .width = 80, .height = 60 });
+    scene.setShadowClipBox(id, .{ .x = -12, .y = -8, .width = 96, .height = 76 });
     scene.setContentClipBox(id, .{ .x = 3, .y = 4, .width = 70, .height = 50 });
     scene.setContentGeometry(id, .{
         .offset = .{ .x = 2, .y = 3 },
@@ -1154,6 +1170,12 @@ test "scene keeps visual state behind generational handles" {
         .width = 80,
         .height = 60,
     }, entry.window.clip_box.?);
+    try std.testing.expectEqual(ClipBox{
+        .x = -12,
+        .y = -8,
+        .width = 96,
+        .height = 76,
+    }, entry.window.shadow_clip_box.?);
     try std.testing.expectEqual(ClipBox{
         .x = 3,
         .y = 4,
