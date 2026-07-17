@@ -2,6 +2,8 @@
 
 const std = @import("std");
 const OutputBackend = @import("backend/output.zig");
+const Config = @import("config.zig");
+const Launcher = @import("launcher.zig");
 const Renderer = @import("render/renderer.zig").Renderer;
 const render = @import("render/types.zig");
 const Server = @import("server.zig");
@@ -11,6 +13,14 @@ const log = std.log.scoped(.main);
 const default_cursor_size = "24";
 
 pub fn main(init: std.process.Init) !void {
+    var arguments = try init.minimal.args.iterateAllocator(init.gpa);
+    defer arguments.deinit();
+    _ = arguments.next();
+    const explicit_config = try parseArguments(&arguments);
+    var configuration = try Config.load(init.gpa, init.io, init.environ_map, explicit_config);
+    defer configuration.deinit();
+    var launcher: Launcher = .init(init.gpa, init.io, init.environ_map);
+    defer launcher.deinit();
     const renderer_kind: Renderer.Kind = if (init.environ_map.get("KEYWORK_RENDERER")) |value|
         std.meta.stringToEnum(Renderer.Kind, value) orelse return error.InvalidRenderer
     else
@@ -69,7 +79,12 @@ pub fn main(init: std.process.Init) !void {
 
     const socket_name = try server.listen();
     try init.environ_map.put("WAYLAND_DISPLAY", socket_name);
-    server.setLauncherEnvironment(init.environ_map);
+    const control_address = try server.listenControl(
+        init.environ_map.get("XDG_RUNTIME_DIR") orelse return error.MissingRuntimeDirectory,
+    );
+    try init.environ_map.put("KEYWORK_CONTROL", control_address);
+    server.setLauncher(&launcher);
+    server.setConfiguredBindings(configuration.bindings);
     var systemd: Systemd = .init(init.io, init.environ_map);
     server.setXwaylandReadyListener(.{
         .context = &systemd,
@@ -77,12 +92,23 @@ pub fn main(init: std.process.Init) !void {
     });
     var buffer: [4096]u8 = undefined;
     var writer = std.Io.File.stdout().writer(init.io, &buffer);
-    try writer.interface.print("WAYLAND_DISPLAY={s}\n", .{socket_name});
+    try writer.interface.print(
+        "WAYLAND_DISPLAY={s}\nKEYWORK_CONTROL={s}\n",
+        .{ socket_name, control_address },
+    );
     try writer.interface.flush();
     server.startXwayland(init.environ_map);
-    try systemd.ready(socket_name, init.environ_map.get("XCURSOR_SIZE").?);
+    try systemd.ready(socket_name, control_address, init.environ_map.get("XCURSOR_SIZE").?);
 
     server.run();
+}
+
+fn parseArguments(arguments: anytype) !?[]const u8 {
+    const first = arguments.next() orelse return null;
+    if (!std.mem.eql(u8, first, "--config")) return error.InvalidArgument;
+    const path = arguments.next() orelse return error.MissingConfigPath;
+    if (arguments.next() != null) return error.InvalidArgument;
+    return path;
 }
 
 fn xwaylandReady(context: *anyopaque, display_name: []const u8) void {
@@ -165,6 +191,8 @@ test {
     _ = @import("slot_map.zig");
     _ = @import("window_manager.zig");
     _ = @import("builtin_keybindings.zig");
+    _ = @import("config.zig");
+    _ = @import("launcher.zig");
     _ = @import("command.zig");
     _ = @import("input_manager.zig");
     _ = @import("window_manager/types.zig");
@@ -217,5 +245,6 @@ test {
     _ = @import("wayland/viewporter.zig");
     _ = @import("wayland/xdg_shell.zig");
     _ = @import("wayland/layer_shell.zig");
+    _ = @import("control.zig");
     _ = @import("server.zig");
 }

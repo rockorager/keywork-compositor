@@ -227,6 +227,7 @@ fn addXdg(self: *Self, xdg_id: XdgShell.WindowId) !WindowId {
     errdefer _ = self.windows.remove(id);
     _ = try self.workspaces.items[workspace].workspace.insert(self.allocator, neutral(id));
     _ = self.workspaces.items[workspace].workspace.focus(neutral(id));
+    self.reportWorkspaceOccupancy(workspace);
     return id;
 }
 
@@ -234,6 +235,7 @@ fn removeId(self: *Self, id: WindowId) void {
     const pending = self.windows.get(id).?.serial != null;
     var window = self.windows.remove(id).?;
     _ = self.workspaces.items[window.workspace].workspace.remove(neutral(id));
+    self.reportWorkspaceOccupancy(window.workspace);
     window.tags.deinit(self.allocator);
     if (self.transaction.removed(pending)) self.publish();
     self.relayout();
@@ -262,7 +264,13 @@ fn addXwayland(self: *Self, xwayland_id: Xwm.WindowId) !?WindowId {
     errdefer _ = self.windows.remove(id);
     _ = try self.workspaces.items[workspace].workspace.insert(self.allocator, neutral(id));
     _ = self.workspaces.items[workspace].workspace.focus(neutral(id));
+    self.reportWorkspaceOccupancy(workspace);
     return id;
+}
+
+fn reportWorkspaceOccupancy(self: *Self, index: usize) void {
+    const entry = &self.workspaces.items[index];
+    self.workspace_protocol.setOccupied(entry.output, entry.number, entry.workspace.members.items.len != 0);
 }
 
 fn workspaceFor(self: *Self, output: OutputLayout.Id) ?usize {
@@ -333,6 +341,8 @@ pub fn outputRemoved(self: *Self, output: OutputLayout.Id) error{OutOfMemory}!vo
         );
         std.debug.assert(moved);
         entry.value.workspace = replacement_index;
+        self.reportWorkspaceOccupancy(source_index);
+        self.reportWorkspaceOccupancy(replacement_index);
         if (entry.value.fullscreen_output) |fullscreen_output| {
             if (std.meta.eql(fullscreen_output, output)) {
                 entry.value.fullscreen_output = replacement_output;
@@ -521,6 +531,8 @@ pub fn moveFocusedToWorkspace(self: *Self, number: u8) void {
     ) catch return;
     std.debug.assert(moved);
     self.windows.get(internal(id)).?.workspace = target;
+    self.reportWorkspaceOccupancy(source);
+    self.reportWorkspaceOccupancy(target);
     self.relayout();
 }
 pub fn addTagToFocused(self: *Self, tag: types.TagId) !void {

@@ -1,0 +1,26 @@
+# Control the Keywork compositor's built-in window-management policy.
+interface dev.rockorager.keywork.compositor
+
+# A direction relative to the currently focused window.
+type Direction (next, previous, left, down, up, right)
+
+# A built-in tiling layout.
+type Layout (master_stack, dwindle, scrolling)
+
+# Change focus within the active workspace.
+method Focus (direction: Direction) -> ()
+
+# Reorder the focused window within the active workspace.
+method MoveFocused (direction: Direction) -> ()
+
+# Change the active workspace's layout.
+method SetLayout (layout: Layout) -> ()
+
+# Activate a numbered workspace on the focused output.
+method SwitchWorkspace (workspace: int) -> ()
+
+# Move the focused window to a numbered workspace on the focused output.
+method MoveFocusedToWorkspace (workspace: int) -> ()
+
+# The requested workspace number is outside Keywork's supported range.
+error InvalidWorkspace (workspace: int)

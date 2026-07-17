@@ -29,7 +29,7 @@ pub const TagSet = struct {
 };
 
 pub const Workspace = struct {
-    layout: layout_mod.Layout = .{ .tiled = .{ .master_stack = .{} } },
+    layout: layout_mod.Layout = .{ .tiled = .{ .dwindle = .{} } },
     members: std.ArrayList(types.WindowId) = .empty,
     focused: ?types.WindowId = null,
 
@@ -176,12 +176,19 @@ test "workspace membership move focus and order have single ownership" {
 }
 
 test "exposed tiled policy state changes" {
-    var workspace: Workspace = .{};
+    var workspace: Workspace = .{ .layout = .init(.master_stack) };
     defer workspace.deinit(std.testing.allocator);
     workspace.layout.tiled.master_stack.setMasterCount(2);
     workspace.layout.tiled.master_stack.setMasterRatio(70);
     try std.testing.expectEqual(@as(u32, 2), workspace.layout.tiled.master_stack.master_count);
     try std.testing.expectEqual(@as(u8, 70), workspace.layout.tiled.master_stack.master_ratio_percent);
+}
+
+test "workspaces default to dwindle" {
+    var workspace: Workspace = .{};
+    defer workspace.deinit(std.testing.allocator);
+    try std.testing.expect(workspace.layout == .tiled);
+    try std.testing.expect(workspace.layout.tiled == .dwindle);
 }
 
 test "switching to dwindle reconstructs tree order and tracks membership" {

@@ -62,6 +62,10 @@ const Surface = @import("wayland/surface.zig");
 const Viewporter = @import("wayland/viewporter.zig");
 const InputManager = @import("input_manager.zig");
 const BuiltinKeybindings = @import("builtin_keybindings.zig");
+const Command = @import("command.zig").Command;
+const Config = @import("config.zig");
+const Launcher = @import("launcher.zig");
+const Control = @import("control.zig");
 const WindowManager = @import("window_manager.zig");
 
 const wl = wayland.server.wl;
@@ -70,6 +74,8 @@ const log = std.log.scoped(.server);
 allocator: std.mem.Allocator,
 io: std.Io,
 display: *wl.Server,
+control: Control,
+control_initialized: bool,
 session: Session,
 session_initialized: bool,
 drm_device: DrmDevice,
@@ -284,6 +290,8 @@ pub fn createWithVirtualOutput(
         .allocator = allocator,
         .io = io,
         .display = display,
+        .control = undefined,
+        .control_initialized = false,
         .session = undefined,
         .session_initialized = false,
         .drm_device = undefined,
@@ -871,6 +879,10 @@ pub fn createWithVirtualOutput(
 
 pub fn destroy(self: *Self) void {
     const allocator = self.allocator;
+    if (self.control_initialized) {
+        self.control.deinit();
+        self.control_initialized = false;
+    }
     if (self.drm_device_initialized) self.drm_device.clearListener();
     self.data_device.cancel();
     if (self.builtin_keybindings_initialized) self.builtin_keybindings.detachNativeInput();
@@ -1557,11 +1569,30 @@ pub fn listen(self: *Self) ![:0]const u8 {
     return socket_name;
 }
 
-pub fn setLauncherEnvironment(
-    self: *Self,
-    environ_map: *const std.process.Environ.Map,
-) void {
-    if (self.native_input_initialized) self.native_input.setEnvironMap(environ_map);
+pub fn listenControl(self: *Self, runtime_directory: []const u8) ![]const u8 {
+    std.debug.assert(self.listening and !self.control_initialized);
+    try self.control.init(
+        self.allocator,
+        self.io,
+        self.eventLoop(),
+        .{ .context = self, .execute = executeControlCommand },
+        runtime_directory,
+    );
+    self.control_initialized = true;
+    return self.control.varlinkAddress();
+}
+
+fn executeControlCommand(context: *anyopaque, command: Command) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.window_manager.execute(command);
+}
+
+pub fn setLauncher(self: *Self, launcher: *Launcher) void {
+    if (self.builtin_keybindings_initialized) self.builtin_keybindings.setLauncher(launcher);
+}
+
+pub fn setConfiguredBindings(self: *Self, bindings: []const Config.Binding) void {
+    if (self.builtin_keybindings_initialized) self.builtin_keybindings.setConfiguredBindings(bindings);
 }
 
 pub fn setXwaylandReadyListener(self: *Self, listener: XwaylandReadyListener) void {

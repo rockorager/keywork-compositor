@@ -787,7 +787,7 @@
       "blocked_by": [
         "ext-foreign-toplevel-list"
       ],
-      "status_detail": "Version 1 advertises one workspace group per output with ten permanent numbered workspaces (1 through 9 and 0), one-dimensional ordering, active-state synchronization, output hotplug, late wl_output bindings, atomic done events, and inert stopped-manager handles. Workspace activation is applied atomically on manager commit; create, remove, deactivate, and assignment capabilities are intentionally not advertised for the fixed per-output model. The privileged global is hidden from sandboxed security-context clients."
+      "status_detail": "Version 1 advertises one workspace group per output and the active or occupied numbered workspaces (1 through 10), with one-dimensional ordering, active-state synchronization, output hotplug, late wl_output bindings, atomic done events, and inert stopped-manager handles. Workspace activation is applied atomically on manager commit; create, remove, deactivate, and assignment capabilities are intentionally not advertised for the fixed per-output model. The privileged global is hidden from sandboxed security-context clients."
     },
     {
       "id": "wlr-output-management",

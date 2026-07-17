@@ -1,62 +1,26 @@
-//! Minimal, fixed key bindings for the built-in window manager.
+//! Configured key bindings for compositor policy and application launching.
 
 const Self = @This();
 
 const std = @import("std");
 const NativeInput = @import("backend/native_input.zig");
-const Command = @import("command.zig").Command;
+const Config = @import("config.zig");
+const Launcher = @import("launcher.zig");
 const KeyboardShortcutsInhibit = @import("wayland/keyboard_shortcuts_inhibit.zig");
 const InputManager = @import("input_manager.zig");
 const WindowManager = @import("window_manager.zig");
+
+const log = std.log.scoped(.keybindings);
 
 allocator: std.mem.Allocator,
 manager: *WindowManager,
 input_manager: *InputManager,
 shortcuts_inhibit: *KeyboardShortcutsInhibit,
 native_input: ?*NativeInput,
+launcher: ?*Launcher = null,
+bindings: []const Config.Binding = &.{},
 device_listener: InputManager.DeviceListener,
 held_keys: std.ArrayList(HeldKey) = .empty,
-
-const super: u32 = 1 << 6; // xkb Mod4/Logo
-const shift: u32 = 1 << 0;
-
-const Binding = struct { modifiers: u32, keysym: u32, command: Command };
-
-/// Built-in defaults: Super+h/j/k/l focus, Super+Shift+h/j/k/l move, and
-/// Super+t/d/s select master-stack, dwindle, or scrolling layout.
-const bindings = [_]Binding{
-    .{ .modifiers = super, .keysym = 'h', .command = .{ .focus_direction = .left } },
-    .{ .modifiers = super, .keysym = 'j', .command = .{ .focus_direction = .down } },
-    .{ .modifiers = super, .keysym = 'k', .command = .{ .focus_direction = .up } },
-    .{ .modifiers = super, .keysym = 'l', .command = .{ .focus_direction = .right } },
-    .{ .modifiers = super | shift, .keysym = 'h', .command = .{ .move_focused_direction = .left } },
-    .{ .modifiers = super | shift, .keysym = 'j', .command = .{ .move_focused_direction = .down } },
-    .{ .modifiers = super | shift, .keysym = 'k', .command = .{ .move_focused_direction = .up } },
-    .{ .modifiers = super | shift, .keysym = 'l', .command = .{ .move_focused_direction = .right } },
-    .{ .modifiers = super, .keysym = 't', .command = .layout_master_stack },
-    .{ .modifiers = super, .keysym = 'd', .command = .layout_dwindle },
-    .{ .modifiers = super, .keysym = 's', .command = .layout_scrolling },
-    .{ .modifiers = super, .keysym = '1', .command = .{ .switch_workspace = 1 } },
-    .{ .modifiers = super, .keysym = '2', .command = .{ .switch_workspace = 2 } },
-    .{ .modifiers = super, .keysym = '3', .command = .{ .switch_workspace = 3 } },
-    .{ .modifiers = super, .keysym = '4', .command = .{ .switch_workspace = 4 } },
-    .{ .modifiers = super, .keysym = '5', .command = .{ .switch_workspace = 5 } },
-    .{ .modifiers = super, .keysym = '6', .command = .{ .switch_workspace = 6 } },
-    .{ .modifiers = super, .keysym = '7', .command = .{ .switch_workspace = 7 } },
-    .{ .modifiers = super, .keysym = '8', .command = .{ .switch_workspace = 8 } },
-    .{ .modifiers = super, .keysym = '9', .command = .{ .switch_workspace = 9 } },
-    .{ .modifiers = super, .keysym = '0', .command = .{ .switch_workspace = 10 } },
-    .{ .modifiers = super | shift, .keysym = '1', .command = .{ .move_to_workspace = 1 } },
-    .{ .modifiers = super | shift, .keysym = '2', .command = .{ .move_to_workspace = 2 } },
-    .{ .modifiers = super | shift, .keysym = '3', .command = .{ .move_to_workspace = 3 } },
-    .{ .modifiers = super | shift, .keysym = '4', .command = .{ .move_to_workspace = 4 } },
-    .{ .modifiers = super | shift, .keysym = '5', .command = .{ .move_to_workspace = 5 } },
-    .{ .modifiers = super | shift, .keysym = '6', .command = .{ .move_to_workspace = 6 } },
-    .{ .modifiers = super | shift, .keysym = '7', .command = .{ .move_to_workspace = 7 } },
-    .{ .modifiers = super | shift, .keysym = '8', .command = .{ .move_to_workspace = 8 } },
-    .{ .modifiers = super | shift, .keysym = '9', .command = .{ .move_to_workspace = 9 } },
-    .{ .modifiers = super | shift, .keysym = '0', .command = .{ .move_to_workspace = 10 } },
-};
 
 const HeldKey = struct {
     device_id: NativeInput.DeviceId,
@@ -84,6 +48,14 @@ pub fn detachNativeInput(self: *Self) void {
     input.clearKeyboardEventListener();
     self.native_input = null;
     self.held_keys.clearRetainingCapacity();
+}
+
+pub fn setLauncher(self: *Self, launcher: *Launcher) void {
+    self.launcher = launcher;
+}
+
+pub fn setConfiguredBindings(self: *Self, bindings: []const Config.Binding) void {
+    self.bindings = bindings;
 }
 
 pub fn deinit(self: *Self) void {
@@ -123,8 +95,19 @@ fn keyPressed(self: *Self, event: NativeInput.KeyboardEvent) NativeInput.Keyboar
     }
     const disposition: NativeInput.KeyboardEventDisposition = if (self.shortcuts_inhibit.inhibitsSeatNamed(device.seat_name))
         .shortcuts_inhibited
-    else if (matchBinding(event.modifiers, event.keysyms)) |binding| blk: {
-        self.manager.execute(binding.command);
+    else if (matchBinding(self.bindings, event.modifiers, event.keysyms)) |binding| blk: {
+        switch (binding.action) {
+            .command => |command| self.manager.execute(command),
+            .run => |argv| {
+                const launcher = self.launcher orelse {
+                    log.err("cannot launch {s}: launcher is unavailable", .{argv[0]});
+                    break :blk .captured;
+                };
+                launcher.launch(argv) catch |err| {
+                    log.err("failed to launch {s}: {t}", .{ argv[0], err });
+                };
+            },
+        }
         break :blk .captured;
     } else .forwarded;
     self.held_keys.append(self.allocator, .{ .device_id = event.device_id, .key_code = event.key_code, .disposition = disposition }) catch return .captured;
@@ -140,7 +123,7 @@ fn keyReleased(self: *Self, event: NativeInput.KeyboardEvent) NativeInput.Keyboa
     return .forwarded;
 }
 
-fn matchBinding(modifiers: u32, keysyms: []const u32) ?Binding {
+fn matchBinding(bindings: []const Config.Binding, modifiers: u32, keysyms: []const u32) ?Config.Binding {
     for (bindings) |binding| {
         if (binding.modifiers != modifiers) continue;
         for (keysyms) |keysym| if (keysym == binding.keysym) return binding;
@@ -160,17 +143,13 @@ fn releaseDevice(self: *Self, id: NativeInput.DeviceId) void {
 }
 fn modifiersChanged(_: *anyopaque, _: ?NativeInput.DeviceId, _: u32, _: u32) void {}
 
-test "default bindings match every symbol and exact modifiers" {
-    try std.testing.expectEqual(.down, matchBinding(super, &.{ 0, 'j' }).?.command.focus_direction);
-    try std.testing.expectEqual(.up, matchBinding(super | shift, &.{'k'}).?.command.move_focused_direction);
-    try std.testing.expect(matchBinding(super | shift, &.{'t'}) == null);
-    try std.testing.expect(matchBinding(0, &.{'j'}) == null);
-    try std.testing.expectEqual(Command.layout_master_stack, matchBinding(super, &.{'t'}).?.command);
-    try std.testing.expectEqual(Command.layout_dwindle, matchBinding(super, &.{'d'}).?.command);
-    try std.testing.expectEqual(@as(u8, 4), matchBinding(super, &.{'4'}).?.command.switch_workspace);
-    try std.testing.expectEqual(@as(u8, 7), matchBinding(super | shift, &.{'7'}).?.command.move_to_workspace);
-    try std.testing.expectEqual(@as(u8, 10), matchBinding(super, &.{'0'}).?.command.switch_workspace);
-    try std.testing.expectEqual(@as(u8, 10), matchBinding(super | shift, &.{'0'}).?.command.move_to_workspace);
+test "binding matching checks every symbol and exact modifiers" {
+    const test_bindings = [_]Config.Binding{
+        .{ .modifiers = Config.super, .keysym = 'j', .action = .{ .command = .{ .focus_direction = .down } } },
+    };
+    try std.testing.expectEqual(.down, matchBinding(&test_bindings, Config.super, &.{ 0, 'j' }).?.action.command.focus_direction);
+    try std.testing.expect(matchBinding(&test_bindings, Config.super | Config.shift, &.{'j'}) == null);
+    try std.testing.expect(matchBinding(&test_bindings, 0, &.{'j'}) == null);
 }
 
 test "held key records press disposition for release" {

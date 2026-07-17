@@ -11,7 +11,7 @@ const SecurityContext = @import("security_context.zig");
 const wl = wayland.server.wl;
 const ext = wayland.server.ext;
 const workspace_count: u8 = 10;
-const workspace_names = [_][*:0]const u8{ "1", "2", "3", "4", "5", "6", "7", "8", "9", "0" };
+const workspace_names = [_][*:0]const u8{ "1", "2", "3", "4", "5", "6", "7", "8", "9", "10" };
 
 allocator: std.mem.Allocator,
 global: *wl.Global,
@@ -29,6 +29,12 @@ pub const ActivationListener = struct {
 const OutputState = struct {
     output: OutputLayout.Id,
     active: u8 = 1,
+    occupied: [workspace_count]bool = @splat(false),
+
+    fn isAdvertised(self: OutputState, number: u8) bool {
+        std.debug.assert(number >= 1 and number <= workspace_count);
+        return self.active == number or self.occupied[number - 1];
+    }
 };
 
 const PendingActivation = struct {
@@ -69,8 +75,28 @@ const Binding = struct {
         const manager = self.manager orelse return;
         _ = try GroupResource.create(self, manager, state.output);
         for (1..workspace_count + 1) |number| {
-            try WorkspaceResource.create(self, manager, state.output, @intCast(number), state.active == number);
+            const workspace_number: u8 = @intCast(number);
+            if (!state.isAdvertised(workspace_number)) continue;
+            try WorkspaceResource.create(self, manager, state.output, workspace_number, state.active == number);
         }
+    }
+
+    fn workspaceFor(self: *Binding, output: OutputLayout.Id, number: u8) ?*WorkspaceResource {
+        for (self.workspaces.items) |workspace| {
+            if (!workspace.removed and workspace.number == number and std.meta.eql(workspace.output, output)) {
+                return workspace;
+            }
+        }
+        return null;
+    }
+
+    fn removeWorkspace(self: *Binding, output: OutputLayout.Id, number: u8) void {
+        const workspace = self.workspaceFor(output, number) orelse return;
+        if (self.groupFor(output)) |group| {
+            if (group.resource) |group_resource| group_resource.sendWorkspaceLeave(workspace.resource);
+        }
+        workspace.resource.sendRemoved();
+        workspace.removed = true;
     }
 
     fn removeOutput(self: *Binding, output_id: OutputLayout.Id, output: *Output) void {
@@ -365,6 +391,27 @@ pub fn setActive(self: *Self, output: OutputLayout.Id, number: u8) void {
     if (self.updateActive(output, number)) self.sendDone();
 }
 
+pub fn setOccupied(self: *Self, output: OutputLayout.Id, number: u8, occupied: bool) void {
+    if (number == 0 or number > workspace_count) return;
+    const state = self.outputState(output) orelse return;
+    const was_advertised = state.isAdvertised(number);
+    if (!self.updateOccupied(output, number, occupied)) return;
+    const is_advertised = state.isAdvertised(number);
+    if (was_advertised == is_advertised) return;
+    for (self.bindings.items) |binding| {
+        const manager = binding.manager orelse continue;
+        if (is_advertised) {
+            WorkspaceResource.create(binding, manager, output, number, state.active == number) catch {
+                manager.postNoMemory();
+                continue;
+            };
+        } else {
+            binding.removeWorkspace(output, number);
+        }
+        manager.sendDone();
+    }
+}
+
 fn updateActive(self: *Self, output: OutputLayout.Id, number: u8) bool {
     if (number == 0 or number > workspace_count) return false;
     const state = self.outputState(output) orelse return false;
@@ -372,13 +419,25 @@ fn updateActive(self: *Self, output: OutputLayout.Id, number: u8) bool {
     const previous = state.active;
     state.active = number;
     for (self.bindings.items) |binding| {
-        if (binding.manager == null) continue;
-        for (binding.workspaces.items) |workspace| {
-            if (workspace.removed or !std.meta.eql(workspace.output, output)) continue;
-            if (workspace.number != previous and workspace.number != number) continue;
-            workspace.resource.sendState(.{ .active = workspace.number == number });
+        const manager = binding.manager orelse continue;
+        if (binding.workspaceFor(output, number)) |workspace| {
+            workspace.resource.sendState(.{ .active = true });
+        } else {
+            WorkspaceResource.create(binding, manager, output, number, true) catch manager.postNoMemory();
+        }
+        if (binding.workspaceFor(output, previous)) |workspace| {
+            workspace.resource.sendState(.{ .active = false });
+            if (!state.isAdvertised(previous)) binding.removeWorkspace(output, previous);
         }
     }
+    return true;
+}
+
+fn updateOccupied(self: *Self, output: OutputLayout.Id, number: u8, occupied: bool) bool {
+    if (number == 0 or number > workspace_count) return false;
+    const state = self.outputState(output) orelse return false;
+    if (state.occupied[number - 1] == occupied) return false;
+    state.occupied[number - 1] = occupied;
     return true;
 }
 
@@ -428,9 +487,30 @@ test "workspace model tracks one active numbered workspace per output" {
     try std.testing.expectEqual(@as(u8, 1), workspace.outputState(second).?.active);
     try std.testing.expect(!workspace.updateActive(first, 10));
     try std.testing.expect(!workspace.updateActive(first, 0));
+    try std.testing.expect(workspace.outputState(first).?.isAdvertised(10));
+    try std.testing.expect(!workspace.outputState(first).?.isAdvertised(1));
 }
 
-test "workspace ten is presented as zero" {
+test "workspace model tracks occupied workspaces per output" {
+    var workspace: Self = undefined;
+    workspace.output_states = .empty;
+    defer workspace.output_states.deinit(std.testing.allocator);
+
+    const first: OutputLayout.Id = .{ .index = 1, .generation = 1 };
+    const second: OutputLayout.Id = .{ .index = 2, .generation = 1 };
+    try workspace.output_states.append(std.testing.allocator, .{ .output = first });
+    try workspace.output_states.append(std.testing.allocator, .{ .output = second });
+
+    try std.testing.expect(workspace.updateOccupied(first, 10, true));
+    try std.testing.expect(workspace.outputState(first).?.occupied[9]);
+    try std.testing.expect(workspace.outputState(first).?.isAdvertised(10));
+    try std.testing.expect(!workspace.outputState(second).?.occupied[9]);
+    try std.testing.expect(!workspace.updateOccupied(first, 10, true));
+    try std.testing.expect(workspace.updateOccupied(first, 10, false));
+    try std.testing.expect(!workspace.updateOccupied(first, 0, true));
+}
+
+test "workspace names match their numbers" {
     try std.testing.expectEqualStrings("1", std.mem.span(workspace_names[0]));
-    try std.testing.expectEqualStrings("0", std.mem.span(workspace_names[9]));
+    try std.testing.expectEqualStrings("10", std.mem.span(workspace_names[9]));
 }

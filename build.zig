@@ -101,38 +101,69 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const root_module = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
+    const varlink = b.addModule("varlink", .{
+        .root_source_file = b.path("src/varlink/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const control = b.createModule(.{
+        .root_source_file = b.path("src/control/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    control.addAnonymousImport("control-interface", .{
+        .root_source_file = b.path("protocol/dev.rockorager.keywork.compositor.varlink"),
+    });
+
+    const compositor = b.createModule(.{
+        .root_source_file = b.path("src/compositor/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
-    root_module.addImport("wayland", wayland);
-    root_module.addImport("vulkan", vulkan);
-    root_module.linkSystemLibrary("libdisplay-info", .{});
-    root_module.linkSystemLibrary("libdrm", .{});
-    root_module.linkSystemLibrary("gbm", .{});
-    root_module.linkSystemLibrary("libinput", .{});
-    root_module.linkSystemLibrary("pixman-1", .{});
-    root_module.linkSystemLibrary("xcursor", .{});
-    root_module.linkSystemLibrary("libseat", .{});
-    root_module.linkSystemLibrary("libsystemd", .{});
-    root_module.linkSystemLibrary("libudev", .{});
-    root_module.linkSystemLibrary("wayland-client", .{});
-    root_module.linkSystemLibrary("wayland-server", .{});
-    root_module.linkSystemLibrary("xkbcommon", .{});
-    root_module.linkSystemLibrary("xcb", .{});
-    root_module.linkSystemLibrary("xcb-composite", .{});
-    root_module.linkSystemLibrary("xcb-icccm", .{});
-    root_module.linkSystemLibrary("xcb-res", .{});
-    root_module.linkSystemLibrary("xcb-xfixes", .{});
+    compositor.addImport("keywork-control", control);
+    compositor.addImport("varlink", varlink);
+    compositor.addImport("wayland", wayland);
+    compositor.addImport("vulkan", vulkan);
+    compositor.addAnonymousImport("default-config", .{
+        .root_source_file = b.path("resources/keywork.conf"),
+    });
+    compositor.linkSystemLibrary("libdisplay-info", .{});
+    compositor.linkSystemLibrary("libdrm", .{});
+    compositor.linkSystemLibrary("gbm", .{});
+    compositor.linkSystemLibrary("libinput", .{});
+    compositor.linkSystemLibrary("pixman-1", .{});
+    compositor.linkSystemLibrary("xcursor", .{});
+    compositor.linkSystemLibrary("libseat", .{});
+    compositor.linkSystemLibrary("libsystemd", .{});
+    compositor.linkSystemLibrary("libudev", .{});
+    compositor.linkSystemLibrary("wayland-client", .{});
+    compositor.linkSystemLibrary("wayland-server", .{});
+    compositor.linkSystemLibrary("xkbcommon", .{});
+    compositor.linkSystemLibrary("xcb", .{});
+    compositor.linkSystemLibrary("xcb-composite", .{});
+    compositor.linkSystemLibrary("xcb-icccm", .{});
+    compositor.linkSystemLibrary("xcb-res", .{});
+    compositor.linkSystemLibrary("xcb-xfixes", .{});
 
     const exe = b.addExecutable(.{
-        .name = "keywork_compositor",
-        .root_module = root_module,
+        .name = "keywork-compositor",
+        .root_module = compositor,
+    });
+    const keyworkctl_module = b.createModule(.{
+        .root_source_file = b.path("src/keyworkctl/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    keyworkctl_module.addImport("varlink", varlink);
+    keyworkctl_module.addImport("keywork-control", control);
+    const keyworkctl = b.addExecutable(.{
+        .name = "keyworkctl",
+        .root_module = keyworkctl_module,
     });
 
     b.installArtifact(exe);
+    b.installArtifact(keyworkctl);
     b.installBinFile("resources/keywork-session", "keywork-session");
     b.installFile(
         "resources/keywork-compositor.service",
@@ -150,6 +181,10 @@ pub fn build(b: *std.Build) void {
         "resources/keywork.desktop",
         "share/wayland-sessions/keywork.desktop",
     );
+    b.installFile(
+        "resources/keywork.conf",
+        "share/keywork/keywork.conf",
+    );
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -162,9 +197,13 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit tests");
     const exe_tests = b.addTest(.{
-        .root_module = root_module,
+        .root_module = compositor,
     });
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
+    const varlink_tests = b.addTest(.{ .root_module = varlink });
+    test_step.dependOn(&b.addRunArtifact(varlink_tests).step);
+    const keyworkctl_tests = b.addTest(.{ .root_module = keyworkctl_module });
+    test_step.dependOn(&b.addRunArtifact(keyworkctl_tests).step);
 
     const fmt_step = b.step("fmt", "Check code formatting");
     const fmt_check = b.addFmt(.{ .paths = &.{ "src", "build.zig", "build.zig.zon" }, .check = true });

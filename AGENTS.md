@@ -40,7 +40,7 @@ try writer.interface.print("hello {s}\n", .{"world"});
 b.addExecutable(.{
     .name = "foo",
     .root_module = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
+        .root_source_file = b.path("src/compositor/main.zig"),
         .target = target,
         .optimize = optimize,
     }),
@@ -76,7 +76,7 @@ const output = try writer.toOwnedSlice();
 - prefer `const foo: Type = .{ .field = value };` over `const foo = Type{ .field = value };`
 - preferred file order: `//!` module doc comment, `const Self = @This();`, imports, `const log = std.log.scoped(...)`
 - pass allocators explicitly; use `errdefer` for cleanup on error
-- keep tests inline with the code they cover; register them in `src/main.zig`
+- keep tests inline with the code they cover; register compositor tests in `src/compositor/main.zig`
 
 ## Safety
 

@@ -15,7 +15,7 @@ Before=xdg-desktop-autostart.target
 Slice=session.slice
 Type=notify
 ExecSearchPath=%h/.local/bin:/usr/local/bin:/usr/bin
-ExecStart=keywork_compositor
+ExecStart=keywork-compositor
 Environment=KEYWORK_OUTPUT=drm
 Environment=KEYWORK_RENDERER=vulkan
 Environment=KEYWORK_SYSTEMD_SESSION=1

@@ -32,7 +32,6 @@ next_input_device_id: DeviceId,
 tablet_tools: std.ArrayList(TabletTool),
 next_tablet_tool_id: TabletToolId,
 device_listener: ?DeviceListener,
-environ_map: ?*const std.process.Environ.Map,
 keymap_compiler: KeymapCompiler,
 default_keymap: *Keymap,
 active_keyboard: ?DeviceId,
@@ -52,7 +51,6 @@ left_ctrl_pressed: bool,
 right_ctrl_pressed: bool,
 left_alt_pressed: bool,
 right_alt_pressed: bool,
-launcher_enter_pressed: bool,
 session_switch_key: ?u32,
 suspended: bool,
 initialized: bool,
@@ -507,7 +505,6 @@ pub fn init(
         .tablet_tools = .empty,
         .next_tablet_tool_id = 1,
         .device_listener = null,
-        .environ_map = null,
         .keymap_compiler = undefined,
         .default_keymap = undefined,
         .active_keyboard = null,
@@ -527,7 +524,6 @@ pub fn init(
         .right_ctrl_pressed = false,
         .left_alt_pressed = false,
         .right_alt_pressed = false,
-        .launcher_enter_pressed = false,
         .session_switch_key = null,
         .suspended = false,
         .initialized = false,
@@ -598,10 +594,6 @@ pub fn deinit(self: *Self) void {
     self.default_keymap.unref();
     self.keymap_compiler.deinit();
     self.* = undefined;
-}
-
-pub fn setEnvironMap(self: *Self, environ_map: *const std.process.Environ.Map) void {
-    self.environ_map = environ_map;
 }
 
 pub fn setDeviceListener(self: *Self, listener: DeviceListener) void {
@@ -1426,9 +1418,6 @@ fn keyboardKey(self: *Self, event: *c.struct_libinput_event_keyboard) void {
     else
         .forwarded;
     const binding_captured = binding_disposition == .captured;
-    const shortcuts_inhibited = binding_disposition == .shortcuts_inhibited;
-    const launcher_captured = forward and !emergency_captured and !binding_captured and
-        !shortcuts_inhibited and self.handleLauncherShortcut(key, pressed);
     const old_state = stateSnapshot(keyboard);
     _ = c.xkb_state_update_key(
         keyboard.state,
@@ -1438,7 +1427,7 @@ fn keyboardKey(self: *Self, event: *c.struct_libinput_event_keyboard) void {
     const new_state = stateSnapshot(keyboard);
     if (!keyboardStatesEqual(old_state, new_state)) self.notifyKeyboardState(device);
     log.debug("key {d} {s}", .{ key, if (pressed) "pressed" else "released" });
-    if (!emergency_captured and !binding_captured and !launcher_captured) {
+    if (!emergency_captured and !binding_captured) {
         self.listener.keyboard_key(
             self.listener.context,
             device.info.id,
@@ -1475,21 +1464,6 @@ fn handleEmergencyShortcut(self: *Self, key: u32, pressed: bool) bool {
             self.session.switchSession(session) catch |err| {
                 log.err("failed to switch to VT {d}: {t}", .{ session, err });
             };
-            return true;
-        }
-    }
-    return false;
-}
-
-fn handleLauncherShortcut(self: *Self, key: u32, pressed: bool) bool {
-    if (key == c.KEY_ENTER) {
-        if (pressed and (self.left_meta_pressed or self.right_meta_pressed)) {
-            self.launcher_enter_pressed = true;
-            self.launchMonstar();
-            return true;
-        }
-        if (!pressed and self.launcher_enter_pressed) {
-            self.launcher_enter_pressed = false;
             return true;
         }
     }
@@ -1604,7 +1578,6 @@ fn resetKeyboardState(self: *Self) void {
     self.right_ctrl_pressed = false;
     self.left_alt_pressed = false;
     self.right_alt_pressed = false;
-    self.launcher_enter_pressed = false;
     self.session_switch_key = null;
     self.listener.keyboard_modifiers(self.listener.context, null, 0, 0, 0, 0);
     if (old_effective != 0) if (self.keyboard_event_listener) |listener| {
@@ -1672,21 +1645,6 @@ fn keyboardStatesEqual(a: KeyboardState, b: KeyboardState) bool {
         a.layout_index == b.layout_index and
         a.capslock_enabled == b.capslock_enabled and
         a.numlock_enabled == b.numlock_enabled;
-}
-
-// Temporary native-session launcher for hardware testing.
-fn launchMonstar(self: *Self) void {
-    const child = std.process.spawn(self.io, .{
-        .argv = &.{"monstar"},
-        .environ_map = self.environ_map,
-        .stdin = .ignore,
-        .stdout = .ignore,
-        .stderr = .inherit,
-    }) catch |err| {
-        log.err("failed to launch monstar: {t}", .{err});
-        return;
-    };
-    log.info("launched monstar (pid {d})", .{child.id.?});
 }
 
 fn pointerMotion(self: *Self, event: *c.struct_libinput_event_pointer) void {

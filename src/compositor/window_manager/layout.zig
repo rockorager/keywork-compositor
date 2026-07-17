@@ -176,10 +176,12 @@ pub const Tiled = union(enum) {
         windows: []const types.WindowInput,
         usable: types.Rect,
     ) !std.ArrayList(types.LayoutPlan) {
-        return switch (self.*) {
+        const plans = try switch (self.*) {
             .master_stack => |*policy| policy.arrange(allocator, windows, usable),
             .dwindle => |*policy| policy.arrange(allocator, windows, usable),
         };
+        setTiledShadowClips(plans.items, usable);
+        return plans;
     }
 };
 
@@ -644,6 +646,40 @@ fn intersection(a: types.Rect, b: types.Rect) ?types.Rect {
     };
 }
 
+fn setTiledShadowClips(plans: []types.LayoutPlan, usable: types.Rect) void {
+    const usable_right = @as(i64, usable.x) + usable.size.width;
+    const usable_bottom = @as(i64, usable.y) + usable.size.height;
+    for (plans, 0..) |*plan, plan_index| {
+        const rect = plan.rect;
+        const rect_right = @as(i64, rect.x) + rect.size.width;
+        const rect_bottom = @as(i64, rect.y) + rect.size.height;
+        var left: i64 = usable.x;
+        var top: i64 = usable.y;
+        var right = usable_right;
+        var bottom = usable_bottom;
+
+        for (plans, 0..) |other, other_index| {
+            if (plan_index == other_index) continue;
+            const other_right = @as(i64, other.rect.x) + other.rect.size.width;
+            const other_bottom = @as(i64, other.rect.y) + other.rect.size.height;
+            const overlaps_vertically = other_bottom > rect.y and other.rect.y < rect_bottom;
+            const overlaps_horizontally = other_right > rect.x and other.rect.x < rect_right;
+            if (overlaps_vertically and other_right <= rect.x) left = @max(left, other_right);
+            if (overlaps_vertically and other.rect.x >= rect_right) right = @min(right, other.rect.x);
+            if (overlaps_horizontally and other_bottom <= rect.y) top = @max(top, other_bottom);
+            if (overlaps_horizontally and other.rect.y >= rect_bottom) bottom = @min(bottom, other.rect.y);
+        }
+
+        std.debug.assert(left <= rect.x and top <= rect.y);
+        std.debug.assert(right >= rect_right and bottom >= rect_bottom);
+        plan.shadow_clip = .{
+            .x = @intCast(left),
+            .y = @intCast(top),
+            .size = types.Size.init(@intCast(right - left), @intCast(bottom - top)),
+        };
+    }
+}
+
 fn inputFor(windows: []const types.WindowInput, id: types.WindowId) ?types.WindowInput {
     for (windows) |window| if (window.id.eql(id)) return window;
     return null;
@@ -720,6 +756,23 @@ test "master stack geometry is deterministic with offsets gaps and remainders" {
         try std.testing.expectEqual(rects.len, plans.items.len);
         for (plans.items, rects) |plan, rect| try std.testing.expectEqual(rect, plan.rect);
     }
+}
+
+test "tiled shadows stop at neighboring window edges" {
+    var layout: Layout = .{ .tiled = .{ .master_stack = .{ .outer_gap = 8, .inner_gap = 8 } } };
+    var plans = try layout.arrange(std.testing.allocator, &.{ input(0, 10), input(1, 10) }, .{
+        .x = 0,
+        .y = 0,
+        .size = types.Size.init(100, 100),
+    }, null);
+    defer plans.deinit(std.testing.allocator);
+
+    const first = plans.items[0];
+    const second = plans.items[1];
+    try std.testing.expectEqual(@as(i32, 0), first.shadow_clip.?.x);
+    try std.testing.expectEqual(@as(u32, @intCast(second.rect.x)), first.shadow_clip.?.size.width);
+    try std.testing.expectEqual(first.rect.x + @as(i32, @intCast(first.rect.size.width)), second.shadow_clip.?.x);
+    try std.testing.expectEqual(@as(u32, 100) - @as(u32, @intCast(second.shadow_clip.?.x)), second.shadow_clip.?.size.width);
 }
 
 test "tiny areas emit every window once without zero sizes" {
