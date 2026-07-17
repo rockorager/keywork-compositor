@@ -451,7 +451,7 @@ pub fn createWithVirtualOutput(
             drm_output.logical_y = 0;
             const id = try self.addRenderOutput(io, .{ .kind = .drm, .size = drm_output.size, .position = .{ .x = x }, .name = "DRM", .description = "Keywork DRM output", .model = "drm-kms", .drm_output = drm_output });
             if (index == 0) render_output_id = id;
-            x += @intCast(drm_output.size.width);
+            x += @intCast(drm_output.logicalSize().width);
         }
     } else render_output_id = try self.addRenderOutput(io, .{
         .kind = output_kind,
@@ -3500,7 +3500,7 @@ fn captureSourceConstraints(
     return switch (target) {
         .output => |output_id| output: {
             const render_output = self.renderOutputForProtocol(output_id) orelse return null;
-            break :output .{ .size = render_output.backend.size() };
+            break :output .{ .size = render_output.backend.modeSize() };
         },
         .toplevel => |window_id| toplevel: {
             const bounds = self.toplevelCaptureBounds(window_id) orelse return null;
@@ -3516,11 +3516,11 @@ fn screencopyConstraints(context: *anyopaque, target: Screencopy.Target) ?render
         const physical = scaledScreencopyRegion(
             region,
             render_output.backend.renderScale(),
-            render_output.backend.size(),
+            render_output.backend.modeSize(),
         ) orelse return null;
         return .{ .width = physical.width, .height = physical.height };
     }
-    return render_output.backend.size();
+    return render_output.backend.modeSize();
 }
 
 fn xwaylandSurfaceAssociated(context: *anyopaque, serial: u64, surface_id: Surface.Id) void {
@@ -4369,6 +4369,39 @@ test "screencopy region follows full output fractional pixel boundaries" {
     );
 }
 
+test "output capture uses pixel dimensions at fractional scale" {
+    const server = try Self.createWithVirtualOutput(
+        std.testing.allocator,
+        std.testing.io,
+        .cpu,
+        .headless,
+        null,
+        .{
+            .size = .{ .width = 6, .height = 3 },
+            .scale = .{ .numerator = 180 },
+        },
+    );
+    defer server.destroy();
+    const output = server.primaryRenderOutput();
+
+    try std.testing.expectEqual(
+        render.Size{ .width = 6, .height = 3 },
+        captureSourceConstraints(server, .{ .output = output.protocol_id }).?.size,
+    );
+    try std.testing.expectEqual(
+        render.Size{ .width = 6, .height = 3 },
+        screencopyConstraints(server, .{ .output = output.protocol_id }).?,
+    );
+
+    var pixels: [18]u32 = undefined;
+    try server.captureOutput(output.protocol_id, false, .{
+        .size = .{ .width = 6, .height = 3 },
+        .stride_pixels = 6,
+        .pixels = &pixels,
+    });
+    for (pixels) |pixel| try std.testing.expectEqual(@as(u32, 0xff18181b), pixel);
+}
+
 test "damage scaling covers fractional sampling edges" {
     try std.testing.expectEqual(
         render.Rect{ .x = 0, .y = 0, .width = 4, .height = 4 },
@@ -4411,13 +4444,13 @@ fn captureOutputRegion(
         const physical = scaledScreencopyRegion(
             region,
             render_output.backend.renderScale(),
-            render_output.backend.size(),
+            render_output.backend.modeSize(),
         ) orelse return error.InvalidTarget;
         if (!std.meta.eql(pixel_buffer.size, render.Size{
             .width = physical.width,
             .height = physical.height,
         })) return error.InvalidTarget;
-        const full_size = render_output.backend.size();
+        const full_size = render_output.backend.modeSize();
         const pixel_count = full_size.pixelCount() catch return error.OutOfMemory;
         const pixels = self.allocator.alloc(u32, pixel_count) catch return error.OutOfMemory;
         defer self.allocator.free(pixels);
@@ -4439,7 +4472,7 @@ fn captureOutputRegion(
         return;
     }
     const scale = render_output.backend.renderScale();
-    const expected_size = render_output.backend.size();
+    const expected_size = render_output.backend.modeSize();
     if (!std.meta.eql(pixel_buffer.size, expected_size)) return error.InvalidTarget;
     const visible_rect = output.logicalRect();
     try self.renderer.beginFrame(
