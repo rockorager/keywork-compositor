@@ -15,8 +15,11 @@ const WorkspaceProtocol = @import("wayland/workspace.zig");
 const Xwm = @import("xwayland/xwm.zig");
 const XwaylandController = @import("window_manager/backend.zig").XwaylandController;
 const types = @import("window_manager/types.zig");
+const layout_mod = @import("window_manager/layout.zig");
 const workspace_mod = @import("window_manager/workspace.zig");
-const Command = @import("command.zig").Command;
+const command_mod = @import("command.zig");
+const Command = command_mod.Command;
+const Direction = command_mod.Direction;
 
 const wl = wayland.server.wl;
 const workspace_count = 10;
@@ -314,7 +317,7 @@ pub fn outputRemoved(self: *Self, output: OutputLayout.Id) error{OutOfMemory}!vo
             migration_count += 1;
         }
     }
-    try self.workspaces.items[replacement_index].workspace.members.ensureUnusedCapacity(
+    try self.workspaces.items[replacement_index].workspace.ensureInsertCapacity(
         self.allocator,
         migration_count,
     );
@@ -322,12 +325,13 @@ pub fn outputRemoved(self: *Self, output: OutputLayout.Id) error{OutOfMemory}!vo
     while (it.next()) |entry| {
         const source_index = entry.value.workspace;
         if (!std.meta.eql(self.workspaces.items[source_index].output, output)) continue;
-        _ = try workspace_mod.Workspace.moveWindow(
+        const moved = try workspace_mod.Workspace.moveWindow(
             self.allocator,
             &self.workspaces.items[source_index].workspace,
             &self.workspaces.items[replacement_index].workspace,
             neutral(entry.id),
         );
+        std.debug.assert(moved);
         entry.value.workspace = replacement_index;
         if (entry.value.fullscreen_output) |fullscreen_output| {
             if (std.meta.eql(fullscreen_output, output)) {
@@ -424,9 +428,12 @@ pub fn execute(self: *Self, command: Command) void {
     switch (command) {
         .focus_next => self.focusNext(),
         .focus_previous => self.focusPrevious(),
+        .focus_direction => |direction| self.focusDirection(direction),
         .move_focused_next => self.moveFocusedNext(),
         .move_focused_previous => self.moveFocusedPrevious(),
-        .layout_tiled => self.switchLayout(.tiled),
+        .move_focused_direction => |direction| self.moveFocusedDirection(direction),
+        .layout_master_stack => self.switchLayout(.master_stack),
+        .layout_dwindle => self.switchLayout(.dwindle),
         .layout_scrolling => self.switchLayout(.scrolling),
         .switch_workspace => |number| self.switchWorkspace(number),
         .move_to_workspace => |number| self.moveFocusedToWorkspace(number),
@@ -439,18 +446,41 @@ pub fn focusNext(self: *Self) void {
 pub fn focusPrevious(self: *Self) void {
     self.cycleFocus(true);
 }
+pub fn focusDirection(self: *Self, direction: Direction) void {
+    const index = self.workspaceFor(self.default_output) orelse return;
+    const workspace = &self.workspaces.items[index].workspace;
+    const candidate = self.directionalNeighbor(workspace, direction) orelse return;
+    const changed = workspace.focus(candidate);
+    std.debug.assert(changed);
+    self.relayout();
+}
 pub fn moveFocusedNext(self: *Self) void {
     self.moveFocused(false);
 }
 pub fn moveFocusedPrevious(self: *Self) void {
     self.moveFocused(true);
 }
-pub fn switchLayout(self: *Self, kind: enum { tiled, scrolling }) void {
+pub fn moveFocusedDirection(self: *Self, direction: Direction) void {
     const index = self.workspaceFor(self.default_output) orelse return;
-    self.workspaces.items[index].workspace.layout = switch (kind) {
-        .tiled => .{ .tiled = .{ .master_stack = .{} } },
-        .scrolling => .{ .scrolling = .{} },
-    };
+    const workspace = &self.workspaces.items[index].workspace;
+    const focused = workspace.focused orelse return;
+    const candidate = self.directionalNeighbor(workspace, direction) orelse return;
+    const changed = workspace.swapWindows(focused, candidate);
+    std.debug.assert(changed);
+    self.relayout();
+}
+pub fn switchLayout(self: *Self, kind: layout_mod.Kind) void {
+    const index = self.workspaceFor(self.default_output) orelse return;
+    const entry = &self.workspaces.items[index];
+    var usable: ?types.Rect = null;
+    if (self.layer_shell.usableAreaFor(entry.output)) |area| {
+        if (area.width > 0 and area.height > 0) usable = .{
+            .x = area.x,
+            .y = area.y,
+            .size = types.Size.init(@intCast(area.width), @intCast(area.height)),
+        };
+    }
+    entry.workspace.setLayout(self.allocator, kind, usable) catch return;
     self.relayout();
 }
 
@@ -483,12 +513,13 @@ pub fn moveFocusedToWorkspace(self: *Self, number: u8) void {
     const target = self.workspaceNumber(self.default_output, number) orelse return;
     if (source == target) return;
     const id = self.workspaces.items[source].workspace.focused orelse return;
-    _ = workspace_mod.Workspace.moveWindow(
+    const moved = workspace_mod.Workspace.moveWindow(
         self.allocator,
         &self.workspaces.items[source].workspace,
         &self.workspaces.items[target].workspace,
         id,
     ) catch return;
+    std.debug.assert(moved);
     self.windows.get(internal(id)).?.workspace = target;
     self.relayout();
 }
@@ -507,19 +538,12 @@ fn cycleFocus(self: *Self, reverse: bool) void {
     const index = self.workspaceFor(self.default_output) orelse return;
     const ws = &self.workspaces.items[index].workspace;
     if (ws.members.items.len == 0) return;
-    var current: usize = 0;
-    for (ws.members.items, 0..) |id, i| if (ws.focused != null and id.eql(ws.focused.?)) {
-        current = i;
-        break;
-    };
-    for (1..ws.members.items.len + 1) |offset| {
-        const candidate_index = if (reverse)
-            (current + ws.members.items.len - offset % ws.members.items.len) % ws.members.items.len
-        else
-            (current + offset) % ws.members.items.len;
-        const window = self.windows.get(internal(ws.members.items[candidate_index])) orelse continue;
+    var candidate = ws.focused orelse ws.members.items[0];
+    for (0..ws.members.items.len) |_| {
+        candidate = ws.nextWindow(candidate, reverse) orelse return;
+        const window = self.windows.get(internal(candidate)) orelse continue;
         if (window.minimized) continue;
-        ws.focused = ws.members.items[candidate_index];
+        ws.focused = candidate;
         break;
     }
     self.relayout();
@@ -528,12 +552,33 @@ fn moveFocused(self: *Self, reverse: bool) void {
     const index = self.workspaceFor(self.default_output) orelse return;
     const ws = &self.workspaces.items[index].workspace;
     const focused = ws.focused orelse return;
-    for (ws.members.items, 0..) |id, i| if (id.eql(focused)) {
-        const other = if (reverse) (i + ws.members.items.len - 1) % ws.members.items.len else (i + 1) % ws.members.items.len;
-        std.mem.swap(types.WindowId, &ws.members.items[i], &ws.members.items[other]);
-        break;
-    };
+    const other = ws.nextWindow(focused, reverse) orelse return;
+    _ = ws.swapWindows(focused, other);
     self.relayout();
+}
+
+fn directionalNeighbor(
+    self: *Self,
+    workspace: *const workspace_mod.Workspace,
+    direction: Direction,
+) ?types.WindowId {
+    const focused = workspace.focused orelse return null;
+    const focused_window = self.windows.get(internal(focused)) orelse return null;
+    const origin = if (focused_window.placement) |plan| plan.rect else return null;
+    var best_id: ?types.WindowId = null;
+    var best_score: ?DirectionalScore = null;
+    for (workspace.members.items) |id| {
+        if (id.eql(focused)) continue;
+        const window = self.windows.get(internal(id)) orelse continue;
+        if (window.minimized) continue;
+        const candidate = if (window.placement) |plan| plan.rect else continue;
+        const score = directionalScore(origin, candidate, direction) orelse continue;
+        if (best_score == null or score.lessThan(best_score.?)) {
+            best_id = id;
+            best_score = score;
+        }
+    }
+    return best_id;
 }
 
 fn relayout(self: *Self) void {
@@ -663,21 +708,22 @@ fn relayout(self: *Self) void {
 }
 
 fn normalizeFocus(self: *Self, entry: *OutputWorkspace) void {
-    if (entry.workspace.focused) |focused| {
-        if (self.windows.get(internal(focused))) |window| {
-            if (!window.minimized) return;
-        }
-    }
-    entry.workspace.focused = null;
-    var index = entry.workspace.members.items.len;
-    while (index > 0) {
-        index -= 1;
-        const id = entry.workspace.members.items[index];
-        const window = self.windows.get(internal(id)) orelse continue;
-        if (window.minimized) continue;
-        entry.workspace.focused = id;
+    const workspace = &entry.workspace;
+    if (workspace.members.items.len == 0) {
+        workspace.focused = null;
         return;
     }
+    var candidate = workspace.focused orelse workspace.members.items[0];
+    for (0..workspace.members.items.len) |_| {
+        if (self.windows.get(internal(candidate))) |window| {
+            if (!window.minimized) {
+                workspace.focused = candidate;
+                return;
+            }
+        }
+        candidate = workspace.nextWindow(candidate, false) orelse break;
+    }
+    workspace.focused = null;
 }
 
 fn publish(self: *Self) void {
@@ -747,6 +793,60 @@ fn publish(self: *Self) void {
 
 fn clampI16(value: i32) i16 {
     return @intCast(std.math.clamp(value, std.math.minInt(i16), std.math.maxInt(i16)));
+}
+
+const DirectionalScore = struct {
+    off_axis: bool,
+    primary: u64,
+    secondary: u64,
+
+    fn lessThan(self: DirectionalScore, other: DirectionalScore) bool {
+        if (self.off_axis != other.off_axis) return !self.off_axis;
+        if (self.primary != other.primary) return self.primary < other.primary;
+        return self.secondary < other.secondary;
+    }
+};
+
+fn directionalScore(origin: types.Rect, candidate: types.Rect, direction: Direction) ?DirectionalScore {
+    const origin_x = doubledCenter(origin.x, origin.size.width);
+    const origin_y = doubledCenter(origin.y, origin.size.height);
+    const candidate_x = doubledCenter(candidate.x, candidate.size.width);
+    const candidate_y = doubledCenter(candidate.y, candidate.size.height);
+    const primary_delta: i64 = switch (direction) {
+        .left => origin_x - candidate_x,
+        .right => candidate_x - origin_x,
+        .up => origin_y - candidate_y,
+        .down => candidate_y - origin_y,
+    };
+    if (primary_delta <= 0) return null;
+    const horizontal = direction == .left or direction == .right;
+    const secondary_delta = if (horizontal)
+        absoluteDifference(origin_y, candidate_y)
+    else
+        absoluteDifference(origin_x, candidate_x);
+    const overlap = if (horizontal)
+        rangesOverlap(origin.y, origin.size.height, candidate.y, candidate.size.height)
+    else
+        rangesOverlap(origin.x, origin.size.width, candidate.x, candidate.size.width);
+    return .{
+        .off_axis = !overlap,
+        .primary = @intCast(primary_delta),
+        .secondary = secondary_delta,
+    };
+}
+
+fn doubledCenter(start: i32, length: u32) i64 {
+    return 2 * @as(i64, start) + length;
+}
+
+fn absoluteDifference(first: i64, second: i64) u64 {
+    return @intCast(if (first >= second) first - second else second - first);
+}
+
+fn rangesOverlap(first_start: i32, first_length: u32, second_start: i32, second_length: u32) bool {
+    const first_end = @as(i64, first_start) + first_length;
+    const second_end = @as(i64, second_start) + second_length;
+    return @as(i64, first_start) < second_end and @as(i64, second_start) < first_end;
 }
 
 fn displayed(mapped: bool, minimized: bool, active: bool, plan: ?types.LayoutPlan) bool {
@@ -976,4 +1076,20 @@ test "XDG configure is sent only for initial or changed state" {
         dimensions,
         configuration,
     ));
+}
+
+test "directional navigation prefers aligned neighbors then distance" {
+    const origin: types.Rect = .{ .x = 40, .y = 40, .size = types.Size.init(20, 20) };
+    const aligned_left: types.Rect = .{ .x = 0, .y = 45, .size = types.Size.init(20, 10) };
+    const closer_aligned_left: types.Rect = .{ .x = 20, .y = 45, .size = types.Size.init(10, 10) };
+    const diagonal_left: types.Rect = .{ .x = 30, .y = 0, .size = types.Size.init(10, 10) };
+    const right: types.Rect = .{ .x = 70, .y = 40, .size = types.Size.init(20, 20) };
+
+    const aligned_score = directionalScore(origin, aligned_left, .left).?;
+    const closer_aligned_score = directionalScore(origin, closer_aligned_left, .left).?;
+    const diagonal_score = directionalScore(origin, diagonal_left, .left).?;
+    try std.testing.expect(aligned_score.lessThan(diagonal_score));
+    try std.testing.expect(closer_aligned_score.lessThan(aligned_score));
+    try std.testing.expect(directionalScore(origin, right, .left) == null);
+    try std.testing.expect(directionalScore(origin, right, .right) != null);
 }

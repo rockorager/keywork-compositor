@@ -34,6 +34,7 @@ pub const Workspace = struct {
     focused: ?types.WindowId = null,
 
     pub fn deinit(self: *Workspace, allocator: std.mem.Allocator) void {
+        self.layout.deinit(allocator);
         self.members.deinit(allocator);
     }
 
@@ -43,16 +44,22 @@ pub const Workspace = struct {
 
     pub fn insert(self: *Workspace, allocator: std.mem.Allocator, id: types.WindowId) !bool {
         if (self.contains(id)) return false;
-        try self.members.append(allocator, id);
+        try self.ensureInsertCapacity(allocator, 1);
+        try self.layout.windowAdded(allocator, id, self.focused);
+        self.members.appendAssumeCapacity(id);
         if (self.focused == null) self.focused = id;
         return true;
     }
 
     pub fn remove(self: *Workspace, id: types.WindowId) bool {
         const index = self.indexOf(id) orelse return false;
+        const next_focus = if (self.focused != null and self.focused.?.eql(id) and self.members.items.len > 1)
+            self.nextWindow(id, false)
+        else
+            self.focused;
+        self.layout.windowRemoved(id);
         _ = self.members.orderedRemove(index);
-        if (self.focused != null and self.focused.?.eql(id))
-            self.focused = if (self.members.items.len == 0) null else self.members.items[@min(index, self.members.items.len - 1)];
+        self.focused = if (self.members.items.len == 0) null else next_focus;
         return true;
     }
 
@@ -71,11 +78,62 @@ pub const Workspace = struct {
 
     pub fn moveWindow(allocator: std.mem.Allocator, from: *Workspace, to: *Workspace, id: types.WindowId) !bool {
         if (!from.contains(id) or to.contains(id)) return false;
-        try to.members.ensureUnusedCapacity(allocator, 1);
+        try to.ensureInsertCapacity(allocator, 1);
         const was_focused = from.focused != null and from.focused.?.eql(id);
+        try to.layout.windowAdded(allocator, id, to.focused);
         std.debug.assert(from.remove(id));
         to.members.appendAssumeCapacity(id);
         if (to.focused == null or was_focused) to.focused = id;
+        return true;
+    }
+
+    pub fn ensureInsertCapacity(
+        self: *Workspace,
+        allocator: std.mem.Allocator,
+        additional_count: usize,
+    ) error{OutOfMemory}!void {
+        try self.members.ensureUnusedCapacity(allocator, additional_count);
+        try self.layout.ensureWindowCapacity(allocator, additional_count);
+    }
+
+    pub fn setLayout(
+        self: *Workspace,
+        allocator: std.mem.Allocator,
+        kind: layout_mod.Kind,
+        usable: ?types.Rect,
+    ) error{OutOfMemory}!void {
+        var replacement: layout_mod.Layout = .init(kind);
+        errdefer replacement.deinit(allocator);
+        if (usable) |area| replacement.setUsableArea(area);
+        try replacement.ensureWindowCapacity(allocator, self.members.items.len);
+        var insertion_focus: ?types.WindowId = null;
+        for (self.members.items) |id| {
+            try replacement.windowAdded(allocator, id, insertion_focus);
+            insertion_focus = id;
+        }
+        self.layout.deinit(allocator);
+        self.layout = replacement;
+    }
+
+    pub fn nextWindow(
+        self: *const Workspace,
+        current: types.WindowId,
+        reverse: bool,
+    ) ?types.WindowId {
+        if (self.layout.usesTreeOrder()) return self.layout.nextWindow(current, reverse);
+        const current_index = self.indexOf(current) orelse return null;
+        const next_index = if (reverse)
+            (current_index + self.members.items.len - 1) % self.members.items.len
+        else
+            (current_index + 1) % self.members.items.len;
+        return self.members.items[next_index];
+    }
+
+    pub fn swapWindows(self: *Workspace, first: types.WindowId, second: types.WindowId) bool {
+        const first_index = self.indexOf(first) orelse return false;
+        const second_index = self.indexOf(second) orelse return false;
+        self.layout.swapWindows(first, second);
+        std.mem.swap(types.WindowId, &self.members.items[first_index], &self.members.items[second_index]);
         return true;
     }
 
@@ -119,8 +177,43 @@ test "workspace membership move focus and order have single ownership" {
 
 test "exposed tiled policy state changes" {
     var workspace: Workspace = .{};
+    defer workspace.deinit(std.testing.allocator);
     workspace.layout.tiled.master_stack.setMasterCount(2);
     workspace.layout.tiled.master_stack.setMasterRatio(70);
     try std.testing.expectEqual(@as(u32, 2), workspace.layout.tiled.master_stack.master_count);
     try std.testing.expectEqual(@as(u8, 70), workspace.layout.tiled.master_stack.master_ratio_percent);
+}
+
+test "switching to dwindle reconstructs tree order and tracks membership" {
+    var workspace: Workspace = .{};
+    defer workspace.deinit(std.testing.allocator);
+    const first = types.id(1);
+    const second = types.id(2);
+    const third = types.id(3);
+    try std.testing.expect(try workspace.insert(std.testing.allocator, first));
+    try std.testing.expect(try workspace.insert(std.testing.allocator, second));
+    try std.testing.expect(try workspace.insert(std.testing.allocator, third));
+    try workspace.setLayout(std.testing.allocator, .dwindle, .{
+        .x = 0,
+        .y = 0,
+        .size = types.Size.init(120, 80),
+    });
+
+    var plans = try workspace.layout.arrange(std.testing.allocator, &.{
+        .{ .id = first, .current = types.Size.init(10, 10) },
+        .{ .id = second, .current = types.Size.init(10, 10) },
+        .{ .id = third, .current = types.Size.init(10, 10) },
+    }, .{ .x = 0, .y = 0, .size = types.Size.init(120, 80) }, workspace.focused);
+    defer plans.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(i32, 8), plans.items[0].rect.x);
+    try std.testing.expectEqual(@as(i32, 64), plans.items[1].rect.x);
+    try std.testing.expectEqual(@as(i32, 8), plans.items[1].rect.y);
+    try std.testing.expectEqual(@as(i32, 44), plans.items[2].rect.y);
+
+    try std.testing.expectEqual(second, workspace.nextWindow(first, false).?);
+    try std.testing.expect(workspace.swapWindows(first, second));
+    try std.testing.expectEqual(third, workspace.nextWindow(first, false).?);
+    try std.testing.expect(workspace.remove(first));
+    try std.testing.expectEqual(third, workspace.focused.?);
+    try std.testing.expectEqual(second, workspace.nextWindow(third, false).?);
 }

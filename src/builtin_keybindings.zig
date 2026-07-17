@@ -22,14 +22,19 @@ const shift: u32 = 1 << 0;
 
 const Binding = struct { modifiers: u32, keysym: u32, command: Command };
 
-/// Built-in defaults: Super+j/k focus, Super+Shift+j/k move, and
-/// Super+t/s select tiled/scrolling layout.
+/// Built-in defaults: Super+h/j/k/l focus, Super+Shift+h/j/k/l move, and
+/// Super+t/d/s select master-stack, dwindle, or scrolling layout.
 const bindings = [_]Binding{
-    .{ .modifiers = super, .keysym = 'j', .command = .focus_next },
-    .{ .modifiers = super, .keysym = 'k', .command = .focus_previous },
-    .{ .modifiers = super | shift, .keysym = 'j', .command = .move_focused_next },
-    .{ .modifiers = super | shift, .keysym = 'k', .command = .move_focused_previous },
-    .{ .modifiers = super, .keysym = 't', .command = .layout_tiled },
+    .{ .modifiers = super, .keysym = 'h', .command = .{ .focus_direction = .left } },
+    .{ .modifiers = super, .keysym = 'j', .command = .{ .focus_direction = .down } },
+    .{ .modifiers = super, .keysym = 'k', .command = .{ .focus_direction = .up } },
+    .{ .modifiers = super, .keysym = 'l', .command = .{ .focus_direction = .right } },
+    .{ .modifiers = super | shift, .keysym = 'h', .command = .{ .move_focused_direction = .left } },
+    .{ .modifiers = super | shift, .keysym = 'j', .command = .{ .move_focused_direction = .down } },
+    .{ .modifiers = super | shift, .keysym = 'k', .command = .{ .move_focused_direction = .up } },
+    .{ .modifiers = super | shift, .keysym = 'l', .command = .{ .move_focused_direction = .right } },
+    .{ .modifiers = super, .keysym = 't', .command = .layout_master_stack },
+    .{ .modifiers = super, .keysym = 'd', .command = .layout_dwindle },
     .{ .modifiers = super, .keysym = 's', .command = .layout_scrolling },
     .{ .modifiers = super, .keysym = '1', .command = .{ .switch_workspace = 1 } },
     .{ .modifiers = super, .keysym = '2', .command = .{ .switch_workspace = 2 } },
@@ -156,10 +161,12 @@ fn releaseDevice(self: *Self, id: NativeInput.DeviceId) void {
 fn modifiersChanged(_: *anyopaque, _: ?NativeInput.DeviceId, _: u32, _: u32) void {}
 
 test "default bindings match every symbol and exact modifiers" {
-    try std.testing.expectEqual(Command.focus_next, matchBinding(super, &.{ 0, 'j' }).?.command);
-    try std.testing.expectEqual(Command.move_focused_previous, matchBinding(super | shift, &.{'k'}).?.command);
+    try std.testing.expectEqual(.down, matchBinding(super, &.{ 0, 'j' }).?.command.focus_direction);
+    try std.testing.expectEqual(.up, matchBinding(super | shift, &.{'k'}).?.command.move_focused_direction);
     try std.testing.expect(matchBinding(super | shift, &.{'t'}) == null);
     try std.testing.expect(matchBinding(0, &.{'j'}) == null);
+    try std.testing.expectEqual(Command.layout_master_stack, matchBinding(super, &.{'t'}).?.command);
+    try std.testing.expectEqual(Command.layout_dwindle, matchBinding(super, &.{'d'}).?.command);
     try std.testing.expectEqual(@as(u8, 4), matchBinding(super, &.{'4'}).?.command.switch_workspace);
     try std.testing.expectEqual(@as(u8, 7), matchBinding(super | shift, &.{'7'}).?.command.move_to_workspace);
     try std.testing.expectEqual(@as(u8, 10), matchBinding(super, &.{'0'}).?.command.switch_workspace);
