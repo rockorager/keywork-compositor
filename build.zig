@@ -6,7 +6,6 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const scanner = Scanner.create(b, .{});
-    const river = b.dependency("river", .{});
     const vulkan = b.dependency("vulkan", .{
         .registry = b.dependency("vulkan_headers", .{}).path("registry/vk.xml"),
     }).module("vulkan-zig");
@@ -45,15 +44,9 @@ pub fn build(b: *std.Build) void {
     scanner.addCustomProtocol(b.path("protocol/wlr-foreign-toplevel-management-unstable-v1.xml"));
     scanner.addCustomProtocol(b.path("protocol/wlr-output-management-unstable-v1.xml"));
     scanner.addCustomProtocol(b.path("protocol/wlr-screencopy-unstable-v1.xml"));
-    scanner.addCustomProtocol(river.path("protocol/upstream/virtual-keyboard-unstable-v1.xml"));
-    scanner.addCustomProtocol(river.path("protocol/upstream/wlr-layer-shell-unstable-v1.xml"));
-    scanner.addCustomProtocol(river.path("protocol/upstream/wlr-output-power-management-unstable-v1.xml"));
-    scanner.addCustomProtocol(river.path("protocol/river-window-management-v1.xml"));
-    scanner.addCustomProtocol(river.path("protocol/river-layer-shell-v1.xml"));
-    scanner.addCustomProtocol(river.path("protocol/river-input-management-v1.xml"));
-    scanner.addCustomProtocol(river.path("protocol/river-libinput-config-v1.xml"));
-    scanner.addCustomProtocol(river.path("protocol/river-xkb-config-v1.xml"));
-    scanner.addCustomProtocol(river.path("protocol/river-xkb-bindings-v1.xml"));
+    scanner.addCustomProtocol(b.path("protocol/upstream/virtual-keyboard-unstable-v1.xml"));
+    scanner.addCustomProtocol(b.path("protocol/upstream/wlr-layer-shell-unstable-v1.xml"));
+    scanner.addCustomProtocol(b.path("protocol/upstream/wlr-output-power-management-unstable-v1.xml"));
     scanner.generate("wl_compositor", 7);
     scanner.generate("wl_subcompositor", 1);
     scanner.generate("wl_shm", 2);
@@ -101,12 +94,6 @@ pub fn build(b: *std.Build) void {
     scanner.generate("zwlr_screencopy_manager_v1", 3);
     scanner.generate("zwlr_layer_shell_v1", 5);
     scanner.generate("zwlr_output_power_manager_v1", 1);
-    scanner.generate("river_window_manager_v1", 5);
-    scanner.generate("river_layer_shell_v1", 1);
-    scanner.generate("river_input_manager_v1", 2);
-    scanner.generate("river_libinput_config_v1", 2);
-    scanner.generate("river_xkb_config_v1", 2);
-    scanner.generate("river_xkb_bindings_v1", 3);
 
     const wayland = b.createModule(.{
         .root_source_file = scanner.result,

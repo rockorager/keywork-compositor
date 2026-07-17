@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "updated": "2026-07-15",
+  "updated": "2026-07-17",
   "baseline": {
     "wayland": "1.25.0",
     "wayland_protocols": "1.49"
@@ -231,29 +231,6 @@
       "status_detail": "Manager and toplevel-decoration lifecycles, mode negotiation, configure events, and initial-configure ordering are implemented through v2."
     },
     {
-      "id": "river-window-management",
-      "priority": "P0",
-      "priority_order": 12,
-      "protocol": "river-window-management-v1",
-      "source": "river",
-      "interfaces": [
-        {
-          "name": "river_window_manager_v1",
-          "current_version": 5,
-          "target_version": 5
-        }
-      ],
-      "status": "done",
-      "privileged": true,
-      "blocked_by": [
-        "security-context",
-        "wl-output",
-        "wl-seat",
-        "xdg-shell"
-      ],
-      "status_detail": "Version 5 window, output, seat, pointer binding, operation, focus, cursor ownership, transaction, and dynamic output lifecycle semantics are implemented. Async presentation is stored as a preference with backend fallback; capture counts remain zero until a capture protocol is implemented. The privileged window-manager global is hidden from sandboxed security-context clients."
-    },
-    {
       "id": "linux-dmabuf",
       "priority": "P1",
       "priority_order": 13,
@@ -312,7 +289,7 @@
         "wl-seat",
         "xdg-shell"
       ],
-      "status_detail": "Version 1 issues unpredictable single-use tokens, validates optional seat serial and requesting-surface focus, and expires unused tokens. Activation consumes valid tokens but intentionally leaves focus policy unchanged until river-window-management gains an activation-request extension."
+      "status_detail": "Version 1 issues unpredictable single-use tokens, validates optional seat serial and requesting-surface focus, and expires unused tokens. Activation consumes valid tokens but intentionally leaves focus policy unchanged until the compositor window manager gains an activation-request boundary."
     },
     {
       "id": "wlr-layer-shell",
@@ -335,7 +312,7 @@
         "wl-seat",
         "xdg-shell"
       ],
-      "status_detail": "Version 5 is implemented with single-output arrangement, exclusive usable-area mechanics, layer rendering and hit testing, popup parenting, keyboard focus policy, and the River layer-shell transaction bridge."
+      "status_detail": "Version 5 is implemented with per-output arrangement, exclusive usable-area mechanics, layer rendering and hit testing, popup parenting, and compositor-owned keyboard focus policy."
     },
     {
       "id": "text-input-v3",
@@ -589,109 +566,6 @@
       "status_detail": "Version 1 creates immutable premultiplied RGBA buffers, snapshots them through the shared surface buffer path, and supports viewporter scaling."
     },
     {
-      "id": "river-input-management",
-      "priority": "P1",
-      "priority_order": 29,
-      "protocol": "river-input-management-v1",
-      "source": "river",
-      "interfaces": [
-        {
-          "name": "river_input_manager_v1",
-          "current_version": 2,
-          "target_version": 2
-        }
-      ],
-      "status": "done",
-      "privileged": true,
-      "blocked_by": [
-        "wl-seat"
-      ],
-      "status_detail": "Version 2 is implemented for native libinput devices, including discovery, hotplug lifetime, repeat, scroll-factor, output/rectangle mapping, dynamic named wl_seat globals, per-seat capabilities and focus, and live keyboard, pointer, button, scroll, touch, and cursor routing. Device-local key, button, and touch state is balanced or cancelled across reassignment and removal."
-    },
-    {
-      "id": "river-libinput-config",
-      "priority": "P1",
-      "priority_order": 30,
-      "protocol": "river-libinput-config-v1",
-      "source": "river",
-      "interfaces": [
-        {
-          "name": "river_libinput_config_v1",
-          "current_version": 2,
-          "target_version": 2
-        }
-      ],
-      "status": "done",
-      "privileged": true,
-      "blocked_by": [
-        "river-input-management"
-      ],
-      "status_detail": "Version 2 is implemented for native libinput devices, including complete support/default/current discovery, configuration result objects, custom acceleration curves, hotplug lifetime, and atomic done updates."
-    },
-    {
-      "id": "river-xkb-config",
-      "priority": "P1",
-      "priority_order": 31,
-      "protocol": "river-xkb-config-v1",
-      "source": "river",
-      "interfaces": [
-        {
-          "name": "river_xkb_config_v1",
-          "current_version": 2,
-          "target_version": 2
-        }
-      ],
-      "status": "done",
-      "privileged": true,
-      "blocked_by": [
-        "river-input-management"
-      ],
-      "status_detail": "Version 2 is implemented for native keyboards, including keymap compilation, per-device keymap and xkb state, layout selection, capslock and numlock control, hotplug lifetime, and atomic state updates."
-    },
-    {
-      "id": "river-xkb-bindings",
-      "priority": "P1",
-      "priority_order": 32,
-      "protocol": "river-xkb-bindings-v1",
-      "source": "river",
-      "interfaces": [
-        {
-          "name": "river_xkb_bindings_v1",
-          "current_version": 3,
-          "target_version": 3
-        }
-      ],
-      "status": "done",
-      "privileged": true,
-      "blocked_by": [
-        "river-window-management",
-        "river-xkb-config"
-      ],
-      "status_detail": "Version 3 is implemented for every active River seat, including seat-scoped keysym/modifier matching, layout overrides, press/release capture, repeat cancellation, chord key eating, modifier watches, device reassignment cleanup, and window-manager manage-sequence enforcement."
-    },
-    {
-      "id": "river-layer-shell",
-      "priority": "P1",
-      "priority_order": 33,
-      "protocol": "river-layer-shell-v1",
-      "source": "river",
-      "interfaces": [
-        {
-          "name": "river_layer_shell_v1",
-          "current_version": 1,
-          "target_version": 1
-        }
-      ],
-      "status": "done",
-      "privileged": true,
-      "blocked_by": [
-        "river-window-management",
-        "security-context",
-        "wlr-layer-shell"
-      ],
-      "status_detail": "Version 1 ties support to the active window-manager session, reports coalesced usable-area and layer-focus state in manage sequences, validates output and seat extensions, and enforces layer focus policy. The privileged global is hidden from sandboxed security-context clients."
-    },
-    {
       "id": "security-context",
       "priority": "P2",
       "priority_order": 34,
@@ -770,7 +644,7 @@
       "blocked_by": [
         "wl-seat"
       ],
-      "status_detail": "Version 1 enforces one inhibitor per surface and seat, activates inhibition only while that exact surface has keyboard focus on the requested seat, and follows focus, grab, keyboard-capability, surface-destruction, and protocol-resource lifetimes. Active inhibitors bypass River xkb bindings and the temporary compositor launcher while preserving press-time key ownership across focus changes; emergency compositor exit and virtual-terminal switching shortcuts remain available as the protocol permits."
+      "status_detail": "Version 1 enforces one inhibitor per surface and seat, activates inhibition only while that exact surface has keyboard focus on the requested seat, and follows focus, grab, keyboard-capability, surface-destruction, and protocol-resource lifetimes. Active inhibitors bypass built-in compositor bindings while preserving press-time key ownership across focus changes; emergency compositor exit and virtual-terminal switching shortcuts remain available as the protocol permits."
     },
     {
       "id": "pointer-gestures",
@@ -911,10 +785,9 @@
       "status": "done",
       "privileged": true,
       "blocked_by": [
-        "ext-foreign-toplevel-list",
-        "river-window-management"
+        "ext-foreign-toplevel-list"
       ],
-      "status_detail": "Version 1 advertises the compositor's single permanent active workspace in one group spanning all outputs, including late wl_output bindings, output hotplug, atomic done events, inert stopped-manager handles, zero mutation capabilities, and sandboxed-client global filtering."
+      "status_detail": "Version 1 advertises one workspace group per output with ten permanent numbered workspaces (1 through 9 and 0), one-dimensional ordering, active-state synchronization, output hotplug, late wl_output bindings, atomic done events, and inert stopped-manager handles. Workspace activation is applied atomically on manager commit; create, remove, deactivate, and assignment capabilities are intentionally not advertised for the fixed per-output model. The privileged global is hidden from sandboxed security-context clients."
     },
     {
       "id": "wlr-output-management",
@@ -935,7 +808,7 @@
         "security-context",
         "wl-output"
       ],
-      "status_detail": "Version 4 head discovery, EDID make/model/serial identity, complete DRM mode advertisement and selection, hotplug lifecycles, stale-serial cancellation, complete test/apply transactions, positions, fractional scales, and native DRM enable/disable are implemented for Kanshi. Mode and scale changes update scanout buffers, logical geometry, rendering, input bounds, wl_output, xdg-output, fractional-scale, layer-shell, and River output state, with transactional rollback on failure. Unsupported custom modes, transforms, and adaptive sync are rejected. The privileged global is hidden from sandboxed security-context clients."
+      "status_detail": "Version 4 head discovery, EDID make/model/serial identity, complete DRM mode advertisement and selection, hotplug lifecycles, stale-serial cancellation, complete test/apply transactions, positions, fractional scales, and native DRM enable/disable are implemented for Kanshi. Mode and scale changes update scanout buffers, logical geometry, rendering, input bounds, wl_output, xdg-output, fractional-scale, layer-shell, and compositor window-management state, with transactional rollback on failure. Unsupported custom modes, transforms, and adaptive sync are rejected. The privileged global is hidden from sandboxed security-context clients."
     },
     {
       "id": "wlr-output-power-management",
@@ -1044,7 +917,7 @@
         "security-context",
         "wl-compositor"
       ],
-      "status_detail": "Version 1 private-global filtering, the xwayland_surface role, double-buffered non-zero unique serial association, commit-time publication, and destruction-safe serial lookup are implemented. Keywork launches and authorizes rootless Xwayland, bootstraps XWM/Composite/EWMH, tracks create/map/configure/unmap/destroy lifecycle, acknowledges map and configure requests, and pairs X11 windows with committed Wayland surfaces through WL_SURFACE_SERIAL regardless of transport arrival order. Paired X11 surfaces are enrolled in the compositor scene with synchronized position, size, map, commit, dissociation, and destruction state. Keyboard focus is synchronized through ICCCM WM_HINTS and WM_TAKE_FOCUS plus EWMH _NET_ACTIVE_WINDOW, with click-to-focus for standalone X11 surfaces. XWM caches live WM_CLASS and EWMH/ICCCM titles, tracks WM_DELETE_WINDOW support for graceful close, publishes Normal/Iconic/Withdrawn WM_STATE transitions, and validates WM_TRANSIENT_FOR relationships and WM_NORMAL_HINTS min/max sizes. Mapped non-override-redirect X11 windows participate in river-window-management-v1 with metadata, parent and size hints, dimensions, move/resize, focus, visibility, stacking, fullscreen, clipping, borders, and close controls, and are listed through standard and wlr foreign-toplevel protocols. EWMH _NET_CLIENT_LIST tracks mapped clients in initial map order, while _NET_CLIENT_LIST_STACKING tracks the compositor's live bottom-to-top scene order across River, transient, auxiliary, and standalone focus changes. Modal state is accepted and exposed to policy, the read-only _NET_WM_STATE_FOCUSED bit is kept synchronized with compositor focus, and authenticated _NET_WM_MOVERESIZE requests from client-side decorations are routed through River pointer-operation policy. XRes 1.2 local client PIDs are exposed to River policy without trusting client-authored PID properties. Input-capable override-redirect windows such as X11 launchers receive temporary keyboard focus while menus, tooltips, notifications, drag icons, and similar transient UI do not, with managed or eligible parent focus restored on unmap. Initial and live EWMH fullscreen, maximize, and minimize requests plus ICCCM WM_CHANGE_STATE minimize requests are routed through River policy, accepted state is published back through _NET_WM_STATE, and wlr foreign-toplevel fullscreen/maximize/minimize controls and state work for X11 windows. EWMH and wlr foreign-toplevel activation requests are applied through the River focus boundary with active state reported back, and EWMH close requests use WM_DELETE_WINDOW when supported. XFixes-backed CLIPBOARD and PRIMARY ownership, MIME discovery, owner replacement, clearing, direct data, and streaming INCR transfers work in both directions without ownership feedback loops. Wayland-source drags target Xdnd v3-v5 clients with XdndProxy and XdndTypeList support, COPY/MOVE/ASK negotiation, root-coordinate motion, post-drop XdndSelection direct or INCR transfer, completion, cancellation, and target-lifetime handling. X11-source drags use a dynamically mapped XdndAware proxy, require a physical left-button grab, preserve Xwayland pointer delivery, discover inline or XdndTypeList MIME types, negotiate COPY/MOVE/ASK with native Wayland targets, stream XdndSelection data directly or with INCR, fall through to native X11 targets, and report accepted or cancelled completion. All standard EWMH _NET_WM_WINDOW_TYPE values and ordered extension fallbacks are recognized, including the required transient-dialog default. Desktop, dock, splash, menu-popup, tooltip, notification, combo, and drag-icon windows bypass normal tiling and foreign-toplevel publication while normal, dialog, utility, toolbar, and torn-off menu windows remain managed. Desktop windows remain at the bottom, auxiliary windows remain above normal toplevels, and managed transients remain above their parents even across River stack updates. _NET_WM_STATE_SKIP_TASKBAR is honored both at initial map and through live property or client-message changes by withdrawing and republishing foreign-toplevel handles as needed. _MOTIF_WM_HINTS decoration masks are validated and translated into live River decoration preferences so undecorated X11 clients are not given compositor frames. Further X11 policy compatibility is best-effort and is not part of protocol completion."
+      "status_detail": "Version 1 private-global filtering, the xwayland_surface role, serial association, rootless Xwayland launch, XWM/Composite/EWMH bootstrap, and X11 window lifecycle tracking are implemented. Managed X11 windows participate directly in the compositor-owned workspace and layout policy, including tiling, focus, visibility, stacking, fullscreen, maximize, minimize, activation, and foreign-toplevel controls. Auxiliary window types bypass tiling while desktop windows remain at the bottom and transients remain above parents. ICCCM/EWMH focus, close, state, clipboard, primary selection, and bidirectional Xdnd transfers are supported. Further X11 policy compatibility is best-effort and is not part of protocol completion."
     },
     {
       "id": "xwayland-keyboard-grab",

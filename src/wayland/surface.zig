@@ -278,8 +278,6 @@ pub const Role = enum {
     cursor,
     drag_icon,
     input_popup,
-    river_decoration,
-    river_shell_surface,
     xwayland,
 };
 

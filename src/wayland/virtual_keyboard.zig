@@ -183,14 +183,17 @@ const Device = struct {
     fn setKeymap(
         self: *Device,
         resource: *zwp.VirtualKeyboardV1,
-        format_value: u32,
+        format: wl.Keyboard.KeymapFormat,
         fd: std.posix.fd_t,
         size: u32,
     ) void {
         const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
-        if (format_value != @intFromEnum(wl.Keyboard.KeymapFormat.xkb_v1) or
-            !validKeymap(self.manager.io, file, size))
-        {
+        if (format != .xkb_v1) {
+            file.close(self.manager.io);
+            resource.postError(.invalid_keymap_format, "unsupported virtual keyboard keymap format");
+            return;
+        }
+        if (!validKeymap(self.manager.io, file, size)) {
             file.close(self.manager.io);
             resource.getClient().postImplementationError("invalid virtual keyboard keymap");
             return;

@@ -88,10 +88,8 @@ fn activate(self: *Self, token_z: [*:0]const u8) void {
     defer self.allocator.free(removed.key);
     if (removed.value.expires_at <= now(self.io)) return;
 
-    // river-window-management-v1 does not yet expose activation requests to
-    // policy. Consuming the token without changing focus preserves that
-    // boundary and matches River's behavior. The stored interaction provenance
-    // must be forwarded when such a policy extension is added.
+    // Activation policy is not wired into the window manager yet. The stored
+    // interaction provenance must be forwarded when that boundary is added.
 }
 
 fn issueToken(

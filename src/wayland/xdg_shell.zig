@@ -2710,7 +2710,7 @@ test "xdg size hints reject contradictory bounds" {
     ));
 }
 
-test "xdg resize edges translate to independent River edge flags" {
+test "xdg resize edges translate to independent policy edge flags" {
     try std.testing.expectEqual(
         ResizeEdges{ .top = true, .left = true },
         ToplevelResource.resizeEdges(.top_left),

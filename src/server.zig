@@ -60,11 +60,9 @@ const Region = @import("region.zig");
 const Scene = @import("scene.zig");
 const Surface = @import("wayland/surface.zig");
 const Viewporter = @import("wayland/viewporter.zig");
-const InputManager = @import("river/input_manager.zig");
-const LibinputConfig = @import("river/libinput_config.zig");
-const XkbConfig = @import("river/xkb_config.zig");
-const XkbBindings = @import("river/xkb_bindings.zig");
-const WindowManager = @import("river/window_manager.zig");
+const InputManager = @import("input_manager.zig");
+const BuiltinKeybindings = @import("builtin_keybindings.zig");
+const WindowManager = @import("window_manager.zig");
 
 const wl = wayland.server.wl;
 const log = std.log.scoped(.server);
@@ -80,12 +78,8 @@ native_input: NativeInput,
 native_input_initialized: bool,
 input_manager: InputManager,
 input_manager_initialized: bool,
-libinput_config: LibinputConfig,
-libinput_config_initialized: bool,
-xkb_config: XkbConfig,
-xkb_config_initialized: bool,
-xkb_bindings: XkbBindings,
-xkb_bindings_initialized: bool,
+builtin_keybindings: BuiltinKeybindings,
+builtin_keybindings_initialized: bool,
 render_outputs: RenderOutputStore,
 primary_render_output: RenderOutputId,
 outputs: OutputLayout,
@@ -116,7 +110,6 @@ xdg_shell: XdgShell,
 xdg_foreign: XdgForeign,
 layer_shell: LayerShell,
 seat: Seat,
-dynamic_seats: std.ArrayList(*SeatEntry),
 input_device_listener: InputManager.DeviceListener,
 routed_keys: std.ArrayList(RoutedKey),
 routed_buttons: std.ArrayList(RoutedButton),
@@ -162,15 +155,10 @@ renderer: renderer_types.Renderer,
 socket_buffer: [11]u8,
 listening: bool,
 xwayland_ready_listener: ?XwaylandReadyListener,
-session_exit_listener: ?SessionExitListener,
 
 pub const XwaylandReadyListener = struct {
     context: *anyopaque,
     ready: *const fn (*anyopaque, []const u8) void,
-};
-pub const SessionExitListener = struct {
-    context: *anyopaque,
-    requested: *const fn (*anyopaque) bool,
 };
 
 const RenderOutput = struct {
@@ -193,12 +181,6 @@ const RenderOutput = struct {
             .y = y + @as(f64, @floatFromInt(position.y)),
         };
     }
-};
-
-const SeatEntry = struct {
-    name: [:0]u8,
-    seat: Seat,
-    removed: bool,
 };
 
 const RoutedKey = struct {
@@ -226,6 +208,11 @@ const RoutedTouch = struct {
     native_id: i32,
     seat: *Seat,
     protocol_id: i32,
+};
+
+const PointerRoute = struct {
+    focus: ?Seat.PointerFocus,
+    root: ?Surface.Id,
 };
 
 const RenderOutputStore = slot_map.SlotMap(*RenderOutput, enum { render_output });
@@ -305,12 +292,8 @@ pub fn createWithVirtualOutput(
         .native_input_initialized = false,
         .input_manager = undefined,
         .input_manager_initialized = false,
-        .libinput_config = undefined,
-        .libinput_config_initialized = false,
-        .xkb_config = undefined,
-        .xkb_config_initialized = false,
-        .xkb_bindings = undefined,
-        .xkb_bindings_initialized = false,
+        .builtin_keybindings = undefined,
+        .builtin_keybindings_initialized = false,
         .render_outputs = .{},
         .primary_render_output = undefined,
         .outputs = undefined,
@@ -341,7 +324,6 @@ pub fn createWithVirtualOutput(
         .xdg_foreign = undefined,
         .layer_shell = undefined,
         .seat = undefined,
-        .dynamic_seats = .empty,
         .input_device_listener = .{
             .context = self,
             .added = inputDeviceAdded,
@@ -391,13 +373,11 @@ pub fn createWithVirtualOutput(
         .socket_buffer = undefined,
         .listening = false,
         .xwayland_ready_listener = null,
-        .session_exit_listener = null,
     };
     errdefer self.routed_touches.deinit(allocator);
     errdefer self.routed_gestures.deinit(allocator);
     errdefer self.routed_buttons.deinit(allocator);
     errdefer self.routed_keys.deinit(allocator);
-    errdefer self.dynamic_seats.deinit(allocator);
     errdefer self.render_outputs.deinit(allocator);
     errdefer self.xwayland_windows.deinit(allocator);
     errdefer self.xwayland_client_stack.deinit(allocator);
@@ -676,36 +656,44 @@ pub fn createWithVirtualOutput(
         &self.seat,
     );
     errdefer self.virtual_keyboard.deinit();
+    try self.workspace.init(allocator, display, &self.security_context, &self.outputs);
+    self.workspace_initialized = true;
+    errdefer {
+        self.workspace.deinit();
+        self.workspace_initialized = false;
+    }
     try self.window_manager.init(
         allocator,
         display,
-        &self.security_context,
         &self.outputs,
         render_output.protocol_id,
-        &self.seat,
         &self.scene,
         &self.xdg_shell,
         .{
             .context = self,
-            .window_info = riverXwaylandWindowInfo,
-            .resize = riverResizeXwaylandWindow,
-            .move = riverMoveXwaylandWindow,
-            .set_fullscreen = riverSetXwaylandWindowFullscreen,
-            .set_maximized = riverSetXwaylandWindowMaximized,
-            .set_minimized = riverSetXwaylandWindowMinimized,
-            .close = riverCloseXwaylandWindow,
-            .refresh_scene = riverRefreshXwaylandScene,
-            .stacking_changed = riverXwaylandStackingChanged,
+            .window_info = xwaylandWindowInfo,
+            .resize = resizeXwaylandWindow,
+            .move = moveXwaylandWindow,
+            .set_fullscreen = setXwaylandWindowFullscreen,
+            .set_maximized = setXwaylandWindowMaximized,
+            .set_minimized = setXwaylandWindowMinimized,
+            .close = closeXwaylandWindow,
+            .refresh_scene = refreshXwaylandScene,
+            .stacking_changed = xwaylandStackingChanged,
         },
         &self.layer_shell,
-        .{ .context = self, .route = routePointer },
-        .{ .context = self, .exit = riverExitSession },
+        &self.workspace,
     );
     self.window_manager_initialized = true;
     errdefer {
         self.window_manager.deinit();
         self.window_manager_initialized = false;
     }
+    self.workspace.setActivationListener(.{
+        .context = self,
+        .activate = workspaceActivationRequested,
+    });
+    errdefer self.workspace.clearActivationListener();
     try self.foreign_toplevel_list.init(
         allocator,
         display,
@@ -713,12 +701,12 @@ pub fn createWithVirtualOutput(
         &self.xdg_shell,
         .{
             .context = self,
-            .window_info = riverXwaylandWindowInfo,
-            .close = riverCloseXwaylandWindow,
-            .request_activation = riverRequestXwaylandWindowActivation,
-            .request_fullscreen = riverRequestXwaylandWindowFullscreen,
-            .request_maximized = riverRequestXwaylandWindowMaximized,
-            .request_minimized = riverRequestXwaylandWindowMinimized,
+            .window_info = xwaylandWindowInfo,
+            .close = closeXwaylandWindow,
+            .request_activation = requestXwaylandWindowActivation,
+            .request_fullscreen = requestXwaylandWindowFullscreen,
+            .request_maximized = requestXwaylandWindowMaximized,
+            .request_minimized = requestXwaylandWindowMinimized,
         },
         &self.outputs,
     );
@@ -813,12 +801,6 @@ pub fn createWithVirtualOutput(
         self.xwayland_server.deinit();
         self.xwayland_server_initialized = false;
     }
-    try self.workspace.init(allocator, display, &self.security_context, &self.outputs);
-    self.workspace_initialized = true;
-    errdefer {
-        self.workspace.deinit();
-        self.workspace_initialized = false;
-    }
     self.subcompositor.setRepaintListener(.{
         .context = self,
         .request = requestRepaint,
@@ -854,67 +836,26 @@ pub fn createWithVirtualOutput(
         }
     }
     const native_input = if (self.native_input_initialized) &self.native_input else null;
-    try self.input_manager.init(
-        allocator,
-        display,
-        &self.security_context,
-        native_input,
-        &self.outputs,
-        render_output.protocol_id,
-    );
+    try self.input_manager.init(allocator, native_input);
     self.input_manager_initialized = true;
     errdefer {
         self.input_manager.detachNativeInput();
         self.input_manager.deinit();
         self.input_manager_initialized = false;
     }
-    self.input_manager.setSeatListener(.{
-        .context = self,
-        .created = inputSeatCreated,
-        .device_changed = inputDeviceSeatChanged,
-        .destroyed = inputSeatDestroyed,
-    });
-    errdefer self.input_manager.clearSeatListener();
     try self.input_manager.addDeviceListener(&self.input_device_listener);
     errdefer self.input_manager.removeDeviceListener(&self.input_device_listener);
-    try self.libinput_config.init(
+    try self.builtin_keybindings.init(
         allocator,
-        display,
-        &self.security_context,
-        &self.input_manager,
-        native_input,
-    );
-    self.libinput_config_initialized = true;
-    errdefer {
-        self.libinput_config.deinit();
-        self.libinput_config_initialized = false;
-    }
-    try self.xkb_config.init(
-        allocator,
-        io,
-        display,
-        &self.security_context,
-        &self.input_manager,
-        native_input,
-    );
-    self.xkb_config_initialized = true;
-    errdefer {
-        self.xkb_config.deinit();
-        self.xkb_config_initialized = false;
-    }
-    try self.xkb_bindings.init(
-        allocator,
-        display,
-        &self.security_context,
         &self.window_manager,
         &self.input_manager,
         &self.keyboard_shortcuts_inhibit,
         native_input,
     );
-    self.xkb_bindings_initialized = true;
+    self.builtin_keybindings_initialized = true;
     errdefer {
-        self.xkb_bindings.deinit();
-        self.xkb_bindings_initialized = false;
+        self.builtin_keybindings.deinit();
+        self.builtin_keybindings_initialized = false;
     }
     requestRepaint(self);
 
@@ -932,37 +873,23 @@ pub fn destroy(self: *Self) void {
     const allocator = self.allocator;
     if (self.drm_device_initialized) self.drm_device.clearListener();
     self.data_device.cancel();
-    if (self.xkb_bindings_initialized) self.xkb_bindings.detachNativeInput();
-    if (self.xkb_config_initialized) self.xkb_config.detachNativeInput();
-    if (self.libinput_config_initialized) self.libinput_config.detachNativeInput();
+    if (self.builtin_keybindings_initialized) self.builtin_keybindings.detachNativeInput();
     if (self.input_manager_initialized) {
         self.input_manager.detachNativeInput();
         self.input_manager.removeDeviceListener(&self.input_device_listener);
-        self.input_manager.clearSeatListener();
     }
     if (self.native_input_initialized) self.native_input.deinit();
     self.layer_shell.clearRepaintListener();
     self.seat.clearRepaintListener();
-    for (self.dynamic_seats.items) |entry| {
-        if (!entry.removed) entry.seat.clearRepaintListener();
-    }
     self.scene.clearRepaintListener();
     self.subcompositor.clearRepaintListener();
     var render_outputs = self.render_outputs.iterator();
     while (render_outputs.next()) |entry| stopRenderOutput(entry.value.*);
     self.display.destroyClients();
     if (self.drm_device_initialized) self.drm_device.releaseClientBuffers();
-    if (self.xkb_bindings_initialized) {
-        self.xkb_bindings.deinit();
-        self.xkb_bindings_initialized = false;
-    }
-    if (self.xkb_config_initialized) {
-        self.xkb_config.deinit();
-        self.xkb_config_initialized = false;
-    }
-    if (self.libinput_config_initialized) {
-        self.libinput_config.deinit();
-        self.libinput_config_initialized = false;
+    if (self.builtin_keybindings_initialized) {
+        self.builtin_keybindings.deinit();
+        self.builtin_keybindings_initialized = false;
     }
     if (self.input_manager_initialized) {
         self.input_manager.deinit();
@@ -976,8 +903,6 @@ pub fn destroy(self: *Self) void {
         self.output_management.deinit();
         self.output_management_initialized = false;
     }
-    self.workspace.deinit();
-    self.workspace_initialized = false;
     self.xwayland_server.deinit();
     self.xwayland_server_initialized = false;
     std.debug.assert(self.xwayland_windows.count() == 0);
@@ -995,8 +920,11 @@ pub fn destroy(self: *Self) void {
     self.image_capture_source_initialized = false;
     self.foreign_toplevel_list.deinit();
     self.foreign_toplevel_list_initialized = false;
+    self.workspace.clearActivationListener();
     self.window_manager.deinit();
     self.window_manager_initialized = false;
+    self.workspace.deinit();
+    self.workspace_initialized = false;
     self.virtual_keyboard.deinit();
     self.input_method.deinit();
     self.text_input.deinit();
@@ -1040,12 +968,6 @@ pub fn destroy(self: *Self) void {
     self.routed_gestures.deinit(allocator);
     self.routed_buttons.deinit(allocator);
     self.routed_keys.deinit(allocator);
-    for (self.dynamic_seats.items) |entry| {
-        entry.seat.deinit();
-        allocator.free(entry.name);
-        allocator.destroy(entry);
-    }
-    self.dynamic_seats.deinit(allocator);
     self.seat.deinit();
     self.compositor.deinit();
     if (self.drm_device_initialized) self.drm_device.deinit();
@@ -1111,10 +1033,8 @@ fn addRenderOutput(
     errdefer stopRenderOutput(render_output);
     const id = try self.render_outputs.insert(self.allocator, render_output);
     errdefer std.debug.assert(self.render_outputs.remove(id) != null);
-    if (self.workspace_initialized) {
-        self.workspace.addOutput(render_output.protocol_id);
-        errdefer self.workspace.removeOutput(render_output.protocol_id);
-    }
+    if (self.workspace_initialized) try self.workspace.addOutput(render_output.protocol_id);
+    errdefer if (self.workspace_initialized) self.workspace.removeOutput(render_output.protocol_id);
     if (self.window_manager_initialized) {
         try self.window_manager.outputAdded(render_output.protocol_id);
     }
@@ -1206,67 +1126,9 @@ fn nativeInputListener(render_output: *RenderOutput) NativeInput.Listener {
     };
 }
 
-fn inputSeatCreated(context: *anyopaque, name: [:0]const u8) error{OutOfMemory}!void {
-    const self: *Self = @ptrCast(@alignCast(context));
-    std.debug.assert(self.seatForName(name) == null);
-
-    const name_copy = try self.allocator.dupeSentinel(u8, name, 0);
-    errdefer self.allocator.free(name_copy);
-    const entry = try self.allocator.create(SeatEntry);
-    errdefer self.allocator.destroy(entry);
-    entry.* = .{ .name = name_copy, .seat = undefined, .removed = false };
-    entry.seat.init(
-        self.allocator,
-        self.native_input.io,
-        self.display,
-        name_copy,
-        self.compositor.surfaceStore(),
-    ) catch |err| {
-        log.err("failed to create input seat {s}: {t}", .{ name, err });
-        self.terminate();
-        return error.OutOfMemory;
-    };
-    errdefer entry.seat.deinit();
-    entry.seat.ensureParentKeyboardEnter();
-    entry.seat.setRepaintListener(.{
-        .context = self,
-        .request = requestRepaint,
-        .cursor_moved = cursorMoved,
-    });
-    errdefer entry.seat.clearRepaintListener();
-    entry.seat.setDefaultCursor(self.cursor_shape.defaultCursor());
-    try self.window_manager.seatAdded(&entry.seat);
-    errdefer self.window_manager.seatRemoved(&entry.seat);
-    try self.data_control.addSeat(&entry.seat);
-    errdefer self.data_control.removeSeat(&entry.seat);
-    try self.dynamic_seats.append(self.allocator, entry);
-    self.refreshSeatCapabilities(&entry.seat, name_copy);
-    requestRepaint(self);
-}
-
-fn inputSeatDestroyed(context: *anyopaque, name: [:0]const u8) void {
-    const self: *Self = @ptrCast(@alignCast(context));
-    for (self.dynamic_seats.items) |entry| {
-        if (entry.removed or !std.mem.eql(u8, entry.name, name)) continue;
-        self.cancelSeatGestures(&entry.seat);
-        entry.seat.setKeyboardAvailable(false);
-        entry.seat.setPointerAvailable(false);
-        entry.seat.setTouchAvailable(false);
-        entry.seat.parentKeyboardLeave();
-        self.window_manager.seatRemoved(&entry.seat);
-        self.data_control.removeSeat(&entry.seat);
-        entry.seat.clearRepaintListener();
-        entry.seat.removeGlobal();
-        entry.removed = true;
-        requestRepaint(self);
-        return;
-    }
-    unreachable;
-}
-
 fn inputDeviceAdded(context: *anyopaque, device: *InputManager.Device) void {
     const self: *Self = @ptrCast(@alignCast(context));
-    const seat = self.seatForName(device.seat_name) orelse return;
+    const seat = &self.seat;
     if (device.device_type == .tablet) {
         const info = self.native_input.tabletInfo(device.id) orelse return;
         self.tablet.addTablet(
@@ -1281,13 +1143,12 @@ fn inputDeviceAdded(context: *anyopaque, device: *InputManager.Device) void {
         const info = self.native_input.tabletPadInfo(device.id) orelse return;
         self.tablet.addPad(device.id, device.physical_id, seat, info) catch return self.terminate();
     }
-    self.refreshSeatCapabilities(seat, device.seat_name);
+    self.refreshSeatCapabilities();
     if (device.device_type == .keyboard) self.prepareSeatKeyboard(seat, device.id);
 }
 
 fn inputDeviceRemoved(context: *anyopaque, device: *InputManager.Device) void {
     const self: *Self = @ptrCast(@alignCast(context));
-    const seat = self.seatForName(device.seat_name) orelse return;
     if (device.device_type == .keyboard) self.releaseDeviceKeys(device.id);
     if (device.device_type == .pointer) {
         self.releaseDeviceButtons(device.id);
@@ -1296,61 +1157,20 @@ fn inputDeviceRemoved(context: *anyopaque, device: *InputManager.Device) void {
     if (device.device_type == .tablet) self.tablet.removeTablet(device.id);
     if (device.device_type == .tablet_pad) self.tablet.removePad(device.id);
     if (device.device_type == .touch) self.cancelDeviceTouches(device.id);
-    self.refreshSeatCapabilities(seat, device.seat_name);
-    if (device.device_type == .keyboard) self.prepareAnySeatKeyboard(seat, device.seat_name);
+    self.refreshSeatCapabilities();
+    if (device.device_type == .keyboard) self.prepareAnySeatKeyboard();
 }
 
-fn inputDeviceSeatChanged(
-    context: *anyopaque,
-    device: *InputManager.Device,
-    previous_name: [:0]const u8,
-) void {
-    const self: *Self = @ptrCast(@alignCast(context));
-    if (device.device_type == .keyboard) self.releaseDeviceKeys(device.id);
-    if (device.device_type == .pointer) {
-        self.releaseDeviceButtons(device.id);
-        self.cancelDeviceGestures(device.id);
-    }
-    if (device.device_type == .touch) self.cancelDeviceTouches(device.id);
-    if (self.seatForName(previous_name)) |previous| {
-        self.refreshSeatCapabilities(previous, previous_name);
-        if (device.device_type == .keyboard) self.prepareAnySeatKeyboard(previous, previous_name);
-    }
-    const next = self.seatForName(device.seat_name) orelse return;
-    if (device.device_type == .tablet) {
-        self.tablet.moveTablet(device.id, next) catch return self.terminate();
-    }
-    if (device.device_type == .tablet_pad) {
-        self.tablet.movePad(device.id, next) catch return self.terminate();
-    }
-    self.refreshSeatCapabilities(next, device.seat_name);
-    if (device.device_type == .keyboard) {
-        next.ensureParentKeyboardEnter();
-        self.prepareSeatKeyboard(next, device.id);
-    }
+fn seatForDevice(self: *Self, _: NativeInput.DeviceId) *Seat {
+    return &self.seat;
 }
 
-fn seatForName(self: *Self, name: []const u8) ?*Seat {
-    if (std.mem.eql(u8, name, "default")) return &self.seat;
-    for (self.dynamic_seats.items) |entry| {
-        if (!entry.removed and std.mem.eql(u8, entry.name, name)) return &entry.seat;
-    }
-    return null;
-}
-
-fn seatForDevice(self: *Self, id: NativeInput.DeviceId) *Seat {
-    if (!self.input_manager_initialized) return &self.seat;
-    const device = self.input_manager.findDevice(id) orelse return &self.seat;
-    return self.seatForName(device.seat_name) orelse &self.seat;
-}
-
-fn refreshSeatCapabilities(self: *Self, seat: *Seat, name: []const u8) void {
+fn refreshSeatCapabilities(self: *Self) void {
     var keyboard = false;
     var pointer = false;
     var touch = false;
     var devices = self.input_manager.deviceIterator();
     while (devices.next()) |device| {
-        if (!std.mem.eql(u8, device.seat_name, name)) continue;
         switch (device.device_type) {
             .keyboard => keyboard = true,
             .pointer => pointer = true,
@@ -1358,23 +1178,23 @@ fn refreshSeatCapabilities(self: *Self, seat: *Seat, name: []const u8) void {
             .tablet, .tablet_pad => {},
         }
     }
-    if (seat == &self.seat and !pointer) {
+    if (!pointer) {
         self.pointer_constraints.deactivateAll();
         self.data_device.cancel();
     }
-    seat.setKeyboardAvailable(keyboard);
-    seat.setPointerAvailable(pointer);
-    seat.setTouchAvailable(touch);
+    self.seat.setKeyboardAvailable(keyboard);
+    self.seat.setPointerAvailable(pointer);
+    self.seat.setTouchAvailable(touch);
 }
 
-fn prepareAnySeatKeyboard(self: *Self, seat: *Seat, name: []const u8) void {
+fn prepareAnySeatKeyboard(self: *Self) void {
     var devices = self.input_manager.deviceIterator();
     while (devices.next()) |device| {
-        if (device.device_type != .keyboard or !std.mem.eql(u8, device.seat_name, name)) continue;
-        self.prepareSeatKeyboard(seat, device.id);
+        if (device.device_type != .keyboard) continue;
+        self.prepareSeatKeyboard(&self.seat, device.id);
         return;
     }
-    seat.setModifiers(0, 0, 0, 0);
+    self.seat.setModifiers(0, 0, 0, 0);
 }
 
 fn prepareSeatKeyboard(self: *Self, seat: *Seat, id: NativeInput.DeviceId) void {
@@ -1401,7 +1221,6 @@ fn removeRenderOutput(self: *Self, id: RenderOutputId) bool {
     const render_output = self.render_outputs.remove(id) orelse return false;
     stopRenderOutput(render_output);
     const protocol_output = self.outputs.get(render_output.protocol_id).?;
-    if (self.workspace_initialized) self.workspace.removeOutput(render_output.protocol_id);
     if (self.foreign_toplevel_list_initialized) {
         self.foreign_toplevel_list.removeOutput(render_output.protocol_id);
     }
@@ -1411,11 +1230,9 @@ fn removeRenderOutput(self: *Self, id: RenderOutputId) bool {
     if (self.screencopy_initialized) self.screencopy.removeOutput(render_output.protocol_id);
     if (self.output_power_initialized) self.output_power.removeOutput(render_output.protocol_id);
     if (self.window_manager_initialized) {
-        self.window_manager.outputRemoved(render_output.protocol_id);
+        self.window_manager.outputRemoved(render_output.protocol_id) catch self.terminate();
     }
-    if (self.input_manager_initialized) {
-        self.input_manager.outputRemoved(render_output.protocol_id);
-    }
+    if (self.workspace_initialized) self.workspace.removeOutput(render_output.protocol_id);
     Surface.discardPresentation(self.compositor.surfaceStore(), protocol_output);
     if (self.xdg_output_initialized) self.xdg_output.removeOutput(protocol_output);
     std.debug.assert(self.outputs.remove(render_output.protocol_id));
@@ -1608,9 +1425,6 @@ fn replacePrimaryRenderOutput(self: *Self, removed_id: RenderOutputId) void {
         self.layer_shell.setDefaultOutput(replacement.protocol_id);
         self.window_manager.setDefaultOutput(replacement.protocol_id);
         self.native_input.retarget(replacement.backend.size(), nativeInputListener(replacement));
-        if (self.input_manager_initialized) {
-            self.input_manager.targetOutputChanged(replacement.protocol_id);
-        }
         return;
     };
     unreachable;
@@ -1637,9 +1451,7 @@ fn drmOutputRemoving(context: *anyopaque, drm_output: *DrmOutput) void {
             if (self.output_management_initialized) self.output_management.syncHead(replacement);
         } else {
             if (self.native_input_initialized) {
-                if (self.xkb_bindings_initialized) self.xkb_bindings.detachNativeInput();
-                if (self.xkb_config_initialized) self.xkb_config.detachNativeInput();
-                if (self.libinput_config_initialized) self.libinput_config.detachNativeInput();
+                if (self.builtin_keybindings_initialized) self.builtin_keybindings.detachNativeInput();
                 if (self.input_manager_initialized) self.input_manager.detachNativeInput();
                 self.native_input.deinit();
                 self.native_input_initialized = false;
@@ -1756,10 +1568,6 @@ pub fn setXwaylandReadyListener(self: *Self, listener: XwaylandReadyListener) vo
     self.xwayland_ready_listener = listener;
 }
 
-pub fn setSessionExitListener(self: *Self, listener: SessionExitListener) void {
-    self.session_exit_listener = listener;
-}
-
 pub fn setWindowBlurRadius(self: *Self, radius: u32) void {
     var effects = Scene.default_effects;
     effects.blur = if (radius == 0) null else .{ .radius = radius };
@@ -1786,14 +1594,6 @@ pub fn run(self: *Self) void {
 
 pub fn terminate(self: *Self) void {
     self.display.terminate();
-}
-
-fn riverExitSession(context: *anyopaque) void {
-    const self: *Self = @ptrCast(@alignCast(context));
-    if (self.session_exit_listener) |listener| {
-        if (listener.requested(listener.context)) return;
-    }
-    self.terminate();
 }
 
 fn requestRepaint(context: *anyopaque) void {
@@ -1965,7 +1765,6 @@ fn outputDamageRectangles(
 fn clearCursorShapes(context: *anyopaque) void {
     const self: *Self = @ptrCast(@alignCast(context));
     self.seat.clearCursorShapes();
-    for (self.dynamic_seats.items) |entry| entry.seat.clearCursorShapes();
     self.tablet.clearCursorShapes();
 }
 
@@ -1994,6 +1793,12 @@ fn idleInhibitorSurfaceVisible(context: *anyopaque, surface_id: Surface.Id) bool
     return self.scene.surfaceMapped(root);
 }
 
+fn workspaceActivationRequested(context: *anyopaque, output: OutputLayout.Id, number: u8) bool {
+    const self: *Self = @ptrCast(@alignCast(context));
+    if (!self.window_manager_initialized) return false;
+    return self.window_manager.activateWorkspaceFromProtocol(output, number);
+}
+
 fn sessionLockStateChanged(context: *anyopaque, locked: bool) void {
     const self: *Self = @ptrCast(@alignCast(context));
     self.refreshIdleInhibition();
@@ -2003,21 +1808,11 @@ fn sessionLockStateChanged(context: *anyopaque, locked: bool) void {
     self.tablet.cancelFocus();
     self.cancelSeatTouches(&self.seat);
     self.seat.suppressPointerFocus(true);
-    self.window_manager.pointerMoved(null);
-    for (self.dynamic_seats.items) |entry| {
-        if (entry.removed) continue;
-        self.cancelSeatTouches(&entry.seat);
-        entry.seat.suppressPointerFocus(true);
-        self.window_manager.pointerMovedForSeat(&entry.seat, null);
-    }
     self.xdg_shell.dismissPopupGrab();
     if (locked) {
         self.virtual_keyboard.setInhibited(true);
         self.input_method.setInhibited(true);
         self.seat.setKeyboardFocus(null);
-        for (self.dynamic_seats.items) |entry| {
-            if (!entry.removed) entry.seat.setKeyboardFocus(null);
-        }
     } else {
         self.seat.setKeyboardFocus(null);
         self.input_method.setInhibited(false);
@@ -2028,17 +1823,6 @@ fn sessionLockStateChanged(context: *anyopaque, locked: bool) void {
                 position.y,
                 self.pointerFocus(position.x, position.y),
             );
-        }
-        for (self.dynamic_seats.items) |entry| {
-            if (entry.removed) continue;
-            entry.seat.setKeyboardFocus(null);
-            if (entry.seat.pointerPosition()) |position| {
-                entry.seat.pointerEnter(
-                    position.x,
-                    position.y,
-                    self.pointerFocus(position.x, position.y),
-                );
-            }
         }
     }
 }
@@ -2631,11 +2415,11 @@ fn routeTouchDown(
     } else if (seat == &self.seat) {
         if (focus) |target| {
             const root = self.subcompositor.rootSurface(target.surface_id);
-            self.focusXwaylandSurface(root);
+            self.window_manager.pointerButton(root, .pressed);
             self.layer_shell.pointerPressed(root);
             requestRepaint(self);
         } else {
-            self.focusXwaylandSurface(null);
+            self.window_manager.pointerButton(null, .pressed);
             if (self.xdg_shell.hasPopupGrab()) self.xdg_shell.dismissPopupGrab();
         }
     }
@@ -2781,7 +2565,6 @@ fn pointerEnter(context: *anyopaque, x: f64, y: f64) void {
     const route = self.pointerRoute(point.x, point.y);
     if (self.session_lock.isLocked()) {
         self.seat.pointerEnter(point.x, point.y, route.focus);
-        self.window_manager.pointerMoved(null);
         return;
     }
     if (self.data_device.isDragging()) {
@@ -2792,16 +2575,9 @@ fn pointerEnter(context: *anyopaque, x: f64, y: f64) void {
             self.data_device.externalDragPointerFocus(point.x, point.y),
         );
         self.routeActiveDrag(0, route, point.x, point.y, false);
-        self.window_manager.pointerMoved(null);
         return;
     }
-    if (self.window_manager.pointerGrabbed()) self.pointer_constraints.deactivateAll();
-    self.seat.pointerEnter(
-        point.x,
-        point.y,
-        if (self.window_manager.pointerGrabbed()) null else route.focus,
-    );
-    self.window_manager.pointerMoved(if (self.window_manager.pointerGrabbed()) null else route.root);
+    self.seat.pointerEnter(point.x, point.y, route.focus);
     self.pointer_constraints.syncFocus();
 }
 
@@ -2811,7 +2587,6 @@ fn pointerLeave(context: *anyopaque) void {
     self.data_device.pointerLeft();
     if (self.xwm_initialized) self.xwm.dragLeft();
     self.seat.pointerLeave();
-    self.window_manager.pointerMoved(null);
 }
 
 fn pointerMotion(context: *anyopaque, time: u32, x: f64, y: f64) void {
@@ -2830,7 +2605,6 @@ fn pointerMotionForSeat(output: *RenderOutput, seat: *Seat, time: u32, x: f64, y
             target.y,
             self.pointerFocus(target.x, target.y),
         );
-        self.window_manager.pointerMovedForSeat(seat, null);
         return;
     }
     if (seat == &self.seat and self.data_device.isDragging()) {
@@ -2843,19 +2617,6 @@ fn pointerMotionForSeat(output: *RenderOutput, seat: *Seat, time: u32, x: f64, y
             self.data_device.externalDragPointerFocus(target.x, target.y),
         );
         self.routeActiveDrag(time, route, target.x, target.y, true);
-        self.window_manager.pointerMovedForSeat(seat, null);
-        return;
-    }
-    if (self.window_manager.pointerGrabbedForSeat(seat)) {
-        if (seat == &self.seat) self.pointer_constraints.deactivateAll();
-        seat.pointerMotion(time, target.x, target.y, null);
-        self.window_manager.pointerMovedForSeat(seat, null);
-        return;
-    }
-    if (seat != &self.seat) {
-        const route = self.pointerRoute(target.x, target.y);
-        seat.pointerMotion(time, target.x, target.y, route.focus);
-        self.window_manager.pointerMovedForSeat(seat, route.root);
         return;
     }
     const motion = self.pointer_constraints.constrainMotion(.{ .x = target.x, .y = target.y });
@@ -2870,7 +2631,6 @@ fn pointerMotionForSeat(output: *RenderOutput, seat: *Seat, time: u32, x: f64, y
         motion.point.y,
         route.focus,
     );
-    self.window_manager.pointerMovedForSeat(seat, route.root);
     self.pointer_constraints.syncFocus();
 }
 
@@ -2942,18 +2702,12 @@ fn pointerButtonForSeat(
         self.pointerRoute(position.x, position.y).root
     else
         null;
-    if (self.window_manager.pointerButtonForSeat(seat, button, state, root)) {
-        if (state == .released) seat.forgetPressedPointerButton(button);
-        if (seat == &self.seat) self.pointer_constraints.deactivateAll();
-        seat.suppressPointerFocus(true);
-        return;
-    }
+    self.window_manager.pointerButton(root, state);
     if (state == .pressed) {
         const focused = if (seat.pointerFocusedSurface()) |surface_id|
             self.subcompositor.rootSurface(surface_id)
         else
             null;
-        if (seat == &self.seat) self.focusXwaylandSurface(root);
         if (seat == &self.seat) self.layer_shell.pointerPressed(focused);
         requestRepaint(self);
     }
@@ -2976,7 +2730,6 @@ fn dragStarted(context: *anyopaque) void {
     const position = self.seat.pointerPosition() orelse return;
     const route = self.pointerRoute(position.x, position.y);
     if (!self.data_device.dragIsExternal()) self.seat.suppressPointerFocus(true);
-    self.window_manager.pointerMoved(null);
     self.routeActiveDrag(0, route, position.x, position.y, false);
 }
 
@@ -2985,12 +2738,7 @@ fn dragEnded(context: *anyopaque) void {
     if (self.xwm_initialized) self.xwm.physicalDragEnded();
     const position = self.seat.pointerPosition() orelse return;
     const route = self.pointerRoute(position.x, position.y);
-    self.seat.pointerEnter(
-        position.x,
-        position.y,
-        if (self.window_manager.pointerGrabbed()) null else route.focus,
-    );
-    self.window_manager.pointerMoved(if (self.window_manager.pointerGrabbed()) null else route.root);
+    self.seat.pointerEnter(position.x, position.y, route.focus);
     self.pointer_constraints.syncFocus();
 }
 
@@ -3002,7 +2750,7 @@ fn dragExternalSourceDestroyed(context: *anyopaque, generation: u64) void {
 fn routeActiveDrag(
     self: *Self,
     time: u32,
-    route: WindowManager.PointerRoute,
+    route: PointerRoute,
     x: f64,
     y: f64,
     motion: bool,
@@ -3094,11 +2842,11 @@ fn touchDown(context: *anyopaque, time: u32, id: i32, x: f64, y: f64) void {
     }
     if (focus) |target| {
         const root = self.subcompositor.rootSurface(target.surface_id);
-        self.focusXwaylandSurface(root);
+        self.window_manager.pointerButton(root, .pressed);
         self.layer_shell.pointerPressed(root);
         requestRepaint(self);
     } else {
-        self.focusXwaylandSurface(null);
+        self.window_manager.pointerButton(null, .pressed);
         if (self.xdg_shell.hasPopupGrab()) self.xdg_shell.dismissPopupGrab();
     }
     self.seat.touchDown(time, id, point.x, point.y, focus) catch {
@@ -3174,12 +2922,7 @@ fn pointerFocus(self: *Self, x: f64, y: f64) ?Seat.PointerFocus {
     return focus;
 }
 
-fn routePointer(context: *anyopaque, x: f64, y: f64) WindowManager.PointerRoute {
-    const self: *Self = @ptrCast(@alignCast(context));
-    return self.pointerRoute(x, y);
-}
-
-fn pointerRoute(self: *Self, x: f64, y: f64) WindowManager.PointerRoute {
+fn pointerRoute(self: *Self, x: f64, y: f64) PointerRoute {
     const focus = self.pointerFocus(x, y);
     return .{
         .focus = focus,
@@ -3800,7 +3543,7 @@ fn xwmWindowAssociated(context: *anyopaque, window_id: Xwm.WindowId, surface_id:
         ) catch {
             _ = self.xwayland_windows.remove(window_id);
             self.scene.removeWindow(scene_id);
-            log.err("failed to expose X11 window {d} to River", .{window_id});
+            log.err("failed to expose X11 window {d} to the window manager", .{window_id});
             self.terminate();
             return;
         };
@@ -3928,13 +3671,13 @@ fn updateXwaylandOverrideRedirectFocus(self: *Self, window_id: Xwm.WindowId) voi
     refreshKeyboardFocus(self);
 }
 
-fn riverXwaylandWindowInfo(context: *anyopaque, window_id: Xwm.WindowId) ?Xwm.WindowInfo {
+fn xwaylandWindowInfo(context: *anyopaque, window_id: Xwm.WindowId) ?Xwm.WindowInfo {
     const self: *Self = @ptrCast(@alignCast(context));
     if (!self.xwm_initialized) return null;
     return self.xwm.windowInfo(window_id);
 }
 
-fn riverResizeXwaylandWindow(
+fn resizeXwaylandWindow(
     context: *anyopaque,
     window_id: Xwm.WindowId,
     width: u16,
@@ -3949,7 +3692,7 @@ fn riverResizeXwaylandWindow(
     return true;
 }
 
-fn riverMoveXwaylandWindow(
+fn moveXwaylandWindow(
     context: *anyopaque,
     window_id: Xwm.WindowId,
     x: i16,
@@ -3964,7 +3707,7 @@ fn riverMoveXwaylandWindow(
     return true;
 }
 
-fn riverSetXwaylandWindowFullscreen(
+fn setXwaylandWindowFullscreen(
     context: *anyopaque,
     window_id: Xwm.WindowId,
     fullscreen: bool,
@@ -3980,7 +3723,7 @@ fn riverSetXwaylandWindowFullscreen(
     }
 }
 
-fn riverSetXwaylandWindowMaximized(
+fn setXwaylandWindowMaximized(
     context: *anyopaque,
     window_id: Xwm.WindowId,
     maximized: bool,
@@ -3996,7 +3739,7 @@ fn riverSetXwaylandWindowMaximized(
     }
 }
 
-fn riverSetXwaylandWindowMinimized(
+fn setXwaylandWindowMinimized(
     context: *anyopaque,
     window_id: Xwm.WindowId,
     minimized: bool,
@@ -4012,7 +3755,7 @@ fn riverSetXwaylandWindowMinimized(
     }
 }
 
-fn riverRequestXwaylandWindowFullscreen(
+fn requestXwaylandWindowFullscreen(
     context: *anyopaque,
     window_id: Xwm.WindowId,
     fullscreen: bool,
@@ -4028,7 +3771,7 @@ fn riverRequestXwaylandWindowFullscreen(
     }
 }
 
-fn riverRequestXwaylandWindowActivation(
+fn requestXwaylandWindowActivation(
     context: *anyopaque,
     window_id: Xwm.WindowId,
     seat: *Seat,
@@ -4039,7 +3782,7 @@ fn riverRequestXwaylandWindowActivation(
     }
 }
 
-fn riverRequestXwaylandWindowMaximized(
+fn requestXwaylandWindowMaximized(
     context: *anyopaque,
     window_id: Xwm.WindowId,
     maximized: bool,
@@ -4050,7 +3793,7 @@ fn riverRequestXwaylandWindowMaximized(
     }
 }
 
-fn riverRequestXwaylandWindowMinimized(
+fn requestXwaylandWindowMinimized(
     context: *anyopaque,
     window_id: Xwm.WindowId,
     minimized: bool,
@@ -4061,17 +3804,17 @@ fn riverRequestXwaylandWindowMinimized(
     }
 }
 
-fn riverCloseXwaylandWindow(context: *anyopaque, window_id: Xwm.WindowId) void {
+fn closeXwaylandWindow(context: *anyopaque, window_id: Xwm.WindowId) void {
     const self: *Self = @ptrCast(@alignCast(context));
     if (self.xwm_initialized) self.xwm.closeWindow(window_id);
 }
 
-fn riverRefreshXwaylandScene(context: *anyopaque, window_id: Xwm.WindowId) void {
+fn refreshXwaylandScene(context: *anyopaque, window_id: Xwm.WindowId) void {
     const self: *Self = @ptrCast(@alignCast(context));
     if (self.xwm_initialized) refreshXwaylandSceneWindow(self, window_id);
 }
 
-fn riverXwaylandStackingChanged(context: *anyopaque) void {
+fn xwaylandStackingChanged(context: *anyopaque) void {
     const self: *Self = @ptrCast(@alignCast(context));
     syncXwaylandClientStacking(self);
 }
@@ -4094,33 +3837,6 @@ fn xwaylandWindowForSurface(self: *Self, surface_id: Surface.Id) ?Xwm.WindowId {
         if (std.meta.eql(entry.value_ptr.surface_id, surface_id)) return entry.key_ptr.*;
     }
     return null;
-}
-
-fn focusXwaylandSurface(self: *Self, root: ?Surface.Id) void {
-    if (self.window_manager.hasActiveManager()) return;
-    var target: ?Xwm.WindowId = null;
-    if (root) |surface_id| {
-        var windows = self.xwayland_windows.iterator();
-        while (windows.next()) |entry| {
-            if (!std.meta.eql(entry.value_ptr.surface_id, surface_id)) continue;
-            const info = self.xwm.windowInfo(entry.key_ptr.*) orelse break;
-            if (info.override_redirect) return;
-            target = entry.key_ptr.*;
-            break;
-        }
-    }
-
-    var windows = self.xwayland_windows.iterator();
-    while (windows.next()) |entry| {
-        const focused = target != null and entry.key_ptr.* == target.?;
-        self.scene.setFocused(entry.value_ptr.scene_id, focused);
-        if (focused) {
-            const info = self.xwm.windowInfo(entry.key_ptr.*) orelse continue;
-            if (info.window_type != .desktop) self.scene.placeTop(entry.value_ptr.scene_id);
-        }
-    }
-    syncXwaylandClientStacking(self);
-    self.refreshKeyboardFocus();
 }
 
 fn syncXwaylandFocus(self: *Self, surface_id: ?Surface.Id) void {
@@ -4896,9 +4612,6 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
     const drag_icon = self.data_device.iconInfo();
     if (drag_icon) |info| self.submitSurfaceTree(output, info.surface_id);
     self.submitSeatCursor(output, &self.seat, false);
-    for (self.dynamic_seats.items) |entry| {
-        if (!entry.removed) self.submitSeatCursor(output, &entry.seat, false);
-    }
     self.submitTabletCursors(output, false);
     self.finishRepaintIfIdle();
     if (presented) |info| outputPresented(render_output, info);
@@ -4968,9 +4681,6 @@ fn renderDesktopContents(
 
     if (paint_cursors) {
         try self.renderSeatCursor(frame, &self.seat, false);
-        for (self.dynamic_seats.items) |entry| {
-            if (!entry.removed) try self.renderSeatCursor(frame, &entry.seat, false);
-        }
         try self.renderTabletCursors(frame, false);
     }
     return top_fullscreen;
@@ -4992,9 +4702,6 @@ fn presentSessionLockFrame(
     self.foreign_toplevel_list.syncOutput(frame.render_output.protocol_id);
     if (lock_surface) |info| self.submitSurfaceTree(frame.output, info.surface_id);
     self.submitSeatCursor(frame.output, &self.seat, true);
-    for (self.dynamic_seats.items) |entry| {
-        if (!entry.removed) self.submitSeatCursor(frame.output, &entry.seat, true);
-    }
     self.submitTabletCursors(frame.output, true);
     self.finishRepaintIfIdle();
     if (presented) |info| outputPresented(frame.render_output, info);
@@ -5020,9 +4727,6 @@ fn renderSessionLockContents(
 
     if (paint_cursors) {
         try self.renderSeatCursor(frame, &self.seat, true);
-        for (self.dynamic_seats.items) |entry| {
-            if (!entry.removed) try self.renderSeatCursor(frame, &entry.seat, true);
-        }
         try self.renderTabletCursors(frame, true);
     }
 }
@@ -5032,29 +4736,15 @@ fn refreshKeyboardFocus(self: *Self) void {
         const focus = self.session_lock.keyboardFocus();
         self.seat.setKeyboardFocus(focus);
         self.syncXwaylandFocus(null);
-        for (self.dynamic_seats.items) |entry| {
-            if (!entry.removed) entry.seat.setKeyboardFocus(focus);
-        }
         return;
     }
     const default_focus = self.layer_shell.keyboardFocus(
         self.xdg_shell.popupKeyboardFocus(),
     ) orelse
         self.xwayland_override_redirect_focus orelse
-        self.window_manager.focusedShellSurface() orelse self.scene.focusedSurface() orelse if (!self.window_manager.hasActiveManager())
-        self.scene.topWindowSurface()
-    else
-        null;
+        self.window_manager.focusedSurface() orelse self.scene.focusedSurface();
     self.seat.setKeyboardFocus(default_focus);
     self.syncXwaylandFocus(default_focus);
-    for (self.dynamic_seats.items) |entry| {
-        if (entry.removed) continue;
-        const focus = self.window_manager.focusedSurfaceForSeat(&entry.seat) orelse if (!self.window_manager.hasActiveManager())
-            self.scene.focusedSurface() orelse self.scene.topWindowSurface()
-        else
-            null;
-        entry.seat.setKeyboardFocus(focus);
-    }
 }
 
 fn renderSeatCursor(
@@ -5611,9 +5301,8 @@ test "server creates and destroys protocol globals" {
     defer server.destroy();
     try std.testing.expect(!server.native_input_initialized);
     try std.testing.expect(server.input_manager_initialized);
-    try std.testing.expect(server.libinput_config_initialized);
-    try std.testing.expect(server.xkb_config_initialized);
-    try std.testing.expect(server.xkb_bindings_initialized);
+    try std.testing.expect(server.builtin_keybindings_initialized);
+    try std.testing.expect(server.window_manager_initialized);
 }
 
 test "server adds and removes independent render outputs" {

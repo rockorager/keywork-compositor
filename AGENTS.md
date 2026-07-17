@@ -86,6 +86,5 @@ const output = try writer.toOwnedSlice();
 
 ## Licensing Boundary
 
-- Keywork is MIT-licensed and uses River only as a source of MIT-licensed protocol XML files.
-- Do not inspect, copy, or adapt River's GPL-3.0-only compositor implementation, including files under `zig-pkg/river-*/river/`.
-- Implement River protocol behavior from the protocol XML and other permissively licensed specifications or documentation.
+- Keywork is MIT-licensed; vendored protocol XML and adapted reference material must use permissive licenses.
+- Do not inspect, copy, or adapt GPL-licensed compositor implementations.

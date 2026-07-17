@@ -75,18 +75,6 @@ pub fn publishDisplay(self: *const Self, display_name: []const u8) !void {
     try self.updateActivationEnvironment(&.{display});
 }
 
-pub fn requestShutdown(self: *const Self) !bool {
-    if (!self.session_enabled) return false;
-    return try run(self.io, &.{
-        "systemctl",
-        "--user",
-        "--no-block",
-        "start",
-        "--job-mode=replace-irreversibly",
-        "keywork-shutdown.target",
-    });
-}
-
 fn updateActivationEnvironment(self: *const Self, assignments: []const []const u8) !void {
     std.debug.assert(assignments.len > 0 and assignments.len <= max_assignments);
 
@@ -133,13 +121,11 @@ test "session publication requires notification and explicit ownership" {
     var systemd: Self = .init(std.testing.io, &environ_map);
     try std.testing.expect(!systemd.notify_enabled);
     try std.testing.expect(!systemd.session_enabled);
-    try std.testing.expect(!try systemd.requestShutdown());
 
     try environ_map.put("NOTIFY_SOCKET", "/run/notify");
     systemd = .init(std.testing.io, &environ_map);
     try std.testing.expect(systemd.notify_enabled);
     try std.testing.expect(!systemd.session_enabled);
-    try std.testing.expect(!try systemd.requestShutdown());
 
     try environ_map.put("KEYWORK_SYSTEMD_SESSION", "1");
     systemd = .init(std.testing.io, &environ_map);

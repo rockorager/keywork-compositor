@@ -75,10 +75,6 @@ pub fn main(init: std.process.Init) !void {
         .context = &systemd,
         .ready = xwaylandReady,
     });
-    server.setSessionExitListener(.{
-        .context = &systemd,
-        .requested = sessionExitRequested,
-    });
     var buffer: [4096]u8 = undefined;
     var writer = std.Io.File.stdout().writer(init.io, &buffer);
     try writer.interface.print("WAYLAND_DISPLAY={s}\n", .{socket_name});
@@ -93,14 +89,6 @@ fn xwaylandReady(context: *anyopaque, display_name: []const u8) void {
     const systemd: *Systemd = @ptrCast(@alignCast(context));
     systemd.publishDisplay(display_name) catch |err| {
         log.warn("failed to publish DISPLAY to the activation environment: {t}", .{err});
-    };
-}
-
-fn sessionExitRequested(context: *anyopaque) bool {
-    const systemd: *Systemd = @ptrCast(@alignCast(context));
-    return systemd.requestShutdown() catch |err| {
-        log.warn("failed to request an orderly graphical-session shutdown: {t}", .{err});
-        return false;
     };
 }
 
@@ -175,6 +163,14 @@ test {
     _ = @import("region.zig");
     _ = @import("scene.zig");
     _ = @import("slot_map.zig");
+    _ = @import("window_manager.zig");
+    _ = @import("builtin_keybindings.zig");
+    _ = @import("command.zig");
+    _ = @import("input_manager.zig");
+    _ = @import("window_manager/types.zig");
+    _ = @import("window_manager/backend.zig");
+    _ = @import("window_manager/layout.zig");
+    _ = @import("window_manager/workspace.zig");
     _ = @import("wayland/compositor.zig");
     _ = @import("wayland/surface.zig");
     _ = @import("wayland/region.zig");
@@ -221,10 +217,5 @@ test {
     _ = @import("wayland/viewporter.zig");
     _ = @import("wayland/xdg_shell.zig");
     _ = @import("wayland/layer_shell.zig");
-    _ = @import("river/input_manager.zig");
-    _ = @import("river/libinput_config.zig");
-    _ = @import("river/xkb_config.zig");
-    _ = @import("river/xkb_bindings.zig");
-    _ = @import("river/window_manager.zig");
     _ = @import("server.zig");
 }
