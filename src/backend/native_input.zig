@@ -760,21 +760,17 @@ pub fn keyboardMatchesKeysym(
     const device = self.findInputDeviceById(id) orelse return false;
     const keyboard = if (device.keyboard) |*value| value else return false;
     if (layout >= c.xkb_keymap_num_layouts(keyboard.keymap.native)) return false;
-    const state = c.xkb_state_new(keyboard.keymap.native) orelse return false;
-    defer c.xkb_state_unref(state);
-    _ = c.xkb_state_update_mask(
-        state,
-        c.xkb_state_serialize_mods(keyboard.state, c.XKB_STATE_MODS_DEPRESSED),
-        c.xkb_state_serialize_mods(keyboard.state, c.XKB_STATE_MODS_LATCHED),
-        c.xkb_state_serialize_mods(keyboard.state, c.XKB_STATE_MODS_LOCKED),
-        0,
-        0,
+    var base_symbols: [*c]const c.xkb_keysym_t = null;
+    const base_count = c.xkb_keymap_key_get_syms_by_level(
+        keyboard.keymap.native,
+        key_code + 8,
         layout,
+        0,
+        &base_symbols,
     );
-    var symbols: [*c]const c.xkb_keysym_t = null;
-    const count = c.xkb_state_key_get_syms(state, key_code + 8, &symbols);
-    if (count <= 0 or symbols == null) return false;
-    for (symbols[0..@intCast(count)]) |symbol| if (symbol == keysym) return true;
+    if (base_count > 0 and base_symbols != null) {
+        for (base_symbols[0..@intCast(base_count)]) |symbol| if (symbol == keysym) return true;
+    }
     return false;
 }
 
@@ -1538,8 +1534,13 @@ fn keyboardEvent(
     pressed: bool,
     seat_level: bool,
 ) KeyboardEvent {
+    const xkb_key_code = key_code + 8;
     var symbols: [*c]const c.xkb_keysym_t = null;
-    const count = c.xkb_state_key_get_syms(keyboard.state, key_code + 8, &symbols);
+    const layout = c.xkb_state_key_get_layout(keyboard.state, xkb_key_code);
+    const count = if (layout == c.XKB_LAYOUT_INVALID)
+        0
+    else
+        c.xkb_keymap_key_get_syms_by_level(keyboard.keymap.native, xkb_key_code, layout, 0, &symbols);
     const keysyms: []const u32 = if (count > 0 and symbols != null)
         symbols[0..@intCast(count)]
     else
