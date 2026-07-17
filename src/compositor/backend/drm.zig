@@ -23,6 +23,12 @@ const log = std.log.scoped(.drm);
 const buffer_count = 2;
 const description_capacity = 512;
 const drm_format_mod_linear: u64 = 0;
+const default_target_dpi: f64 = 110.0;
+const minimum_plausible_dpi: f64 = 50.0;
+const maximum_plausible_dpi: f64 = 500.0;
+const maximum_axis_dpi_ratio: f64 = 1.2;
+const default_scale_step = render.Scale.denominator / 4;
+const maximum_default_scale = render.Scale.denominator * 4;
 
 allocator: std.mem.Allocator,
 io: std.Io,
@@ -501,6 +507,7 @@ pub fn activate(self: *Self, fd: std.posix.fd_t, selection: Selection, device_pa
     std.debug.assert(selection.mode_index < selection.modes.len);
     const selected_mode = selection.modes[selection.mode_index];
     const selected_size = selected_mode.size();
+    const first_activation = self.size.width == 0;
     if (self.size.width != 0 and (!std.meta.eql(self.size, selected_size) or
         self.connector_id != selection.connector_id or
         self.primary_plane_id != selection.primary_plane_id or
@@ -522,6 +529,7 @@ pub fn activate(self: *Self, fd: std.posix.fd_t, selection: Selection, device_pa
     self.mode = selected_mode.value;
     self.size = selected_size;
     self.physical_size = selection.physical_size;
+    if (first_activation) self.scale = defaultScale(selected_size, selection.physical_size);
     self.connector_id = selection.connector_id;
     self.crtc_id = selection.crtc_id;
     self.primary_plane_id = selection.primary_plane_id;
@@ -1105,6 +1113,35 @@ fn modeListsEqual(a: []const Mode, b: []const Mode) bool {
         if (!std.meta.eql(a_mode, b_mode)) return false;
     }
     return true;
+}
+
+fn defaultScale(pixel_size: render.Size, physical_size: render.Size) render.Scale {
+    const pixels_x: f64 = @floatFromInt(pixel_size.width);
+    const pixels_y: f64 = @floatFromInt(pixel_size.height);
+    const millimeters_x: f64 = @floatFromInt(physical_size.width);
+    const millimeters_y: f64 = @floatFromInt(physical_size.height);
+    const dpi_x = pixels_x * 25.4 / millimeters_x;
+    const dpi_y = pixels_y * 25.4 / millimeters_y;
+    if (!std.math.isFinite(dpi_x) or !std.math.isFinite(dpi_y) or
+        dpi_x < minimum_plausible_dpi or dpi_x > maximum_plausible_dpi or
+        dpi_y < minimum_plausible_dpi or dpi_y > maximum_plausible_dpi or
+        @max(dpi_x, dpi_y) / @min(dpi_x, dpi_y) > maximum_axis_dpi_ratio)
+    {
+        return .{};
+    }
+
+    const diagonal_pixels = std.math.sqrt(pixels_x * pixels_x + pixels_y * pixels_y);
+    const diagonal_inches = std.math.sqrt(
+        millimeters_x * millimeters_x + millimeters_y * millimeters_y,
+    ) / 25.4;
+    const scale = diagonal_pixels / diagonal_inches / default_target_dpi;
+    const quantized = @round(scale * render.Scale.denominator / default_scale_step) *
+        default_scale_step;
+    return .{ .numerator = @intFromFloat(std.math.clamp(
+        quantized,
+        render.Scale.denominator,
+        maximum_default_scale,
+    )) };
 }
 
 fn refreshNanoseconds(mode: c.drmModeModeInfo) u32 {
@@ -1744,6 +1781,32 @@ test "DRM mode inventory equality includes timing and preference" {
     b = a;
     b[0].preferred = false;
     try std.testing.expect(!modeListsEqual(&a, &b));
+}
+
+test "DRM default scale targets a readable physical density" {
+    try std.testing.expectEqual(
+        render.Scale{ .numerator = 120 },
+        defaultScale(.{ .width = 1920, .height = 1080 }, .{ .width = 531, .height = 299 }),
+    );
+    try std.testing.expectEqual(
+        render.Scale{ .numerator = 150 },
+        defaultScale(.{ .width = 3840, .height = 2160 }, .{ .width = 708, .height = 399 }),
+    );
+    try std.testing.expectEqual(
+        render.Scale{ .numerator = 180 },
+        defaultScale(.{ .width = 3840, .height = 2160 }, .{ .width = 598, .height = 336 }),
+    );
+}
+
+test "DRM default scale rejects implausible physical dimensions" {
+    try std.testing.expectEqual(
+        render.Scale{},
+        defaultScale(.{ .width = 3840, .height = 2160 }, .{ .width = 1, .height = 1 }),
+    );
+    try std.testing.expectEqual(
+        render.Scale{},
+        defaultScale(.{ .width = 3840, .height = 2160 }, .{ .width = 600, .height = 600 }),
+    );
 }
 
 test "DRM mode refresh converts to presentation period" {
