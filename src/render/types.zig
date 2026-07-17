@@ -219,6 +219,7 @@ pub const Shadow = struct {
     blur_radius: u32,
     spread: i32,
     color: Color,
+    cutout: ?RoundedClip = null,
     clip: ?Rect = null,
 };
 

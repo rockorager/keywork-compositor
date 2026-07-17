@@ -269,6 +269,10 @@ fn translateCommand(
             .blur_radius = shadow.blur_radius,
             .spread = shadow.spread,
             .color = shadow.color,
+            .cutout = if (shadow.cutout) |cutout| .{
+                .rect = translateRect(cutout.rect, origin),
+                .radius = cutout.radius,
+            } else null,
             .clip = if (shadow.clip) |clip| translateRect(clip, origin) else null,
         } },
         .backdrop_blur => |blur| .{ .backdrop_blur = .{
@@ -326,6 +330,10 @@ fn scaleCommand(command: render_types.Command, scale: render_types.Scale) render
             .blur_radius = scaleUnsigned(shadow.blur_radius, scale),
             .spread = scaleSigned(shadow.spread, scale),
             .color = shadow.color,
+            .cutout = if (shadow.cutout) |cutout| .{
+                .rect = scaleRect(cutout.rect, scale),
+                .radius = scaleUnsigned(cutout.radius, scale),
+            } else null,
             .clip = if (shadow.clip) |clip| scaleRect(clip, scale) else null,
         } },
         .backdrop_blur => |blur| .{ .backdrop_blur = .{

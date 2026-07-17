@@ -5241,6 +5241,17 @@ fn renderWindow(
         clip_box.translated(window.position.x, window.position.y)
     else
         null;
+    if (window.effects.blur) |blur| {
+        const blur_command = [_]render.Command{
+            .{ .backdrop_blur = .{
+                .rect = content_rect,
+                .corner_radius = window.effects.corner_radius,
+                .radius = blur.radius,
+                .clip = window_clip,
+            } },
+        };
+        try self.renderCommands(frame, &blur_command);
+    }
     if (window.effects.shadow) |shadow| {
         const shadow_command = [_]render.Command{
             .{ .shadow = .{
@@ -5254,21 +5265,14 @@ fn renderWindow(
                 .blur_radius = shadow.blur_radius,
                 .spread = shadow.spread,
                 .color = shadow.color,
+                .cutout = .{
+                    .rect = content_rect,
+                    .radius = window.effects.corner_radius,
+                },
                 .clip = window_clip,
             } },
         };
         try self.renderCommands(frame, &shadow_command);
-    }
-    if (window.effects.blur) |blur| {
-        const blur_command = [_]render.Command{
-            .{ .backdrop_blur = .{
-                .rect = content_rect,
-                .corner_radius = window.effects.corner_radius,
-                .radius = blur.radius,
-                .clip = window_clip,
-            } },
-        };
-        try self.renderCommands(frame, &blur_command);
     }
     try self.renderWindowDecorations(frame, id, window, .below, window_clip);
     var content_visible = true;

@@ -3166,8 +3166,16 @@ fn compileDrawRuns(
 
             const requested_radius = @max(@as(i64, shadow.corner_radius) + spread, 0);
             const radius = @min(requested_radius, @divTrunc(@min(shape_width, shape_height), 2));
+            const cutout = shadow.cutout orelse render.RoundedClip{
+                .rect = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
+                .radius = 0,
+            };
+            const cutout_radius = @min(
+                cutout.radius,
+                @min(cutout.rect.width, cutout.rect.height) / 2,
+            );
             try self.emitDamaged(frame, clipped, .shadow, null, .{ .width = 1, .height = 1 }, .{
-                .destination = rectFloats(clipped),
+                .destination = rectFloats(cutout.rect),
                 .source = .{ 0, 0, 1, 1 },
                 .clip = undefined,
                 .color = colorFloats(shadow.color),
@@ -3180,8 +3188,8 @@ fn compileDrawRuns(
                 .parameters = .{
                     @floatFromInt(radius),
                     @floatFromInt(shadow.blur_radius),
-                    0,
-                    0,
+                    @floatFromInt(cutout_radius),
+                    @floatFromInt(@intFromBool(shadow.cutout != null)),
                 },
             });
         },

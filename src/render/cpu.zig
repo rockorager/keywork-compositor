@@ -45,7 +45,7 @@ pub fn render(self: *Self, frame: render_types.Frame, target: render_types.Pixel
                 }
                 try fill(destination, clipped, solid.color, pixman.PIXMAN_OP_OVER);
             },
-            .shadow => |shadow| try self.drawShadow(destination, frame.size, shadow),
+            .shadow => |shadow| try drawShadow(destination, frame.size, shadow),
             .backdrop_blur => |blur| try self.drawBackdropBlur(target, blur, frame.damage),
             .image => |image| try composite(destination, frame.size, image),
         }
@@ -116,7 +116,6 @@ fn createImage(buffer: render_types.PixelBuffer, force_opaque: bool) Error!*pixm
 }
 
 fn drawShadow(
-    self: *Self,
     destination: *pixman.pixman_image_t,
     destination_size: render_types.Size,
     shadow: render_types.Shadow,
@@ -152,23 +151,8 @@ fn drawShadow(
         composite_rect = composite_rect.intersection(clip) orelse return;
     }
 
-    const sample_x = @max(mask_x, @as(i64, composite_rect.x) - blur);
-    const sample_y = @max(mask_y, @as(i64, composite_rect.y) - blur);
-    const sample_right = @min(
-        mask_right,
-        @as(i64, composite_rect.x) + composite_rect.width + blur,
-    );
-    const sample_bottom = @min(
-        mask_bottom,
-        @as(i64, composite_rect.y) + composite_rect.height + blur,
-    );
-    const sample_width = sample_right - sample_x;
-    const sample_height = sample_bottom - sample_y;
-    if (sample_width > std.math.maxInt(c_int) or sample_height > std.math.maxInt(c_int)) {
-        return error.InvalidTarget;
-    }
-    const width: u32 = @intCast(sample_width);
-    const height: u32 = @intCast(sample_height);
+    const width = composite_rect.width;
+    const height = composite_rect.height;
     const mask = pixman.pixman_image_create_bits(
         pixman.PIXMAN_a8,
         @intCast(width),
@@ -185,15 +169,48 @@ fn drawShadow(
         radius_value,
         @divTrunc(@min(shape_width, shape_height), 2),
     ));
-    const shape_left: f64 = @floatFromInt(shape_x - sample_x);
-    const shape_top: f64 = @floatFromInt(shape_y - sample_y);
+    const shape_left: f64 = @floatFromInt(shape_x);
+    const shape_top: f64 = @floatFromInt(shape_y);
     const shape_size_x: f64 = @floatFromInt(shape_width);
     const shape_size_y: f64 = @floatFromInt(shape_height);
+    var cutout_left: f64 = 0;
+    var cutout_top: f64 = 0;
+    var cutout_width: f64 = 0;
+    var cutout_height: f64 = 0;
+    var cutout_radius: f64 = 0;
+    if (shadow.cutout) |cutout| {
+        cutout_left = @floatFromInt(cutout.rect.x);
+        cutout_top = @floatFromInt(cutout.rect.y);
+        cutout_width = @floatFromInt(cutout.rect.width);
+        cutout_height = @floatFromInt(cutout.rect.height);
+        cutout_radius = @floatFromInt(@min(
+            cutout.radius,
+            @min(cutout.rect.width, cutout.rect.height) / 2,
+        ));
+    }
     for (0..height) |y| {
         for (0..width) |x| {
-            const pixel_x: f64 = @as(f64, @floatFromInt(x)) + 0.5;
-            const pixel_y: f64 = @as(f64, @floatFromInt(y)) + 0.5;
-            const coverage = roundedRectCoverage(
+            const pixel_x: f64 = @as(f64, @floatFromInt(composite_rect.x)) +
+                @as(f64, @floatFromInt(x)) + 0.5;
+            const pixel_y: f64 = @as(f64, @floatFromInt(composite_rect.y)) +
+                @as(f64, @floatFromInt(y)) + 0.5;
+            var cutout_alpha: f64 = 1;
+            if (shadow.cutout != null) {
+                cutout_alpha -= roundedRectCoverage(
+                    pixel_x,
+                    pixel_y,
+                    cutout_left,
+                    cutout_top,
+                    cutout_width,
+                    cutout_height,
+                    cutout_radius,
+                );
+                if (cutout_alpha == 0) {
+                    data[y * stride + x] = 0;
+                    continue;
+                }
+            }
+            const coverage = roundedBoxShadowCoverage(
                 pixel_x,
                 pixel_y,
                 shape_left,
@@ -201,12 +218,12 @@ fn drawShadow(
                 shape_size_x,
                 shape_size_y,
                 radius,
+                @floatFromInt(shadow.blur_radius),
+            ) * cutout_alpha;
+            data[y * stride + x] = @intFromFloat(
+                std.math.clamp(coverage, 0.0, 1.0) * 255.0 + 0.5,
             );
-            data[y * stride + x] = @intFromFloat(coverage * 255.0);
         }
-    }
-    if (shadow.blur_radius > 0) {
-        try blurMask(self.allocator, data, stride, width, height, shadow.blur_radius);
     }
 
     const color: pixman.pixman_color_t = .{
@@ -225,8 +242,8 @@ fn drawShadow(
         destination,
         0,
         0,
-        @intCast(@as(i64, composite_rect.x) - sample_x),
-        @intCast(@as(i64, composite_rect.y) - sample_y),
+        0,
+        0,
         composite_rect.x,
         composite_rect.y,
         @intCast(composite_rect.width),
@@ -476,42 +493,75 @@ fn roundedRectCoverage(
     return std.math.clamp(0.5 - signed_distance, 0.0, 1.0);
 }
 
-fn blurMask(
-    allocator: std.mem.Allocator,
-    data: [*]u8,
-    stride: usize,
-    width: u32,
-    height: u32,
-    radius_value: u32,
-) Error!void {
-    const pixel_count = std.math.mul(usize, width, height) catch return error.InvalidTarget;
-    const temporary = allocator.alloc(u8, pixel_count) catch return error.OutOfMemory;
-    defer allocator.free(temporary);
-
-    const radius: usize = radius_value;
-    const kernel = std.math.add(usize, std.math.mul(usize, radius, 2) catch
-        return error.InvalidTarget, 1) catch return error.InvalidTarget;
-    for (0..height) |y| {
-        var sum: u64 = 0;
-        for (0..@min(radius + 1, width)) |x| sum += data[y * stride + x];
-        for (0..width) |x| {
-            temporary[y * width + x] = @intCast(sum / kernel);
-            if (x >= radius) sum -= data[y * stride + x - radius];
-            const added = x + radius + 1;
-            if (added < width) sum += data[y * stride + added];
-        }
+fn roundedBoxShadowCoverage(
+    pixel_x: f64,
+    pixel_y: f64,
+    left: f64,
+    top: f64,
+    width: f64,
+    height: f64,
+    radius: f64,
+    blur_radius: f64,
+) f64 {
+    if (blur_radius == 0) {
+        return roundedRectCoverage(pixel_x, pixel_y, left, top, width, height, radius);
     }
 
-    for (0..width) |x| {
-        var sum: u64 = 0;
-        for (0..@min(radius + 1, height)) |y| sum += temporary[y * width + x];
-        for (0..height) |y| {
-            data[y * stride + x] = @intCast(sum / kernel);
-            if (y >= radius) sum -= temporary[(y - radius) * width + x];
-            const added = y + radius + 1;
-            if (added < height) sum += temporary[added * width + x];
-        }
+    const sigma = blur_radius * 0.5;
+    const half_width = width * 0.5;
+    const half_height = height * 0.5;
+    const x = pixel_x - (left + half_width);
+    const y = pixel_y - (top + half_height);
+    const low = y - half_height;
+    const high = y + half_height;
+    const start = std.math.clamp(-3.0 * sigma, low, high);
+    const end = std.math.clamp(3.0 * sigma, low, high);
+    const step = (end - start) * 0.25;
+    var sample_y = start + step * 0.5;
+    var coverage: f64 = 0;
+    for (0..4) |_| {
+        coverage += roundedBoxShadowX(
+            x,
+            y - sample_y,
+            sigma,
+            radius,
+            half_width,
+            half_height,
+        ) * gaussian(sample_y, sigma) * step;
+        sample_y += step;
     }
+    return std.math.clamp(coverage, 0.0, 1.0);
+}
+
+fn roundedBoxShadowX(
+    x: f64,
+    y: f64,
+    sigma: f64,
+    radius: f64,
+    half_width: f64,
+    half_height: f64,
+) f64 {
+    const delta = @min(half_height - radius - @abs(y), 0.0);
+    const curved = half_width - radius +
+        std.math.sqrt(@max(0.0, radius * radius - delta * delta));
+    const scale = std.math.sqrt(0.5) / sigma;
+    const lower = 0.5 + 0.5 * erfApprox((x - curved) * scale);
+    const upper = 0.5 + 0.5 * erfApprox((x + curved) * scale);
+    return upper - lower;
+}
+
+fn gaussian(value: f64, sigma: f64) f64 {
+    return std.math.exp(-(value * value) / (2.0 * sigma * sigma)) /
+        (std.math.sqrt(2.0 * std.math.pi) * sigma);
+}
+
+fn erfApprox(value: f64) f64 {
+    const sign: f64 = if (value < 0) -1 else if (value > 0) 1 else 0;
+    const absolute = @abs(value);
+    var denominator = 1.0 +
+        (0.278393 + (0.230389 + 0.078108 * absolute * absolute) * absolute) * absolute;
+    denominator *= denominator;
+    return sign - sign / (denominator * denominator);
 }
 
 fn composite(
@@ -1094,6 +1144,34 @@ test "CPU renderer draws blurred rounded shadows" {
     try std.testing.expectEqual(@as(u32, 0), output.pixel(3, 4));
     try std.testing.expectEqual(@as(u32, 0), output.pixel(5, 4));
     try std.testing.expectEqual(@as(u32, 0), output.pixel(8, 8));
+}
+
+test "CPU renderer cuts the rounded window interior out of shadows" {
+    const size: render_types.Size = .{ .width = 15, .height = 15 };
+    var output = try headless.init(std.testing.allocator, size);
+    defer output.deinit();
+
+    const commands = [_]render_types.Command{
+        .{ .shadow = .{
+            .rect = .{ .x = 4, .y = 6, .width = 7, .height = 7 },
+            .corner_radius = 2,
+            .blur_radius = 3,
+            .spread = 0,
+            .color = render_types.Color.rgba(0, 0, 0, 255),
+            .cutout = .{
+                .rect = .{ .x = 4, .y = 4, .width = 7, .height = 7 },
+                .radius = 2,
+            },
+        } },
+    };
+
+    var renderer = Self.init(std.testing.allocator);
+    defer renderer.deinit();
+    try renderer.render(.{ .size = size, .commands = &commands }, output.target());
+
+    try std.testing.expectEqual(@as(u32, 0), output.pixel(7, 7));
+    try std.testing.expect(@as(u8, @truncate(output.pixel(7, 12) >> 24)) > 0);
+    try std.testing.expect(@as(u8, @truncate(output.pixel(4, 4) >> 24)) > 0);
 }
 
 test "CPU renderer bounds shadow work to the clipped output" {
