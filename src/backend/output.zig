@@ -224,11 +224,19 @@ pub fn cancel(self: *Self) void {
     }
 }
 
-pub fn present(self: *Self, damage: *const Region) !?presentation.Info {
+pub fn present(
+    self: *Self,
+    damage: *const Region,
+    render_fence_fd: ?std.posix.fd_t,
+) !?presentation.Info {
     return switch (self.backend) {
-        .drm => |output| output.present(damage),
-        .headless => presentation.Info.now(self.io),
+        .drm => |output| output.present(damage, render_fence_fd),
+        .headless => blk: {
+            std.debug.assert(render_fence_fd == null);
+            break :blk presentation.Info.now(self.io);
+        },
         .nested => |*output| blk: {
+            std.debug.assert(render_fence_fd == null);
             try output.present();
             break :blk null;
         },

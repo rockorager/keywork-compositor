@@ -4803,8 +4803,11 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
     if (self.session_lock.isLocked()) {
         try self.renderSessionLockContents(&frame, true);
         renderer_frame_active = false;
-        try self.renderer.finishFrame();
-        return self.presentSessionLockFrame(&frame);
+        const render_fence_fd = try self.renderer.finishFrameScanout();
+        defer if (render_fence_fd) |fd| {
+            _ = std.c.close(fd);
+        };
+        return self.presentSessionLockFrame(&frame, render_fence_fd);
     }
 
     const top_fullscreen = try self.renderDesktopContents(&frame, true);
@@ -4820,8 +4823,11 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
     }
     if (!direct_scanout) {
         renderer_frame_active = false;
-        try self.renderer.finishFrame();
-        presented = render_output.backend.present(&frame_damage) catch
+        const render_fence_fd = try self.renderer.finishFrameScanout();
+        defer if (render_fence_fd) |fd| {
+            _ = std.c.close(fd);
+        };
+        presented = render_output.backend.present(&frame_damage, render_fence_fd) catch
             return error.InvalidTarget;
     }
     output.endFrame();
@@ -4940,9 +4946,13 @@ fn renderDesktopContents(
 fn presentSessionLockFrame(
     self: *Self,
     frame: *const OutputFrame,
+    render_fence_fd: ?std.posix.fd_t,
 ) renderer_types.Renderer.Error!void {
     const lock_surface = self.session_lock.surfaceForOutput(frame.render_output.protocol_id);
-    const presented = frame.render_output.backend.present(frame.presentation_damage.?) catch
+    const presented = frame.render_output.backend.present(
+        frame.presentation_damage.?,
+        render_fence_fd,
+    ) catch
         return error.InvalidTarget;
     frame.render_output.lock_frame_pending = true;
     frame.output.endFrame();

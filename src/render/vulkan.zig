@@ -7,6 +7,10 @@ const vk = @import("vulkan");
 const CpuRenderer = @import("cpu.zig");
 const render = @import("types.zig");
 const shaders = @import("vulkan_shaders.zig");
+const sync = @cImport({
+    @cInclude("linux/dma-buf.h");
+    @cInclude("sys/ioctl.h");
+});
 const log = std.log.scoped(.vulkan);
 
 allocator: std.mem.Allocator,
@@ -21,6 +25,7 @@ queue_family_index: u32,
 command_pool: vk.CommandPool,
 command_buffer: vk.CommandBuffer,
 fence: vk.Fence,
+scanout_semaphore: vk.Semaphore,
 fence_pending: bool,
 format: vk.Format,
 swap_red_blue: bool,
@@ -50,6 +55,8 @@ instances: std.ArrayList(Instance) = .empty,
 draw_runs: std.ArrayList(DrawRun) = .empty,
 blur_ops: std.ArrayList(BlurOp) = .empty,
 prepared_images: std.ArrayList(PreparedImage) = .empty,
+pending_wait_semaphores: std.ArrayList(vk.Semaphore) = .empty,
+pending_textures: std.ArrayList(Texture) = .empty,
 dmabuf_modifiers: []u64,
 dmabuf_sampled_modifiers: []u64,
 dmabuf_source_modifiers: []u64,
@@ -808,6 +815,31 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
         return error.VulkanUnavailable;
     errdefer device_wrapper.destroyFence(device, fence, null);
 
+    var sync_fd_properties: vk.ExternalSemaphoreProperties = .{
+        .export_from_imported_handle_types = .{},
+        .compatible_handle_types = .{},
+    };
+    if (dmabuf_capable) instance_wrapper.getPhysicalDeviceExternalSemaphorePropertiesKHR(
+        physical_device,
+        &.{ .handle_type = .{ .sync_fd_bit = true } },
+        &sync_fd_properties,
+    );
+    const sync_fd_capable = dmabuf_capable and
+        sync_fd_properties.external_semaphore_features.exportable_bit and
+        sync_fd_properties.external_semaphore_features.importable_bit;
+    var scanout_semaphore = vk.Semaphore.null_handle;
+    if (sync_fd_capable) {
+        const export_info: vk.ExportSemaphoreCreateInfo = .{
+            .handle_types = .{ .sync_fd_bit = true },
+        };
+        scanout_semaphore = device_wrapper.createSemaphore(device, &.{
+            .p_next = &export_info,
+        }, null) catch .null_handle;
+    }
+    errdefer if (scanout_semaphore != .null_handle) {
+        device_wrapper.destroySemaphore(device, scanout_semaphore, null);
+    };
+
     const format = chooseFormat(instance_wrapper, physical_device) orelse
         return error.VulkanUnavailable;
     if (format != .b8g8r8a8_unorm) {
@@ -900,6 +932,7 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
         .command_pool = command_pool,
         .command_buffer = command_buffer,
         .fence = fence,
+        .scanout_semaphore = scanout_semaphore,
         .fence_pending = false,
         .format = format,
         .swap_red_blue = format == .r8g8b8a8_unorm,
@@ -938,6 +971,7 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
 pub fn deinit(self: *Self) void {
     self.device_wrapper.deviceWaitIdle(self.device) catch {};
     self.fence_pending = false;
+    self.releasePendingResources();
     self.fallback.deinit();
     self.destroyCachedResources();
     if (self.dmabuf_modifiers.len != 0) self.allocator.free(self.dmabuf_modifiers);
@@ -947,6 +981,8 @@ pub fn deinit(self: *Self) void {
     self.draw_runs.deinit(self.allocator);
     self.blur_ops.deinit(self.allocator);
     self.prepared_images.deinit(self.allocator);
+    self.pending_wait_semaphores.deinit(self.allocator);
+    self.pending_textures.deinit(self.allocator);
     self.destroyInstanceBuffer();
     self.destroyWorkBuffer();
     destroyGraphics(self.device_wrapper, self.device, .{
@@ -965,6 +1001,9 @@ pub fn deinit(self: *Self) void {
         .blur_composite_pipeline = self.blur_composite_pipeline,
         .sampler = self.sampler,
     });
+    if (self.scanout_semaphore != .null_handle) {
+        self.device_wrapper.destroySemaphore(self.device, self.scanout_semaphore, null);
+    }
     self.device_wrapper.destroyFence(self.device, self.fence, null);
     self.device_wrapper.destroyCommandPool(self.device, self.command_pool, null);
     self.device_wrapper.destroyDevice(self.device, null);
@@ -1251,33 +1290,87 @@ fn releaseTarget(self: *Self, id: u64) void {
 }
 
 fn releaseOutput(self: *Self, key: TargetKey) void {
-    if (self.fence_pending) {
-        const wait_result = self.device_wrapper.waitForFences(
-            self.device,
-            &.{self.fence},
-            .true,
-            std.math.maxInt(u64),
-        ) catch blk: {
-            self.device_wrapper.deviceWaitIdle(self.device) catch {};
-            break :blk vk.Result.success;
-        };
-        _ = wait_result;
-        self.fence_pending = false;
-    }
+    self.drainPending() catch {};
     if (self.outputs.fetchRemove(key)) |removed| self.destroyOutput(removed.value);
 }
 
+fn drainPending(self: *Self) Error!void {
+    if (!self.fence_pending) {
+        std.debug.assert(self.pending_wait_semaphores.items.len == 0);
+        std.debug.assert(self.pending_textures.items.len == 0);
+        return;
+    }
+    const result = self.device_wrapper.waitForFences(
+        self.device,
+        &.{self.fence},
+        .true,
+        std.math.maxInt(u64),
+    ) catch {
+        self.device_wrapper.deviceWaitIdle(self.device) catch {};
+        self.fence_pending = false;
+        self.releasePendingResources();
+        return error.VulkanFailure;
+    };
+    if (result != .success) {
+        self.device_wrapper.deviceWaitIdle(self.device) catch {};
+        self.fence_pending = false;
+        self.releasePendingResources();
+        return error.VulkanFailure;
+    }
+    self.fence_pending = false;
+    self.releasePendingResources();
+}
+
+fn releasePendingResources(self: *Self) void {
+    for (self.pending_wait_semaphores.items) |semaphore| {
+        self.device_wrapper.destroySemaphore(self.device, semaphore, null);
+    }
+    self.pending_wait_semaphores.clearRetainingCapacity();
+    for (self.pending_textures.items) |texture| self.destroyTexture(texture);
+    self.pending_textures.clearRetainingCapacity();
+}
+
+fn disableScanoutSemaphore(self: *Self) void {
+    if (self.scanout_semaphore == .null_handle) return;
+    self.device_wrapper.destroySemaphore(self.device, self.scanout_semaphore, null);
+    self.scanout_semaphore = .null_handle;
+}
+
 pub fn renderFrame(self: *Self, frame: render.Frame, target: render.Target) Error!void {
+    _ = try self.renderFrameWithCompletion(frame, target, .wait);
+}
+
+pub fn renderFrameScanout(
+    self: *Self,
+    frame: render.Frame,
+    target: render.Target,
+) Error!?std.posix.fd_t {
+    return self.renderFrameWithCompletion(frame, target, .sync_fd);
+}
+
+const CompletionMode = enum {
+    wait,
+    sync_fd,
+};
+
+fn renderFrameWithCompletion(
+    self: *Self,
+    frame: render.Frame,
+    target: render.Target,
+    completion_mode: CompletionMode,
+) Error!?std.posix.fd_t {
+    try self.drainPending();
     const required_pixels = try validateTarget(frame, target);
     const target_key = targetKey(target);
     if (!supports(frame.commands)) {
-        return switch (target) {
-            .pixels => |pixels| blk: {
+        switch (target) {
+            .pixels => |pixels| {
                 self.invalidateOutput(target_key);
-                break :blk self.fallback.render(frame, pixels);
+                try self.fallback.render(frame, pixels);
             },
             .offscreen, .dmabuf => try self.renderGpuFallback(frame, target_key),
-        };
+        }
+        return null;
     }
 
     self.frame_number +%= 1;
@@ -1288,12 +1381,15 @@ pub fn renderFrame(self: *Self, frame: render.Frame, target: render.Target) Erro
             self.blur_ops.items.len == 0 and
             self.prepared_images.items.len == 0,
     );
+    var temporary_textures_pending = false;
     defer {
         self.instances.clearRetainingCapacity();
         self.draw_runs.clearRetainingCapacity();
         self.blur_ops.clearRetainingCapacity();
-        for (self.prepared_images.items) |prepared| {
-            if (prepared.cache_id == null) self.destroyTexture(prepared.texture);
+        if (!temporary_textures_pending) {
+            for (self.prepared_images.items) |prepared| {
+                if (prepared.cache_id == null) self.destroyTexture(prepared.texture);
+            }
         }
         self.prepared_images.clearRetainingCapacity();
     }
@@ -1302,6 +1398,7 @@ pub fn renderFrame(self: *Self, frame: render.Frame, target: render.Target) Erro
     defer if (!frame_succeeded) {
         self.device_wrapper.deviceWaitIdle(self.device) catch {};
         self.fence_pending = false;
+        self.releasePendingResources();
         self.resetCommandBufferForTarget(target_key);
         self.invalidateOutput(target_key);
         self.invalidatePreparedTextures(self.prepared_images.items);
@@ -1715,18 +1812,19 @@ pub fn renderFrame(self: *Self, frame: render.Frame, target: render.Target) Erro
         );
     }
 
-    var wait_semaphores: std.ArrayList(vk.Semaphore) = .empty;
-    defer {
-        for (wait_semaphores.items) |semaphore| {
-            self.device_wrapper.destroySemaphore(self.device, semaphore, null);
-        }
-        wait_semaphores.deinit(self.allocator);
-    }
     var wait_stages: std.ArrayList(vk.PipelineStageFlags) = .empty;
     defer wait_stages.deinit(self.allocator);
-    wait_semaphores.ensureTotalCapacity(self.allocator, self.prepared_images.items.len) catch
-        return error.OutOfMemory;
+    self.pending_wait_semaphores.ensureTotalCapacity(
+        self.allocator,
+        self.prepared_images.items.len,
+    ) catch return error.OutOfMemory;
     wait_stages.ensureTotalCapacity(self.allocator, self.prepared_images.items.len) catch
+        return error.OutOfMemory;
+    var temporary_texture_count: usize = 0;
+    for (self.prepared_images.items) |prepared| {
+        if (prepared.cache_id == null) temporary_texture_count += 1;
+    }
+    self.pending_textures.ensureTotalCapacity(self.allocator, temporary_texture_count) catch
         return error.OutOfMemory;
     for (self.prepared_images.items, 0..) |prepared, index| {
         if (!prepared.texture.imported or
@@ -1755,38 +1853,35 @@ pub fn renderFrame(self: *Self, frame: render.Frame, target: render.Target) Erro
             if (!(source.end_cpu_read)(source.context)) return error.VulkanFailure;
             continue;
         };
-        wait_semaphores.appendAssumeCapacity(semaphore);
+        self.pending_wait_semaphores.appendAssumeCapacity(semaphore);
         wait_stages.appendAssumeCapacity(.{ .all_commands_bit = true });
     }
 
+    const async_submission = completion_mode == .sync_fd and
+        output.kind == .dmabuf and self.scanout_semaphore != .null_handle;
     // Queue submission makes prior coherent mapped writes visible to every
     // device access in the submission; no host pipeline barrier is needed.
     const submit_info: vk.SubmitInfo = .{
-        .wait_semaphore_count = @intCast(wait_semaphores.items.len),
-        .p_wait_semaphores = wait_semaphores.items.ptr,
+        .wait_semaphore_count = @intCast(self.pending_wait_semaphores.items.len),
+        .p_wait_semaphores = self.pending_wait_semaphores.items.ptr,
         .p_wait_dst_stage_mask = wait_stages.items.ptr,
         .command_buffer_count = 1,
         .p_command_buffers = @ptrCast(&command_buffer),
+        .signal_semaphore_count = @intFromBool(async_submission),
+        .p_signal_semaphores = if (async_submission)
+            @ptrCast(&self.scanout_semaphore)
+        else
+            null,
     };
     self.device_wrapper.queueSubmit(self.queue, &.{submit_info}, self.fence) catch
         return error.VulkanFailure;
     self.fence_pending = true;
-    const wait_result = self.device_wrapper.waitForFences(
-        self.device,
-        &.{self.fence},
-        .true,
-        std.math.maxInt(u64),
-    ) catch {
-        self.device_wrapper.deviceWaitIdle(self.device) catch {};
-        self.fence_pending = false;
-        return error.VulkanFailure;
-    };
-    if (wait_result != .success) {
-        self.device_wrapper.deviceWaitIdle(self.device) catch {};
-        self.fence_pending = false;
-        return error.VulkanFailure;
+    for (self.prepared_images.items) |prepared| {
+        if (prepared.cache_id == null) {
+            self.pending_textures.appendAssumeCapacity(prepared.texture);
+        }
     }
-    self.fence_pending = false;
+    temporary_textures_pending = true;
     output.initialized = true;
     if (self.blur_ops.items.len != 0) output.blur_initialized = blur_initialized;
     for (self.prepared_images.items) |prepared| {
@@ -1796,8 +1891,74 @@ pub fn renderFrame(self: *Self, frame: render.Frame, target: render.Target) Erro
             texture.version = prepared.desired_version;
         }
     }
+
+    if (async_submission) {
+        const completion_fd = self.device_wrapper.getSemaphoreFdKHR(self.device, &.{
+            .semaphore = self.scanout_semaphore,
+            .handle_type = .{ .sync_fd_bit = true },
+        }) catch {
+            try self.drainPending();
+            self.disableScanoutSemaphore();
+            log.warn("Vulkan sync-file export failed; using blocking scanout", .{});
+            frame_succeeded = true;
+            return null;
+        };
+        if (completion_fd < 0) {
+            try self.drainPending();
+            frame_succeeded = true;
+            return null;
+        }
+        var completion_fd_owned = true;
+        defer if (completion_fd_owned) {
+            _ = std.c.close(completion_fd);
+        };
+        for (self.prepared_images.items, 0..) |prepared, index| {
+            if (!prepared.texture.imported or
+                !isFirstImportedTexture(self.prepared_images.items, index)) continue;
+            if (!importDmaBufSyncFile(
+                prepared.buffer.dmabuf.?.fd,
+                completion_fd,
+                sync.DMA_BUF_SYNC_READ,
+            )) {
+                try self.drainPending();
+                self.disableScanoutSemaphore();
+                log.warn("DMA-BUF sync-file import failed; using blocking scanout", .{});
+                frame_succeeded = true;
+                return null;
+            }
+        }
+        frame_succeeded = true;
+        completion_fd_owned = false;
+        return completion_fd;
+    }
+
+    try self.drainPending();
     frame_succeeded = true;
     if (output.kind == .pixels) copyDamageToTarget(frame, target.pixels, self.work_mapped.?);
+    return null;
+}
+
+fn importDmaBufSyncFile(
+    dmabuf_fd: std.posix.fd_t,
+    sync_file_fd: std.posix.fd_t,
+    flags: u32,
+) bool {
+    var import_sync_file: sync.dma_buf_import_sync_file = .{
+        .flags = flags,
+        .fd = sync_file_fd,
+    };
+    while (true) {
+        const result = sync.ioctl(
+            dmabuf_fd,
+            sync.DMA_BUF_IOCTL_IMPORT_SYNC_FILE,
+            &import_sync_file,
+        );
+        if (result >= 0) return true;
+        switch (std.posix.errno(result)) {
+            .INTR, .AGAIN => continue,
+            else => return false,
+        }
+    }
 }
 
 fn isFirstImportedTexture(prepared_images: []const PreparedImage, index: usize) bool {

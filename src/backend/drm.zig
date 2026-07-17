@@ -14,6 +14,8 @@ const c = @cImport({
     @cInclude("libdisplay-info/info.h");
     @cInclude("libudev.h");
     @cInclude("libdrm/drm_fourcc.h");
+    @cInclude("linux/dma-buf.h");
+    @cInclude("sys/ioctl.h");
     @cInclude("xf86drm.h");
     @cInclude("xf86drmMode.h");
 });
@@ -43,6 +45,7 @@ primary_plane_id: ?u32,
 atomic_plane: ?AtomicPlaneProperties,
 scanout_modifiers: []u64,
 implicit_scanout: bool,
+sync_file_import_supported: bool,
 connector_name: [32]u8,
 connector_name_length: usize,
 make_value: [*c]u8,
@@ -214,6 +217,7 @@ pub fn init(
         .atomic_plane = null,
         .scanout_modifiers = &.{},
         .implicit_scanout = true,
+        .sync_file_import_supported = true,
         .connector_name = undefined,
         .connector_name_length = 0,
         .make_value = null,
@@ -362,11 +366,32 @@ pub fn cancel(self: *Self) void {
     self.acquired = null;
 }
 
-pub fn present(self: *Self, frame_damage: *const Region) !?presentation.Info {
+pub fn present(
+    self: *Self,
+    frame_damage: *const Region,
+    render_fence_fd: ?std.posix.fd_t,
+) !?presentation.Info {
     const index = self.acquired orelse return error.NoAcquiredBuffer;
     const fd = self.device_access.fd(self.device_access.context) orelse return error.SessionInactive;
     if (!self.device_access.active(self.device_access.context)) return error.SessionInactive;
     const buffer = &self.buffers[index];
+    if (render_fence_fd) |fence_fd| {
+        const gbm_buffer = buffer.gbm orelse return error.InvalidRenderFence;
+        if (buffer.render_target_id == null) return error.InvalidRenderFence;
+        var imported = false;
+        if (self.sync_file_import_supported) {
+            imported = importSyncFile(gbm_buffer.fd, fence_fd);
+            if (!imported) {
+                self.sync_file_import_supported = false;
+                log.warn("DMA-BUF sync-file import failed; blocking before DRM commits", .{});
+            }
+        }
+        // Legacy commits don't consistently consume DMA-BUF reservation
+        // fences. Initial modesets are rare, so wait for both cases.
+        if (!imported or !self.mode_set or self.atomic_plane == null) {
+            try waitSyncFile(fence_fd);
+        }
+    }
     for (&self.buffer_damage) |*damage| try damage.unionWith(frame_damage);
     if (buffer.render_target_id == null) copyShadowDamage(
         buffer.pixels,
@@ -405,6 +430,40 @@ pub fn present(self: *Self, frame_damage: *const Region) !?presentation.Info {
     self.pending = index;
     self.acquired = null;
     return null;
+}
+
+fn importSyncFile(dmabuf_fd: std.posix.fd_t, sync_file_fd: std.posix.fd_t) bool {
+    var import_sync_file: c.dma_buf_import_sync_file = .{
+        .flags = c.DMA_BUF_SYNC_WRITE,
+        .fd = sync_file_fd,
+    };
+    while (true) {
+        const result = c.ioctl(
+            dmabuf_fd,
+            c.DMA_BUF_IOCTL_IMPORT_SYNC_FILE,
+            &import_sync_file,
+        );
+        if (result >= 0) return true;
+        switch (std.posix.errno(result)) {
+            .INTR, .AGAIN => continue,
+            else => return false,
+        }
+    }
+}
+
+fn waitSyncFile(sync_file_fd: std.posix.fd_t) !void {
+    var poll_fds = [_]std.posix.pollfd{.{
+        .fd = sync_file_fd,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    if (try std.posix.poll(&poll_fds, -1) == 0 or
+        poll_fds[0].revents & std.posix.POLL.IN == 0 or
+        poll_fds[0].revents &
+            (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL) != 0)
+    {
+        return error.RenderFenceWaitFailed;
+    }
 }
 
 pub fn tryDirectScanout(self: *Self, buffer: render.PixelBuffer) DirectScanoutResult {
@@ -1695,7 +1754,7 @@ test "DRM mode refresh converts to presentation period" {
     try std.testing.expectEqual(presentation.nominal_refresh_nanoseconds, refreshNanoseconds(mode));
 }
 
-test "GBM Vulkan target is accepted as a DRM framebuffer" {
+test "GBM Vulkan target accepts asynchronous render completion" {
     const fd = std.c.open("/dev/dri/card0", std.c.O{
         .ACCMODE = .RDWR,
         .CLOEXEC = true,
@@ -1762,10 +1821,15 @@ test "GBM Vulkan target is accepted as a DRM framebuffer" {
     defer _ = c.drmModeRmFB(fd, selected.?.framebuffer_id);
     defer access.release_target(access.context, selected.?.target_id);
 
-    try renderer.renderFrame(.{
+    const completion_fd = try renderer.renderFrameScanout(.{
         .size = size,
         .commands = &.{.{ .clear = render.Color.rgba(12, 34, 56, 255) }},
     }, .{ .dmabuf = .{ .id = selected.?.target_id, .size = size } });
+    if (completion_fd) |fence_fd| {
+        defer _ = std.c.close(fence_fd);
+        try std.testing.expect(importSyncFile(selected.?.buffer.fd, fence_fd));
+        try waitSyncFile(fence_fd);
+    }
 }
 
 test "DRM scale preserves mode pixels and derives logical size" {

@@ -146,6 +146,30 @@ pub const Renderer = struct {
         }, active.target);
     }
 
+    /// Returns an owned sync-file descriptor when rendering can complete
+    /// asynchronously. The caller must close it after handing it to the
+    /// display backend.
+    pub fn finishFrameScanout(self: *Renderer) Error!?std.posix.fd_t {
+        const active = self.active_frame orelse unreachable;
+        self.active_frame = null;
+        defer self.commands.clearRetainingCapacity();
+        const frame: render_types.Frame = .{
+            .size = active.target.size(),
+            .commands = self.commands.items,
+            .damage = active.damage,
+        };
+        return switch (self.backend) {
+            .cpu => |*renderer| switch (active.target) {
+                .pixels => |pixels| blk: {
+                    try renderer.render(frame, pixels);
+                    break :blk null;
+                },
+                .offscreen, .dmabuf => error.InvalidTarget,
+            },
+            .vulkan => |*renderer| renderer.renderFrameScanout(frame, active.target),
+        };
+    }
+
     pub fn directScanoutCandidate(self: *Renderer) ?render_types.PixelBuffer {
         const active = self.active_frame orelse return null;
         if (self.commands.items.len != 2) return null;
