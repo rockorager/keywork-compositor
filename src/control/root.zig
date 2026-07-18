@@ -15,6 +15,7 @@ pub const switch_workspace_method = interface_name ++ ".SwitchWorkspace";
 pub const move_focused_to_workspace_method = interface_name ++ ".MoveFocusedToWorkspace";
 pub const reload_configuration_method = interface_name ++ ".ReloadConfiguration";
 pub const quit_method = interface_name ++ ".Quit";
+pub const configuration_reload_failed_error = interface_name ++ ".ConfigurationReloadFailed";
 
 pub const minimum_workspace = 1;
 pub const maximum_workspace = 10;

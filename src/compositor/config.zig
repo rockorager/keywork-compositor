@@ -127,8 +127,27 @@ pub const InputRule = struct {
     settings: InputSettings = .{},
 };
 
+pub const Color = struct {
+    red: u8,
+    green: u8,
+    blue: u8,
+    alpha: u8,
+};
+
+pub const GeneralSettings = struct {
+    focus_follows_mouse: bool = true,
+    inner_gap: u32 = 8,
+    outer_gap: u32 = 8,
+    blur_radius: u32 = 16,
+    shadow_enabled: bool = true,
+    shadow_blur_radius: u32 = 24,
+    shadow_color: Color = .{ .red = 0, .green = 0, .blue = 0, .alpha = 160 },
+    focused_shadow_color: Color = .{ .red = 0, .green = 0, .blue = 0, .alpha = 160 },
+};
+
 pub const Snapshot = struct {
     arena: std.heap.ArenaAllocator,
+    general: GeneralSettings,
     bindings: []const Binding,
     input_rules: []const InputRule,
 
@@ -144,6 +163,9 @@ pub const Problem = enum {
     directive_outside_section,
     invalid_directive,
     unknown_directive,
+    invalid_general_setting,
+    unknown_general_setting,
+    duplicate_general_setting,
     empty_binding,
     unterminated_quote,
     dangling_escape,
@@ -203,6 +225,7 @@ pub const Store = struct {
     io: std.Io,
     environ_map: *const std.process.Environ.Map,
     explicit_path: ?[]u8,
+    failure_message: ?[]u8,
     snapshot: Snapshot,
 
     pub fn init(
@@ -218,8 +241,10 @@ pub const Store = struct {
             .io = io,
             .environ_map = environ_map,
             .explicit_path = owned_path,
+            .failure_message = null,
             .snapshot = undefined,
         };
+        errdefer if (self.failure_message) |message| allocator.free(message);
         self.snapshot = self.loadSnapshot() catch |err| switch (err) {
             error.InvalidConfiguration, error.ConfigurationReadFailed => fallback: {
                 log.warn("initial configuration failed; using built-in defaults", .{});
@@ -233,12 +258,21 @@ pub const Store = struct {
     pub fn deinit(self: *Store) void {
         self.snapshot.deinit();
         if (self.explicit_path) |path| self.allocator.free(path);
+        if (self.failure_message) |message| self.allocator.free(message);
         self.* = undefined;
     }
 
     /// Returns a completely parsed replacement without changing active state.
-    pub fn loadSnapshot(self: *const Store) !Snapshot {
-        if (self.explicit_path) |path| return switch (try loadPath(self.allocator, self.io, path)) {
+    pub fn loadSnapshot(self: *Store) !Snapshot {
+        if (self.failure_message) |message| self.allocator.free(message);
+        self.failure_message = null;
+
+        if (self.explicit_path) |path| return switch (try loadPath(
+            self.allocator,
+            self.io,
+            path,
+            &self.failure_message,
+        )) {
             .snapshot => |snapshot| snapshot,
             .not_found => fallback: {
                 log.info("no configuration found at {s}; using built-in defaults", .{path});
@@ -248,22 +282,26 @@ pub const Store = struct {
 
         if (self.environ_map.get("XDG_CONFIG_HOME")) |directory| {
             if (std.fs.path.isAbsolute(directory)) {
-                if (try loadBelow(self.allocator, self.io, directory)) |snapshot| return snapshot;
+                if (try loadBelow(self.allocator, self.io, directory, &self.failure_message)) |snapshot| return snapshot;
             }
         } else if (self.environ_map.get("HOME")) |home| {
             const directory = try std.fs.path.join(self.allocator, &.{ home, ".config" });
             defer self.allocator.free(directory);
-            if (try loadBelow(self.allocator, self.io, directory)) |snapshot| return snapshot;
+            if (try loadBelow(self.allocator, self.io, directory, &self.failure_message)) |snapshot| return snapshot;
         }
 
         const config_directories = self.environ_map.get("XDG_CONFIG_DIRS") orelse "/etc/xdg";
         var iterator = std.mem.splitScalar(u8, config_directories, ':');
         while (iterator.next()) |directory| {
             if (directory.len == 0 or !std.fs.path.isAbsolute(directory)) continue;
-            if (try loadBelow(self.allocator, self.io, directory)) |snapshot| return snapshot;
+            if (try loadBelow(self.allocator, self.io, directory, &self.failure_message)) |snapshot| return snapshot;
         }
         log.info("no configuration found; using built-in defaults", .{});
         return defaultSnapshot(self.allocator);
+    }
+
+    pub fn failureMessage(self: *const Store) ?[]const u8 {
+        return self.failure_message;
     }
 };
 
@@ -280,16 +318,26 @@ fn defaultSnapshot(allocator: std.mem.Allocator) !Snapshot {
     };
 }
 
-fn loadBelow(allocator: std.mem.Allocator, io: std.Io, directory: []const u8) !?Snapshot {
+fn loadBelow(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    directory: []const u8,
+    failure_message: *?[]u8,
+) !?Snapshot {
     const path = try std.fs.path.join(allocator, &.{ directory, "keywork", "config" });
     defer allocator.free(path);
-    return switch (try loadPath(allocator, io, path)) {
+    return switch (try loadPath(allocator, io, path, failure_message)) {
         .not_found => null,
         .snapshot => |snapshot| snapshot,
     };
 }
 
-fn loadPath(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !LoadAttempt {
+fn loadPath(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    failure_message: *?[]u8,
+) !LoadAttempt {
     const source = std.Io.Dir.cwd().readFileAlloc(
         io,
         path,
@@ -299,7 +347,13 @@ fn loadPath(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !LoadAtt
         error.FileNotFound, error.NotDir => return .not_found,
         error.OutOfMemory => return error.OutOfMemory,
         else => {
-            log.err("could not read {s}: {t}", .{ path, err });
+            std.debug.assert(failure_message.* == null);
+            failure_message.* = try std.fmt.allocPrint(
+                allocator,
+                "{s}: could not read configuration: {t}",
+                .{ path, err },
+            );
+            log.err("{s}", .{failure_message.*.?});
             return error.ConfigurationReadFailed;
         },
     };
@@ -311,10 +365,13 @@ fn loadPath(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !LoadAtt
             break :loaded .{ .snapshot = snapshot };
         },
         .diagnostic => |diagnostic| {
-            log.err(
+            std.debug.assert(failure_message.* == null);
+            failure_message.* = try std.fmt.allocPrint(
+                allocator,
                 "{s}:{d}: {s}",
                 .{ path, diagnostic.line, problemMessage(diagnostic.problem) },
             );
+            log.err("{s}", .{failure_message.*.?});
             return error.InvalidConfiguration;
         },
     };
@@ -324,6 +381,7 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !ParseResult {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
     const arena_allocator = arena.allocator();
+    var general: GeneralParser = .{};
     var bindings: std.ArrayList(Binding) = .empty;
     var input_rules: std.ArrayList(InputRule) = .empty;
     var section: Section = .none;
@@ -339,6 +397,10 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !ParseResult {
                 return .{ .diagnostic = .{ .line = line_number, .problem = .invalid_section } };
             }
             const header = std.mem.trim(u8, line[1 .. line.len - 1], " \t");
+            if (std.mem.eql(u8, header, "general")) {
+                section = .general;
+                continue;
+            }
             if (std.mem.eql(u8, header, "bindings")) {
                 section = .bindings;
                 continue;
@@ -370,6 +432,13 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !ParseResult {
         const value = std.mem.trim(u8, line[equals + 1 ..], " \t");
         switch (section) {
             .none => unreachable,
+            .general => parseGeneralSetting(&general, name, value) catch |err| {
+                arena.deinit();
+                return .{ .diagnostic = .{
+                    .line = line_number,
+                    .problem = problemForGeneralSettingError(err),
+                } };
+            },
             .bindings => {
                 if (!std.mem.eql(u8, name, "bind")) {
                     arena.deinit();
@@ -396,6 +465,7 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !ParseResult {
     }
     return .{ .snapshot = .{
         .arena = arena,
+        .general = general.settings,
         .bindings = try bindings.toOwnedSlice(arena_allocator),
         .input_rules = try input_rules.toOwnedSlice(arena_allocator),
     } };
@@ -403,9 +473,81 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !ParseResult {
 
 const Section = union(enum) {
     none,
+    general,
     bindings,
     input: usize,
 };
+
+const GeneralParser = struct {
+    settings: GeneralSettings = .{},
+    seen: std.EnumSet(GeneralSetting) = .initEmpty(),
+};
+
+const GeneralSetting = enum {
+    focus_follows_mouse,
+    inner_gap,
+    outer_gap,
+    blur_radius,
+    shadow,
+    shadow_blur_radius,
+    shadow_color,
+    focused_shadow_color,
+};
+
+const GeneralSettingError = error{
+    InvalidGeneralSetting,
+    UnknownGeneralSetting,
+    DuplicateGeneralSetting,
+};
+
+fn parseGeneralSetting(
+    general: *GeneralParser,
+    name: []const u8,
+    value: []const u8,
+) GeneralSettingError!void {
+    const setting = enumFromConfig(GeneralSetting, name) orelse
+        return error.UnknownGeneralSetting;
+    if (general.seen.contains(setting)) return error.DuplicateGeneralSetting;
+    switch (setting) {
+        .focus_follows_mouse => general.settings.focus_follows_mouse = try parseGeneralToggle(value),
+        .inner_gap => general.settings.inner_gap = try parseGeneralSize(value),
+        .outer_gap => general.settings.outer_gap = try parseGeneralSize(value),
+        .blur_radius => general.settings.blur_radius = try parseGeneralSize(value),
+        .shadow => general.settings.shadow_enabled = try parseGeneralToggle(value),
+        .shadow_blur_radius => general.settings.shadow_blur_radius = try parseGeneralSize(value),
+        .shadow_color => general.settings.shadow_color = try parseColor(value),
+        .focused_shadow_color => general.settings.focused_shadow_color = try parseColor(value),
+    }
+    general.seen.insert(setting);
+}
+
+fn parseGeneralToggle(value: []const u8) GeneralSettingError!bool {
+    if (std.mem.eql(u8, value, "enabled")) return true;
+    if (std.mem.eql(u8, value, "disabled")) return false;
+    return error.InvalidGeneralSetting;
+}
+
+fn parseGeneralSize(value: []const u8) GeneralSettingError!u32 {
+    const size = std.fmt.parseInt(u32, value, 10) catch
+        return error.InvalidGeneralSetting;
+    if (size > 256) return error.InvalidGeneralSetting;
+    return size;
+}
+
+fn parseColor(value: []const u8) GeneralSettingError!Color {
+    if ((value.len != 7 and value.len != 9) or value[0] != '#') {
+        return error.InvalidGeneralSetting;
+    }
+    return .{
+        .red = std.fmt.parseInt(u8, value[1..3], 16) catch return error.InvalidGeneralSetting,
+        .green = std.fmt.parseInt(u8, value[3..5], 16) catch return error.InvalidGeneralSetting,
+        .blue = std.fmt.parseInt(u8, value[5..7], 16) catch return error.InvalidGeneralSetting,
+        .alpha = if (value.len == 9)
+            std.fmt.parseInt(u8, value[7..9], 16) catch return error.InvalidGeneralSetting
+        else
+            255,
+    };
+}
 
 const InputHeaderError = error{
     InvalidInputMatcher,
@@ -759,6 +901,15 @@ fn problemForInputHeaderError(err: anyerror) Problem {
     };
 }
 
+fn problemForGeneralSettingError(err: anyerror) Problem {
+    return switch (err) {
+        error.InvalidGeneralSetting => .invalid_general_setting,
+        error.UnknownGeneralSetting => .unknown_general_setting,
+        error.DuplicateGeneralSetting => .duplicate_general_setting,
+        else => unreachable,
+    };
+}
+
 fn problemForInputSettingError(err: anyerror) Problem {
     return switch (err) {
         error.InvalidInputSetting => .invalid_input_setting,
@@ -775,6 +926,9 @@ pub fn problemMessage(problem: Problem) []const u8 {
         .directive_outside_section => "directive appears outside a section",
         .invalid_directive => "directive must contain '='",
         .unknown_directive => "unknown directive",
+        .invalid_general_setting => "invalid general setting",
+        .unknown_general_setting => "unknown general setting",
+        .duplicate_general_setting => "duplicate general setting",
         .empty_binding => "binding requires a trigger and action",
         .unterminated_quote => "unterminated quoted argument",
         .dangling_escape => "unfinished argument escape",
@@ -815,6 +969,7 @@ test "configuration parses typed commands and explicit run argv" {
         .diagnostic => return error.UnexpectedDiagnostic,
     };
     defer snapshot.deinit();
+    try std.testing.expect(snapshot.general.focus_follows_mouse);
     try std.testing.expectEqual(@as(usize, 7), snapshot.bindings.len);
     try std.testing.expectEqual(Direction.left, snapshot.bindings[0].action.command.focus_direction);
     try std.testing.expectEqual(Direction.down, snapshot.bindings[1].action.command.move_focused_direction);
@@ -833,6 +988,7 @@ test "valid empty configuration disables configured bindings" {
         .diagnostic => return error.UnexpectedDiagnostic,
     };
     defer snapshot.deinit();
+    try std.testing.expect(snapshot.general.focus_follows_mouse);
     try std.testing.expectEqual(@as(usize, 0), snapshot.bindings.len);
     try std.testing.expectEqual(@as(usize, 0), snapshot.input_rules.len);
 }
@@ -840,11 +996,52 @@ test "valid empty configuration disables configured bindings" {
 test "embedded default configuration is valid and complete" {
     var snapshot = try defaultSnapshot(std.testing.allocator);
     defer snapshot.deinit();
+    try std.testing.expect(snapshot.general.focus_follows_mouse);
     try std.testing.expectEqual(@as(usize, 33), snapshot.bindings.len);
     try std.testing.expectEqual(@as(usize, 0), snapshot.input_rules.len);
     try std.testing.expectEqual(Direction.left, snapshot.bindings[0].action.command.focus_direction);
     try std.testing.expectEqual(WindowTarget.focused, snapshot.bindings[8].action.command.close);
     try std.testing.expectEqualStrings("monstar", snapshot.bindings[32].action.run[0]);
+}
+
+test "general settings parse and reject invalid directives" {
+    const result = try parse(std.testing.allocator,
+        \\[general]
+        \\focus-follows-mouse=disabled
+        \\inner-gap=12
+        \\outer-gap=16
+        \\blur-radius=32
+        \\shadow=disabled
+        \\shadow-blur-radius=48
+        \\shadow-color=#10203040
+        \\focused-shadow-color=#aabbcc
+    );
+    var snapshot = switch (result) {
+        .snapshot => |snapshot| snapshot,
+        .diagnostic => return error.UnexpectedDiagnostic,
+    };
+    defer snapshot.deinit();
+    try std.testing.expect(!snapshot.general.focus_follows_mouse);
+    try std.testing.expectEqual(@as(u32, 12), snapshot.general.inner_gap);
+    try std.testing.expectEqual(@as(u32, 16), snapshot.general.outer_gap);
+    try std.testing.expectEqual(@as(u32, 32), snapshot.general.blur_radius);
+    try std.testing.expect(!snapshot.general.shadow_enabled);
+    try std.testing.expectEqual(@as(u32, 48), snapshot.general.shadow_blur_radius);
+    try std.testing.expectEqual(Color{ .red = 0x10, .green = 0x20, .blue = 0x30, .alpha = 0x40 }, snapshot.general.shadow_color);
+    try std.testing.expectEqual(Color{ .red = 0xaa, .green = 0xbb, .blue = 0xcc, .alpha = 0xff }, snapshot.general.focused_shadow_color);
+
+    const invalid = try parse(std.testing.allocator, "[general]\nfocus-follows-mouse=sometimes\n");
+    try std.testing.expectEqual(Problem.invalid_general_setting, invalid.diagnostic.problem);
+    const invalid_radius = try parse(std.testing.allocator, "[general]\nblur-radius=257\n");
+    try std.testing.expectEqual(Problem.invalid_general_setting, invalid_radius.diagnostic.problem);
+    const invalid_gap = try parse(std.testing.allocator, "[general]\ninner-gap=257\n");
+    try std.testing.expectEqual(Problem.invalid_general_setting, invalid_gap.diagnostic.problem);
+    const invalid_color = try parse(std.testing.allocator, "[general]\nshadow-color=#12345z\n");
+    try std.testing.expectEqual(Problem.invalid_general_setting, invalid_color.diagnostic.problem);
+    const unknown = try parse(std.testing.allocator, "[general]\nmouse-warping=enabled\n");
+    try std.testing.expectEqual(Problem.unknown_general_setting, unknown.diagnostic.problem);
+    const duplicate = try parse(std.testing.allocator, "[general]\nfocus-follows-mouse=enabled\nfocus-follows-mouse=disabled\n");
+    try std.testing.expectEqual(Problem.duplicate_general_setting, duplicate.diagnostic.problem);
 }
 
 test "input rules parse matchers and typed settings" {

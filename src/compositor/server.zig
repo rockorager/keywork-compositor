@@ -77,6 +77,7 @@ display: *wl.Server,
 control: Control,
 control_initialized: bool,
 configuration: ?Config.Store,
+window_blur_radius_override: ?u32,
 session: Session,
 session_initialized: bool,
 drm_device: DrmDevice,
@@ -295,6 +296,7 @@ pub fn createWithVirtualOutput(
         .control = undefined,
         .control_initialized = false,
         .configuration = null,
+        .window_blur_radius_override = null,
         .session = undefined,
         .session_initialized = false,
         .drm_device = undefined,
@@ -1600,9 +1602,15 @@ fn executeControlCommand(context: *anyopaque, command: Command) void {
     self.window_manager.execute(command);
 }
 
-fn reloadControlConfiguration(context: *anyopaque) !void {
+fn reloadControlConfiguration(context: *anyopaque) ?[]const u8 {
     const self: *Self = @ptrCast(@alignCast(context));
-    try self.reloadConfiguration();
+    self.reloadConfiguration() catch |err| {
+        if (self.configuration) |*configuration| {
+            if (configuration.failureMessage()) |message| return message;
+        }
+        return @errorName(err);
+    };
+    return null;
 }
 
 fn quitControlSession(context: *anyopaque) void {
@@ -1618,6 +1626,7 @@ pub fn setConfiguration(self: *Self, configuration: *Config.Store) void {
     std.debug.assert(self.configuration == null);
     self.configuration = configuration.*;
     configuration.* = undefined;
+    self.applyGeneralConfiguration(self.configuration.?.snapshot.general);
     self.applyInputConfiguration(self.configuration.?.snapshot.input_rules);
     if (self.builtin_keybindings_initialized) {
         self.builtin_keybindings.setConfiguredBindings(self.configuration.?.snapshot.bindings);
@@ -1628,6 +1637,7 @@ pub fn reloadConfiguration(self: *Self) !void {
     const configuration = if (self.configuration) |*value| value else return error.ConfigurationUnavailable;
     var replacement = try configuration.loadSnapshot();
     errdefer replacement.deinit();
+    self.applyGeneralConfiguration(replacement.general);
     self.applyInputConfiguration(replacement.input_rules);
     if (self.builtin_keybindings_initialized) {
         self.builtin_keybindings.setConfiguredBindings(replacement.bindings);
@@ -1636,6 +1646,37 @@ pub fn reloadConfiguration(self: *Self) !void {
     configuration.snapshot = replacement;
     previous.deinit();
     log.info("configuration reloaded", .{});
+}
+
+fn applyGeneralConfiguration(self: *Self, general: Config.GeneralSettings) void {
+    self.window_manager.setFocusFollowsMouse(general.focus_follows_mouse);
+    self.window_manager.setGaps(general.inner_gap, general.outer_gap);
+    var effects = windowEffects(general, general.shadow_color);
+    var focused_effects = windowEffects(general, general.focused_shadow_color);
+    if (self.window_blur_radius_override) |radius| {
+        effects.blur = if (radius == 0) null else .{ .radius = radius };
+        focused_effects.blur = if (radius == 0) null else .{ .radius = radius };
+    }
+    self.window_manager.setWindowEffects(effects, focused_effects);
+}
+
+fn windowEffects(general: Config.GeneralSettings, shadow_color: Config.Color) Scene.Effects {
+    const defaults = Scene.default_effects;
+    return .{
+        .corner_radius = defaults.corner_radius,
+        .blur = if (general.blur_radius == 0) null else .{ .radius = general.blur_radius },
+        .shadow = if (general.shadow_enabled) .{
+            .offset = defaults.shadow.?.offset,
+            .blur_radius = general.shadow_blur_radius,
+            .spread = defaults.shadow.?.spread,
+            .color = render.Color.rgba(
+                shadow_color.red,
+                shadow_color.green,
+                shadow_color.blue,
+                shadow_color.alpha,
+            ),
+        } else null,
+    };
 }
 
 const EffectiveInputSettings = struct {
@@ -1867,9 +1908,12 @@ pub fn setXwaylandDisplayListener(self: *Self, listener: XwaylandDisplayListener
 }
 
 pub fn setWindowBlurRadius(self: *Self, radius: u32) void {
-    var effects = Scene.default_effects;
-    effects.blur = if (radius == 0) null else .{ .radius = radius };
-    self.window_manager.setWindowEffects(effects);
+    std.debug.assert(radius <= 256);
+    self.window_blur_radius_override = radius;
+    self.applyGeneralConfiguration(if (self.configuration) |*configuration|
+        configuration.snapshot.general
+    else
+        .{});
 }
 
 pub fn startXwayland(
@@ -2880,6 +2924,7 @@ fn pointerEnter(context: *anyopaque, x: f64, y: f64) void {
         return;
     }
     self.seat.pointerEnter(point.x, point.y, route.focus);
+    if (!self.xdg_shell.hasPopupGrab()) self.window_manager.pointerMoved(route.root);
     self.pointer_constraints.syncFocus();
 }
 
@@ -2933,6 +2978,7 @@ fn pointerMotionForSeat(output: *RenderOutput, seat: *Seat, time: u32, x: f64, y
         motion.point.y,
         route.focus,
     );
+    if (!self.xdg_shell.hasPopupGrab()) self.window_manager.pointerMoved(route.root);
     self.pointer_constraints.syncFocus();
 }
 
@@ -3041,6 +3087,7 @@ fn dragEnded(context: *anyopaque) void {
     const position = self.seat.pointerPosition() orelse return;
     const route = self.pointerRoute(position.x, position.y);
     self.seat.pointerEnter(position.x, position.y, route.focus);
+    if (!self.xdg_shell.hasPopupGrab()) self.window_manager.pointerMoved(route.root);
     self.pointer_constraints.syncFocus();
 }
 
@@ -5612,6 +5659,33 @@ test "server creates and destroys protocol globals" {
     try std.testing.expect(server.input_manager_initialized);
     try std.testing.expect(server.builtin_keybindings_initialized);
     try std.testing.expect(server.window_manager_initialized);
+}
+
+test "general configuration maps window blur and shadow effects" {
+    const defaults: Config.GeneralSettings = .{};
+    try std.testing.expect(std.meta.eql(
+        Scene.default_effects,
+        windowEffects(defaults, defaults.shadow_color),
+    ));
+
+    const focused_color: Config.Color = .{
+        .red = 0x7a,
+        .green = 0xa2,
+        .blue = 0xf7,
+        .alpha = 0x80,
+    };
+    const focused = windowEffects(defaults, focused_color);
+    try std.testing.expectEqual(
+        render.Color.rgba(0x7a, 0xa2, 0xf7, 0x80),
+        focused.shadow.?.color,
+    );
+
+    var disabled = defaults;
+    disabled.blur_radius = 0;
+    disabled.shadow_enabled = false;
+    const effects = windowEffects(disabled, disabled.shadow_color);
+    try std.testing.expect(effects.blur == null);
+    try std.testing.expect(effects.shadow == null);
 }
 
 test "server adds and removes independent render outputs" {

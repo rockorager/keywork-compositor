@@ -46,6 +46,16 @@ pub const Layout = union(enum) {
         }
     }
 
+    pub fn setGaps(self: *Layout, inner_gap: u32, outer_gap: u32) void {
+        switch (self.*) {
+            .tiled => |*layout| layout.setGaps(inner_gap, outer_gap),
+            .scrolling => |*layout| {
+                layout.inner_gap = inner_gap;
+                layout.outer_gap = outer_gap;
+            },
+        }
+    }
+
     pub fn windowAdded(
         self: *Layout,
         allocator: std.mem.Allocator,
@@ -130,6 +140,19 @@ pub const Tiled = union(enum) {
         switch (self.*) {
             .master_stack => {},
             .dwindle => |*policy| policy.setUsableArea(usable),
+        }
+    }
+
+    fn setGaps(self: *Tiled, inner_gap: u32, outer_gap: u32) void {
+        switch (self.*) {
+            .master_stack => |*policy| {
+                policy.inner_gap = inner_gap;
+                policy.outer_gap = outer_gap;
+            },
+            .dwindle => |*policy| {
+                policy.inner_gap = inner_gap;
+                policy.outer_gap = outer_gap;
+            },
         }
     }
 
@@ -647,37 +670,7 @@ fn intersection(a: types.Rect, b: types.Rect) ?types.Rect {
 }
 
 fn setTiledShadowClips(plans: []types.LayoutPlan, usable: types.Rect) void {
-    const usable_right = @as(i64, usable.x) + usable.size.width;
-    const usable_bottom = @as(i64, usable.y) + usable.size.height;
-    for (plans, 0..) |*plan, plan_index| {
-        const rect = plan.rect;
-        const rect_right = @as(i64, rect.x) + rect.size.width;
-        const rect_bottom = @as(i64, rect.y) + rect.size.height;
-        var left: i64 = usable.x;
-        var top: i64 = usable.y;
-        var right = usable_right;
-        var bottom = usable_bottom;
-
-        for (plans, 0..) |other, other_index| {
-            if (plan_index == other_index) continue;
-            const other_right = @as(i64, other.rect.x) + other.rect.size.width;
-            const other_bottom = @as(i64, other.rect.y) + other.rect.size.height;
-            const overlaps_vertically = other_bottom > rect.y and other.rect.y < rect_bottom;
-            const overlaps_horizontally = other_right > rect.x and other.rect.x < rect_right;
-            if (overlaps_vertically and other_right <= rect.x) left = @max(left, other_right);
-            if (overlaps_vertically and other.rect.x >= rect_right) right = @min(right, other.rect.x);
-            if (overlaps_horizontally and other_bottom <= rect.y) top = @max(top, other_bottom);
-            if (overlaps_horizontally and other.rect.y >= rect_bottom) bottom = @min(bottom, other.rect.y);
-        }
-
-        std.debug.assert(left <= rect.x and top <= rect.y);
-        std.debug.assert(right >= rect_right and bottom >= rect_bottom);
-        plan.shadow_clip = .{
-            .x = @intCast(left),
-            .y = @intCast(top),
-            .size = types.Size.init(@intCast(right - left), @intCast(bottom - top)),
-        };
-    }
+    for (plans) |*plan| plan.shadow_clip = usable;
 }
 
 fn inputFor(windows: []const types.WindowInput, id: types.WindowId) ?types.WindowInput {
@@ -758,21 +751,41 @@ test "master stack geometry is deterministic with offsets gaps and remainders" {
     }
 }
 
-test "tiled shadows stop at neighboring window edges" {
+test "gap configuration applies to every layout" {
+    var master_stack: Layout = .init(.master_stack);
+    master_stack.setGaps(12, 16);
+    try std.testing.expectEqual(@as(u32, 12), master_stack.tiled.master_stack.inner_gap);
+    try std.testing.expectEqual(@as(u32, 16), master_stack.tiled.master_stack.outer_gap);
+
+    var dwindle: Layout = .init(.dwindle);
+    defer dwindle.deinit(std.testing.allocator);
+    dwindle.setGaps(20, 24);
+    try std.testing.expectEqual(@as(u32, 20), dwindle.tiled.dwindle.inner_gap);
+    try std.testing.expectEqual(@as(u32, 24), dwindle.tiled.dwindle.outer_gap);
+
+    var scrolling: Layout = .init(.scrolling);
+    scrolling.setGaps(28, 32);
+    try std.testing.expectEqual(@as(u32, 28), scrolling.scrolling.inner_gap);
+    try std.testing.expectEqual(@as(u32, 32), scrolling.scrolling.outer_gap);
+}
+
+test "tiled shadows share the usable area without neighbor clipping" {
     var layout: Layout = .{ .tiled = .{ .master_stack = .{ .outer_gap = 8, .inner_gap = 8 } } };
-    var plans = try layout.arrange(std.testing.allocator, &.{ input(0, 10), input(1, 10) }, .{
-        .x = 0,
-        .y = 0,
+    const usable: types.Rect = .{
+        .x = 10,
+        .y = 20,
         .size = types.Size.init(100, 100),
-    }, null);
+    };
+    var plans = try layout.arrange(
+        std.testing.allocator,
+        &.{ input(0, 10), input(1, 10) },
+        usable,
+        null,
+    );
     defer plans.deinit(std.testing.allocator);
 
-    const first = plans.items[0];
-    const second = plans.items[1];
-    try std.testing.expectEqual(@as(i32, 0), first.shadow_clip.?.x);
-    try std.testing.expectEqual(@as(u32, @intCast(second.rect.x)), first.shadow_clip.?.size.width);
-    try std.testing.expectEqual(first.rect.x + @as(i32, @intCast(first.rect.size.width)), second.shadow_clip.?.x);
-    try std.testing.expectEqual(@as(u32, 100) - @as(u32, @intCast(second.shadow_clip.?.x)), second.shadow_clip.?.size.width);
+    try std.testing.expectEqual(usable, plans.items[0].shadow_clip.?);
+    try std.testing.expectEqual(usable, plans.items[1].shadow_clip.?);
 }
 
 test "tiny areas emit every window once without zero sizes" {

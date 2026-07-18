@@ -38,7 +38,11 @@ workspaces: std.ArrayList(OutputWorkspace) = .empty,
 transaction: Transaction = .{},
 configure_timer: *wl.EventSource,
 layer_focus: LayerShell.FocusClass = .none,
+focus_follows_mouse: bool = true,
+inner_gap: u32 = 8,
+outer_gap: u32 = 8,
 window_effects: Scene.Effects = Scene.default_effects,
+focused_window_effects: Scene.Effects = Scene.default_effects,
 
 const WindowStore = slot_map.SlotMap(Window, enum { builtin_window });
 pub const WindowId = WindowStore.Id;
@@ -300,6 +304,10 @@ fn appendOutputWorkspaces(self: *Self, output: OutputLayout.Id) !void {
             .number = @intCast(number),
             .active = number == 1,
         });
+        self.workspaces.items[self.workspaces.items.len - 1].workspace.layout.setGaps(
+            self.inner_gap,
+            self.outer_gap,
+        );
     }
 }
 
@@ -379,12 +387,40 @@ pub fn setDefaultOutput(self: *Self, output: OutputLayout.Id) void {
     self.default_output = output;
 }
 
-pub fn setWindowEffects(self: *Self, effects: Scene.Effects) void {
-    if (std.meta.eql(self.window_effects, effects)) return;
+pub fn setGaps(self: *Self, inner_gap: u32, outer_gap: u32) void {
+    std.debug.assert(inner_gap <= 256 and outer_gap <= 256);
+    if (self.inner_gap == inner_gap and self.outer_gap == outer_gap) return;
+    self.inner_gap = inner_gap;
+    self.outer_gap = outer_gap;
+    for (self.workspaces.items) |*entry| {
+        entry.workspace.layout.setGaps(inner_gap, outer_gap);
+    }
+    self.relayout();
+}
+
+pub fn setWindowEffects(
+    self: *Self,
+    effects: Scene.Effects,
+    focused_effects: Scene.Effects,
+) void {
+    if (std.meta.eql(self.window_effects, effects) and
+        std.meta.eql(self.focused_window_effects, focused_effects)) return;
     self.window_effects = effects;
+    self.focused_window_effects = focused_effects;
     var it = self.windows.iterator();
     while (it.next()) |entry| {
-        self.scene.setEffects(entry.value.scene_id, if (entry.value.fullscreen_output != null) .{} else effects);
+        const window = entry.value;
+        const focused = self.workspaces.items[window.workspace].workspace.focused != null and
+            neutral(entry.id).eql(self.workspaces.items[window.workspace].workspace.focused.?);
+        self.scene.setEffects(
+            window.scene_id,
+            if (window.fullscreen_output != null)
+                .{}
+            else if (focused)
+                focused_effects
+            else
+                effects,
+        );
     }
 }
 
@@ -396,8 +432,22 @@ pub fn focusedSurface(self: *Self) ?Surface.Id {
     return window.surface_id;
 }
 
+pub fn setFocusFollowsMouse(self: *Self, enabled: bool) void {
+    self.focus_follows_mouse = enabled;
+}
+
+pub fn pointerMoved(self: *Self, root: ?Surface.Id) void {
+    if (!self.focus_follows_mouse) return;
+    self.focusPointerRoot(root);
+}
+
 pub fn pointerButton(self: *Self, root: ?Surface.Id, state: wl.Pointer.ButtonState) void {
-    if (state != .pressed or self.layer_focus == .exclusive) return;
+    if (state != .pressed) return;
+    self.focusPointerRoot(root);
+}
+
+fn focusPointerRoot(self: *Self, root: ?Surface.Id) void {
+    if (self.layer_focus == .exclusive) return;
     const surface_id = root orelse return;
     var candidate: ?WindowId = null;
     var it = self.windows.iterator();
@@ -409,9 +459,17 @@ pub fn pointerButton(self: *Self, root: ?Surface.Id, state: wl.Pointer.ButtonSta
     const window = self.windows.get(id) orelse return;
     const workspace = &self.workspaces.items[window.workspace];
     if (!workspace.active) return;
-    self.default_output = workspace.output;
+    const target = neutral(id);
+    const output_changed = !std.meta.eql(self.default_output, workspace.output);
+    const focus_changed = workspace.workspace.focused == null or
+        !workspace.workspace.focused.?.eql(target);
     _ = self.layer_shell.relinquishNonExclusiveFocus();
-    _ = workspace.workspace.focus(neutral(id));
+    if (!output_changed and !focus_changed) return;
+    self.default_output = workspace.output;
+    if (focus_changed) {
+        const changed = workspace.workspace.focus(target);
+        std.debug.assert(changed);
+    }
     self.relayout();
 }
 
@@ -502,6 +560,7 @@ pub fn switchLayout(self: *Self, kind: layout_mod.Kind) void {
         };
     }
     entry.workspace.setLayout(self.allocator, kind, usable) catch return;
+    entry.workspace.layout.setGaps(self.inner_gap, self.outer_gap);
     self.relayout();
 }
 
@@ -774,7 +833,15 @@ fn publish(self: *Self) void {
                 self.xwayland.set_minimized(self.xwayland.context, id, window.minimized);
             },
         }
-        self.scene.setEffects(window.scene_id, if (window.fullscreen_output != null) .{} else self.window_effects);
+        self.scene.setEffects(
+            window.scene_id,
+            if (window.fullscreen_output != null)
+                .{}
+            else if (focused)
+                self.focused_window_effects
+            else
+                self.window_effects,
+        );
         const clip_box: ?Scene.ClipBox = if (plan) |placement|
             if (placement.clip) |clip| .{
                 .x = clip.x -| placement.rect.x,

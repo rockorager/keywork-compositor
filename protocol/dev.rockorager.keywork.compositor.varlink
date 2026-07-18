@@ -32,4 +32,4 @@ method Quit () -> ()
 error InvalidWorkspace (workspace: int)
 
 # The selected configuration could not be read or validated.
-error ConfigurationReloadFailed ()
+error ConfigurationReloadFailed (message: string)

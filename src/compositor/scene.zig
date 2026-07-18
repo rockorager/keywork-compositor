@@ -83,7 +83,7 @@ pub const default_effects: Effects = .{
     .corner_radius = 12,
     .blur = .{ .radius = 16 },
     .shadow = .{
-        .offset = .{ .y = 10 },
+        .offset = .{},
         .blur_radius = 24,
         .spread = 3,
         .color = render.Color.rgba(0, 0, 0, 160),

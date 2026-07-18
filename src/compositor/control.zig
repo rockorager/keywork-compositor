@@ -40,7 +40,7 @@ clients: std.ArrayList(*Client),
 pub const Executor = struct {
     context: *anyopaque,
     execute: *const fn (*anyopaque, command.Command) void,
-    reload: *const fn (*anyopaque) anyerror!void,
+    reload: *const fn (*anyopaque) ?[]const u8,
     quit: *const fn (*anyopaque) void,
 };
 
@@ -454,10 +454,10 @@ fn handleMessage(
             if (!call.oneway) try writeInvalidParameter(allocator, output, "parameters");
             return;
         }
-        executor.reload(executor.context) catch {
-            if (!call.oneway) try writeConfigurationReloadFailed(allocator, output);
+        if (executor.reload(executor.context)) |failure_message| {
+            if (!call.oneway) try writeConfigurationReloadFailed(allocator, output, failure_message);
             return;
-        };
+        }
         if (!call.oneway) try writeSuccess(allocator, output);
         return;
     }
@@ -544,10 +544,11 @@ fn writeInvalidWorkspace(
 fn writeConfigurationReloadFailed(
     allocator: std.mem.Allocator,
     output: *std.ArrayList(u8),
+    message: []const u8,
 ) !void {
     try writeMessage(allocator, output, .{
-        .@"error" = interface_name ++ ".ConfigurationReloadFailed",
-        .parameters = Empty{},
+        .@"error" = control.configuration_reload_failed_error,
+        .parameters = .{ .message = message },
     });
 }
 
@@ -562,7 +563,7 @@ fn writeMessage(
 const Recorder = struct {
     commands: std.ArrayList(command.Command) = .empty,
     reload_count: usize = 0,
-    reload_error: ?anyerror = null,
+    reload_failure: ?[]const u8 = null,
     quit_count: usize = 0,
 
     fn deinit(self: *Recorder) void {
@@ -578,10 +579,10 @@ const Recorder = struct {
         self.commands.append(std.testing.allocator, value) catch unreachable;
     }
 
-    fn reload(context: *anyopaque) !void {
+    fn reload(context: *anyopaque) ?[]const u8 {
         const self: *Recorder = @ptrCast(@alignCast(context));
         self.reload_count += 1;
-        if (self.reload_error) |err| return err;
+        return self.reload_failure;
     }
 
     fn quit(context: *anyopaque) void {
@@ -675,11 +676,11 @@ test "configuration reload returns success or a typed failure" {
     try std.testing.expectEqualStrings("{\"parameters\":{}}\x00", output.items);
 
     output.clearRetainingCapacity();
-    recorder.reload_error = error.InvalidConfiguration;
+    recorder.reload_failure = "/home/test/.config/keywork/config:3: unknown general setting";
     try handleMessage(std.testing.allocator, recorder.executor(), call, &output, &quit_requested);
     try std.testing.expectEqual(@as(usize, 2), recorder.reload_count);
     try std.testing.expectEqualStrings(
-        "{\"error\":\"dev.rockorager.keywork.compositor.ConfigurationReloadFailed\",\"parameters\":{}}\x00",
+        "{\"error\":\"dev.rockorager.keywork.compositor.ConfigurationReloadFailed\",\"parameters\":{\"message\":\"/home/test/.config/keywork/config:3: unknown general setting\"}}\x00",
         output.items,
     );
 }

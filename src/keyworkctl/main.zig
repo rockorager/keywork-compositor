@@ -88,11 +88,29 @@ fn run(init: std.process.Init) !void {
     if (reply.value.@"error") |name| {
         var buffer: [1024]u8 = undefined;
         var stderr = std.Io.File.stderr().writer(init.io, &buffer);
-        try stderr.interface.print("keyworkctl: Varlink error: {s}\n", .{name});
+        if (remoteErrorMessage(name, reply.value.parameters)) |message| {
+            try stderr.interface.print("keyworkctl: {s}\n", .{message});
+        } else {
+            try stderr.interface.print("keyworkctl: Varlink error: {s}\n", .{name});
+        }
         try stderr.interface.flush();
         return error.RemoteError;
     }
     if (reply.value.continues) return error.UnexpectedContinuation;
+}
+
+fn remoteErrorMessage(name: []const u8, parameters: ?std.json.Value) ?[]const u8 {
+    if (!std.mem.eql(u8, name, control.configuration_reload_failed_error)) return null;
+    const value = parameters orelse return null;
+    const object = switch (value) {
+        .object => |object| object,
+        else => return null,
+    };
+    const message = object.get("message") orelse return null;
+    return switch (message) {
+        .string => |string| string,
+        else => null,
+    };
 }
 
 fn printUsage(io: std.Io, err: anyerror) anyerror {
@@ -160,4 +178,16 @@ test "reload parameters encode as an empty object" {
         "{\"method\":\"dev.rockorager.keywork.compositor.ReloadConfiguration\",\"parameters\":{}}\x00",
         output.items,
     );
+}
+
+test "configuration reload errors expose their message" {
+    var parsed = try std.json.parseFromSlice(varlink.Reply, std.testing.allocator,
+        \\{"error":"dev.rockorager.keywork.compositor.ConfigurationReloadFailed","parameters":{"message":"/tmp/keywork.conf:4: invalid general setting"}}
+    , .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(
+        "/tmp/keywork.conf:4: invalid general setting",
+        remoteErrorMessage(parsed.value.@"error".?, parsed.value.parameters).?,
+    );
+    try std.testing.expect(remoteErrorMessage("org.varlink.service.MethodNotFound", parsed.value.parameters) == null);
 }
