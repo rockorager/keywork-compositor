@@ -442,6 +442,9 @@ pub fn execute(self: *Self, command: Command) void {
         .move_focused_next => self.moveFocusedNext(),
         .move_focused_previous => self.moveFocusedPrevious(),
         .move_focused_direction => |direction| self.moveFocusedDirection(direction),
+        .close => |target| switch (target) {
+            .focused => self.closeFocused(),
+        },
         .layout_master_stack => self.switchLayout(.master_stack),
         .layout_dwindle => self.switchLayout(.dwindle),
         .layout_scrolling => self.switchLayout(.scrolling),
@@ -478,6 +481,14 @@ pub fn moveFocusedDirection(self: *Self, direction: Direction) void {
     const changed = workspace.swapWindows(focused, candidate);
     std.debug.assert(changed);
     self.relayout();
+}
+pub fn closeFocused(self: *Self) void {
+    const window = self.focusedWindow() orelse return;
+    if (!window.mapped or window.minimized) return;
+    switch (window.backend) {
+        .xdg => |id| self.xdg_shell.closeWindow(id),
+        .xwayland => |id| self.xwayland.close(self.xwayland.context, id),
+    }
 }
 pub fn switchLayout(self: *Self, kind: layout_mod.Kind) void {
     const index = self.workspaceFor(self.default_output) orelse return;

@@ -7,6 +7,10 @@ pub const Direction = enum {
     right,
 };
 
+pub const WindowTarget = enum {
+    focused,
+};
+
 pub const Command = union(enum) {
     focus_next,
     focus_previous,
@@ -14,6 +18,7 @@ pub const Command = union(enum) {
     move_focused_next,
     move_focused_previous,
     move_focused_direction: Direction,
+    close: WindowTarget,
     layout_master_stack,
     layout_dwindle,
     layout_scrolling,

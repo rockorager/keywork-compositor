@@ -4,6 +4,7 @@ const std = @import("std");
 const command = @import("command.zig");
 const Command = command.Command;
 const Direction = command.Direction;
+const WindowTarget = command.WindowTarget;
 const Launcher = @import("launcher.zig");
 const NativeInput = @import("backend/native_input.zig");
 
@@ -153,6 +154,7 @@ pub const Problem = enum {
     unknown_action,
     invalid_action_arguments,
     invalid_direction,
+    invalid_window_target,
     invalid_layout,
     invalid_workspace,
     invalid_executable,
@@ -185,6 +187,7 @@ const BindingError = error{
     UnknownAction,
     InvalidActionArguments,
     InvalidDirection,
+    InvalidWindowTarget,
     InvalidLayout,
     InvalidWorkspace,
     InvalidExecutable,
@@ -593,6 +596,8 @@ fn parseBinding(allocator: std.mem.Allocator, value: []const u8) (BindingError |
         .{ .command = try parseDirectionalCommand(arguments, false) }
     else if (std.mem.eql(u8, action_name, "move-focused"))
         .{ .command = try parseDirectionalCommand(arguments, true) }
+    else if (std.mem.eql(u8, action_name, "close"))
+        .{ .command = .{ .close = try parseWindowTarget(arguments) } }
     else if (std.mem.eql(u8, action_name, "set-layout"))
         .{ .command = try parseLayout(arguments) }
     else if (std.mem.eql(u8, action_name, "switch-workspace"))
@@ -704,6 +709,12 @@ fn parseDirectionalCommand(arguments: []const []const u8, move: bool) BindingErr
     return if (move) .{ .move_focused_direction = parsed } else .{ .focus_direction = parsed };
 }
 
+fn parseWindowTarget(arguments: []const []const u8) BindingError!WindowTarget {
+    if (arguments.len != 1) return error.InvalidActionArguments;
+    return std.meta.stringToEnum(WindowTarget, arguments[0]) orelse
+        error.InvalidWindowTarget;
+}
+
 fn parseLayout(arguments: []const []const u8) BindingError!Command {
     if (arguments.len != 1) return error.InvalidActionArguments;
     if (std.mem.eql(u8, arguments[0], "master-stack")) return .layout_master_stack;
@@ -731,6 +742,7 @@ fn problemForError(err: anyerror) Problem {
         error.UnknownAction => .unknown_action,
         error.InvalidActionArguments => .invalid_action_arguments,
         error.InvalidDirection => .invalid_direction,
+        error.InvalidWindowTarget => .invalid_window_target,
         error.InvalidLayout => .invalid_layout,
         error.InvalidWorkspace => .invalid_workspace,
         error.InvalidExecutable => .invalid_executable,
@@ -773,6 +785,7 @@ pub fn problemMessage(problem: Problem) []const u8 {
         .unknown_action => "unknown binding action",
         .invalid_action_arguments => "invalid arguments for binding action",
         .invalid_direction => "invalid direction",
+        .invalid_window_target => "invalid window target",
         .invalid_layout => "invalid layout",
         .invalid_workspace => "workspace must be between 1 and 10",
         .invalid_executable => "executable must be an absolute path or a bare filename",
@@ -790,6 +803,7 @@ test "configuration parses typed commands and explicit run argv" {
         \\[bindings]
         \\bind=super+h focus left
         \\bind=super+shift+j move-focused down
+        \\bind=super+q close focused
         \\bind=super+t set-layout master-stack
         \\bind=super+1 switch-workspace 1
         \\bind=super+shift+0 move-focused-to-workspace 10
@@ -801,14 +815,15 @@ test "configuration parses typed commands and explicit run argv" {
         .diagnostic => return error.UnexpectedDiagnostic,
     };
     defer snapshot.deinit();
-    try std.testing.expectEqual(@as(usize, 6), snapshot.bindings.len);
+    try std.testing.expectEqual(@as(usize, 7), snapshot.bindings.len);
     try std.testing.expectEqual(Direction.left, snapshot.bindings[0].action.command.focus_direction);
     try std.testing.expectEqual(Direction.down, snapshot.bindings[1].action.command.move_focused_direction);
-    try std.testing.expectEqual(Command.layout_master_stack, snapshot.bindings[2].action.command);
-    try std.testing.expectEqual(@as(u8, 10), snapshot.bindings[4].action.command.move_to_workspace);
-    try std.testing.expectEqualStrings("foot", snapshot.bindings[5].action.run[0]);
-    try std.testing.expectEqualStrings("Keywork Terminal", snapshot.bindings[5].action.run[2]);
-    try std.testing.expectEqualStrings("empty=", snapshot.bindings[5].action.run[3]);
+    try std.testing.expectEqual(WindowTarget.focused, snapshot.bindings[2].action.command.close);
+    try std.testing.expectEqual(Command.layout_master_stack, snapshot.bindings[3].action.command);
+    try std.testing.expectEqual(@as(u8, 10), snapshot.bindings[5].action.command.move_to_workspace);
+    try std.testing.expectEqualStrings("foot", snapshot.bindings[6].action.run[0]);
+    try std.testing.expectEqualStrings("Keywork Terminal", snapshot.bindings[6].action.run[2]);
+    try std.testing.expectEqualStrings("empty=", snapshot.bindings[6].action.run[3]);
 }
 
 test "valid empty configuration disables configured bindings" {
@@ -825,10 +840,11 @@ test "valid empty configuration disables configured bindings" {
 test "embedded default configuration is valid and complete" {
     var snapshot = try defaultSnapshot(std.testing.allocator);
     defer snapshot.deinit();
-    try std.testing.expectEqual(@as(usize, 32), snapshot.bindings.len);
+    try std.testing.expectEqual(@as(usize, 33), snapshot.bindings.len);
     try std.testing.expectEqual(@as(usize, 0), snapshot.input_rules.len);
     try std.testing.expectEqual(Direction.left, snapshot.bindings[0].action.command.focus_direction);
-    try std.testing.expectEqualStrings("monstar", snapshot.bindings[31].action.run[0]);
+    try std.testing.expectEqual(WindowTarget.focused, snapshot.bindings[8].action.command.close);
+    try std.testing.expectEqualStrings("monstar", snapshot.bindings[32].action.run[0]);
 }
 
 test "input rules parse matchers and typed settings" {
@@ -942,4 +958,6 @@ test "configuration rejects malformed syntax and unknown sections" {
     try std.testing.expectEqual(Problem.unknown_section, section.diagnostic.problem);
     const modifier = try parse(std.testing.allocator, "[bindings]\nbind=super+super+x focus left\n");
     try std.testing.expectEqual(Problem.duplicate_modifier, modifier.diagnostic.problem);
+    const window_target = try parse(std.testing.allocator, "[bindings]\nbind=super+q close all\n");
+    try std.testing.expectEqual(Problem.invalid_window_target, window_target.diagnostic.problem);
 }
