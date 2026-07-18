@@ -3779,10 +3779,14 @@ fn borderRoot(self: *Self, x: f64, y: f64) ?Surface.Id {
             const content = windowContentRect(window, content_size) orelse continue;
             var commands: [4]render.Command = undefined;
             const clip = if (window.clip_box) |box| box.translated(window.position.x, window.position.y) else null;
-            for (makeBorderCommands(content, borders, clip, &commands)) |command| {
-                const solid = command.solid_rect;
-                const visible = if (solid.clip) |command_clip| solid.rect.intersection(command_clip) orelse continue else solid.rect;
-                if (pointInRect(x, y, visible)) return window.surface_id;
+            for (makeBorderCommands(
+                content,
+                borders,
+                window.effects.corner_radius,
+                clip,
+                &commands,
+            )) |command| {
+                if (pointInBorderCommand(x, y, command)) return window.surface_id;
             }
             if (fullscreen != null) return null;
         },
@@ -6142,6 +6146,7 @@ fn renderWindowBorders(
     const border_commands = makeBorderCommands(
         content_rect,
         borders,
+        window.effects.corner_radius,
         clip,
         &commands,
     );
@@ -6173,10 +6178,26 @@ fn renderWindowDecorations(
 fn makeBorderCommands(
     content_rect: render.Rect,
     borders: Scene.Borders,
+    corner_radius: u32,
     clip: ?render.Rect,
     commands: *[4]render.Command,
 ) []const render.Command {
     const width = borders.width;
+    if (corner_radius > 0 and borders.edges.top and borders.edges.bottom and
+        borders.edges.left and borders.edges.right)
+    {
+        commands[0] = .{ .shadow = .{
+            .rect = content_rect,
+            .corner_radius = corner_radius,
+            .blur_radius = 0,
+            .spread = @intCast(width),
+            .color = borders.color,
+            .cutout = .{ .rect = content_rect, .radius = corner_radius },
+            .clip = clip,
+        } };
+        return commands[0..1];
+    }
+
     const width_i32: i32 = @intCast(width);
     const content_width_i32: i32 = @intCast(@min(
         content_rect.width,
@@ -6249,6 +6270,33 @@ fn makeBorderCommands(
     }
     std.debug.assert(command_count > 0);
     return commands[0..command_count];
+}
+
+fn pointInBorderCommand(x: f64, y: f64, command: render.Command) bool {
+    return switch (command) {
+        .solid_rect => |solid| if (solid.clip) |clip|
+            pointInRect(x, y, solid.rect) and pointInRect(x, y, clip)
+        else
+            pointInRect(x, y, solid.rect),
+        .shadow => |shadow| contains: {
+            std.debug.assert(shadow.blur_radius == 0);
+            std.debug.assert(shadow.spread > 0);
+            if (shadow.clip) |clip| {
+                if (!pointInRect(x, y, clip)) break :contains false;
+            }
+            const spread: u32 = @intCast(shadow.spread);
+            const outer = expandDamageRect(shadow.rect, spread);
+            if (!pointInRoundedRect(
+                x,
+                y,
+                outer,
+                shadow.corner_radius +| spread,
+            )) break :contains false;
+            const cutout = shadow.cutout orelse break :contains true;
+            break :contains !pointInRoundedRect(x, y, cutout.rect, cutout.radius);
+        },
+        else => unreachable,
+    };
 }
 
 fn windowContentRect(window: *const Scene.Window, content_size: render.Size) ?render.Rect {
@@ -6435,6 +6483,7 @@ test "window borders occupy only requested exterior edges and corners" {
             .width = 4,
             .color = color,
         },
+        12,
         .{ .x = 0, .y = 0, .width = 200, .height = 200 },
         &commands,
     );
@@ -6465,6 +6514,35 @@ test "window borders occupy only requested exterior edges and corners" {
         .width = 200,
         .height = 200,
     }, result[0].solid_rect.clip.?);
+}
+
+test "window border follows rounded content corners" {
+    var commands: [4]render.Command = undefined;
+    const content: render.Rect = .{ .x = 10, .y = 20, .width = 100, .height = 50 };
+    const result = makeBorderCommands(
+        content,
+        .{
+            .edges = .{ .top = true, .bottom = true, .left = true, .right = true },
+            .width = 4,
+            .color = render.Color.rgba(0x80, 0x40, 0x20, 0xff),
+        },
+        12,
+        null,
+        &commands,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), result.len);
+    const border = result[0].shadow;
+    try std.testing.expectEqual(content, border.rect);
+    try std.testing.expectEqual(@as(u32, 12), border.corner_radius);
+    try std.testing.expectEqual(@as(u32, 0), border.blur_radius);
+    try std.testing.expectEqual(@as(i32, 4), border.spread);
+    try std.testing.expectEqual(content, border.cutout.?.rect);
+    try std.testing.expectEqual(@as(u32, 12), border.cutout.?.radius);
+    try std.testing.expect(pointInBorderCommand(50, 18, result[0]));
+    try std.testing.expect(pointInBorderCommand(12, 22, result[0]));
+    try std.testing.expect(!pointInBorderCommand(7, 17, result[0]));
+    try std.testing.expect(!pointInBorderCommand(50, 21, result[0]));
 }
 
 test "content clip boxes intersect window dimensions in global coordinates" {
