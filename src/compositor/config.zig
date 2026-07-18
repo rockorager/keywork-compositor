@@ -127,6 +127,51 @@ pub const InputRule = struct {
     settings: InputSettings = .{},
 };
 
+pub const OutputDeviceMatch = struct {
+    name: []const u8,
+    make: ?[]const u8 = null,
+    model: ?[]const u8 = null,
+    serial: ?[]const u8 = null,
+};
+
+pub const OutputMatcher = struct {
+    name: ?[]const u8 = null,
+    make: ?[]const u8 = null,
+    model: ?[]const u8 = null,
+    serial: ?[]const u8 = null,
+
+    pub fn matches(self: OutputMatcher, output: OutputDeviceMatch) bool {
+        if (self.name) |pattern| if (!globMatches(pattern, output.name)) return false;
+        inline for (.{ "make", "model", "serial" }) |field| {
+            if (@field(self, field)) |pattern| {
+                const actual = @field(output, field) orelse return false;
+                if (!globMatches(pattern, actual)) return false;
+            }
+        }
+        return true;
+    }
+};
+
+pub const OutputMode = struct {
+    width: u32,
+    height: u32,
+    refresh_millihertz: ?i32 = null,
+};
+
+pub const OutputPosition = struct { x: i32, y: i32 };
+
+pub const OutputSettings = struct {
+    enable: ?bool = null,
+    mode: ?OutputMode = null,
+    position: ?OutputPosition = null,
+    scale_v120_numerator: ?u32 = null,
+};
+
+pub const OutputRule = struct {
+    matcher: OutputMatcher,
+    settings: OutputSettings = .{},
+};
+
 pub const Color = struct {
     red: u8,
     green: u8,
@@ -152,6 +197,7 @@ pub const Snapshot = struct {
     general: GeneralSettings,
     bindings: []const Binding,
     input_rules: []const InputRule,
+    output_rules: []const OutputRule,
 
     pub fn deinit(self: *Snapshot) void {
         self.arena.deinit();
@@ -188,6 +234,12 @@ pub const Problem = enum {
     invalid_input_setting,
     unknown_input_setting,
     duplicate_input_setting,
+    invalid_output_matcher,
+    unknown_output_matcher,
+    duplicate_output_matcher,
+    invalid_output_setting,
+    unknown_output_setting,
+    duplicate_output_setting,
 };
 
 pub const Diagnostic = struct {
@@ -386,6 +438,7 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !ParseResult {
     var general: GeneralParser = .{};
     var bindings: std.ArrayList(Binding) = .empty;
     var input_rules: std.ArrayList(InputRule) = .empty;
+    var output_rules: std.ArrayList(OutputRule) = .empty;
     var section: Section = .none;
     var lines = std.mem.splitScalar(u8, source, '\n');
     var line_number: usize = 0;
@@ -405,6 +458,15 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !ParseResult {
             }
             if (std.mem.eql(u8, header, "bindings")) {
                 section = .bindings;
+                continue;
+            }
+            if (parseOutputHeader(arena_allocator, header) catch |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                arena.deinit();
+                return .{ .diagnostic = .{ .line = line_number, .problem = problemForOutputHeaderError(err) } };
+            }) |matcher| {
+                try output_rules.append(arena_allocator, .{ .matcher = matcher });
+                section = .{ .output = output_rules.items.len - 1 };
                 continue;
             }
             const matcher = parseInputHeader(arena_allocator, header) catch |err| {
@@ -463,6 +525,10 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !ParseResult {
                     .problem = problemForInputSettingError(err),
                 } };
             },
+            .output => |index| parseOutputSetting(&output_rules.items[index].settings, name, value) catch |err| {
+                arena.deinit();
+                return .{ .diagnostic = .{ .line = line_number, .problem = problemForOutputSettingError(err) } };
+            },
         }
     }
     return .{ .snapshot = .{
@@ -470,6 +536,7 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !ParseResult {
         .general = general.settings,
         .bindings = try bindings.toOwnedSlice(arena_allocator),
         .input_rules = try input_rules.toOwnedSlice(arena_allocator),
+        .output_rules = try output_rules.toOwnedSlice(arena_allocator),
     } };
 }
 
@@ -478,6 +545,7 @@ const Section = union(enum) {
     general,
     bindings,
     input: usize,
+    output: usize,
 };
 
 const GeneralParser = struct {
@@ -601,6 +669,108 @@ fn parseInputHeader(
         }
     }
     return matcher;
+}
+
+const OutputHeaderError = error{
+    InvalidOutputMatcher,
+    UnknownOutputMatcher,
+    DuplicateOutputMatcher,
+};
+
+fn parseOutputHeader(
+    allocator: std.mem.Allocator,
+    header: []const u8,
+) (OutputHeaderError || error{OutOfMemory})!?OutputMatcher {
+    const section_name = "output";
+    if (!std.mem.startsWith(u8, header, section_name)) return null;
+    if (header.len > section_name.len and header[section_name.len] != ' ' and
+        header[section_name.len] != '\t') return null;
+    const words = parseWords(allocator, std.mem.trim(u8, header[section_name.len..], " \t")) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.UnterminatedQuote, error.DanglingEscape => return error.InvalidOutputMatcher,
+        else => unreachable,
+    };
+    var matcher: OutputMatcher = .{};
+    for (words) |word| {
+        const equals = std.mem.indexOfScalar(u8, word, '=') orelse return error.InvalidOutputMatcher;
+        const name = word[0..equals];
+        const value = word[equals + 1 ..];
+        if (name.len == 0 or value.len == 0) return error.InvalidOutputMatcher;
+        if (std.mem.eql(u8, name, "name")) {
+            if (matcher.name != null) return error.DuplicateOutputMatcher;
+            matcher.name = value;
+        } else if (std.mem.eql(u8, name, "make")) {
+            if (matcher.make != null) return error.DuplicateOutputMatcher;
+            matcher.make = value;
+        } else if (std.mem.eql(u8, name, "model")) {
+            if (matcher.model != null) return error.DuplicateOutputMatcher;
+            matcher.model = value;
+        } else if (std.mem.eql(u8, name, "serial")) {
+            if (matcher.serial != null) return error.DuplicateOutputMatcher;
+            matcher.serial = value;
+        } else return error.UnknownOutputMatcher;
+    }
+    return matcher;
+}
+
+const OutputSettingError = error{
+    InvalidOutputSetting,
+    UnknownOutputSetting,
+    DuplicateOutputSetting,
+};
+
+fn parseOutputSetting(settings: *OutputSettings, name: []const u8, value: []const u8) OutputSettingError!void {
+    if (std.mem.eql(u8, name, "enable")) {
+        if (settings.enable != null) return error.DuplicateOutputSetting;
+        if (std.mem.eql(u8, value, "enabled")) {
+            settings.enable = true;
+        } else if (std.mem.eql(u8, value, "disabled")) {
+            settings.enable = false;
+        } else return error.InvalidOutputSetting;
+    } else if (std.mem.eql(u8, name, "mode")) {
+        if (settings.mode != null) return error.DuplicateOutputSetting;
+        settings.mode = try parseOutputMode(value);
+    } else if (std.mem.eql(u8, name, "position")) {
+        if (settings.position != null) return error.DuplicateOutputSetting;
+        settings.position = try parseOutputPosition(value);
+    } else if (std.mem.eql(u8, name, "scale")) {
+        if (settings.scale_v120_numerator != null) return error.DuplicateOutputSetting;
+        const scale = std.fmt.parseFloat(f64, value) catch return error.InvalidOutputSetting;
+        if (!std.math.isFinite(scale) or scale <= 0 or scale > @as(f64, @floatFromInt(std.math.maxInt(u32))) / 120.0)
+            return error.InvalidOutputSetting;
+        const numerator: u32 = @intFromFloat(@round(scale * 120.0));
+        if (numerator == 0) return error.InvalidOutputSetting;
+        settings.scale_v120_numerator = numerator;
+    } else return error.UnknownOutputSetting;
+}
+
+fn parseOutputMode(value: []const u8) OutputSettingError!OutputMode {
+    const x = std.mem.indexOfScalar(u8, value, 'x') orelse return error.InvalidOutputSetting;
+    if (x == 0) return error.InvalidOutputSetting;
+    const at = std.mem.indexOfScalarPos(u8, value, x + 1, '@');
+    const height_end = at orelse value.len;
+    const width = std.fmt.parseInt(u32, value[0..x], 10) catch return error.InvalidOutputSetting;
+    const height = std.fmt.parseInt(u32, value[x + 1 .. height_end], 10) catch return error.InvalidOutputSetting;
+    if (width == 0 or height == 0) return error.InvalidOutputSetting;
+    var refresh: ?i32 = null;
+    if (at) |index| {
+        var source = value[index + 1 ..];
+        if (std.mem.endsWith(u8, source, "Hz")) source = source[0 .. source.len - 2];
+        const hz = std.fmt.parseFloat(f64, source) catch return error.InvalidOutputSetting;
+        if (!std.math.isFinite(hz) or hz <= 0 or hz > @as(f64, @floatFromInt(std.math.maxInt(i32))) / 1000.0)
+            return error.InvalidOutputSetting;
+        refresh = @intFromFloat(@round(hz * 1000.0));
+        if (refresh.? <= 0) return error.InvalidOutputSetting;
+    }
+    return .{ .width = width, .height = height, .refresh_millihertz = refresh };
+}
+
+fn parseOutputPosition(value: []const u8) OutputSettingError!OutputPosition {
+    const comma = std.mem.indexOfScalar(u8, value, ',') orelse return error.InvalidOutputSetting;
+    return .{
+        .x = std.fmt.parseInt(i32, value[0..comma], 10) catch return error.InvalidOutputSetting,
+        .y = std.fmt.parseInt(i32, value[comma + 1 ..], 10) catch return error.InvalidOutputSetting,
+    };
 }
 
 const InputSettingError = error{
@@ -925,6 +1095,24 @@ fn problemForInputSettingError(err: anyerror) Problem {
     };
 }
 
+fn problemForOutputHeaderError(err: anyerror) Problem {
+    return switch (err) {
+        error.InvalidOutputMatcher => .invalid_output_matcher,
+        error.UnknownOutputMatcher => .unknown_output_matcher,
+        error.DuplicateOutputMatcher => .duplicate_output_matcher,
+        else => unreachable,
+    };
+}
+
+fn problemForOutputSettingError(err: anyerror) Problem {
+    return switch (err) {
+        error.InvalidOutputSetting => .invalid_output_setting,
+        error.UnknownOutputSetting => .unknown_output_setting,
+        error.DuplicateOutputSetting => .duplicate_output_setting,
+        else => unreachable,
+    };
+}
+
 pub fn problemMessage(problem: Problem) []const u8 {
     return switch (problem) {
         .invalid_section => "invalid section header",
@@ -955,6 +1143,12 @@ pub fn problemMessage(problem: Problem) []const u8 {
         .invalid_input_setting => "invalid input setting",
         .unknown_input_setting => "unknown input setting",
         .duplicate_input_setting => "duplicate input setting",
+        .invalid_output_matcher => "invalid output matcher",
+        .unknown_output_matcher => "unknown output matcher",
+        .duplicate_output_matcher => "duplicate output matcher",
+        .invalid_output_setting => "invalid output setting",
+        .unknown_output_setting => "unknown output setting",
+        .duplicate_output_setting => "duplicate output setting",
     };
 }
 
@@ -997,6 +1191,7 @@ test "valid empty configuration disables configured bindings" {
     try std.testing.expectEqual(GeneralSettings{}, snapshot.general);
     try std.testing.expectEqual(@as(usize, 0), snapshot.bindings.len);
     try std.testing.expectEqual(@as(usize, 0), snapshot.input_rules.len);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.output_rules.len);
 }
 
 test "embedded default configuration is valid and complete" {
@@ -1005,9 +1200,61 @@ test "embedded default configuration is valid and complete" {
     try std.testing.expectEqual(GeneralSettings{}, snapshot.general);
     try std.testing.expectEqual(@as(usize, 33), snapshot.bindings.len);
     try std.testing.expectEqual(@as(usize, 0), snapshot.input_rules.len);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.output_rules.len);
     try std.testing.expectEqual(Direction.left, snapshot.bindings[0].action.command.focus_direction);
     try std.testing.expectEqual(WindowTarget.focused, snapshot.bindings[8].action.command.close);
     try std.testing.expectEqualStrings("monstar", snapshot.bindings[32].action.run[0]);
+}
+
+test "output rules parse in order and match output identity" {
+    const result = try parse(std.testing.allocator,
+        \\[output]
+        \\scale=1.25
+        \\[output name="DP-?" make="Del*" model=U2723QE serial=ABC*]
+        \\enable=disabled
+        \\mode=3840x2160@59.94Hz
+        \\position=-1920,40
+    );
+    var snapshot = switch (result) {
+        .snapshot => |snapshot| snapshot,
+        .diagnostic => return error.UnexpectedDiagnostic,
+    };
+    defer snapshot.deinit();
+    try std.testing.expectEqual(@as(usize, 2), snapshot.output_rules.len);
+    try std.testing.expect(snapshot.output_rules[0].matcher.matches(.{ .name = "anything" }));
+    try std.testing.expectEqual(@as(u32, 150), snapshot.output_rules[0].settings.scale_v120_numerator.?);
+    const rule = snapshot.output_rules[1];
+    try std.testing.expect(rule.matcher.matches(.{
+        .name = "DP-1",
+        .make = "Dell Inc.",
+        .model = "U2723QE",
+        .serial = "ABC123",
+    }));
+    try std.testing.expect(!rule.matcher.matches(.{ .name = "DP-1", .make = "Dell Inc.", .model = "U2723QE" }));
+    try std.testing.expectEqual(false, rule.settings.enable.?);
+    try std.testing.expectEqual(@as(i32, 59940), rule.settings.mode.?.refresh_millihertz.?);
+    try std.testing.expectEqual(OutputPosition{ .x = -1920, .y = 40 }, rule.settings.position.?);
+}
+
+test "output rules reject invalid matchers and settings" {
+    const cases = [_]struct { source: []const u8, problem: Problem }{
+        .{ .source = "[output name]\n", .problem = .invalid_output_matcher },
+        .{ .source = "[output connector=DP-1]\n", .problem = .unknown_output_matcher },
+        .{ .source = "[output name=a name=b]\n", .problem = .duplicate_output_matcher },
+        .{ .source = "[output]\nenable=maybe\n", .problem = .invalid_output_setting },
+        .{ .source = "[output]\ntransform=90\n", .problem = .unknown_output_setting },
+        .{ .source = "[output]\nscale=1\nscale=2\n", .problem = .duplicate_output_setting },
+        .{ .source = "[output]\nscale=0\n", .problem = .invalid_output_setting },
+        .{ .source = "[output]\nscale=nan\n", .problem = .invalid_output_setting },
+        .{ .source = "[output]\nmode=1920-1080\n", .problem = .invalid_output_setting },
+        .{ .source = "[output]\nmode=1920x1080@0Hz\n", .problem = .invalid_output_setting },
+        .{ .source = "[output]\nposition=1:2\n", .problem = .invalid_output_setting },
+        .{ .source = "[outputs]\n", .problem = .unknown_section },
+    };
+    for (cases) |case| {
+        const result = try parse(std.testing.allocator, case.source);
+        try std.testing.expectEqual(case.problem, result.diagnostic.problem);
+    }
 }
 
 test "general settings parse and reject invalid directives" {

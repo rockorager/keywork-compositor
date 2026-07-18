@@ -522,6 +522,15 @@ const RenderOutputConfig = struct {
     drm_output: ?*DrmOutput = null,
 };
 
+const EffectiveOutputSettings = struct {
+    enabled: bool,
+    mode_index: usize,
+    requested_mode: ?Config.OutputMode = null,
+    x: i32,
+    y: i32,
+    scale: render.Scale,
+};
+
 pub const VirtualOutputConfig = struct {
     size: render.Size = .{ .width = 1280, .height = 720 },
     scale: render.Scale = .{},
@@ -1576,6 +1585,13 @@ fn drmOutputAdded(context: *anyopaque, drm_output: *DrmOutput) void {
     }
     if (self.output_management_initialized) {
         self.output_management.addHead(drm_output) catch return self.terminate();
+        if (self.configuration) |*configuration| {
+            self.applyConfiguredOutputs(configuration.snapshot.output_rules, drm_output) catch |err| {
+                log.warn("failed to apply configuration for hotplugged output {s}: {t}", .{
+                    drm_output.name(), err,
+                });
+            };
+        }
     }
     requestRepaint(self);
 }
@@ -1774,6 +1790,10 @@ fn drmOutputRemoving(context: *anyopaque, drm_output: *DrmOutput) void {
 
 fn applyOutputConfiguration(context: *anyopaque, changes: []const OutputManagement.Change) bool {
     const self: *Self = @ptrCast(@alignCast(context));
+    return self.applyOutputChanges(changes);
+}
+
+fn applyOutputChanges(self: *Self, changes: []const OutputManagement.Change) bool {
     for (changes) |change| {
         if (change.old_mode_index == change.mode_index) continue;
         self.drm_device.setOutputMode(change.output, change.mode_index) catch {
@@ -1804,8 +1824,114 @@ fn applyOutputConfiguration(context: *anyopaque, changes: []const OutputManageme
             return false;
         };
     }
+    for (changes) |change| {
+        if (change.enabled) continue;
+        change.output.logical_x = change.x;
+        change.output.logical_y = change.y;
+        change.output.scale = change.scale;
+    }
     requestRepaint(self);
     return true;
+}
+
+fn overlayOutputSettings(
+    effective: *EffectiveOutputSettings,
+    settings: Config.OutputSettings,
+) void {
+    if (settings.enable) |enabled| effective.enabled = enabled;
+    if (settings.position) |position| {
+        effective.x = position.x;
+        effective.y = position.y;
+    }
+    if (settings.mode) |mode| effective.requested_mode = mode;
+    if (settings.scale_v120_numerator) |numerator| effective.scale = .{ .numerator = numerator };
+}
+
+fn resolveOutputMode(modes: []const DrmOutput.Mode, requested: Config.OutputMode) !usize {
+    var selected: ?usize = null;
+    for (modes, 0..) |mode, index| {
+        const size = mode.size();
+        if (size.width != requested.width or size.height != requested.height) continue;
+        if (selected == null or if (requested.refresh_millihertz) |refresh|
+            @abs(@as(i64, mode.refreshMillihertz()) - refresh) <
+                @abs(@as(i64, modes[selected.?].refreshMillihertz()) - refresh)
+        else
+            mode.preferred and !modes[selected.?].preferred)
+        {
+            selected = index;
+        }
+    }
+    return selected orelse error.OutputModeUnavailable;
+}
+
+fn outputDeviceMatch(output: *const DrmOutput) Config.OutputDeviceMatch {
+    return .{
+        .name = output.name(),
+        .make = output.make(),
+        .model = output.model(),
+        .serial = output.serial(),
+    };
+}
+
+fn overlayMatchingOutputRules(
+    effective: *EffectiveOutputSettings,
+    device: Config.OutputDeviceMatch,
+    rules: []const Config.OutputRule,
+) bool {
+    var matched = false;
+    for (rules) |rule| {
+        if (!rule.matcher.matches(device)) continue;
+        matched = true;
+        overlayOutputSettings(effective, rule.settings);
+    }
+    return matched;
+}
+
+fn configuredOutputChange(output: *DrmOutput, rules: []const Config.OutputRule) !?OutputManagement.Change {
+    var effective: EffectiveOutputSettings = .{
+        .enabled = output.enabled,
+        .mode_index = output.currentModeIndex(),
+        .x = output.logical_x,
+        .y = output.logical_y,
+        .scale = output.scale,
+    };
+    if (!overlayMatchingOutputRules(&effective, outputDeviceMatch(output), rules)) return null;
+    if (effective.requested_mode) |mode| {
+        effective.mode_index = try resolveOutputMode(output.availableModes(), mode);
+    }
+    _ = try effective.scale.logicalSize(output.availableModes()[effective.mode_index].size());
+    if (effective.enabled == output.enabled and effective.mode_index == output.currentModeIndex() and
+        effective.x == output.logical_x and effective.y == output.logical_y and
+        effective.scale.numerator == output.scale.numerator) return null;
+    return .{
+        .output = output,
+        .was_enabled = output.enabled,
+        .enabled = effective.enabled,
+        .old_x = output.logical_x,
+        .old_y = output.logical_y,
+        .old_scale = output.scale,
+        .old_mode_index = output.currentModeIndex(),
+        .x = effective.x,
+        .y = effective.y,
+        .scale = effective.scale,
+        .mode_index = effective.mode_index,
+    };
+}
+
+fn applyConfiguredOutputs(self: *Self, rules: []const Config.OutputRule, only: ?*DrmOutput) !void {
+    if (!self.drm_device_initialized) return;
+    var changes: std.ArrayList(OutputManagement.Change) = .empty;
+    defer changes.deinit(self.allocator);
+    for (self.drm_device.outputs()) |output| {
+        if (only != null and only.? != output) continue;
+        if (try configuredOutputChange(output, rules)) |change| try changes.append(self.allocator, change);
+    }
+    if (changes.items.len != 0) {
+        if (!self.applyOutputChanges(changes.items)) return error.OutputConfigurationFailed;
+        if (self.output_management_initialized) {
+            for (changes.items) |change| self.output_management.syncHead(change.output);
+        }
+    }
 }
 
 fn rollbackOutputConfiguration(self: *Self, changes: []const OutputManagement.Change) void {
@@ -1836,7 +1962,10 @@ fn rollbackOutputConfiguration(self: *Self, changes: []const OutputManagement.Ch
         self.disableDrmOutput(change.output) catch return self.terminate();
     }
     for (changes) |change| {
-        if (!change.output.enabled) change.output.scale = change.old_scale;
+        if (change.output.enabled) continue;
+        change.output.logical_x = change.old_x;
+        change.output.logical_y = change.old_y;
+        change.output.scale = change.old_scale;
     }
     requestRepaint(self);
 }
@@ -1930,6 +2059,9 @@ pub fn setConfiguration(self: *Self, configuration: *Config.Store) void {
     std.debug.assert(self.configuration == null);
     self.configuration = configuration.*;
     configuration.* = undefined;
+    self.applyConfiguredOutputs(self.configuration.?.snapshot.output_rules, null) catch |err| {
+        log.warn("failed to apply configured outputs; preserving default layout: {t}", .{err});
+    };
     self.applyGeneralConfiguration(self.configuration.?.snapshot.general);
     self.applyInputConfiguration(self.configuration.?.snapshot.input_rules);
     if (self.builtin_keybindings_initialized) {
@@ -1941,6 +2073,7 @@ pub fn reloadConfiguration(self: *Self) !void {
     const configuration = if (self.configuration) |*value| value else return error.ConfigurationUnavailable;
     var replacement = try configuration.loadSnapshot();
     errdefer replacement.deinit();
+    try self.applyConfiguredOutputs(replacement.output_rules, null);
     self.applyGeneralConfiguration(replacement.general);
     self.applyInputConfiguration(replacement.input_rules);
     if (self.builtin_keybindings_initialized) {
@@ -6379,4 +6512,77 @@ test "input settings overlay in order and can restore defaults" {
     try std.testing.expectEqual(NativeInput.Toggle.disabled, effective.natural_scroll.?);
     try std.testing.expectEqual(@as(f64, 1), effective.scroll_factor);
     try std.testing.expectEqual(@as(i32, 30), effective.repeat_rate);
+}
+
+fn testOutputMode(width: u16, height: u16, refresh_hertz: u32, preferred: bool) DrmOutput.Mode {
+    var mode = std.mem.zeroes(DrmOutput.Mode);
+    mode.value.hdisplay = width;
+    mode.value.vdisplay = height;
+    mode.value.vrefresh = refresh_hertz;
+    mode.preferred = preferred;
+    return mode;
+}
+
+test "output settings overlay in order and preserve unspecified live fields" {
+    var effective: EffectiveOutputSettings = .{
+        .enabled = true,
+        .mode_index = 2,
+        .x = 41,
+        .y = -3,
+        .scale = .{ .numerator = 120 },
+    };
+    overlayOutputSettings(&effective, .{
+        .enable = false,
+        .position = .{ .x = 10, .y = 20 },
+        .scale_v120_numerator = 180,
+    });
+    overlayOutputSettings(&effective, .{ .enable = true, .position = .{ .x = 30, .y = 40 } });
+
+    try std.testing.expect(effective.enabled);
+    try std.testing.expectEqual(@as(usize, 2), effective.mode_index);
+    try std.testing.expectEqual(@as(i32, 30), effective.x);
+    try std.testing.expectEqual(@as(i32, 40), effective.y);
+    try std.testing.expectEqual(@as(u32, 180), effective.scale.numerator);
+}
+
+test "nonmatching output rules are omitted" {
+    var effective: EffectiveOutputSettings = .{
+        .enabled = true,
+        .mode_index = 0,
+        .x = 4,
+        .y = 5,
+        .scale = .{},
+    };
+    const rules = [_]Config.OutputRule{.{
+        .matcher = .{ .name = "DP-*" },
+        .settings = .{ .enable = false },
+    }};
+    try std.testing.expect(!overlayMatchingOutputRules(&effective, .{ .name = "HDMI-A-1" }, &rules));
+    try std.testing.expect(effective.enabled);
+}
+
+test "output mode resolution prefers preferred and closest refresh" {
+    const modes = [_]DrmOutput.Mode{
+        testOutputMode(1920, 1080, 60, false),
+        testOutputMode(1920, 1080, 75, true),
+        testOutputMode(1920, 1080, 120, false),
+        testOutputMode(1280, 720, 60, true),
+    };
+    try std.testing.expectEqual(@as(usize, 1), try resolveOutputMode(&modes, .{
+        .width = 1920,
+        .height = 1080,
+    }));
+    try std.testing.expectEqual(@as(usize, 2), try resolveOutputMode(&modes, .{
+        .width = 1920,
+        .height = 1080,
+        .refresh_millihertz = 110_000,
+    }));
+}
+
+test "output mode resolution rejects unavailable size" {
+    const modes = [_]DrmOutput.Mode{testOutputMode(1920, 1080, 60, true)};
+    try std.testing.expectError(error.OutputModeUnavailable, resolveOutputMode(&modes, .{
+        .width = 2560,
+        .height = 1440,
+    }));
 }
