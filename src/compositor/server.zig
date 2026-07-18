@@ -67,6 +67,7 @@ const Output = @import("wayland/output.zig");
 const OutputLayout = @import("wayland/output_layout.zig");
 const OutputManagement = @import("wayland/output_management.zig");
 const OutputPower = @import("wayland/output_power.zig");
+const GammaControl = @import("wayland/gamma_control.zig");
 const DrmLease = @import("wayland/drm_lease.zig");
 const OutputBackend = @import("backend/output.zig");
 const DrmDevice = @import("backend/drm_device.zig");
@@ -118,6 +119,8 @@ output_management: OutputManagement,
 output_management_initialized: bool,
 output_power: OutputPower,
 output_power_initialized: bool,
+gamma_control: GammaControl,
+gamma_control_initialized: bool,
 drm_lease: DrmLease,
 drm_lease_initialized: bool,
 single_pixel_buffer: SinglePixelBuffer,
@@ -699,6 +702,8 @@ pub fn createWithVirtualOutput(
         .output_management_initialized = false,
         .output_power = undefined,
         .output_power_initialized = false,
+        .gamma_control = undefined,
+        .gamma_control_initialized = false,
         .drm_lease = undefined,
         .drm_lease_initialized = false,
         .single_pixel_buffer = undefined,
@@ -907,6 +912,23 @@ pub fn createWithVirtualOutput(
         errdefer {
             self.output_power.deinit();
             self.output_power_initialized = false;
+        }
+        try self.gamma_control.init(
+            allocator,
+            display,
+            &self.outputs,
+            &self.security_context,
+            .{
+                .context = self,
+                .gamma_size = outputGammaSize,
+                .set_gamma = setOutputGamma,
+                .reset_gamma = resetOutputGamma,
+            },
+        );
+        self.gamma_control_initialized = true;
+        errdefer {
+            self.gamma_control.deinit();
+            self.gamma_control_initialized = false;
         }
         try self.drm_lease.init(
             allocator,
@@ -1440,6 +1462,10 @@ pub fn destroy(self: *Self) void {
         self.drm_lease.deinit();
         self.drm_lease_initialized = false;
     }
+    if (self.gamma_control_initialized) {
+        self.gamma_control.deinit();
+        self.gamma_control_initialized = false;
+    }
     if (self.output_power_initialized) {
         self.output_power.deinit();
         self.output_power_initialized = false;
@@ -1787,7 +1813,10 @@ fn prepareSeatKeyboard(self: *Self, seat: *Seat, id: NativeInput.DeviceId) void 
 }
 
 fn removeRenderOutput(self: *Self, id: RenderOutputId) bool {
-    const render_output = self.render_outputs.remove(id) orelse return false;
+    const render_output = (self.render_outputs.get(id) orelse return false).*;
+    if (self.gamma_control_initialized) self.gamma_control.removeOutput(render_output.protocol_id);
+    const removed = self.render_outputs.remove(id) orelse unreachable;
+    std.debug.assert(removed == render_output);
     stopRenderOutput(render_output);
     const protocol_output = self.outputs.get(render_output.protocol_id).?;
     if (self.foreign_toplevel_list_initialized) {
@@ -1896,6 +1925,31 @@ fn setOutputPowerState(context: *anyopaque, output_id: OutputLayout.Id, powered:
     requestRepaint(self);
     if (!powered) self.session_lock.refreshSecurity();
     return true;
+}
+
+fn outputGammaSize(context: *anyopaque, output_id: OutputLayout.Id) ?u32 {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const render_output = self.findProtocolRenderOutput(output_id) orelse return null;
+    const drm_output = render_output.backend.drmOutput() orelse return null;
+    return drm_output.gammaSize();
+}
+
+fn setOutputGamma(context: *anyopaque, output_id: OutputLayout.Id, table: []const u16) bool {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const render_output = self.findProtocolRenderOutput(output_id) orelse return false;
+    const drm_output = render_output.backend.drmOutput() orelse return false;
+    drm_output.setGamma(table) catch |err| {
+        log.warn("failed to set gamma ramps on {s}: {t}", .{ drm_output.name(), err });
+        return false;
+    };
+    return true;
+}
+
+fn resetOutputGamma(context: *anyopaque, output_id: OutputLayout.Id) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const render_output = self.findProtocolRenderOutput(output_id) orelse return;
+    const drm_output = render_output.backend.drmOutput() orelse return;
+    drm_output.resetGamma();
 }
 
 fn outputSecureWithoutFrame(context: *anyopaque, output_id: OutputLayout.Id) bool {
@@ -2293,6 +2347,7 @@ fn revokeDrmLease(context: *anyopaque, lessee_id: u32) void {
 
 fn drmDeviceActivated(context: *anyopaque) void {
     const self: *Self = @ptrCast(@alignCast(context));
+    if (self.gamma_control_initialized) self.gamma_control.refreshOutputs();
     if (self.drm_lease_initialized) self.drm_lease.@"resume"();
 }
 

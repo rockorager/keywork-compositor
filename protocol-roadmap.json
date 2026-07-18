@@ -1339,16 +1339,17 @@
       "interfaces": [
         {
           "name": "zwlr_gamma_control_manager_v1",
-          "current_version": null,
+          "current_version": 1,
           "target_version": 1
         }
       ],
-      "status": "not_started",
+      "status": "done",
       "privileged": true,
       "blocked_by": [
         "color-management",
         "wlr-output-management"
-      ]
+      ],
+      "status_detail": "Version 1 restricts the global to privileged clients, enforces exclusive per-output controls, validates native-endian 16-bit ramp FDs, applies legacy DRM CRTC gamma tables, restores identity on release, and retains live ramps across power, mode, and session transitions."
     }
   ]
 }

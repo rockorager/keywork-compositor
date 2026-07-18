@@ -49,6 +49,8 @@ connector_id: u32,
 crtc_id: u32,
 primary_plane_id: ?u32,
 atomic_plane: ?AtomicPlaneProperties,
+gamma_size: u32,
+gamma_lut: []u16,
 scanout_modifiers: []u64,
 implicit_scanout: bool,
 sync_file_import_supported: bool,
@@ -228,6 +230,8 @@ pub fn init(
         .crtc_id = 0,
         .primary_plane_id = null,
         .atomic_plane = null,
+        .gamma_size = 0,
+        .gamma_lut = &.{},
         .scanout_modifiers = &.{},
         .implicit_scanout = true,
         .sync_file_import_supported = true,
@@ -267,6 +271,7 @@ pub fn deinit(self: *Self) void {
     std.debug.assert(self.direct_framebuffers.count() == 0);
     self.direct_framebuffers.deinit(self.allocator);
     self.clearIdentity();
+    self.allocator.free(self.gamma_lut);
     self.allocator.free(self.modes);
     self.allocator.free(self.scanout_modifiers);
     for (&self.buffer_damage) |*damage| damage.deinit();
@@ -425,6 +430,9 @@ pub fn present(
             &self.mode,
         ) != 0) return error.ModeSetFailed;
         self.mode_set = true;
+        self.applyDesiredGamma(fd) catch |err| {
+            log.warn("failed to restore gamma ramps on {s}: {t}", .{ self.name(), err });
+        };
         self.displayed = index;
         self.acquired = null;
         self.setDirectScanoutActive(false);
@@ -605,6 +613,15 @@ pub fn activate(self: *Self, fd: std.posix.fd_t, selection: Selection, device_pa
         c.drmModeFreeCrtc(self.old_crtc.?);
         self.old_crtc = null;
     }
+    self.gamma_size = if (self.old_crtc.?.*.gamma_size > 0)
+        @intCast(self.old_crtc.?.*.gamma_size)
+    else
+        0;
+    const expected_gamma_values = std.math.mul(usize, self.gamma_size, 3) catch 0;
+    if (self.gamma_lut.len != 0 and self.gamma_lut.len != expected_gamma_values) {
+        self.allocator.free(self.gamma_lut);
+        self.gamma_lut = &.{};
+    }
 
     if (!self.powered) {
         if (c.drmModeSetCrtc(fd, self.crtc_id, 0, 0, 0, null, 0, null) != 0) {
@@ -673,6 +690,9 @@ pub fn isPrimaryNode(path: []const u8) bool {
 }
 
 pub fn deactivate(self: *Self, fd: std.posix.fd_t) void {
+    if (self.gamma_lut.len != 0) self.applyIdentityGamma(fd) catch |err| {
+        log.warn("failed to restore gamma ramps before releasing {s}: {t}", .{ self.name(), err });
+    };
     if (self.old_crtc) |old_crtc| restoreCrtc(fd, self.connector_id, old_crtc);
     self.release(fd);
 }
@@ -784,6 +804,89 @@ pub fn setMode(self: *Self, fd: std.posix.fd_t, mode_index: usize) !void {
     self.mode = mode.value;
     self.size = size;
     self.refresh_nanoseconds = refreshNanoseconds(self.mode);
+}
+
+pub fn gammaSize(self: *const Self) ?u32 {
+    if (self.old_crtc == null or self.gamma_size == 0) return null;
+    return self.gamma_size;
+}
+
+pub fn setGamma(self: *Self, table: []const u16) !void {
+    const gamma_size = self.gammaSize() orelse return error.GammaUnsupported;
+    const expected_values = std.math.mul(usize, gamma_size, 3) catch
+        return error.InvalidGammaSize;
+    if (table.len != expected_values) return error.InvalidGammaSize;
+
+    const replacement = try self.allocator.dupe(u16, table);
+    errdefer self.allocator.free(replacement);
+    if (self.powered) {
+        const fd = self.device_access.fd(self.device_access.context) orelse
+            return error.SessionInactive;
+        if (!self.device_access.active(self.device_access.context)) {
+            return error.SessionInactive;
+        }
+        try self.applyGamma(fd, replacement);
+    }
+    self.allocator.free(self.gamma_lut);
+    self.gamma_lut = replacement;
+}
+
+pub fn resetGamma(self: *Self) void {
+    if (self.gamma_lut.len == 0) return;
+    if (self.powered and self.device_access.active(self.device_access.context)) {
+        if (self.device_access.fd(self.device_access.context)) |fd| {
+            self.applyIdentityGamma(fd) catch |err| {
+                log.warn("failed to reset gamma ramps on {s}: {t}", .{ self.name(), err });
+            };
+        }
+    }
+    self.allocator.free(self.gamma_lut);
+    self.gamma_lut = &.{};
+}
+
+fn applyDesiredGamma(self: *Self, fd: std.posix.fd_t) !void {
+    if (self.gamma_lut.len == 0) return;
+    try self.applyGamma(fd, self.gamma_lut);
+}
+
+fn applyGamma(self: *const Self, fd: std.posix.fd_t, table: []const u16) !void {
+    const gamma_size: usize = self.gamma_size;
+    std.debug.assert(gamma_size != 0 and table.len == gamma_size * 3);
+    if (c.drmModeCrtcSetGamma(
+        fd,
+        self.crtc_id,
+        self.gamma_size,
+        @constCast(table[0..gamma_size].ptr),
+        @constCast(table[gamma_size .. gamma_size * 2].ptr),
+        @constCast(table[gamma_size * 2 ..].ptr),
+    ) != 0) return error.SetGammaFailed;
+}
+
+fn applyIdentityGamma(self: *const Self, fd: std.posix.fd_t) !void {
+    if (self.gamma_size == 0) return;
+    const ramp = try self.allocator.alloc(u16, self.gamma_size);
+    defer self.allocator.free(ramp);
+    fillIdentityGammaRamp(ramp);
+    if (c.drmModeCrtcSetGamma(
+        fd,
+        self.crtc_id,
+        self.gamma_size,
+        ramp.ptr,
+        ramp.ptr,
+        ramp.ptr,
+    ) != 0) return error.SetGammaFailed;
+}
+
+fn fillIdentityGammaRamp(ramp: []u16) void {
+    if (ramp.len == 0) return;
+    if (ramp.len == 1) {
+        ramp[0] = std.math.maxInt(u16);
+        return;
+    }
+    const denominator = ramp.len - 1;
+    for (ramp, 0..) |*value, index| {
+        value.* = @intCast(index * std.math.maxInt(u16) / denominator);
+    }
 }
 
 fn availableBuffer(self: *const Self) ?usize {
@@ -1787,6 +1890,16 @@ fn restoreCrtc(fd: std.posix.fd_t, connector_id: u32, old_crtc: *c.drmModeCrtc) 
     ) != 0) {
         log.err("failed to restore CRTC {d}", .{old_crtc.*.crtc_id});
     }
+}
+
+test "identity gamma ramp spans the full unsigned range" {
+    var ramp: [5]u16 = undefined;
+    fillIdentityGammaRamp(&ramp);
+    try std.testing.expectEqualSlices(u16, &.{ 0, 16383, 32767, 49151, 65535 }, &ramp);
+
+    var singleton: [1]u16 = undefined;
+    fillIdentityGammaRamp(&singleton);
+    try std.testing.expectEqual(@as(u16, 65535), singleton[0]);
 }
 
 test "shadow copy respects scanout pitch" {

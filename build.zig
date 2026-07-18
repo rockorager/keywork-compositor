@@ -66,6 +66,7 @@ pub fn build(b: *std.Build) void {
     scanner.addCustomProtocol(b.path("protocol/upstream/wlr-virtual-pointer-unstable-v1.xml"));
     scanner.addCustomProtocol(b.path("protocol/upstream/wlr-layer-shell-unstable-v1.xml"));
     scanner.addCustomProtocol(b.path("protocol/upstream/wlr-output-power-management-unstable-v1.xml"));
+    scanner.addCustomProtocol(b.path("protocol/upstream/wlr-gamma-control-unstable-v1.xml"));
     scanner.generate("wl_compositor", 7);
     scanner.generate("wl_subcompositor", 1);
     scanner.generate("wl_shm", 2);
@@ -132,6 +133,7 @@ pub fn build(b: *std.Build) void {
     scanner.generate("gtk_shell1", 5);
     scanner.generate("zwlr_layer_shell_v1", 5);
     scanner.generate("zwlr_output_power_manager_v1", 1);
+    scanner.generate("zwlr_gamma_control_manager_v1", 1);
 
     const wayland = b.createModule(.{
         .root_source_file = scanner.result,
