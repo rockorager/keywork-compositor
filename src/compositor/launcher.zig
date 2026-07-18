@@ -161,8 +161,18 @@ fn launchWithVarlink(self: *Self, argv: []const []const u8) !void {
         .{ std.c.getpid(), self.next_unit_id },
     );
     self.next_unit_id +%= 1;
+    const resolved_executable = if (std.fs.path.isAbsolute(argv[0]))
+        null
+    else
+        try resolveExecutable(
+            self.allocator,
+            self.io,
+            self.environ_map.get("PATH") orelse return error.FileNotFound,
+            argv[0],
+        );
+    defer if (resolved_executable) |path| self.allocator.free(path);
     const commands = [_]StartTransientParameters.ExecCommand{.{
-        .path = argv[0],
+        .path = resolved_executable orelse argv[0],
         .arguments = argv,
     }};
     var reply = try self.client.?.call(start_transient_method, StartTransientParameters{
@@ -211,6 +221,47 @@ fn clearClient(self: *Self) void {
     self.client = null;
 }
 
+fn resolveExecutable(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    search_path: []const u8,
+    executable: []const u8,
+) ![]u8 {
+    const current_path = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(current_path);
+    var directories = std.mem.tokenizeScalar(u8, search_path, ':');
+    var access_denied = false;
+    while (directories.next()) |directory| {
+        const candidate = try std.fs.path.join(
+            allocator,
+            if (std.fs.path.isAbsolute(directory))
+                &.{ directory, executable }
+            else
+                &.{ current_path, directory, executable },
+        );
+        std.Io.Dir.cwd().access(io, candidate, .{ .execute = true }) catch |err| {
+            allocator.free(candidate);
+            switch (err) {
+                error.FileNotFound => continue,
+                error.AccessDenied, error.PermissionDenied => {
+                    access_denied = true;
+                    continue;
+                },
+                else => return err,
+            }
+        };
+        const stat = std.Io.Dir.cwd().statFile(io, candidate, .{}) catch |err| {
+            allocator.free(candidate);
+            return err;
+        };
+        if (stat.kind == .file) return candidate;
+        access_denied = true;
+        allocator.free(candidate);
+    }
+    if (access_denied) return error.AccessDenied;
+    return error.FileNotFound;
+}
+
 fn unsupportedError(name: []const u8) bool {
     return std.mem.eql(u8, name, "org.varlink.service.InterfaceNotFound") or
         std.mem.eql(u8, name, "org.varlink.service.MethodNotFound") or
@@ -241,4 +292,31 @@ test "only capability errors permit an unambiguous fallback" {
     try std.testing.expect(unsupportedError("org.varlink.service.MethodNotFound"));
     try std.testing.expect(!unsupportedError("io.systemd.Unit.UnitExists"));
     try std.testing.expect(!unsupportedError("org.varlink.service.InvalidParameter"));
+}
+
+test "bare executables resolve through the configured search path" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const executable = try temporary.dir.createFile(std.testing.io, "probe", .{
+        .permissions = .executable_file,
+    });
+    executable.close(std.testing.io);
+
+    var directory_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const directory_length = try temporary.dir.realPath(std.testing.io, &directory_buffer);
+    const directory = directory_buffer[0..directory_length];
+    const resolved = try resolveExecutable(
+        std.testing.allocator,
+        std.testing.io,
+        directory,
+        "probe",
+    );
+    defer std.testing.allocator.free(resolved);
+    const expected = try std.fs.path.join(std.testing.allocator, &.{ directory, "probe" });
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, resolved);
+    try std.testing.expectError(
+        error.FileNotFound,
+        resolveExecutable(std.testing.allocator, std.testing.io, directory, "missing"),
+    );
 }
