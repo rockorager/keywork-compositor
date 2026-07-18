@@ -28,6 +28,7 @@ const KeyboardShortcutsInhibit = @import("wayland/keyboard_shortcuts_inhibit.zig
 const IdleNotify = @import("wayland/idle_notify.zig");
 const Seat = @import("wayland/seat.zig");
 const DataDevice = @import("wayland/data_device.zig");
+const XdgToplevelDrag = @import("wayland/xdg_toplevel_drag.zig");
 const PrimarySelection = @import("wayland/primary_selection.zig");
 const DataControl = @import("wayland/data_control.zig");
 const ForeignToplevelList = @import("wayland/foreign_toplevel_list.zig");
@@ -135,6 +136,7 @@ routed_gestures: std.ArrayList(RoutedGesture),
 routed_touches: std.ArrayList(RoutedTouch),
 next_touch_id: u31,
 data_device: DataDevice,
+xdg_toplevel_drag: XdgToplevelDrag,
 primary_selection: PrimarySelection,
 data_control: DataControl,
 foreign_toplevel_list: ForeignToplevelList,
@@ -701,6 +703,7 @@ pub fn createWithVirtualOutput(
         .routed_touches = .empty,
         .next_touch_id = 0,
         .data_device = undefined,
+        .xdg_toplevel_drag = undefined,
         .primary_selection = undefined,
         .data_control = undefined,
         .foreign_toplevel_list = undefined,
@@ -1083,6 +1086,20 @@ pub fn createWithVirtualOutput(
         self.window_manager.deinit();
         self.window_manager_initialized = false;
     }
+    try self.xdg_toplevel_drag.init(
+        allocator,
+        display,
+        &self.data_device,
+        &self.xdg_shell,
+        &self.seat,
+        .{
+            .context = self,
+            .begin = xdgToplevelDragBegin,
+            .motion = xdgToplevelDragMotion,
+            .end = xdgToplevelDragEnd,
+        },
+    );
+    errdefer self.xdg_toplevel_drag.deinit();
     self.workspace.setActivationListener(.{
         .context = self,
         .activate = workspaceActivationRequested,
@@ -1325,6 +1342,7 @@ pub fn destroy(self: *Self) void {
     self.foreign_toplevel_list.deinit();
     self.foreign_toplevel_list_initialized = false;
     self.workspace.clearActivationListener();
+    self.xdg_toplevel_drag.deinit();
     self.window_manager.deinit();
     self.window_manager_initialized = false;
     self.workspace.deinit();
@@ -3524,7 +3542,8 @@ fn pointerEnter(context: *anyopaque, x: f64, y: f64) void {
             point.y,
             self.data_device.externalDragPointerFocus(point.x, point.y),
         );
-        self.routeActiveDrag(0, route, point.x, point.y, false);
+        self.xdg_toplevel_drag.pointerMotion(point.x, point.y);
+        self.routeActiveDrag(0, self.dragPointerRoute(point.x, point.y), point.x, point.y, false);
         return;
     }
     self.seat.pointerEnter(point.x, point.y, route.focus);
@@ -3567,14 +3586,20 @@ fn pointerMotionForSeat(output: *RenderOutput, seat: *Seat, time: u32, x: f64, y
     }
     if (seat == &self.seat and self.data_device.isDragging()) {
         self.pointer_constraints.deactivateAll();
-        const route = self.pointerRoute(target.x, target.y);
         seat.pointerMotion(
             time,
             target.x,
             target.y,
             self.data_device.externalDragPointerFocus(target.x, target.y),
         );
-        self.routeActiveDrag(time, route, target.x, target.y, true);
+        self.xdg_toplevel_drag.pointerMotion(target.x, target.y);
+        self.routeActiveDrag(
+            time,
+            self.dragPointerRoute(target.x, target.y),
+            target.x,
+            target.y,
+            true,
+        );
         return;
     }
     const motion = self.pointer_constraints.constrainMotion(.{ .x = target.x, .y = target.y });
@@ -3723,9 +3748,39 @@ fn dragStarted(context: *anyopaque) void {
     self.pointer_constraints.deactivateAll();
     if (self.xwm_initialized) self.xwm.dragStarted();
     const position = self.seat.pointerPosition() orelse return;
-    const route = self.pointerRoute(position.x, position.y);
+    const route = self.dragPointerRoute(position.x, position.y);
     if (!self.data_device.dragIsExternal()) self.seat.suppressPointerFocus(true);
     self.routeActiveDrag(0, route, position.x, position.y, false);
+}
+
+fn xdgToplevelDragBegin(
+    context: *anyopaque,
+    window_id: XdgShell.WindowId,
+    pointer_x: f64,
+    pointer_y: f64,
+    x_offset: i32,
+    y_offset: i32,
+    use_offset_hint: bool,
+) bool {
+    const self: *Self = @ptrCast(@alignCast(context));
+    return self.window_manager.beginToplevelDrag(
+        window_id,
+        pointer_x,
+        pointer_y,
+        x_offset,
+        y_offset,
+        use_offset_hint,
+    );
+}
+
+fn xdgToplevelDragMotion(context: *anyopaque, x: f64, y: f64) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.window_manager.updateToplevelDrag(x, y);
+}
+
+fn xdgToplevelDragEnd(context: *anyopaque) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.window_manager.endToplevelDrag();
 }
 
 fn dragEnded(context: *anyopaque) void {
@@ -3898,6 +3953,15 @@ fn touchOrientation(context: *anyopaque, id: i32, orientation: f64) void {
 }
 
 fn pointerFocus(self: *Self, x: f64, y: f64) ?Seat.PointerFocus {
+    return self.pointerFocusExcluding(x, y, null);
+}
+
+fn pointerFocusExcluding(
+    self: *Self,
+    x: f64,
+    y: f64,
+    excluded_window: ?Scene.Id,
+) ?Seat.PointerFocus {
     if (self.session_lock.isLocked()) {
         var outputs = self.outputs.iterator();
         while (outputs.next()) |entry| {
@@ -3910,7 +3974,7 @@ fn pointerFocus(self: *Self, x: f64, y: f64) ?Seat.PointerFocus {
         }
         return null;
     }
-    const focus = self.scenePointerFocus(x, y);
+    const focus = self.scenePointerFocus(x, y, excluded_window);
     if (focus) |candidate| {
         if (self.xdg_shell.hasPopupGrab() and
             !self.xdg_shell.popupGrabOwnsSurface(candidate.surface_id)) return null;
@@ -3919,7 +3983,20 @@ fn pointerFocus(self: *Self, x: f64, y: f64) ?Seat.PointerFocus {
 }
 
 fn pointerRoute(self: *Self, x: f64, y: f64) PointerRoute {
-    const focus = self.pointerFocus(x, y);
+    return self.pointerRouteExcluding(x, y, null);
+}
+
+fn dragPointerRoute(self: *Self, x: f64, y: f64) PointerRoute {
+    return self.pointerRouteExcluding(x, y, self.xdg_toplevel_drag.attachedScene());
+}
+
+fn pointerRouteExcluding(
+    self: *Self,
+    x: f64,
+    y: f64,
+    excluded_window: ?Scene.Id,
+) PointerRoute {
+    const focus = self.pointerFocusExcluding(x, y, excluded_window);
     return .{
         .focus = focus,
         .root = if (focus) |value|
@@ -3927,15 +4004,18 @@ fn pointerRoute(self: *Self, x: f64, y: f64) PointerRoute {
         else if (self.session_lock.isLocked())
             null
         else
-            self.borderRoot(x, y),
+            self.borderRoot(x, y, excluded_window),
     };
 }
 
-fn borderRoot(self: *Self, x: f64, y: f64) ?Surface.Id {
-    const fullscreen = self.topFullscreenAtPoint(x, y);
+fn borderRoot(self: *Self, x: f64, y: f64, excluded_window: ?Scene.Id) ?Surface.Id {
+    const fullscreen = excludeScene(self.topFullscreenAtPoint(x, y), excluded_window);
     var nodes = self.scene.reverseNodeIterator();
     while (nodes.next()) |entry| switch (entry) {
         .window => |window_entry| {
+            if (excluded_window) |excluded| {
+                if (std.meta.eql(window_entry.id, excluded)) continue;
+            }
             if (fullscreen) |fullscreen_id| {
                 if (!std.meta.eql(window_entry.id, fullscreen_id)) continue;
             }
@@ -3966,7 +4046,12 @@ fn borderRoot(self: *Self, x: f64, y: f64) ?Surface.Id {
     return null;
 }
 
-fn scenePointerFocus(self: *Self, x: f64, y: f64) ?Seat.PointerFocus {
+fn scenePointerFocus(
+    self: *Self,
+    x: f64,
+    y: f64,
+    excluded_window: ?Scene.Id,
+) ?Seat.PointerFocus {
     var input_popups = self.input_method.reversePopupIterator();
     while (input_popups.next()) |popup| {
         if (self.hitTestSurface(
@@ -3978,13 +4063,16 @@ fn scenePointerFocus(self: *Self, x: f64, y: f64) ?Seat.PointerFocus {
     }
     if (self.hitTestLayerPopups(x, y)) |focus| return focus;
     if (self.hitTestLayer(.overlay, x, y)) |focus| return focus;
-    const fullscreen = self.topFullscreenAtPoint(x, y);
+    const fullscreen = excludeScene(self.topFullscreenAtPoint(x, y), excluded_window);
     if (fullscreen == null) {
         if (self.hitTestLayer(.top, x, y)) |focus| return focus;
     }
     var nodes = self.scene.reverseNodeIterator();
     while (nodes.next()) |entry| switch (entry) {
         .window => |window_entry| {
+            if (excluded_window) |excluded| {
+                if (std.meta.eql(window_entry.id, excluded)) continue;
+            }
             if (fullscreen) |fullscreen_id| {
                 if (!std.meta.eql(window_entry.id, fullscreen_id)) continue;
                 return self.hitTestWindow(window_entry.id, window_entry.window, x, y);
@@ -4006,6 +4094,14 @@ fn scenePointerFocus(self: *Self, x: f64, y: f64) ?Seat.PointerFocus {
     if (self.hitTestLayer(.bottom, x, y)) |focus| return focus;
     if (self.hitTestLayer(.background, x, y)) |focus| return focus;
     return null;
+}
+
+fn excludeScene(candidate: ?Scene.Id, excluded: ?Scene.Id) ?Scene.Id {
+    const value = candidate orelse return null;
+    if (excluded) |excluded_id| {
+        if (std.meta.eql(value, excluded_id)) return null;
+    }
+    return value;
 }
 
 fn topFullscreenAtPoint(self: *Self, x: f64, y: f64) ?Scene.Id {

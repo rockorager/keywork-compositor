@@ -45,6 +45,7 @@ window_effects: Scene.Effects = Scene.default_effects,
 focused_window_effects: Scene.Effects = Scene.default_effects,
 focused_window_border: ?Scene.Borders = null,
 tiling_drag: ?TilingDrag = null,
+toplevel_drag: ?ToplevelDrag = null,
 
 const WindowStore = slot_map.SlotMap(Window, enum { builtin_window });
 pub const WindowId = WindowStore.Id;
@@ -52,6 +53,12 @@ pub const WindowId = WindowStore.Id;
 const TilingDrag = struct {
     source: WindowId,
     target: ?WindowId = null,
+};
+
+const ToplevelDrag = struct {
+    window: WindowId,
+    grab_x: f64,
+    grab_y: f64,
 };
 
 const KnownXwaylandWindow = struct {
@@ -67,6 +74,7 @@ const Window = struct {
     fixed_size_floating: bool = false,
     floating_override: ?bool = null,
     floating_restore_size: ?types.Size = null,
+    floating_position: ?Scene.Position = null,
     tags: workspace_mod.TagSet = .{},
     serial: ?u32 = null,
     placement: ?types.LayoutPlan = null,
@@ -334,6 +342,9 @@ fn addXdg(self: *Self, xdg_id: XdgShell.WindowId) !WindowId {
 
 fn removeId(self: *Self, id: WindowId) void {
     const pending = self.windows.get(id).?.serial != null;
+    if (self.toplevel_drag) |drag| {
+        if (std.meta.eql(drag.window, id)) self.toplevel_drag = null;
+    }
     var window = self.windows.remove(id).?;
     _ = self.workspaces.items[window.workspace].workspace.remove(neutral(id));
     self.reportWorkspaceOccupancy(window.workspace);
@@ -691,6 +702,75 @@ pub fn endTilingDrag(self: *Self, commit: bool) bool {
     return true;
 }
 
+pub fn beginToplevelDrag(
+    self: *Self,
+    xdg_id: XdgShell.WindowId,
+    pointer_x: f64,
+    pointer_y: f64,
+    x_offset: i32,
+    y_offset: i32,
+    use_offset_hint: bool,
+) bool {
+    if (self.toplevel_drag != null or self.layer_focus == .exclusive) return false;
+    const id = self.findXdg(xdg_id) orelse return false;
+    const window = self.windows.get(id) orelse return false;
+    if (!window.mapped or window.minimized or window.fullscreen_output != null) return false;
+    const current = self.scene.windowPosition(window.scene_id) orelse return false;
+    const grab_x = if (use_offset_hint)
+        @as(f64, @floatFromInt(x_offset))
+    else
+        pointer_x - @as(f64, @floatFromInt(current.x));
+    const grab_y = if (use_offset_hint)
+        @as(f64, @floatFromInt(y_offset))
+    else
+        pointer_y - @as(f64, @floatFromInt(current.y));
+    const position = toplevelDragPosition(pointer_x, pointer_y, grab_x, grab_y);
+    if (!self.isFloating(window)) {
+        const dimensions = self.currentDimensions(window);
+        window.floating_restore_size = types.Size.init(
+            @intCast(@max(1, dimensions.width)),
+            @intCast(@max(1, dimensions.height)),
+        );
+    }
+    window.floating_override = true;
+    window.floating_position = position;
+    const workspace = &self.workspaces.items[window.workspace];
+    _ = workspace.workspace.focus(neutral(id));
+    _ = workspace.workspace.raise(neutral(id));
+    self.default_output = workspace.output;
+    self.toplevel_drag = .{ .window = id, .grab_x = grab_x, .grab_y = grab_y };
+    self.relayout();
+    self.xdg_shell.setWindowPosition(xdg_id, position);
+    self.scene.placeTop(window.scene_id);
+    return true;
+}
+
+pub fn updateToplevelDrag(self: *Self, pointer_x: f64, pointer_y: f64) void {
+    const drag = self.toplevel_drag orelse return;
+    const window = self.windows.get(drag.window) orelse {
+        self.toplevel_drag = null;
+        return;
+    };
+    const xdg_id = switch (window.backend) {
+        .xdg => |id| id,
+        .xwayland => unreachable,
+    };
+    const position = toplevelDragPosition(pointer_x, pointer_y, drag.grab_x, drag.grab_y);
+    window.floating_position = position;
+    if (window.placement) |*placement| {
+        placement.rect.x = position.x;
+        placement.rect.y = position.y;
+    }
+    self.xdg_shell.setWindowPosition(xdg_id, position);
+    self.scene.placeTop(window.scene_id);
+}
+
+pub fn endToplevelDrag(self: *Self) void {
+    if (self.toplevel_drag == null) return;
+    self.toplevel_drag = null;
+    self.relayout();
+}
+
 fn isDraggableTiledWindow(self: *Self, window: *const Window) bool {
     return window.mapped and !window.minimized and window.fullscreen_output == null and
         !self.isFloating(window) and self.transientParent(window) == null and
@@ -801,7 +881,10 @@ pub fn toggleFocusedFloating(self: *Self) void {
     const window = self.focusedWindow() orelse return;
     if (!window.mapped or window.minimized) return;
     window.floating_override = !self.isFloating(window);
-    if (!self.isFloating(window)) window.floating_restore_size = null;
+    if (!self.isFloating(window)) {
+        window.floating_restore_size = null;
+        window.floating_position = null;
+    }
     self.relayout();
 }
 pub fn switchLayout(self: *Self, kind: layout_mod.Kind) void {
@@ -1001,7 +1084,7 @@ fn relayout(self: *Self) void {
             }
             window.placement = .{
                 .id = member,
-                .rect = centeredRect(bounds, size),
+                .rect = floatingRect(bounds, size, window.floating_position),
                 .visible = true,
             };
         }
@@ -1028,7 +1111,11 @@ fn relayout(self: *Self) void {
                 }
                 window.placement = .{
                     .id = member,
-                    .rect = centeredRect(parent_placement.rect, size),
+                    .rect = floatingRect(
+                        parent_placement.rect,
+                        size,
+                        window.floating_position,
+                    ),
                     .visible = parent_placement.visible,
                 };
                 changed = true;
@@ -1251,12 +1338,36 @@ fn clampI16(value: i32) i16 {
     return @intCast(std.math.clamp(value, std.math.minInt(i16), std.math.maxInt(i16)));
 }
 
+fn toplevelDragPosition(x: f64, y: f64, grab_x: f64, grab_y: f64) Scene.Position {
+    return .{
+        .x = dragCoordinate(x - grab_x),
+        .y = dragCoordinate(y - grab_y),
+    };
+}
+
+fn dragCoordinate(value: f64) i32 {
+    return @intFromFloat(@floor(std.math.clamp(
+        value,
+        @as(f64, @floatFromInt(std.math.minInt(i32))),
+        @as(f64, @floatFromInt(std.math.maxInt(i32))),
+    )));
+}
+
 fn centeredRect(parent: types.Rect, size: types.Size) types.Rect {
     return .{
         .x = centeredCoordinate(parent.x, parent.size.width, size.width),
         .y = centeredCoordinate(parent.y, parent.size.height, size.height),
         .size = size,
     };
+}
+
+fn floatingRect(parent: types.Rect, size: types.Size, position: ?Scene.Position) types.Rect {
+    var rect = centeredRect(parent, size);
+    if (position) |value| {
+        rect.x = value.x;
+        rect.y = value.y;
+    }
+    return rect;
 }
 
 fn pointInLayoutPlan(x: f64, y: f64, plan: types.LayoutPlan) bool {
@@ -1671,6 +1782,10 @@ test "transient toplevel is centered over its parent" {
         types.Rect{ .x = 0, .y = 0, .size = types.Size.init(1000, 700) },
         centeredRect(parent, types.Size.init(1000, 700)),
     );
+    try std.testing.expectEqual(
+        types.Rect{ .x = 700, .y = 400, .size = types.Size.init(500, 300) },
+        floatingRect(parent, types.Size.init(500, 300), .{ .x = 700, .y = 400 }),
+    );
 }
 
 test "manually floated windows are capped to two thirds of the usable area" {
@@ -1709,6 +1824,17 @@ test "tiling drag hit testing honors visibility and layout clipping" {
     var hidden = plan;
     hidden.visible = false;
     try std.testing.expect(visibleLayoutRect(hidden) == null);
+}
+
+test "toplevel drag preserves the grab offset and clamps coordinates" {
+    try std.testing.expectEqual(
+        Scene.Position{ .x = 90, .y = 185 },
+        toplevelDragPosition(100.75, 200.25, 10, 15),
+    );
+    try std.testing.expectEqual(
+        Scene.Position{ .x = std.math.maxInt(i32), .y = std.math.minInt(i32) },
+        toplevelDragPosition(1.0e20, -1.0e20, 0, 0),
+    );
 }
 
 test "directional navigation prefers aligned neighbors then distance" {

@@ -950,6 +950,22 @@ pub fn toplevelForSurface(self: *Self, surface_id: Surface.Id) ?ToplevelInfo {
     return null;
 }
 
+pub fn toplevelFromResource(self: *Self, resource: *xdg.Toplevel) ?ToplevelInfo {
+    const data = resource.getUserData() orelse return null;
+    const toplevel: *ToplevelResource = @ptrCast(@alignCast(data));
+    if (toplevel.shell != self) return null;
+    const xdg_surface = self.xdg_surfaces.get(toplevel.xdg_surface_id) orelse return null;
+    if (self.windows.get(toplevel.id) == null or xdg_surface.toplevel_resource != resource)
+        return null;
+    return .{
+        .window_id = toplevel.id,
+        .surface_resource = Surface.resourceFor(self.surface_store, xdg_surface.surface_id) orelse
+            return null,
+        .xdg_surface_resource = toplevel.xdg_surface_resource.resource,
+        .resource = resource,
+    };
+}
+
 pub fn setForeignParent(
     self: *Self,
     child_surface_id: Surface.Id,

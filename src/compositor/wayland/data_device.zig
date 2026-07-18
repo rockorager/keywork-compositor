@@ -42,6 +42,13 @@ pub const Listener = struct {
     repaint: *const fn (*anyopaque) void,
 };
 
+pub const ToplevelDragHandler = struct {
+    context: *anyopaque,
+    started: *const fn (*anyopaque) void,
+    ended: *const fn (*anyopaque) void,
+    source_destroyed: *const fn (*anyopaque) void,
+};
+
 pub const SelectionListener = struct {
     context: *anyopaque,
     changed: *const fn (*anyopaque) void,
@@ -66,6 +73,7 @@ const SourceState = struct {
     used: bool = false,
     actions_set: bool = false,
     dnd_actions: wl.DataDeviceManager.DndAction = .{},
+    toplevel_drag_handler: ?ToplevelDragHandler = null,
 
     fn deinit(self: *SourceState, allocator: std.mem.Allocator) void {
         for (self.mime_types.items) |mime_type| allocator.free(mime_type);
@@ -525,6 +533,10 @@ const DeviceResource = struct {
             const adapter: *SourceResource = @ptrCast(@alignCast(data));
             if (adapter.manager != self.manager or source.getClient() != resource.getClient()) return;
             const state = self.manager.sources.get(adapter.id) orelse return;
+            if (state.toplevel_drag_handler != null) {
+                source.postError(.invalid_source, "toplevel drag source used for selection");
+                return;
+            }
             if (state.actions_set) {
                 source.postError(.invalid_source, "drag-and-drop source used for selection");
                 return;
@@ -602,6 +614,9 @@ fn startDrag(
         .source_client = client,
         .origin = origin.handle(),
     };
+    if (source_id) |id| if (self.sources.get(id).?.toplevel_drag_handler) |handler| {
+        handler.started(handler.context);
+    };
     self.seat.setDragCursorController(client);
     self.notifyDragSelectionChanged();
     self.listener.started(self.listener.context);
@@ -610,6 +625,33 @@ fn startDrag(
 
 pub fn isDragging(self: *const Self) bool {
     return self.drag != null;
+}
+
+pub fn setToplevelDragHandler(
+    self: *Self,
+    source_resource: *wl.DataSource,
+    handler: ToplevelDragHandler,
+) error{InvalidSource}!void {
+    const data = source_resource.getUserData() orelse return error.InvalidSource;
+    const adapter: *SourceResource = @ptrCast(@alignCast(data));
+    if (adapter.manager != self) return error.InvalidSource;
+    const source = self.sources.get(adapter.id) orelse return error.InvalidSource;
+    if (source.used or source.toplevel_drag_handler != null) return error.InvalidSource;
+    source.toplevel_drag_handler = handler;
+}
+
+pub fn clearToplevelDragHandler(
+    self: *Self,
+    source_resource: *wl.DataSource,
+    context: *anyopaque,
+) void {
+    const data = source_resource.getUserData() orelse unreachable;
+    const adapter: *SourceResource = @ptrCast(@alignCast(data));
+    std.debug.assert(adapter.manager == self);
+    const source = self.sources.get(adapter.id) orelse unreachable;
+    const handler = source.toplevel_drag_handler orelse unreachable;
+    std.debug.assert(handler.context == context);
+    source.toplevel_drag_handler = null;
 }
 
 pub fn pointerEntered(self: *Self, focus: ?Seat.PointerFocus) void {
@@ -1025,7 +1067,13 @@ fn sendLeave(self: *Self, client: *wl.Client) void {
 }
 
 fn finishPhysicalDrag(self: *Self) void {
-    std.debug.assert(self.drag != null);
+    const drag = self.drag orelse unreachable;
+    if (drag.source) |source| switch (source) {
+        .local => |id| if (self.sources.get(id)) |local| {
+            if (local.toplevel_drag_handler) |handler| handler.ended(handler.context);
+        },
+        .external => {},
+    };
     self.drag = null;
     self.notifyDragSelectionChanged();
     self.clearDragIcon();
@@ -1417,6 +1465,9 @@ fn sourceDestroyed(self: *Self, id: SourceId) void {
                 retained.generation,
             );
         }
+    }
+    if (self.sources.get(id)) |source| {
+        if (source.toplevel_drag_handler) |handler| handler.source_destroyed(handler.context);
     }
 }
 

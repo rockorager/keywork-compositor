@@ -1050,16 +1050,17 @@
       "interfaces": [
         {
           "name": "xdg_toplevel_drag_manager_v1",
-          "current_version": null,
+          "current_version": 1,
           "target_version": 1
         }
       ],
-      "status": "not_started",
+      "status": "done",
       "privileged": false,
       "blocked_by": [
         "wl-data-device-manager",
         "xdg-shell"
-      ]
+      ],
+      "status_detail": "Version 1 implements exclusive pre-drag data-source reservation, manager and drag lifecycles and errors, mapped and newly mapped toplevel attachment, automatic detachment on unmap or destruction, and movement termination on drop or cancellation. Attached windows are raised, moved through persistent floating placement with geometry-relative offsets, and excluded with their popups, decorations, and borders from drag target hit testing. Source, manager, and replacement-toplevel lifecycles are exercised end to end."
     },
     {
       "id": "xdg-toplevel-icon",
