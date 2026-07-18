@@ -100,13 +100,16 @@ pub fn ready(
         if (notified <= 0) return error.NotifyFailed;
     }
     // Session services connect to Wayland, so they cannot become ready until
-    // the compositor enters its event loop.
+    // the compositor enters its event loop. Desktop autostart is a separate
+    // job so its gate can wait for keywork-shell's status notifier host after
+    // the session target itself becomes active.
     if (self.session_enabled and !try self.run(&.{
         "systemctl",
         "--user",
         "--no-block",
         "start",
         "keywork-session.target",
+        "keywork-xdg-autostart.service",
     })) return error.SessionTargetStartFailed;
 }
 

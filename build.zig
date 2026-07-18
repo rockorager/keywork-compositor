@@ -169,6 +169,14 @@ pub fn build(b: *std.Build) void {
         "share/systemd/user/keywork-session.target",
     );
     b.installFile(
+        "resources/keywork-xdg-autostart.service",
+        "share/systemd/user/keywork-xdg-autostart.service",
+    );
+    b.installFile(
+        "resources/keywork-xdg-autostart.target",
+        "share/systemd/user/keywork-xdg-autostart.target",
+    );
+    b.installFile(
         "resources/keywork.desktop",
         "share/wayland-sessions/keywork.desktop",
     );

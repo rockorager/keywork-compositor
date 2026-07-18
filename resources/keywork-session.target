@@ -5,6 +5,3 @@ Wants=graphical-session-pre.target
 After=graphical-session-pre.target
 
 Wants=keywork-shell.service
-
-Wants=xdg-desktop-autostart.target
-Before=xdg-desktop-autostart.target
