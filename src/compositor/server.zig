@@ -77,7 +77,6 @@ display: *wl.Server,
 control: Control,
 control_initialized: bool,
 configuration: ?Config.Store,
-window_blur_radius_override: ?u32,
 session: Session,
 session_initialized: bool,
 drm_device: DrmDevice,
@@ -296,7 +295,6 @@ pub fn createWithVirtualOutput(
         .control = undefined,
         .control_initialized = false,
         .configuration = null,
-        .window_blur_radius_override = null,
         .session = undefined,
         .session_initialized = false,
         .drm_device = undefined,
@@ -1579,7 +1577,7 @@ pub fn listen(self: *Self) ![:0]const u8 {
     return socket_name;
 }
 
-pub fn listenControl(self: *Self, runtime_directory: []const u8) ![]const u8 {
+pub fn listenControl(self: *Self, runtime_directory: []const u8) !void {
     std.debug.assert(self.listening and !self.control_initialized);
     try self.control.init(
         self.allocator,
@@ -1594,7 +1592,6 @@ pub fn listenControl(self: *Self, runtime_directory: []const u8) ![]const u8 {
         runtime_directory,
     );
     self.control_initialized = true;
-    return self.control.varlinkAddress();
 }
 
 fn executeControlCommand(context: *anyopaque, command: Command) void {
@@ -1651,13 +1648,10 @@ pub fn reloadConfiguration(self: *Self) !void {
 fn applyGeneralConfiguration(self: *Self, general: Config.GeneralSettings) void {
     self.window_manager.setFocusFollowsMouse(general.focus_follows_mouse);
     self.window_manager.setGaps(general.inner_gap, general.outer_gap);
-    var effects = windowEffects(general, general.shadow_color);
-    var focused_effects = windowEffects(general, general.focused_shadow_color);
-    if (self.window_blur_radius_override) |radius| {
-        effects.blur = if (radius == 0) null else .{ .radius = radius };
-        focused_effects.blur = if (radius == 0) null else .{ .radius = radius };
-    }
-    self.window_manager.setWindowEffects(effects, focused_effects);
+    self.window_manager.setWindowEffects(
+        windowEffects(general, general.shadow_color),
+        windowEffects(general, general.focused_shadow_color),
+    );
 }
 
 fn windowEffects(general: Config.GeneralSettings, shadow_color: Config.Color) Scene.Effects {
@@ -1905,15 +1899,6 @@ fn reportInputStatus(device_name: []const u8, setting_name: []const u8, status: 
 
 pub fn setXwaylandDisplayListener(self: *Self, listener: XwaylandDisplayListener) void {
     self.xwayland_display_listener = listener;
-}
-
-pub fn setWindowBlurRadius(self: *Self, radius: u32) void {
-    std.debug.assert(radius <= 256);
-    self.window_blur_radius_override = radius;
-    self.applyGeneralConfiguration(if (self.configuration) |*configuration|
-        configuration.snapshot.general
-    else
-        .{});
 }
 
 pub fn startXwayland(

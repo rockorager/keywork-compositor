@@ -2,7 +2,6 @@
 
 pub const interface_name = "dev.rockorager.keywork.compositor";
 pub const socket_name = interface_name;
-pub const environment_name = "KEYWORK_CONTROL";
 pub const interface_description = @embedFile("control-interface");
 
 pub const Direction = enum { next, previous, left, down, up, right };

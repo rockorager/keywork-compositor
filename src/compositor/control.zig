@@ -19,7 +19,6 @@ const log = std.log.scoped(.control);
 
 pub const socket_name = control.socket_name;
 pub const interface_name = control.interface_name;
-pub const environment_name = control.environment_name;
 
 const service_interface_name = varlink.service_interface_name;
 const interface_description = control.interface_description;
@@ -103,10 +102,6 @@ pub fn deinit(self: *Self) void {
     };
     self.allocator.free(self.address);
     self.* = undefined;
-}
-
-pub fn varlinkAddress(self: *const Self) []const u8 {
-    return self.address;
 }
 
 fn socketPath(address: [:0]const u8) [:0]const u8 {

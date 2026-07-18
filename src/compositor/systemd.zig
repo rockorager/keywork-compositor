@@ -12,10 +12,11 @@ const log = std.log.scoped(.systemd);
 const current_desktop = "XDG_CURRENT_DESKTOP=keywork";
 const session_desktop = "XDG_SESSION_DESKTOP=keywork";
 const session_type = "XDG_SESSION_TYPE=wayland";
-const max_assignments = 6;
+const max_assignments = 5;
 const environment_names = [_][]const u8{
     "WAYLAND_DISPLAY",
     "DISPLAY",
+    // Legacy cleanup only; Keywork no longer publishes or reads this variable.
     "KEYWORK_CONTROL",
     "XDG_CURRENT_DESKTOP",
     "XDG_SESSION_DESKTOP",
@@ -61,7 +62,6 @@ pub fn prepare(self: *const Self) !void {
 pub fn ready(
     self: *const Self,
     wayland_display: []const u8,
-    control_address: []const u8,
     cursor_size: []const u8,
 ) !void {
     if (self.session_enabled) {
@@ -71,12 +71,6 @@ pub fn ready(
             "WAYLAND_DISPLAY={s}",
             .{wayland_display},
         );
-        var control_buffer: [256]u8 = undefined;
-        const control = try std.fmt.bufPrint(
-            &control_buffer,
-            "KEYWORK_CONTROL={s}",
-            .{control_address},
-        );
         var cursor_size_buffer: [64]u8 = undefined;
         const cursor_size_assignment = try std.fmt.bufPrint(
             &cursor_size_buffer,
@@ -85,7 +79,6 @@ pub fn ready(
         );
         try self.updateActivationEnvironment(&.{
             display,
-            control,
             current_desktop,
             session_desktop,
             session_type,

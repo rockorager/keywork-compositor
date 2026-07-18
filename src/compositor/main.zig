@@ -11,26 +11,63 @@ const Systemd = @import("systemd.zig");
 
 const log = std.log.scoped(.main);
 const default_cursor_size = "24";
+const usage =
+    \\usage: keywork-compositor [OPTIONS]
+    \\
+    \\options:
+    \\  --config PATH             use an explicit configuration file
+    \\  --output KIND             select drm, nested, or headless output
+    \\  --renderer KIND           select cpu or vulkan rendering
+    \\  --headless-size WIDTHxHEIGHT
+    \\  --headless-scale SCALE
+    \\  --drm-device PATH         use an explicit DRM device
+    \\  --help                    show this help
+    \\
+;
+
+const StartupOptions = struct {
+    help: bool = false,
+    config_path: ?[]const u8 = null,
+    output: ?OutputBackend.Kind = null,
+    renderer: ?Renderer.Kind = null,
+    headless_size: ?render.Size = null,
+    headless_scale: ?render.Scale = null,
+    drm_device: ?[]const u8 = null,
+
+    fn outputKind(self: StartupOptions) OutputBackend.Kind {
+        return self.output orelse .drm;
+    }
+
+    fn rendererKind(self: StartupOptions) Renderer.Kind {
+        return self.renderer orelse if (self.outputKind() == .drm) .vulkan else .cpu;
+    }
+};
 
 pub fn main(init: std.process.Init) !void {
     var arguments = try init.minimal.args.iterateAllocator(init.gpa);
     defer arguments.deinit();
     _ = arguments.next();
-    const explicit_config = try parseArguments(&arguments);
-    const output_kind: OutputBackend.Kind = if (init.environ_map.get("KEYWORK_OUTPUT")) |value|
-        std.meta.stringToEnum(OutputBackend.Kind, value) orelse return error.InvalidOutputBackend
-    else
-        .drm;
-    const renderer_kind: Renderer.Kind = if (init.environ_map.get("KEYWORK_RENDERER")) |value|
-        std.meta.stringToEnum(Renderer.Kind, value) orelse return error.InvalidRenderer
-    else if (output_kind == .drm)
-        .vulkan
-    else
-        .cpu;
+    const options = parseArguments(&arguments) catch |err| {
+        var buffer: [2048]u8 = undefined;
+        var writer = std.Io.File.stderr().writer(init.io, &buffer);
+        writer.interface.print("keywork-compositor: {t}\n\n{s}", .{ err, usage }) catch {};
+        writer.interface.flush() catch {};
+        std.process.exit(2);
+    };
+    if (options.help) {
+        var buffer: [1024]u8 = undefined;
+        var writer = std.Io.File.stdout().writer(init.io, &buffer);
+        defer writer.interface.flush() catch {};
+        try writer.interface.writeAll(usage);
+        return;
+    }
+    const output_kind = options.outputKind();
+    const renderer_kind = options.rendererKind();
     const native_session = output_kind == .drm;
     if (native_session) {
         _ = init.environ_map.swapRemove("WAYLAND_DISPLAY");
         _ = init.environ_map.swapRemove("DISPLAY");
+        // Stop leaking the obsolete control-address override from older sessions.
         _ = init.environ_map.swapRemove("KEYWORK_CONTROL");
         try init.environ_map.put("XDG_CURRENT_DESKTOP", "keywork");
         try init.environ_map.put("XDG_SESSION_DESKTOP", "keywork");
@@ -50,14 +87,8 @@ pub fn main(init: std.process.Init) !void {
     var launcher: Launcher = .init(init.gpa, init.io, init.environ_map);
     defer launcher.deinit();
     var virtual_output: Server.VirtualOutputConfig = .{};
-    if (output_kind == .headless) {
-        if (init.environ_map.get("KEYWORK_HEADLESS_SIZE")) |value| {
-            virtual_output.size = parseHeadlessSize(value) catch return error.InvalidHeadlessSize;
-        }
-        if (init.environ_map.get("KEYWORK_HEADLESS_SCALE")) |value| {
-            virtual_output.scale = parseHeadlessScale(value) catch return error.InvalidHeadlessScale;
-        }
-    }
+    if (options.headless_size) |size| virtual_output.size = size;
+    if (options.headless_scale) |scale| virtual_output.scale = scale;
     if (init.environ_map.get("XCURSOR_SIZE") == null) {
         try init.environ_map.put("XCURSOR_SIZE", default_cursor_size);
     }
@@ -66,7 +97,7 @@ pub fn main(init: std.process.Init) !void {
         init.io,
         renderer_kind,
         output_kind,
-        init.environ_map.get("KEYWORK_DRM_DEVICE"),
+        options.drm_device,
         virtual_output,
     );
     defer server.destroy();
@@ -74,13 +105,9 @@ pub fn main(init: std.process.Init) !void {
         init.gpa,
         init.io,
         init.environ_map,
-        explicit_config,
+        options.config_path,
     );
     server.setConfiguration(&configuration);
-    if (init.environ_map.get("KEYWORK_BLUR_RADIUS")) |value| {
-        server.setWindowBlurRadius(parseBlurRadius(value) catch
-            return error.InvalidBlurRadius);
-    }
 
     const interrupt = try server.eventLoop().addSignal(
         *Server,
@@ -113,10 +140,9 @@ pub fn main(init: std.process.Init) !void {
 
     const socket_name = try server.listen();
     try init.environ_map.put("WAYLAND_DISPLAY", socket_name);
-    const control_address = try server.listenControl(
+    try server.listenControl(
         init.environ_map.get("XDG_RUNTIME_DIR") orelse return error.MissingRuntimeDirectory,
     );
-    try init.environ_map.put("KEYWORK_CONTROL", control_address);
     server.setLauncher(&launcher);
     server.setXwaylandDisplayListener(.{
         .context = &systemd,
@@ -125,13 +151,10 @@ pub fn main(init: std.process.Init) !void {
     });
     var buffer: [4096]u8 = undefined;
     var writer = std.Io.File.stdout().writer(init.io, &buffer);
-    try writer.interface.print(
-        "WAYLAND_DISPLAY={s}\nKEYWORK_CONTROL={s}\n",
-        .{ socket_name, control_address },
-    );
+    try writer.interface.print("WAYLAND_DISPLAY={s}\n", .{socket_name});
     try writer.interface.flush();
     server.startXwayland(init.environ_map);
-    systemd.ready(socket_name, control_address, init.environ_map.get("XCURSOR_SIZE").?) catch |err| {
+    systemd.ready(socket_name, init.environ_map.get("XCURSOR_SIZE").?) catch |err| {
         systemd.shutdown() catch |shutdown_err| {
             log.warn("failed to roll back graphical session startup: {t}", .{shutdown_err});
         };
@@ -144,12 +167,55 @@ pub fn main(init: std.process.Init) !void {
     };
 }
 
-fn parseArguments(arguments: anytype) !?[]const u8 {
-    const first = arguments.next() orelse return null;
-    if (!std.mem.eql(u8, first, "--config")) return error.InvalidArgument;
-    const path = arguments.next() orelse return error.MissingConfigPath;
-    if (arguments.next() != null) return error.InvalidArgument;
-    return path;
+fn parseArguments(arguments: anytype) !StartupOptions {
+    var options: StartupOptions = .{};
+    while (arguments.next()) |argument| {
+        if (std.mem.eql(u8, argument, "--help")) {
+            if (options.help) return error.DuplicateArgument;
+            options.help = true;
+        } else if (std.mem.eql(u8, argument, "--config")) {
+            if (options.config_path != null) return error.DuplicateArgument;
+            options.config_path = arguments.next() orelse return error.MissingArgument;
+        } else if (std.mem.eql(u8, argument, "--output")) {
+            if (options.output != null) return error.DuplicateArgument;
+            const value = arguments.next() orelse return error.MissingArgument;
+            options.output = std.meta.stringToEnum(OutputBackend.Kind, value) orelse
+                return error.InvalidOutputBackend;
+        } else if (std.mem.eql(u8, argument, "--renderer")) {
+            if (options.renderer != null) return error.DuplicateArgument;
+            const value = arguments.next() orelse return error.MissingArgument;
+            options.renderer = std.meta.stringToEnum(Renderer.Kind, value) orelse
+                return error.InvalidRenderer;
+        } else if (std.mem.eql(u8, argument, "--headless-size")) {
+            if (options.headless_size != null) return error.DuplicateArgument;
+            const value = arguments.next() orelse return error.MissingArgument;
+            options.headless_size = parseHeadlessSize(value) catch
+                return error.InvalidHeadlessSize;
+        } else if (std.mem.eql(u8, argument, "--headless-scale")) {
+            if (options.headless_scale != null) return error.DuplicateArgument;
+            const value = arguments.next() orelse return error.MissingArgument;
+            options.headless_scale = parseHeadlessScale(value) catch
+                return error.InvalidHeadlessScale;
+        } else if (std.mem.eql(u8, argument, "--drm-device")) {
+            if (options.drm_device != null) return error.DuplicateArgument;
+            const value = arguments.next() orelse return error.MissingArgument;
+            if (value.len == 0) return error.InvalidDrmDevice;
+            options.drm_device = value;
+        } else {
+            return error.InvalidArgument;
+        }
+    }
+    if (options.help) return options;
+    const output = options.outputKind();
+    if (output != .headless and
+        (options.headless_size != null or options.headless_scale != null))
+    {
+        return error.HeadlessOptionRequiresHeadlessOutput;
+    }
+    if (output != .drm and options.drm_device != null) {
+        return error.DrmDeviceRequiresDrmOutput;
+    }
+    return options;
 }
 
 fn xwaylandDisplayAvailable(context: *anyopaque, display_name: []const u8) void {
@@ -202,12 +268,6 @@ fn parseHeadlessScale(value: []const u8) !render.Scale {
     return .{ .numerator = @intFromFloat(scaled) };
 }
 
-fn parseBlurRadius(value: []const u8) !u32 {
-    const radius = std.fmt.parseInt(u32, value, 10) catch return error.InvalidBlurRadius;
-    if (radius > 256) return error.InvalidBlurRadius;
-    return radius;
-}
-
 fn terminate(_: c_int, server: *Server) c_int {
     server.terminate();
     return 0;
@@ -226,6 +286,78 @@ fn reapChildren(_: c_int, _: *Server) c_int {
     return 0;
 }
 
+const TestArguments = struct {
+    values: []const []const u8,
+    index: usize = 0,
+
+    fn next(self: *@This()) ?[]const u8 {
+        if (self.index == self.values.len) return null;
+        defer self.index += 1;
+        return self.values[self.index];
+    }
+};
+
+test "startup options replace environment backend controls" {
+    var defaults: TestArguments = .{ .values = &.{} };
+    const default_options = try parseArguments(&defaults);
+    try std.testing.expectEqual(OutputBackend.Kind.drm, default_options.outputKind());
+    try std.testing.expectEqual(Renderer.Kind.vulkan, default_options.rendererKind());
+
+    var configured: TestArguments = .{ .values = &.{
+        "--config",
+        "/tmp/keywork.conf",
+        "--output",
+        "headless",
+        "--renderer",
+        "vulkan",
+        "--headless-size",
+        "2880x1800",
+        "--headless-scale",
+        "1.5",
+    } };
+    const options = try parseArguments(&configured);
+    try std.testing.expectEqualStrings("/tmp/keywork.conf", options.config_path.?);
+    try std.testing.expectEqual(OutputBackend.Kind.headless, options.outputKind());
+    try std.testing.expectEqual(Renderer.Kind.vulkan, options.rendererKind());
+    try std.testing.expectEqual(render.Size{ .width = 2880, .height = 1800 }, options.headless_size.?);
+    try std.testing.expectEqual(@as(u32, 180), options.headless_scale.?.numerator);
+
+    var drm: TestArguments = .{ .values = &.{ "--drm-device", "/dev/dri/card1" } };
+    const drm_options = try parseArguments(&drm);
+    try std.testing.expectEqualStrings("/dev/dri/card1", drm_options.drm_device.?);
+
+    var help: TestArguments = .{ .values = &.{ "--help", "--headless-size", "1920x1080" } };
+    try std.testing.expect((try parseArguments(&help)).help);
+}
+
+test "startup options reject duplicates and backend-specific misuse" {
+    var duplicate: TestArguments = .{ .values = &.{ "--output", "drm", "--output", "nested" } };
+    try std.testing.expectError(error.DuplicateArgument, parseArguments(&duplicate));
+
+    var missing: TestArguments = .{ .values = &.{"--renderer"} };
+    try std.testing.expectError(error.MissingArgument, parseArguments(&missing));
+
+    var invalid_output: TestArguments = .{ .values = &.{ "--output", "windowed" } };
+    try std.testing.expectError(error.InvalidOutputBackend, parseArguments(&invalid_output));
+
+    var misplaced_headless: TestArguments = .{ .values = &.{ "--headless-size", "1920x1080" } };
+    try std.testing.expectError(
+        error.HeadlessOptionRequiresHeadlessOutput,
+        parseArguments(&misplaced_headless),
+    );
+
+    var misplaced_drm: TestArguments = .{ .values = &.{
+        "--output",
+        "nested",
+        "--drm-device",
+        "/dev/dri/card1",
+    } };
+    try std.testing.expectError(
+        error.DrmDeviceRequiresDrmOutput,
+        parseArguments(&misplaced_drm),
+    );
+}
+
 test "headless output configuration parses physical size and fractional scale" {
     try std.testing.expectEqual(
         render.Size{ .width = 2880, .height = 1800 },
@@ -234,12 +366,6 @@ test "headless output configuration parses physical size and fractional scale" {
     try std.testing.expectEqual(@as(u32, 180), (try parseHeadlessScale("1.5")).numerator);
     try std.testing.expectError(error.InvalidHeadlessSize, parseHeadlessSize("2880"));
     try std.testing.expectError(error.InvalidHeadlessScale, parseHeadlessScale("0"));
-}
-
-test "window blur radius is bounded" {
-    try std.testing.expectEqual(@as(u32, 0), try parseBlurRadius("0"));
-    try std.testing.expectEqual(@as(u32, 24), try parseBlurRadius("24"));
-    try std.testing.expectError(error.InvalidBlurRadius, parseBlurRadius("257"));
 }
 
 test {

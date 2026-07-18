@@ -61,14 +61,10 @@ fn run(init: std.process.Init) !void {
     }
     const command = parse(arguments[0..count]) catch |err| return printUsage(init.io, err);
 
-    var allocated_address: ?[]u8 = null;
-    defer if (allocated_address) |value| init.gpa.free(value);
-    const address = init.environ_map.get(control.environment_name) orelse address: {
-        const runtime_directory = init.environ_map.get("XDG_RUNTIME_DIR") orelse return error.MissingRuntimeDirectory;
-        if (!std.fs.path.isAbsolute(runtime_directory)) return error.InvalidRuntimeDirectory;
-        allocated_address = try std.fmt.allocPrint(init.gpa, "unix:{s}/{s}", .{ runtime_directory, control.socket_name });
-        break :address allocated_address.?;
-    };
+    const runtime_directory = init.environ_map.get("XDG_RUNTIME_DIR") orelse
+        return error.MissingRuntimeDirectory;
+    const address = try controlAddress(init.gpa, runtime_directory);
+    defer init.gpa.free(address);
     var client = try varlink.Client.connect(init.gpa, init.io, address);
     defer client.deinit();
     switch (command) {
@@ -101,6 +97,15 @@ fn run(init: std.process.Init) !void {
         return error.RemoteError;
     }
     if (reply.value.continues) return error.UnexpectedContinuation;
+}
+
+fn controlAddress(allocator: std.mem.Allocator, runtime_directory: []const u8) ![]u8 {
+    if (!std.fs.path.isAbsolute(runtime_directory)) return error.InvalidRuntimeDirectory;
+    return std.fmt.allocPrint(
+        allocator,
+        "unix:{s}/{s}",
+        .{ runtime_directory, control.socket_name },
+    );
 }
 
 fn remoteErrorMessage(name: []const u8, parameters: ?std.json.Value) ?[]const u8 {
@@ -174,6 +179,19 @@ test "CLI parsing maps wire values and validates workspaces" {
     try std.testing.expectError(error.InvalidDirection, parse(&.{ "focus", "sideways" }));
     try std.testing.expectError(error.InvalidWindowTarget, parse(&.{ "close", "all" }));
     try std.testing.expectError(error.UnknownCommand, parse(&.{ "unknown", "value" }));
+}
+
+test "control address uses the fixed runtime socket" {
+    const address = try controlAddress(std.testing.allocator, "/run/user/1000");
+    defer std.testing.allocator.free(address);
+    try std.testing.expectEqualStrings(
+        "unix:/run/user/1000/dev.rockorager.keywork.compositor",
+        address,
+    );
+    try std.testing.expectError(
+        error.InvalidRuntimeDirectory,
+        controlAddress(std.testing.allocator, "run/user/1000"),
+    );
 }
 
 test "reload parameters encode as an empty object" {

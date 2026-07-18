@@ -210,11 +210,8 @@ fn launch(self: *Self) !void {
         self,
     );
 
-    const environ_map = self.environ_map.?;
-    const executable = environ_map.get("KEYWORK_XWAYLAND") orelse "Xwayland";
     self.pid = try self.spawn(
-        executable,
-        environ_map,
+        self.environ_map.?,
         wayland_fds[1],
         wm_fds[1],
         notify_fds[1],
@@ -249,15 +246,11 @@ pub fn terminate(self: *Self) void {
 
 fn spawn(
     self: *Self,
-    executable: []const u8,
     environ_map: *const std.process.Environ.Map,
     wayland_fd: std.posix.fd_t,
     wm_child_fd: std.posix.fd_t,
     notify_child_fd: std.posix.fd_t,
 ) !std.posix.pid_t {
-    const executable_z = try self.allocator.dupeZ(u8, executable);
-    defer self.allocator.free(executable_z);
-
     var child_env = try environ_map.clone(self.allocator);
     defer child_env.deinit();
     try child_env.put("WAYLAND_SOCKET", "3");
@@ -266,7 +259,7 @@ fn spawn(
 
     const display_name_z = self.display_name_buffer[0..self.display_name_length :0];
     const argv = [_:null]?[*:0]const u8{
-        executable_z.ptr,
+        "Xwayland",
         display_name_z.ptr,
         "-rootless",
         "-core",
@@ -332,7 +325,7 @@ fn spawn(
     var pid: std.posix.pid_t = undefined;
     const result = c.posix_spawnp(
         &pid,
-        executable_z.ptr,
+        "Xwayland",
         &actions,
         &attributes,
         @ptrCast(@constCast(&argv)),
