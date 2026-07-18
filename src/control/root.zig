@@ -6,10 +6,12 @@ pub const environment_name = "KEYWORK_CONTROL";
 pub const interface_description = @embedFile("control-interface");
 
 pub const Direction = enum { next, previous, left, down, up, right };
+pub const WindowTarget = enum { focused };
 pub const Layout = enum { master_stack, dwindle, scrolling };
 
 pub const focus_method = interface_name ++ ".Focus";
 pub const move_focused_method = interface_name ++ ".MoveFocused";
+pub const close_method = interface_name ++ ".Close";
 pub const set_layout_method = interface_name ++ ".SetLayout";
 pub const switch_workspace_method = interface_name ++ ".SwitchWorkspace";
 pub const move_focused_to_workspace_method = interface_name ++ ".MoveFocusedToWorkspace";

@@ -45,6 +45,7 @@ pub const Executor = struct {
 };
 
 const Direction = control.Direction;
+const WindowTarget = control.WindowTarget;
 const Layout = control.Layout;
 
 pub fn init(
@@ -407,6 +408,18 @@ fn handleMessage(
         if (!call.oneway) try writeSuccess(allocator, output);
         return;
     }
+    if (std.mem.eql(u8, call.method, control.close_method)) {
+        const parameters = parseParameters(struct { target: WindowTarget }, allocator, call.parameters) catch {
+            if (!call.oneway) try writeInvalidParameter(allocator, output, "target");
+            return;
+        };
+        defer parameters.deinit();
+        executor.execute(executor.context, .{ .close = switch (parameters.value.target) {
+            .focused => .focused,
+        } });
+        if (!call.oneway) try writeSuccess(allocator, output);
+        return;
+    }
     if (std.mem.eql(u8, call.method, control.set_layout_method)) {
         const parameters = parseParameters(struct { layout: Layout }, allocator, call.parameters) catch {
             if (!call.oneway) try writeInvalidParameter(allocator, output, "layout");
@@ -605,6 +618,9 @@ test "fragmented and coalesced calls execute typed commands in order" {
     const workspace =
         \\{"method":"dev.rockorager.keywork.compositor.SwitchWorkspace","parameters":{"workspace":3}}
     ;
+    const close =
+        \\{"method":"dev.rockorager.keywork.compositor.Close","parameters":{"target":"focused"}}
+    ;
     try input.appendSlice(std.testing.allocator, focus[0..20]);
     var quit_requested = false;
     try processInput(std.testing.allocator, recorder.executor(), &input, &output, &quit_requested);
@@ -613,9 +629,11 @@ test "fragmented and coalesced calls execute typed commands in order" {
     try input.append(std.testing.allocator, 0);
     try input.appendSlice(std.testing.allocator, workspace);
     try input.append(std.testing.allocator, 0);
+    try input.appendSlice(std.testing.allocator, close);
+    try input.append(std.testing.allocator, 0);
     try processInput(std.testing.allocator, recorder.executor(), &input, &output, &quit_requested);
 
-    try std.testing.expectEqual(@as(usize, 2), recorder.commands.items.len);
+    try std.testing.expectEqual(@as(usize, 3), recorder.commands.items.len);
     try std.testing.expect(std.meta.eql(
         command.Command{ .focus_direction = .left },
         recorder.commands.items[0],
@@ -624,8 +642,12 @@ test "fragmented and coalesced calls execute typed commands in order" {
         command.Command{ .switch_workspace = 3 },
         recorder.commands.items[1],
     ));
+    try std.testing.expect(std.meta.eql(
+        command.Command{ .close = .focused },
+        recorder.commands.items[2],
+    ));
     try std.testing.expectEqualStrings(
-        "{\"parameters\":{}}\x00{\"parameters\":{}}\x00",
+        "{\"parameters\":{}}\x00{\"parameters\":{}}\x00{\"parameters\":{}}\x00",
         output.items,
     );
 }

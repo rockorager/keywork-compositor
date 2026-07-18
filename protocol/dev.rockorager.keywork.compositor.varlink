@@ -4,6 +4,9 @@ interface dev.rockorager.keywork.compositor
 # A direction relative to the currently focused window.
 type Direction (next, previous, left, down, up, right)
 
+# A window selected for an operation.
+type WindowTarget (focused)
+
 # A built-in tiling layout.
 type Layout (master_stack, dwindle, scrolling)
 
@@ -12,6 +15,9 @@ method Focus (direction: Direction) -> ()
 
 # Reorder the focused window within the active workspace.
 method MoveFocused (direction: Direction) -> ()
+
+# Ask a window to close.
+method Close (target: WindowTarget) -> ()
 
 # Change the active workspace's layout.
 method SetLayout (layout: Layout) -> ()

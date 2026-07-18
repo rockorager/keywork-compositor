@@ -84,6 +84,10 @@ const output = try writer.toOwnedSlice();
 - Keep functions small and push pure computation into helpers.
 - Comments should explain why, not what.
 
+## Command Surfaces
+
+- Keep user-facing compositor commands in sync across configuration keybindings, the Varlink interface and server dispatch, and `keyworkctl` parsing, help, and calls. Update tests for each affected surface.
+
 ## Licensing Boundary
 
 - Keywork is MIT-licensed; vendored protocol XML and adapted reference material must use permissive licenses.
