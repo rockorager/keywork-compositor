@@ -59,6 +59,8 @@ const Window = struct {
     surface_id: Surface.Id,
     workspace: usize,
     fixed_size_floating: bool = false,
+    floating_override: ?bool = null,
+    floating_restore_size: ?types.Size = null,
     tags: workspace_mod.TagSet = .{},
     serial: ?u32 = null,
     placement: ?types.LayoutPlan = null,
@@ -240,6 +242,22 @@ fn fixedSizeWantsFloating(minimum: XdgShell.SizeHint, maximum: XdgShell.SizeHint
 
 fn automaticallyFloating(self: *Self, window: *const Window) bool {
     return window.fixed_size_floating or self.transientParent(window) != null;
+}
+
+fn isFloating(self: *Self, window: *const Window) bool {
+    return window.floating_override orelse self.automaticallyFloating(window);
+}
+
+fn setFullscreen(self: *Self, window: *Window, output: ?OutputLayout.Id) void {
+    if (window.fullscreen_output == null and output != null and self.isFloating(window)) {
+        const current = self.currentDimensions(window);
+        window.floating_restore_size = types.Size.init(
+            @intCast(@max(1, current.width)),
+            @intCast(@max(1, current.height)),
+        );
+    }
+    window.fullscreen_output = output;
+    if (output == null and !self.isFloating(window)) window.floating_restore_size = null;
 }
 
 fn transientDepth(self: *Self, window: *const Window) usize {
@@ -601,6 +619,12 @@ pub fn execute(self: *Self, command: Command) void {
         .close => |target| switch (target) {
             .focused => self.closeFocused(),
         },
+        .toggle_fullscreen => |target| switch (target) {
+            .focused => self.toggleFocusedFullscreen(),
+        },
+        .toggle_floating => |target| switch (target) {
+            .focused => self.toggleFocusedFloating(),
+        },
         .layout_master_stack => self.switchLayout(.master_stack),
         .layout_dwindle => self.switchLayout(.dwindle),
         .layout_scrolling => self.switchLayout(.scrolling),
@@ -645,6 +669,22 @@ pub fn closeFocused(self: *Self) void {
         .xdg => |id| self.xdg_shell.closeWindow(id),
         .xwayland => |id| self.xwayland.close(self.xwayland.context, id),
     }
+}
+pub fn toggleFocusedFullscreen(self: *Self) void {
+    const window = self.focusedWindow() orelse return;
+    if (!window.mapped or window.minimized) return;
+    self.setFullscreen(window, if (window.fullscreen_output == null)
+        self.workspaces.items[window.workspace].output
+    else
+        null);
+    self.relayout();
+}
+pub fn toggleFocusedFloating(self: *Self) void {
+    const window = self.focusedWindow() orelse return;
+    if (!window.mapped or window.minimized) return;
+    window.floating_override = !self.isFloating(window);
+    if (!self.isFloating(window)) window.floating_restore_size = null;
+    self.relayout();
 }
 pub fn switchLayout(self: *Self, kind: layout_mod.Kind) void {
     const index = self.workspaceFor(self.default_output) orelse return;
@@ -775,7 +815,7 @@ fn relayout(self: *Self) void {
         for (entry.workspace.members.items) |member| {
             const window = self.windows.get(internal(member)) orelse continue;
             if (window.minimized or window.fullscreen_output != null or
-                self.automaticallyFloating(window)) continue;
+                self.isFloating(window)) continue;
             const current = self.currentDimensions(window);
             inputs.append(self.allocator, .{ .id = member, .current = types.Size.init(@intCast(@max(1, current.width)), @intCast(@max(1, current.height))) }) catch return;
         }
@@ -826,17 +866,24 @@ fn relayout(self: *Self) void {
         for (entry.workspace.members.items) |member| {
             const window = self.windows.get(internal(member)) orelse continue;
             if (window.placement != null or window.fullscreen_output != null or
-                !window.fixed_size_floating or self.transientParent(window) != null) continue;
+                !self.isFloating(window) or self.transientParent(window) != null) continue;
             const current = self.currentDimensions(window);
+            const current_size = types.Size.init(
+                @intCast(@max(1, current.width)),
+                @intCast(@max(1, current.height)),
+            );
+            const restore_size = window.floating_restore_size;
+            const size = restore_size orelse
+                if (window.floating_override orelse false)
+                    manualFloatingSize(bounds.size, current)
+                else
+                    current_size;
+            if (restore_size) |expected| {
+                if (std.meta.eql(current_size, expected)) window.floating_restore_size = null;
+            }
             window.placement = .{
                 .id = member,
-                .rect = centeredRect(
-                    bounds,
-                    types.Size.init(
-                        @intCast(@max(1, current.width)),
-                        @intCast(@max(1, current.height)),
-                    ),
-                ),
+                .rect = centeredRect(bounds, size),
                 .visible = true,
             };
         }
@@ -852,15 +899,18 @@ fn relayout(self: *Self) void {
                 const parent = self.windows.get(self.transientParent(window) orelse continue) orelse continue;
                 const parent_placement = parent.placement orelse continue;
                 const current = self.currentDimensions(window);
+                const current_size = types.Size.init(
+                    @intCast(@max(1, current.width)),
+                    @intCast(@max(1, current.height)),
+                );
+                const restore_size = window.floating_restore_size;
+                const size = restore_size orelse current_size;
+                if (restore_size) |expected| {
+                    if (std.meta.eql(current_size, expected)) window.floating_restore_size = null;
+                }
                 window.placement = .{
                     .id = member,
-                    .rect = centeredRect(
-                        parent_placement.rect,
-                        types.Size.init(
-                            @intCast(@max(1, current.width)),
-                            @intCast(@max(1, current.height)),
-                        ),
-                    ),
+                    .rect = centeredRect(parent_placement.rect, size),
                     .visible = parent_placement.visible,
                 };
                 changed = true;
@@ -874,7 +924,7 @@ fn relayout(self: *Self) void {
         for (entry.workspace.members.items) |member| {
             const window = self.windows.get(internal(member)) orelse continue;
             const output = self.outputs.get(entry.output) orelse continue;
-            const floating = self.automaticallyFloating(window);
+            const floating = self.isFloating(window);
             const plan = window.placement;
             const current_dimensions = self.currentDimensions(window);
             const dimensions: XdgShell.Dimensions = if (plan) |placement| .{
@@ -1056,6 +1106,11 @@ fn publish(self: *Self) void {
         }
         for (workspace.workspace.members.items) |member| {
             const window = self.windows.get(internal(member)) orelse continue;
+            if (window.placement != null and window.fullscreen_output == null and
+                self.isFloating(window)) self.scene.placeTop(window.scene_id);
+        }
+        for (workspace.workspace.members.items) |member| {
+            const window = self.windows.get(internal(member)) orelse continue;
             if (window.placement != null and window.fullscreen_output != null) {
                 self.scene.placeTop(window.scene_id);
             }
@@ -1099,6 +1154,15 @@ fn centeredCoordinate(parent_start: i32, parent_length: u32, child_length: u32) 
         std.math.minInt(i32),
         std.math.maxInt(i32),
     ));
+}
+
+fn manualFloatingSize(bounds: types.Size, current: XdgShell.Dimensions) types.Size {
+    const maximum_width: u32 = @intCast(@max(1, @divFloor(@as(i64, bounds.width) * 2, 3)));
+    const maximum_height: u32 = @intCast(@max(1, @divFloor(@as(i64, bounds.height) * 2, 3)));
+    return types.Size.init(
+        @min(@as(u32, @intCast(@max(1, current.width))), maximum_width),
+        @min(@as(u32, @intCast(@max(1, current.height))), maximum_height),
+    );
 }
 
 const DirectionalScore = struct {
@@ -1191,7 +1255,7 @@ fn windowCommitted(context: *anyopaque, id: XdgShell.WindowId, serial: ?u32) boo
     const self: *Self = @ptrCast(@alignCast(context));
     const window = self.windows.get(self.findXdg(id) orelse return false) orelse return false;
     window.mapped = true;
-    if (self.automaticallyFloating(window)) self.relayout();
+    if (self.isFloating(window)) self.relayout();
     if (serial != null and window.serial == serial) {
         window.serial = null;
         if (self.transaction.configured()) self.publish();
@@ -1231,11 +1295,11 @@ fn windowRequest(context: *anyopaque, id: XdgShell.WindowId, request: XdgShell.W
         .minimize => window.minimized = true,
         .maximize => window.maximized = true,
         .unmaximize => window.maximized = false,
-        .fullscreen => |fullscreen| window.fullscreen_output = if (fullscreen) |resource|
+        .fullscreen => |fullscreen| self.setFullscreen(window, if (fullscreen) |resource|
             if (self.outputs.findResource(resource)) |entry| entry.id else self.workspaces.items[window.workspace].output
         else
-            self.workspaces.items[window.workspace].output,
-        .exit_fullscreen => window.fullscreen_output = null,
+            self.workspaces.items[window.workspace].output),
+        .exit_fullscreen => self.setFullscreen(window, null),
         else => {},
     }
     self.relayout();
@@ -1275,8 +1339,18 @@ pub fn xwaylandWindowMapped(self: *Self, id: Xwm.WindowId, mapped: bool) void {
     self.relayout();
 }
 
-pub fn xwaylandWindowConfigured(self: *Self, id: Xwm.WindowId, _: Xwm.Geometry, override_redirect: bool) void {
-    if (override_redirect) if (self.findXwayland(id)) |managed| self.removeId(managed);
+pub fn xwaylandWindowConfigured(self: *Self, id: Xwm.WindowId, geometry: Xwm.Geometry, override_redirect: bool) void {
+    if (override_redirect) {
+        if (self.findXwayland(id)) |managed| self.removeId(managed);
+        return;
+    }
+    const window = self.windows.get(self.findXwayland(id) orelse return) orelse return;
+    const restore_size = window.floating_restore_size orelse return;
+    if (window.fullscreen_output == null and
+        restore_size.width == geometry.width and restore_size.height == geometry.height)
+    {
+        window.floating_restore_size = null;
+    }
 }
 
 pub fn xwaylandWindowMetadataChanged(self: *Self, id: Xwm.WindowId) void {
@@ -1290,7 +1364,7 @@ pub fn xwaylandWindowMetadataChanged(self: *Self, id: Xwm.WindowId) void {
 
 pub fn xwaylandWindowFullscreenRequested(self: *Self, id: Xwm.WindowId, fullscreen: bool, output: ?OutputLayout.Id) void {
     const window = self.windows.get(self.findXwayland(id) orelse return) orelse return;
-    window.fullscreen_output = if (fullscreen) output orelse self.workspaces.items[window.workspace].output else null;
+    self.setFullscreen(window, if (fullscreen) output orelse self.workspaces.items[window.workspace].output else null);
     self.relayout();
 }
 
@@ -1445,6 +1519,23 @@ test "transient toplevel is centered over its parent" {
     try std.testing.expectEqual(
         types.Rect{ .x = 0, .y = 0, .size = types.Size.init(1000, 700) },
         centeredRect(parent, types.Size.init(1000, 700)),
+    );
+}
+
+test "manually floated windows are capped to two thirds of the usable area" {
+    try std.testing.expectEqual(
+        types.Size.init(800, 600),
+        manualFloatingSize(
+            types.Size.init(1200, 900),
+            .{ .width = 1200, .height = 900 },
+        ),
+    );
+    try std.testing.expectEqual(
+        types.Size.init(640, 480),
+        manualFloatingSize(
+            types.Size.init(1200, 900),
+            .{ .width = 640, .height = 480 },
+        ),
     );
 }
 

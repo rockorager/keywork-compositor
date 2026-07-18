@@ -420,6 +420,30 @@ fn handleMessage(
         if (!call.oneway) try writeSuccess(allocator, output);
         return;
     }
+    if (std.mem.eql(u8, call.method, control.toggle_fullscreen_method)) {
+        const parameters = parseParameters(struct { target: WindowTarget }, allocator, call.parameters) catch {
+            if (!call.oneway) try writeInvalidParameter(allocator, output, "target");
+            return;
+        };
+        defer parameters.deinit();
+        executor.execute(executor.context, .{ .toggle_fullscreen = switch (parameters.value.target) {
+            .focused => .focused,
+        } });
+        if (!call.oneway) try writeSuccess(allocator, output);
+        return;
+    }
+    if (std.mem.eql(u8, call.method, control.toggle_floating_method)) {
+        const parameters = parseParameters(struct { target: WindowTarget }, allocator, call.parameters) catch {
+            if (!call.oneway) try writeInvalidParameter(allocator, output, "target");
+            return;
+        };
+        defer parameters.deinit();
+        executor.execute(executor.context, .{ .toggle_floating = switch (parameters.value.target) {
+            .focused => .focused,
+        } });
+        if (!call.oneway) try writeSuccess(allocator, output);
+        return;
+    }
     if (std.mem.eql(u8, call.method, control.set_layout_method)) {
         const parameters = parseParameters(struct { layout: Layout }, allocator, call.parameters) catch {
             if (!call.oneway) try writeInvalidParameter(allocator, output, "layout");
@@ -742,6 +766,43 @@ test "oneway calls suppress replies and invalid workspaces return typed errors" 
     try std.testing.expectEqual(@as(usize, 1), recorder.commands.items.len);
     try std.testing.expectEqualStrings(
         "{\"error\":\"dev.rockorager.keywork.compositor.InvalidWorkspace\",\"parameters\":{\"workspace\":0}}\x00",
+        output.items,
+    );
+}
+
+test "window state calls execute typed focused-window commands" {
+    var recorder: Recorder = .{};
+    defer recorder.deinit();
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(std.testing.allocator);
+    var quit_requested = false;
+
+    try handleMessage(
+        std.testing.allocator,
+        recorder.executor(),
+        "{\"method\":\"dev.rockorager.keywork.compositor.ToggleFullscreen\",\"parameters\":{\"target\":\"focused\"}}",
+        &output,
+        &quit_requested,
+    );
+    try handleMessage(
+        std.testing.allocator,
+        recorder.executor(),
+        "{\"method\":\"dev.rockorager.keywork.compositor.ToggleFloating\",\"parameters\":{\"target\":\"focused\"}}",
+        &output,
+        &quit_requested,
+    );
+
+    try std.testing.expectEqual(@as(usize, 2), recorder.commands.items.len);
+    try std.testing.expectEqual(
+        command.Command{ .toggle_fullscreen = .focused },
+        recorder.commands.items[0],
+    );
+    try std.testing.expectEqual(
+        command.Command{ .toggle_floating = .focused },
+        recorder.commands.items[1],
+    );
+    try std.testing.expectEqualStrings(
+        "{\"parameters\":{}}\x00{\"parameters\":{}}\x00",
         output.items,
     );
 }

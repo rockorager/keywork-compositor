@@ -10,6 +10,7 @@ const usage =
     \\
     \\commands: focus DIRECTION | move-focused DIRECTION | set-layout LAYOUT
     \\          close TARGET
+    \\          toggle-fullscreen TARGET | toggle-floating TARGET
     \\          switch-workspace WORKSPACE | move-focused-to-workspace WORKSPACE
     \\          stats [--reset] | reload | quit
     \\directions: next, previous, left, down, up, right
@@ -22,6 +23,8 @@ const Command = union(enum) {
     focus: control.Direction,
     move_focused: control.Direction,
     close: control.WindowTarget,
+    toggle_fullscreen: control.WindowTarget,
+    toggle_floating: control.WindowTarget,
     set_layout: control.Layout,
     switch_workspace: i64,
     move_to_workspace: i64,
@@ -83,6 +86,8 @@ fn run(init: std.process.Init) !void {
         .focus => |direction| try client.call(control.focus_method, .{ .direction = direction }),
         .move_focused => |direction| try client.call(control.move_focused_method, .{ .direction = direction }),
         .close => |target| try client.call(control.close_method, .{ .target = target }),
+        .toggle_fullscreen => |target| try client.call(control.toggle_fullscreen_method, .{ .target = target }),
+        .toggle_floating => |target| try client.call(control.toggle_floating_method, .{ .target = target }),
         .set_layout => |layout| try client.call(control.set_layout_method, .{ .layout = layout }),
         .switch_workspace => |workspace| try client.call(control.switch_workspace_method, .{ .workspace = workspace }),
         .move_to_workspace => |workspace| try client.call(control.move_focused_to_workspace_method, .{ .workspace = workspace }),
@@ -242,6 +247,8 @@ fn parse(arguments: []const []const u8) !Command {
     if (std.mem.eql(u8, name, "focus")) return .{ .focus = parseDirection(value) orelse return error.InvalidDirection };
     if (std.mem.eql(u8, name, "move-focused")) return .{ .move_focused = parseDirection(value) orelse return error.InvalidDirection };
     if (std.mem.eql(u8, name, "close")) return .{ .close = parseWindowTarget(value) orelse return error.InvalidWindowTarget };
+    if (std.mem.eql(u8, name, "toggle-fullscreen")) return .{ .toggle_fullscreen = parseWindowTarget(value) orelse return error.InvalidWindowTarget };
+    if (std.mem.eql(u8, name, "toggle-floating")) return .{ .toggle_floating = parseWindowTarget(value) orelse return error.InvalidWindowTarget };
     if (std.mem.eql(u8, name, "set-layout")) return .{ .set_layout = parseLayout(value) orelse return error.InvalidLayout };
     if (std.mem.eql(u8, name, "switch-workspace")) return .{
         .switch_workspace = try parseWorkspace(value),
@@ -274,6 +281,8 @@ fn parseLayout(value: []const u8) ?control.Layout {
 test "CLI parsing maps wire values and validates workspaces" {
     try std.testing.expectEqual(control.Direction.left, (try parse(&.{ "focus", "left" })).focus);
     try std.testing.expectEqual(control.WindowTarget.focused, (try parse(&.{ "close", "focused" })).close);
+    try std.testing.expectEqual(control.WindowTarget.focused, (try parse(&.{ "toggle-fullscreen", "focused" })).toggle_fullscreen);
+    try std.testing.expectEqual(control.WindowTarget.focused, (try parse(&.{ "toggle-floating", "focused" })).toggle_floating);
     try std.testing.expectEqual(control.Layout.master_stack, (try parse(&.{ "set-layout", "master-stack" })).set_layout);
     try std.testing.expectEqual(@as(i64, 10), (try parse(&.{ "switch-workspace", "10" })).switch_workspace);
     try std.testing.expect(!(try parse(&.{"stats"})).stats);

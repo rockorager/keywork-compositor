@@ -916,6 +916,10 @@ fn parseBinding(allocator: std.mem.Allocator, value: []const u8) (BindingError |
         .{ .command = try parseDirectionalCommand(arguments, true) }
     else if (std.mem.eql(u8, action_name, "close"))
         .{ .command = .{ .close = try parseWindowTarget(arguments) } }
+    else if (std.mem.eql(u8, action_name, "toggle-fullscreen"))
+        .{ .command = .{ .toggle_fullscreen = try parseWindowTarget(arguments) } }
+    else if (std.mem.eql(u8, action_name, "toggle-floating"))
+        .{ .command = .{ .toggle_floating = try parseWindowTarget(arguments) } }
     else if (std.mem.eql(u8, action_name, "set-layout"))
         .{ .command = try parseLayout(arguments) }
     else if (std.mem.eql(u8, action_name, "switch-workspace"))
@@ -1158,6 +1162,8 @@ test "configuration parses typed commands and explicit run argv" {
         \\bind=super+h focus left
         \\bind=super+shift+j move-focused down
         \\bind=super+q close focused
+        \\bind=super+f toggle-fullscreen focused
+        \\bind=super+shift+space toggle-floating focused
         \\bind=super+t set-layout master-stack
         \\bind=super+1 switch-workspace 1
         \\bind=super+shift+0 move-focused-to-workspace 10
@@ -1170,15 +1176,17 @@ test "configuration parses typed commands and explicit run argv" {
     };
     defer snapshot.deinit();
     try std.testing.expect(snapshot.general.focus_follows_mouse);
-    try std.testing.expectEqual(@as(usize, 7), snapshot.bindings.len);
+    try std.testing.expectEqual(@as(usize, 9), snapshot.bindings.len);
     try std.testing.expectEqual(Direction.left, snapshot.bindings[0].action.command.focus_direction);
     try std.testing.expectEqual(Direction.down, snapshot.bindings[1].action.command.move_focused_direction);
     try std.testing.expectEqual(WindowTarget.focused, snapshot.bindings[2].action.command.close);
-    try std.testing.expectEqual(Command.layout_master_stack, snapshot.bindings[3].action.command);
-    try std.testing.expectEqual(@as(u8, 10), snapshot.bindings[5].action.command.move_to_workspace);
-    try std.testing.expectEqualStrings("foot", snapshot.bindings[6].action.run[0]);
-    try std.testing.expectEqualStrings("Keywork Terminal", snapshot.bindings[6].action.run[2]);
-    try std.testing.expectEqualStrings("empty=", snapshot.bindings[6].action.run[3]);
+    try std.testing.expectEqual(WindowTarget.focused, snapshot.bindings[3].action.command.toggle_fullscreen);
+    try std.testing.expectEqual(WindowTarget.focused, snapshot.bindings[4].action.command.toggle_floating);
+    try std.testing.expectEqual(Command.layout_master_stack, snapshot.bindings[5].action.command);
+    try std.testing.expectEqual(@as(u8, 10), snapshot.bindings[7].action.command.move_to_workspace);
+    try std.testing.expectEqualStrings("foot", snapshot.bindings[8].action.run[0]);
+    try std.testing.expectEqualStrings("Keywork Terminal", snapshot.bindings[8].action.run[2]);
+    try std.testing.expectEqualStrings("empty=", snapshot.bindings[8].action.run[3]);
 }
 
 test "valid empty configuration disables configured bindings" {
@@ -1198,12 +1206,14 @@ test "embedded default configuration is valid and complete" {
     var snapshot = try defaultSnapshot(std.testing.allocator);
     defer snapshot.deinit();
     try std.testing.expectEqual(GeneralSettings{}, snapshot.general);
-    try std.testing.expectEqual(@as(usize, 33), snapshot.bindings.len);
+    try std.testing.expectEqual(@as(usize, 35), snapshot.bindings.len);
     try std.testing.expectEqual(@as(usize, 0), snapshot.input_rules.len);
     try std.testing.expectEqual(@as(usize, 0), snapshot.output_rules.len);
     try std.testing.expectEqual(Direction.left, snapshot.bindings[0].action.command.focus_direction);
     try std.testing.expectEqual(WindowTarget.focused, snapshot.bindings[8].action.command.close);
-    try std.testing.expectEqualStrings("monstar", snapshot.bindings[32].action.run[0]);
+    try std.testing.expectEqual(WindowTarget.focused, snapshot.bindings[9].action.command.toggle_fullscreen);
+    try std.testing.expectEqual(WindowTarget.focused, snapshot.bindings[10].action.command.toggle_floating);
+    try std.testing.expectEqualStrings("monstar", snapshot.bindings[34].action.run[0]);
 }
 
 test "output rules parse in order and match output identity" {

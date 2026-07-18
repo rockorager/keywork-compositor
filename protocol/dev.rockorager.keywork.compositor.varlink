@@ -49,6 +49,12 @@ method MoveFocused (direction: Direction) -> ()
 # Ask a window to close.
 method Close (target: WindowTarget) -> ()
 
+# Toggle whether a window fills its output.
+method ToggleFullscreen (target: WindowTarget) -> ()
+
+# Toggle whether a window participates in the tiling layout.
+method ToggleFloating (target: WindowTarget) -> ()
+
 # Change the active workspace's layout.
 method SetLayout (layout: Layout) -> ()
 
