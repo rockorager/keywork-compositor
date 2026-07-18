@@ -460,6 +460,7 @@ test {
     _ = @import("wayland/single_pixel_buffer.zig");
     _ = @import("wayland/content_type.zig");
     _ = @import("wayland/color_management.zig");
+    _ = @import("wayland/color_representation.zig");
     _ = @import("wayland/background_effect.zig");
     _ = @import("wayland/security_context.zig");
     _ = @import("wayland/drm_lease.zig");

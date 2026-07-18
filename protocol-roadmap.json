@@ -1279,15 +1279,16 @@
       "interfaces": [
         {
           "name": "wp_color_representation_manager_v1",
-          "current_version": null,
+          "current_version": 1,
           "target_version": 1
         }
       ],
-      "status": "not_started",
+      "status": "done",
       "privileged": false,
       "blocked_by": [
         "color-management"
-      ]
+      ],
+      "status_detail": "Version 1 advertises only electrical premultiplied alpha and identity/full RGB representation; chroma locations are accepted as metadata but rejected at commit time whenever RGB contents exist."
     },
     {
       "id": "alpha-modifier",

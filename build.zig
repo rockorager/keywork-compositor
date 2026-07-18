@@ -33,6 +33,7 @@ pub fn build(b: *std.Build) void {
     scanner.addSystemProtocol("staging/cursor-shape/cursor-shape-v1.xml");
     scanner.addSystemProtocol("staging/content-type/content-type-v1.xml");
     scanner.addSystemProtocol("staging/color-management/color-management-v1.xml");
+    scanner.addSystemProtocol("staging/color-representation/color-representation-v1.xml");
     scanner.addSystemProtocol("staging/security-context/security-context-v1.xml");
     scanner.addSystemProtocol("staging/drm-lease/drm-lease-v1.xml");
     scanner.addSystemProtocol("staging/ext-background-effect/ext-background-effect-v1.xml");
@@ -95,6 +96,7 @@ pub fn build(b: *std.Build) void {
     scanner.generate("wp_cursor_shape_manager_v1", 2);
     scanner.generate("wp_content_type_manager_v1", 1);
     scanner.generate("wp_color_manager_v1", 3);
+    scanner.generate("wp_color_representation_manager_v1", 1);
     scanner.generate("wp_security_context_manager_v1", 1);
     scanner.generate("wp_drm_lease_device_v1", 1);
     scanner.generate("ext_background_effect_manager_v1", 1);

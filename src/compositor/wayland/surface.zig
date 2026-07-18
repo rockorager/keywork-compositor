@@ -26,6 +26,7 @@ has_pending_attachment: bool,
 role_handler: ?RoleHandler,
 viewport_handler: ?ViewportHandler,
 content_type_handler: ?ContentTypeHandler,
+color_representation_handler: ?ColorRepresentationHandler,
 tearing_control_handler: ?TearingControlHandler,
 fifo_handler: ?FifoHandler,
 commit_timer_handler: ?CommitTimerHandler,
@@ -50,6 +51,8 @@ pub const State = struct {
     current_viewport: ViewportState,
     pending_content_type: ContentType,
     current_content_type: ContentType,
+    pending_color_representation: ColorRepresentationState,
+    current_color_representation: ColorRepresentationState,
     pending_presentation_hint: PresentationHint,
     current_presentation_hint: PresentationHint,
     pending_fifo_set: bool,
@@ -100,6 +103,8 @@ pub const State = struct {
             .current_viewport = .{},
             .pending_content_type = .none,
             .current_content_type = .none,
+            .pending_color_representation = .{},
+            .current_color_representation = .{},
             .pending_presentation_hint = .vsync,
             .current_presentation_hint = .vsync,
             .pending_fifo_set = false,
@@ -192,6 +197,7 @@ pub fn create(
         .role_handler = null,
         .viewport_handler = null,
         .content_type_handler = null,
+        .color_representation_handler = null,
         .tearing_control_handler = null,
         .fifo_handler = null,
         .commit_timer_handler = null,
@@ -302,6 +308,45 @@ pub fn setPendingContentType(self: *Self, content_type: ContentType) void {
 pub fn currentContentType(store: *Store, id: Id) ?ContentType {
     const surface_state = store.get(id) orelse return null;
     return surface_state.current_content_type;
+}
+
+pub const ColorRepresentationState = struct {
+    alpha_mode: ?wp.ColorRepresentationSurfaceV1.AlphaMode = null,
+    coefficients: ?wp.ColorRepresentationSurfaceV1.Coefficients = null,
+    range: ?wp.ColorRepresentationSurfaceV1.Range = null,
+    chroma_location: ?wp.ColorRepresentationSurfaceV1.ChromaLocation = null,
+};
+
+pub const ColorRepresentationHandler = struct {
+    context: *anyopaque,
+    surface_destroyed: *const fn (*anyopaque) void,
+    validate_commit: *const fn (*anyopaque, ColorRepresentationState, bool) bool,
+};
+
+pub fn setColorRepresentationHandler(self: *Self, handler: ColorRepresentationHandler) error{AlreadyExists}!void {
+    if (self.color_representation_handler != null) return error.AlreadyExists;
+    self.color_representation_handler = handler;
+}
+
+pub fn clearColorRepresentationHandler(self: *Self, context: *anyopaque) void {
+    const handler = self.color_representation_handler orelse unreachable;
+    std.debug.assert(handler.context == context);
+    self.color_representation_handler = null;
+    self.state().pending_color_representation = .{};
+}
+
+pub fn setPendingColorRepresentation(self: *Self, value: ColorRepresentationState) void {
+    std.debug.assert(self.color_representation_handler != null);
+    self.state().pending_color_representation = value;
+}
+
+pub fn pendingColorRepresentation(self: *Self) ColorRepresentationState {
+    return self.state().pending_color_representation;
+}
+
+pub fn currentColorRepresentation(store: *Store, id: Id) ?ColorRepresentationState {
+    const surface_state = store.get(id) orelse return null;
+    return surface_state.current_color_representation;
 }
 
 pub const PresentationHint = wp.TearingControlV1.PresentationHint;
@@ -503,6 +548,7 @@ const CachedCommit = struct {
     transform: wl.Output.Transform,
     viewport: ViewportState,
     content_type: ContentType,
+    color_representation: ColorRepresentationState,
     presentation_hint: PresentationHint,
     blur_region: Region,
     blur_region_changed: bool,
@@ -1051,6 +1097,13 @@ fn commit(self: *Self) void {
     const timing_ready = surface_state.pending_timing_ready;
 
     const commit_info = pendingCommitInfo(self);
+    if (self.color_representation_handler) |handler| {
+        if (!handler.validate_commit(
+            handler.context,
+            surface_state.pending_color_representation,
+            commit_info.has_buffer,
+        )) return;
+    }
     const action = if (self.role_handler) |handler|
         handler.before_commit(handler.context, commit_info)
     else
@@ -1162,6 +1215,7 @@ fn applyPending(self: *Self, commit_info: CommitInfo) void {
     surface_state.current_transform = surface_state.pending_transform;
     surface_state.current_viewport = surface_state.pending_viewport;
     surface_state.current_content_type = surface_state.pending_content_type;
+    surface_state.current_color_representation = surface_state.pending_color_representation;
     surface_state.current_presentation_hint = surface_state.pending_presentation_hint;
     surface_state.current_offset_x = surface_state.pending_offset_x;
     surface_state.current_offset_y = surface_state.pending_offset_y;
@@ -1256,6 +1310,7 @@ fn cachePending(self: *Self, role_ready: bool) bool {
         .transform = surface_state.pending_transform,
         .viewport = surface_state.pending_viewport,
         .content_type = surface_state.pending_content_type,
+        .color_representation = surface_state.pending_color_representation,
         .presentation_hint = surface_state.pending_presentation_hint,
         .blur_region = Region.init(),
         .blur_region_changed = surface_state.pending_blur_region_changed,
@@ -1378,6 +1433,7 @@ fn applyCached(self: *Self, cached: *CachedCommit) void {
     surface_state.current_transform = cached.transform;
     surface_state.current_viewport = cached.viewport;
     surface_state.current_content_type = cached.content_type;
+    surface_state.current_color_representation = cached.color_representation;
     surface_state.current_presentation_hint = cached.presentation_hint;
     surface_state.current_offset_x = cached.offset_x;
     surface_state.current_offset_y = cached.offset_y;
@@ -1587,6 +1643,10 @@ fn handleDestroy(_: *wl.Surface, self: *Self) void {
     }
     if (self.content_type_handler) |handler| {
         self.content_type_handler = null;
+        handler.surface_destroyed(handler.context);
+    }
+    if (self.color_representation_handler) |handler| {
+        self.color_representation_handler = null;
         handler.surface_destroyed(handler.context);
     }
     if (self.tearing_control_handler) |handler| {
@@ -2759,6 +2819,7 @@ fn testCachedCommit(
         .transform = .normal,
         .viewport = .{},
         .content_type = .none,
+        .color_representation = .{},
         .presentation_hint = .vsync,
         .blur_region = Region.init(),
         .blur_region_changed = false,
@@ -2811,6 +2872,7 @@ test "commit timing preserves synchronized and ordered application" {
         .role_handler = null,
         .viewport_handler = null,
         .content_type_handler = null,
+        .color_representation_handler = null,
         .tearing_control_handler = null,
         .fifo_handler = null,
         .commit_timer_handler = null,
@@ -2857,6 +2919,7 @@ test "commit timing moves a pending target to exactly one cached commit" {
         .role_handler = null,
         .viewport_handler = null,
         .content_type_handler = null,
+        .color_representation_handler = null,
         .tearing_control_handler = null,
         .fifo_handler = null,
         .commit_timer_handler = null,
@@ -2898,6 +2961,7 @@ test "synchronized application ignores FIFO waits while desynchronized applicati
         .role_handler = null,
         .viewport_handler = null,
         .content_type_handler = null,
+        .color_representation_handler = null,
         .tearing_control_handler = null,
         .fifo_handler = null,
         .commit_timer_handler = null,
@@ -2931,6 +2995,7 @@ test "synchronized application ignores FIFO waits while desynchronized applicati
         .transform = .normal,
         .viewport = .{},
         .content_type = .none,
+        .color_representation = .{},
         .presentation_hint = .vsync,
         .blur_region = Region.init(),
         .blur_region_changed = false,

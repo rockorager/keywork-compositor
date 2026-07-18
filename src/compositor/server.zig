@@ -16,6 +16,7 @@ const LayerShell = @import("wayland/layer_shell.zig");
 const SinglePixelBuffer = @import("wayland/single_pixel_buffer.zig");
 const ContentType = @import("wayland/content_type.zig");
 const ColorManagement = @import("wayland/color_management.zig");
+const ColorRepresentation = @import("wayland/color_representation.zig");
 const BackgroundEffect = @import("wayland/background_effect.zig");
 const SecurityContext = @import("wayland/security_context.zig");
 const SessionLock = @import("wayland/session_lock.zig");
@@ -121,6 +122,7 @@ drm_lease_initialized: bool,
 single_pixel_buffer: SinglePixelBuffer,
 content_type: ContentType,
 color_management: ColorManagement,
+color_representation: ColorRepresentation,
 background_effect: BackgroundEffect,
 security_context: SecurityContext,
 session_lock: SessionLock,
@@ -700,6 +702,7 @@ pub fn createWithVirtualOutput(
         .single_pixel_buffer = undefined,
         .content_type = undefined,
         .color_management = undefined,
+        .color_representation = undefined,
         .background_effect = undefined,
         .security_context = undefined,
         .session_lock = undefined,
@@ -826,6 +829,8 @@ pub fn createWithVirtualOutput(
     errdefer self.outputs.deinit();
     try self.color_management.init(allocator, display, &self.outputs);
     errdefer self.color_management.deinit();
+    try self.color_representation.init(allocator, display);
+    errdefer self.color_representation.deinit();
     try self.seat.init(allocator, io, display, "default", self.compositor.surfaceStore());
     errdefer self.seat.deinit();
     try self.transient_seat.init(
@@ -1512,6 +1517,7 @@ pub fn destroy(self: *Self) void {
     while (render_outputs.next()) |entry| {
         std.debug.assert(self.removeRenderOutput(entry.id));
     }
+    self.color_representation.deinit();
     self.color_management.deinit();
     self.outputs.deinit();
     self.render_outputs.deinit(allocator);
