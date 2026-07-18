@@ -43,6 +43,7 @@ inner_gap: u32 = 16,
 outer_gap: u32 = 16,
 window_effects: Scene.Effects = Scene.default_effects,
 focused_window_effects: Scene.Effects = Scene.default_effects,
+focused_window_border: ?Scene.Borders = null,
 
 const WindowStore = slot_map.SlotMap(Window, enum { builtin_window });
 pub const WindowId = WindowStore.Id;
@@ -492,6 +493,21 @@ pub fn setWindowEffects(
                 focused_effects
             else
                 effects,
+        );
+    }
+}
+
+pub fn setFocusedWindowBorder(self: *Self, border: ?Scene.Borders) void {
+    if (std.meta.eql(self.focused_window_border, border)) return;
+    self.focused_window_border = border;
+    var it = self.windows.iterator();
+    while (it.next()) |entry| {
+        const window = entry.value;
+        const focused = self.workspaces.items[window.workspace].workspace.focused != null and
+            neutral(entry.id).eql(self.workspaces.items[window.workspace].workspace.focused.?);
+        self.scene.setBorders(
+            window.scene_id,
+            if (window.fullscreen_output == null and focused) border else null,
         );
     }
 }
@@ -973,6 +989,13 @@ fn publish(self: *Self) void {
             neutral(entry.id).eql(self.workspaces.items[window.workspace].workspace.focused.?);
         self.scene.setFocused(window.scene_id, focused);
         self.scene.setFullscreen(window.scene_id, window.fullscreen_output != null);
+        self.scene.setBorders(
+            window.scene_id,
+            if (window.fullscreen_output == null and focused)
+                self.focused_window_border
+            else
+                null,
+        );
         switch (window.backend) {
             .xdg => |id| {
                 self.xdg_shell.setWindowFocused(id, focused);

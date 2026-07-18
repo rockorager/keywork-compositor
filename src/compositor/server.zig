@@ -1959,6 +1959,7 @@ fn applyGeneralConfiguration(self: *Self, general: Config.GeneralSettings) void 
         normal_effects,
         windowEffects(general, general.focused_shadow_color),
     );
+    self.window_manager.setFocusedWindowBorder(focusedWindowBorder(general));
     if (!std.meta.eql(self.layer_shell_effects, normal_effects)) {
         self.layer_shell_effects = normal_effects;
         requestRepaint(self);
@@ -1981,6 +1982,16 @@ fn windowEffects(general: Config.GeneralSettings, shadow_color: Config.Color) Sc
                 shadow_color.alpha,
             ),
         } else null,
+    };
+}
+
+fn focusedWindowBorder(general: Config.GeneralSettings) ?Scene.Borders {
+    if (general.focused_border_width == 0) return null;
+    const color = general.focused_border_color;
+    return .{
+        .edges = .{ .top = true, .bottom = true, .left = true, .right = true },
+        .width = general.focused_border_width,
+        .color = render.Color.rgba(color.red, color.green, color.blue, color.alpha),
     };
 }
 
@@ -6146,6 +6157,39 @@ test "general configuration maps window blur and shadow effects" {
     const effects = windowEffects(disabled, disabled.shadow_color);
     try std.testing.expect(effects.blur == null);
     try std.testing.expect(effects.shadow == null);
+}
+
+test "general configuration maps focused window border" {
+    const defaults: Config.GeneralSettings = .{};
+    const default_border = focusedWindowBorder(defaults).?;
+    try std.testing.expectEqual(@as(u32, 2), default_border.width);
+    try std.testing.expectEqual(
+        render.Color.rgba(0x28, 0x70, 0xbd, 0xff),
+        default_border.color,
+    );
+
+    var disabled = defaults;
+    disabled.focused_border_width = 0;
+    try std.testing.expect(focusedWindowBorder(disabled) == null);
+
+    var configured = defaults;
+    configured.focused_border_width = 3;
+    configured.focused_border_color = .{
+        .red = 0x7a,
+        .green = 0xa2,
+        .blue = 0xf7,
+        .alpha = 0x80,
+    };
+    const border = focusedWindowBorder(configured).?;
+    try std.testing.expectEqual(@as(u32, 3), border.width);
+    try std.testing.expectEqual(
+        render.Color.rgba(0x7a, 0xa2, 0xf7, 0x80),
+        border.color,
+    );
+    try std.testing.expect(border.edges.top);
+    try std.testing.expect(border.edges.bottom);
+    try std.testing.expect(border.edges.left);
+    try std.testing.expect(border.edges.right);
 }
 
 test "server adds and removes independent render outputs" {

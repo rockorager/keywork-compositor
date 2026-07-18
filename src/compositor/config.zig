@@ -142,7 +142,9 @@ pub const GeneralSettings = struct {
     shadow_enabled: bool = true,
     shadow_blur_radius: u32 = 24,
     shadow_color: Color = .{ .red = 0x11, .green = 0x11, .blue = 0x13, .alpha = 0x80 },
-    focused_shadow_color: Color = .{ .red = 0x69, .green = 0x6e, .blue = 0x77, .alpha = 0x80 },
+    focused_shadow_color: Color = .{ .red = 0x11, .green = 0x11, .blue = 0x13, .alpha = 0x80 },
+    focused_border_width: u32 = 2,
+    focused_border_color: Color = .{ .red = 0x28, .green = 0x70, .blue = 0xbd, .alpha = 0xff },
 };
 
 pub const Snapshot = struct {
@@ -492,6 +494,8 @@ const GeneralSetting = enum {
     shadow_blur_radius,
     shadow_color,
     focused_shadow_color,
+    focused_border_width,
+    focused_border_color,
 };
 
 const GeneralSettingError = error{
@@ -517,6 +521,8 @@ fn parseGeneralSetting(
         .shadow_blur_radius => general.settings.shadow_blur_radius = try parseGeneralSize(value),
         .shadow_color => general.settings.shadow_color = try parseColor(value),
         .focused_shadow_color => general.settings.focused_shadow_color = try parseColor(value),
+        .focused_border_width => general.settings.focused_border_width = try parseGeneralSize(value),
+        .focused_border_color => general.settings.focused_border_color = try parseColor(value),
     }
     general.seen.insert(setting);
 }
@@ -1015,6 +1021,8 @@ test "general settings parse and reject invalid directives" {
         \\shadow-blur-radius=48
         \\shadow-color=#10203040
         \\focused-shadow-color=#aabbcc
+        \\focused-border-width=3
+        \\focused-border-color=#7aa2f780
     );
     var snapshot = switch (result) {
         .snapshot => |snapshot| snapshot,
@@ -1029,6 +1037,8 @@ test "general settings parse and reject invalid directives" {
     try std.testing.expectEqual(@as(u32, 48), snapshot.general.shadow_blur_radius);
     try std.testing.expectEqual(Color{ .red = 0x10, .green = 0x20, .blue = 0x30, .alpha = 0x40 }, snapshot.general.shadow_color);
     try std.testing.expectEqual(Color{ .red = 0xaa, .green = 0xbb, .blue = 0xcc, .alpha = 0xff }, snapshot.general.focused_shadow_color);
+    try std.testing.expectEqual(@as(u32, 3), snapshot.general.focused_border_width);
+    try std.testing.expectEqual(Color{ .red = 0x7a, .green = 0xa2, .blue = 0xf7, .alpha = 0x80 }, snapshot.general.focused_border_color);
 
     const invalid = try parse(std.testing.allocator, "[general]\nfocus-follows-mouse=sometimes\n");
     try std.testing.expectEqual(Problem.invalid_general_setting, invalid.diagnostic.problem);
@@ -1036,6 +1046,8 @@ test "general settings parse and reject invalid directives" {
     try std.testing.expectEqual(Problem.invalid_general_setting, invalid_radius.diagnostic.problem);
     const invalid_gap = try parse(std.testing.allocator, "[general]\ninner-gap=257\n");
     try std.testing.expectEqual(Problem.invalid_general_setting, invalid_gap.diagnostic.problem);
+    const invalid_border_width = try parse(std.testing.allocator, "[general]\nfocused-border-width=257\n");
+    try std.testing.expectEqual(Problem.invalid_general_setting, invalid_border_width.diagnostic.problem);
     const invalid_color = try parse(std.testing.allocator, "[general]\nshadow-color=#12345z\n");
     try std.testing.expectEqual(Problem.invalid_general_setting, invalid_color.diagnostic.problem);
     const unknown = try parse(std.testing.allocator, "[general]\nmouse-warping=enabled\n");
