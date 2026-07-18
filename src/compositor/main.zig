@@ -89,9 +89,7 @@ pub fn main(init: std.process.Init) !void {
     var virtual_output: Server.VirtualOutputConfig = .{};
     if (options.headless_size) |size| virtual_output.size = size;
     if (options.headless_scale) |scale| virtual_output.scale = scale;
-    if (init.environ_map.get("XCURSOR_SIZE") == null) {
-        try init.environ_map.put("XCURSOR_SIZE", default_cursor_size);
-    }
+    try ensureCursorSize(init.environ_map);
     const server = try Server.createWithVirtualOutput(
         init.gpa,
         init.io,
@@ -216,6 +214,11 @@ fn parseArguments(arguments: anytype) !StartupOptions {
         return error.DrmDeviceRequiresDrmOutput;
     }
     return options;
+}
+
+fn ensureCursorSize(environ_map: *std.process.Environ.Map) !void {
+    const cursor_size = environ_map.get("XCURSOR_SIZE") orelse "";
+    if (cursor_size.len == 0) try environ_map.put("XCURSOR_SIZE", default_cursor_size);
 }
 
 fn xwaylandDisplayAvailable(context: *anyopaque, display_name: []const u8) void {
@@ -366,6 +369,22 @@ test "headless output configuration parses physical size and fractional scale" {
     try std.testing.expectEqual(@as(u32, 180), (try parseHeadlessScale("1.5")).numerator);
     try std.testing.expectError(error.InvalidHeadlessSize, parseHeadlessSize("2880"));
     try std.testing.expectError(error.InvalidHeadlessScale, parseHeadlessScale("0"));
+}
+
+test "cursor size defaults when missing or empty" {
+    var environ_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ_map.deinit();
+
+    try ensureCursorSize(&environ_map);
+    try std.testing.expectEqualStrings(default_cursor_size, environ_map.get("XCURSOR_SIZE").?);
+
+    try environ_map.put("XCURSOR_SIZE", "");
+    try ensureCursorSize(&environ_map);
+    try std.testing.expectEqualStrings(default_cursor_size, environ_map.get("XCURSOR_SIZE").?);
+
+    try environ_map.put("XCURSOR_SIZE", "32");
+    try ensureCursorSize(&environ_map);
+    try std.testing.expectEqualStrings("32", environ_map.get("XCURSOR_SIZE").?);
 }
 
 test {
