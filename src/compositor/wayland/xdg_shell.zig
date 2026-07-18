@@ -1644,6 +1644,19 @@ const XdgSurfaceResource = struct {
             self.resource.postError(.not_constructed, "xdg_surface committed before role creation");
             return .reject;
         }
+        if (state.role.? == .toplevel) {
+            const window = self.shell.windows.get(state.role.?.toplevel) orelse unreachable;
+            if (!ToplevelResource.validSizeHints(
+                window.pending_min_size,
+                window.pending_max_size,
+            )) {
+                state.toplevel_resource.?.postError(
+                    .invalid_size,
+                    "invalid minimum or maximum window size",
+                );
+                return .reject;
+            }
+        }
         if (state.role.? == .popup) {
             const popup = self.shell.popups.get(state.role.?.popup) orelse return .reject;
             if (popup.scene_id == null) {
@@ -2311,21 +2324,13 @@ const ToplevelResource = struct {
             .set_parent => |set| self.setParent(resource, set.parent),
             .set_title => |set| self.setText(resource, &window.title, set.title),
             .set_app_id => |set| self.setText(resource, &window.app_id, set.app_id),
-            .set_max_size => |set| {
-                const size: SizeHint = .{ .width = set.width, .height = set.height };
-                if (!validMaxSize(size, window.pending_min_size)) {
-                    resource.postError(.invalid_size, "invalid maximum window size");
-                    return;
-                }
-                window.pending_max_size = size;
+            .set_max_size => |set| window.pending_max_size = .{
+                .width = set.width,
+                .height = set.height,
             },
-            .set_min_size => |set| {
-                const size: SizeHint = .{ .width = set.width, .height = set.height };
-                if (!validMinSize(size, window.pending_max_size)) {
-                    resource.postError(.invalid_size, "invalid minimum window size");
-                    return;
-                }
-                window.pending_min_size = size;
+            .set_min_size => |set| window.pending_min_size = .{
+                .width = set.width,
+                .height = set.height,
             },
             .show_window_menu => |menu| {
                 if (!self.acceptsUserAction(resource, menu.seat, menu.serial)) return;
@@ -2449,23 +2454,16 @@ const ToplevelResource = struct {
         _ = self.shell.notifyWindowMetadataChanged(self.id);
     }
 
-    fn validMaxSize(maximum: SizeHint, minimum: SizeHint) bool {
-        if (maximum.width < 0 or maximum.height < 0) return false;
+    fn validSizeHints(minimum: SizeHint, maximum: SizeHint) bool {
+        if (minimum.width < 0 or minimum.height < 0 or
+            maximum.width < 0 or maximum.height < 0)
+        {
+            return false;
+        }
         if (maximum.width != 0 and minimum.width != 0 and maximum.width < minimum.width) {
             return false;
         }
         if (maximum.height != 0 and minimum.height != 0 and maximum.height < minimum.height) {
-            return false;
-        }
-        return true;
-    }
-
-    fn validMinSize(minimum: SizeHint, maximum: SizeHint) bool {
-        if (minimum.width < 0 or minimum.height < 0) return false;
-        if (maximum.width != 0 and minimum.width != 0 and minimum.width > maximum.width) {
-            return false;
-        }
-        if (maximum.height != 0 and minimum.height != 0 and minimum.height > maximum.height) {
             return false;
         }
         return true;
@@ -2695,18 +2693,22 @@ test "xdg toplevel states are gated by protocol version" {
     }, toplevelStates(configuration, 7, &values));
 }
 
-test "xdg size hints reject contradictory bounds" {
-    try std.testing.expect(ToplevelResource.validMaxSize(
+test "xdg size hints validate committed bounds" {
+    try std.testing.expect(ToplevelResource.validSizeHints(
+        .{ .width = 50, .height = 50 },
         .{ .width = 100, .height = 100 },
-        .{ .width = 50, .height = 50 },
     ));
-    try std.testing.expect(!ToplevelResource.validMaxSize(
+    try std.testing.expect(!ToplevelResource.validSizeHints(
+        .{ .width = 50, .height = 50 },
         .{ .width = 40, .height = 100 },
-        .{ .width = 50, .height = 50 },
     ));
-    try std.testing.expect(!ToplevelResource.validMinSize(
+    try std.testing.expect(!ToplevelResource.validSizeHints(
         .{ .width = -1, .height = 0 },
         .{},
+    ));
+    try std.testing.expect(!ToplevelResource.validSizeHints(
+        .{},
+        .{ .width = 0, .height = -1 },
     ));
 }
 
