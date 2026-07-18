@@ -31,6 +31,7 @@ const DataDevice = @import("wayland/data_device.zig");
 const XdgToplevelDrag = @import("wayland/xdg_toplevel_drag.zig");
 const XdgToplevelIcon = @import("wayland/xdg_toplevel_icon.zig");
 const XdgDialog = @import("wayland/xdg_dialog.zig");
+const XdgSystemBell = @import("wayland/xdg_system_bell.zig");
 const PrimarySelection = @import("wayland/primary_selection.zig");
 const DataControl = @import("wayland/data_control.zig");
 const ForeignToplevelList = @import("wayland/foreign_toplevel_list.zig");
@@ -141,6 +142,7 @@ data_device: DataDevice,
 xdg_toplevel_drag: XdgToplevelDrag,
 xdg_toplevel_icon: XdgToplevelIcon,
 xdg_dialog: XdgDialog,
+xdg_system_bell: XdgSystemBell,
 primary_selection: PrimarySelection,
 data_control: DataControl,
 foreign_toplevel_list: ForeignToplevelList,
@@ -710,6 +712,7 @@ pub fn createWithVirtualOutput(
         .xdg_toplevel_drag = undefined,
         .xdg_toplevel_icon = undefined,
         .xdg_dialog = undefined,
+        .xdg_system_bell = undefined,
         .primary_selection = undefined,
         .data_control = undefined,
         .foreign_toplevel_list = undefined,
@@ -1110,6 +1113,8 @@ pub fn createWithVirtualOutput(
     errdefer self.xdg_toplevel_icon.deinit();
     try self.xdg_dialog.init(allocator, display, &self.xdg_shell);
     errdefer self.xdg_dialog.deinit();
+    try self.xdg_system_bell.init(display);
+    errdefer self.xdg_system_bell.deinit();
     self.workspace.setActivationListener(.{
         .context = self,
         .activate = workspaceActivationRequested,
@@ -1352,6 +1357,7 @@ pub fn destroy(self: *Self) void {
     self.foreign_toplevel_list.deinit();
     self.foreign_toplevel_list_initialized = false;
     self.workspace.clearActivationListener();
+    self.xdg_system_bell.deinit();
     self.xdg_dialog.deinit();
     self.xdg_toplevel_icon.deinit();
     self.xdg_toplevel_drag.deinit();

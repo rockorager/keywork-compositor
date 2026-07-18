@@ -1112,15 +1112,16 @@
       "interfaces": [
         {
           "name": "xdg_system_bell_v1",
-          "current_version": null,
+          "current_version": 1,
           "target_version": 1
         }
       ],
-      "status": "not_started",
+      "status": "done",
       "privileged": false,
       "blocked_by": [
         "xdg-shell"
-      ]
+      ],
+      "status_detail": "Version 1 advertises the system-bell global and accepts bell requests with either an associated surface or no surface. Requests follow the protocol-permitted no-feedback policy, matching the existing GTK system-bell behavior until Keywork gains a shared audible or visual notification subsystem. Null, toplevel-associated, and object-destruction lifecycles are exercised end to end."
     },
     {
       "id": "xdg-toplevel-tag",
