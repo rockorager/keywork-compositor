@@ -49,6 +49,7 @@ const Workspace = @import("wayland/workspace.zig");
 const TextInput = @import("wayland/text_input.zig");
 const InputMethod = @import("wayland/input_method.zig");
 const VirtualKeyboard = @import("wayland/virtual_keyboard.zig");
+const VirtualPointer = @import("wayland/virtual_pointer.zig");
 const PresentationProtocol = @import("wayland/presentation.zig");
 const FractionalScale = @import("wayland/fractional_scale.zig");
 const Fixes = @import("wayland/fixes.zig");
@@ -175,6 +176,7 @@ workspace_initialized: bool,
 text_input: TextInput,
 input_method: InputMethod,
 virtual_keyboard: VirtualKeyboard,
+virtual_pointer: VirtualPointer,
 presentation_protocol: PresentationProtocol,
 fractional_scale: FractionalScale,
 fixes: Fixes,
@@ -555,9 +557,14 @@ const RoutedKey = struct {
 };
 
 const RoutedButton = struct {
-    device_id: NativeInput.DeviceId,
+    source: PointerButtonSource,
     seat: *Seat,
     button: u32,
+};
+
+const PointerButtonSource = union(enum) {
+    native: NativeInput.DeviceId,
+    virtual: u64,
 };
 
 const GestureKind = enum { swipe, pinch, hold };
@@ -748,6 +755,7 @@ pub fn createWithVirtualOutput(
         .text_input = undefined,
         .input_method = undefined,
         .virtual_keyboard = undefined,
+        .virtual_pointer = undefined,
         .presentation_protocol = undefined,
         .fractional_scale = undefined,
         .fixes = undefined,
@@ -1080,6 +1088,16 @@ pub fn createWithVirtualOutput(
         &self.transient_seat,
     );
     errdefer self.virtual_keyboard.deinit();
+    try self.virtual_pointer.init(
+        allocator,
+        display,
+        &self.security_context,
+        &self.seat,
+        &self.transient_seat,
+        &self.outputs,
+        .{ .context = self, .event = virtualPointerEvent },
+    );
+    errdefer self.virtual_pointer.deinit();
     try self.workspace.init(allocator, display, &self.security_context, &self.outputs);
     self.workspace_initialized = true;
     errdefer {
@@ -1403,6 +1421,7 @@ pub fn destroy(self: *Self) void {
     self.window_manager_initialized = false;
     self.workspace.deinit();
     self.workspace_initialized = false;
+    self.virtual_pointer.deinit();
     self.virtual_keyboard.deinit();
     self.transient_seat.deinit();
     self.input_method.deinit();
@@ -1672,7 +1691,7 @@ fn refreshSeatCapabilities(self: *Self) void {
             .tablet, .tablet_pad => {},
         }
     }
-    if (!pointer) {
+    if (!pointer and !self.seat.hasVirtualPointers()) {
         self.pointer_constraints.deactivateAll();
         self.data_device.cancel();
     }
@@ -3260,15 +3279,26 @@ fn routePointerButton(
     state: wl.Pointer.ButtonState,
 ) void {
     const seat = self.seatForDevice(device_id);
+    self.routePointerButtonFromSource(.{ .native = device_id }, seat, time, button, state);
+}
+
+fn routePointerButtonFromSource(
+    self: *Self,
+    source: PointerButtonSource,
+    seat: *Seat,
+    time: u32,
+    button: u32,
+    state: wl.Pointer.ButtonState,
+) void {
     self.idle_notify.notifyActivity(seat);
     switch (state) {
         .pressed => {
             for (self.routed_buttons.items) |routed| {
-                if (routed.device_id == device_id and routed.button == button) return;
+                if (std.meta.eql(routed.source, source) and routed.button == button) return;
             }
             const already_pressed = self.seatButtonHeld(seat, button);
             self.routed_buttons.append(self.allocator, .{
-                .device_id = device_id,
+                .source = source,
                 .seat = seat,
                 .button = button,
             }) catch return self.terminate();
@@ -3276,7 +3306,7 @@ fn routePointerButton(
         },
         .released => {
             for (self.routed_buttons.items, 0..) |routed, index| {
-                if (routed.device_id != device_id or routed.button != button) continue;
+                if (!std.meta.eql(routed.source, source) or routed.button != button) continue;
                 _ = self.routed_buttons.orderedRemove(index);
                 if (self.seatButtonHeld(routed.seat, button)) return;
                 self.pointerButtonForSeat(routed.seat, time, button, state);
@@ -3293,7 +3323,11 @@ fn releaseDeviceButtons(self: *Self, device_id: NativeInput.DeviceId) void {
     var index: usize = 0;
     while (index < self.routed_buttons.items.len) {
         const routed = self.routed_buttons.items[index];
-        if (routed.device_id != device_id) {
+        const matches = switch (routed.source) {
+            .native => |candidate| candidate == device_id,
+            .virtual => false,
+        };
+        if (!matches) {
             index += 1;
             continue;
         }
@@ -3624,44 +3658,62 @@ fn pointerMotion(context: *anyopaque, time: u32, x: f64, y: f64) void {
 
 fn pointerMotionForSeat(output: *RenderOutput, seat: *Seat, time: u32, x: f64, y: f64) void {
     const self = output.server;
-    self.idle_notify.notifyActivity(seat);
     const target = output.globalPoint(x, y);
+    self.pointerMotionGlobalForSeat(output, seat, time, target.x, target.y);
+}
+
+fn pointerMotionGlobalForSeat(
+    self: *Self,
+    backend_output: ?*RenderOutput,
+    seat: *Seat,
+    time: u32,
+    x: f64,
+    y: f64,
+) void {
+    self.idle_notify.notifyActivity(seat);
     if (self.session_lock.isLocked()) {
         seat.pointerMotion(
             time,
-            target.x,
-            target.y,
-            self.pointerFocus(target.x, target.y),
+            x,
+            y,
+            self.pointerFocus(x, y),
         );
         return;
     }
     if (seat == &self.seat and self.window_manager.tilingDragActive()) {
         self.pointer_constraints.deactivateAll();
-        seat.pointerMotion(time, target.x, target.y, null);
-        if (self.window_manager.updateTilingDrag(target.x, target.y)) requestRepaint(self);
+        seat.pointerMotion(time, x, y, null);
+        if (self.window_manager.updateTilingDrag(x, y)) requestRepaint(self);
         return;
     }
     if (seat == &self.seat and self.data_device.isDragging()) {
         self.pointer_constraints.deactivateAll();
         seat.pointerMotion(
             time,
-            target.x,
-            target.y,
-            self.data_device.externalDragPointerFocus(target.x, target.y),
+            x,
+            y,
+            self.data_device.externalDragPointerFocus(x, y),
         );
-        self.xdg_toplevel_drag.pointerMotion(target.x, target.y);
+        self.xdg_toplevel_drag.pointerMotion(x, y);
         self.routeActiveDrag(
             time,
-            self.dragPointerRoute(target.x, target.y),
-            target.x,
-            target.y,
+            self.dragPointerRoute(x, y),
+            x,
+            y,
             true,
         );
         return;
     }
-    const motion = self.pointer_constraints.constrainMotion(.{ .x = target.x, .y = target.y });
-    if (motion.point.x != target.x or motion.point.y != target.y) {
-        self.synchronizeBackendPointer(output, motion.point.x, motion.point.y);
+    if (seat != &self.seat) {
+        const route = self.pointerRoute(x, y);
+        seat.pointerMotion(time, x, y, route.focus);
+        return;
+    }
+    const motion = self.pointer_constraints.constrainMotion(.{ .x = x, .y = y });
+    if (motion.point.x != x or motion.point.y != y) {
+        if (backend_output) |output| {
+            self.synchronizeBackendPointer(output, motion.point.x, motion.point.y);
+        }
     }
     if (motion.locked) return;
     const route = self.pointerRoute(motion.point.x, motion.point.y);
@@ -3673,6 +3725,165 @@ fn pointerMotionForSeat(output: *RenderOutput, seat: *Seat, time: u32, x: f64, y
     );
     if (!self.xdg_shell.hasPopupGrab()) self.window_manager.pointerMoved(route.root);
     self.pointer_constraints.syncFocus();
+}
+
+const VirtualPointerBounds = struct {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    output: ?*RenderOutput,
+};
+
+fn virtualPointerBounds(
+    self: *Self,
+    mapped_output: ?OutputLayout.Id,
+) ?VirtualPointerBounds {
+    if (mapped_output) |output_id| {
+        if (self.findProtocolRenderOutput(output_id)) |render_output| {
+            const output = self.outputs.get(output_id) orelse return null;
+            const position = output.logicalPosition();
+            const size = output.logicalSize();
+            return .{
+                .x = @floatFromInt(position.x),
+                .y = @floatFromInt(position.y),
+                .width = @floatFromInt(size.width),
+                .height = @floatFromInt(size.height),
+                .output = render_output,
+            };
+        }
+    }
+
+    var left: ?i64 = null;
+    var top: ?i64 = null;
+    var right: ?i64 = null;
+    var bottom: ?i64 = null;
+    var outputs = self.outputs.iterator();
+    while (outputs.next()) |entry| {
+        const position = entry.output.logicalPosition();
+        const size = entry.output.logicalSize();
+        left = @min(left orelse position.x, position.x);
+        top = @min(top orelse position.y, position.y);
+        const output_right = @as(i64, position.x) + size.width;
+        const output_bottom = @as(i64, position.y) + size.height;
+        right = @max(right orelse output_right, output_right);
+        bottom = @max(bottom orelse output_bottom, output_bottom);
+    }
+    const x = left orelse return null;
+    const y = top orelse return null;
+    return .{
+        .x = @floatFromInt(x),
+        .y = @floatFromInt(y),
+        .width = @floatFromInt(right.? - x),
+        .height = @floatFromInt(bottom.? - y),
+        .output = null,
+    };
+}
+
+fn renderOutputAt(self: *Self, x: f64, y: f64) *RenderOutput {
+    var outputs = self.render_outputs.iterator();
+    while (outputs.next()) |entry| {
+        const output = entry.value.*;
+        const protocol_output = self.outputs.get(output.protocol_id) orelse continue;
+        if (pointInRect(x, y, protocol_output.logicalRect())) return output;
+    }
+    return self.primaryRenderOutput();
+}
+
+fn clampVirtualPointerCoordinate(value: f64, origin: f64, dimension: f64) f64 {
+    std.debug.assert(dimension >= 1);
+    return std.math.clamp(value, origin, origin + dimension - 1);
+}
+
+fn normalizedVirtualPointerCoordinate(
+    value: u32,
+    extent: u32,
+    origin: f64,
+    dimension: f64,
+) f64 {
+    std.debug.assert(extent > 0 and dimension >= 1);
+    const position = @as(f64, @floatFromInt(@min(value, extent))) /
+        @as(f64, @floatFromInt(extent));
+    return origin + position * (dimension - 1);
+}
+
+fn virtualPointerEvent(
+    context: *anyopaque,
+    seat: *Seat,
+    mapped_output: ?OutputLayout.Id,
+    source: u64,
+    event: VirtualPointer.Event,
+) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    switch (event) {
+        .motion => |motion| {
+            const bounds = self.virtualPointerBounds(mapped_output) orelse return;
+            if (seat == &self.seat) {
+                self.relative_pointer.motion(
+                    @as(u64, motion.time) * std.time.us_per_ms,
+                    motion.dx,
+                    motion.dy,
+                    motion.dx,
+                    motion.dy,
+                );
+            }
+            const current = seat.pointerPosition();
+            const current_x = if (current) |point| point.x else bounds.x;
+            const current_y = if (current) |point| point.y else bounds.y;
+            const x = clampVirtualPointerCoordinate(current_x + motion.dx, bounds.x, bounds.width);
+            const y = clampVirtualPointerCoordinate(current_y + motion.dy, bounds.y, bounds.height);
+            self.pointerMotionGlobalForSeat(
+                bounds.output orelse self.renderOutputAt(x, y),
+                seat,
+                motion.time,
+                x,
+                y,
+            );
+        },
+        .motion_absolute => |motion| {
+            if (motion.x_extent == 0 or motion.y_extent == 0) return;
+            const bounds = self.virtualPointerBounds(mapped_output) orelse return;
+            const x = normalizedVirtualPointerCoordinate(
+                motion.x,
+                motion.x_extent,
+                bounds.x,
+                bounds.width,
+            );
+            const y = normalizedVirtualPointerCoordinate(
+                motion.y,
+                motion.y_extent,
+                bounds.y,
+                bounds.height,
+            );
+            self.pointerMotionGlobalForSeat(
+                bounds.output orelse self.renderOutputAt(x, y),
+                seat,
+                motion.time,
+                x,
+                y,
+            );
+        },
+        .button => |button| self.routePointerButtonFromSource(
+            .{ .virtual = source },
+            seat,
+            button.time,
+            button.button,
+            button.state,
+        ),
+        .axis => |axis| {
+            self.idle_notify.notifyActivity(seat);
+            seat.pointerAxis(axis.time, axis.axis, axis.value);
+        },
+        .frame => seat.pointerFrame(),
+        .axis_source => |axis_source| seat.pointerAxisSource(axis_source),
+        .axis_stop => |stop| seat.pointerAxisStop(stop.time, stop.axis),
+        .axis_discrete => |axis| {
+            self.idle_notify.notifyActivity(seat);
+            seat.pointerAxisDiscrete(axis.axis, axis.discrete);
+            seat.pointerAxisValue120(axis.axis, axis.discrete *| 120);
+            seat.pointerAxis(axis.time, axis.axis, axis.value);
+        },
+    }
 }
 
 fn synchronizeBackendPointer(self: *Self, output: *RenderOutput, x: f64, y: f64) void {
@@ -6846,6 +7057,29 @@ test "X11 pointer buttons map to Linux button codes" {
     try std.testing.expectEqual(@as(?u32, 0x111), x11PointerButton(3));
     try std.testing.expectEqual(@as(?u32, null), x11PointerButton(0));
     try std.testing.expectEqual(@as(?u32, null), x11PointerButton(4));
+}
+
+test "virtual pointer coordinates respect mapped bounds" {
+    try std.testing.expectEqual(
+        @as(f64, -100),
+        clampVirtualPointerCoordinate(-200, -100, 640),
+    );
+    try std.testing.expectEqual(
+        @as(f64, 539),
+        clampVirtualPointerCoordinate(700, -100, 640),
+    );
+    try std.testing.expectEqual(
+        @as(f64, -100),
+        normalizedVirtualPointerCoordinate(0, 1000, -100, 640),
+    );
+    try std.testing.expectEqual(
+        @as(f64, 219.5),
+        normalizedVirtualPointerCoordinate(500, 1000, -100, 640),
+    );
+    try std.testing.expectEqual(
+        @as(f64, 539),
+        normalizedVirtualPointerCoordinate(1200, 1000, -100, 640),
+    );
 }
 
 test "fullscreen selection is isolated to each output" {

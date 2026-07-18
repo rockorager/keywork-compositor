@@ -33,6 +33,7 @@ touch_ever_available: bool,
 keyboard_available: bool,
 virtual_keyboard_count: usize,
 pointer_available: bool,
+virtual_pointer_count: usize,
 touch_available: bool,
 keymap: ?Keymap,
 repeat_info: RepeatInfo,
@@ -259,6 +260,7 @@ pub fn init(
         .keyboard_available = false,
         .virtual_keyboard_count = 0,
         .pointer_available = false,
+        .virtual_pointer_count = 0,
         .touch_available = false,
         .keymap = null,
         .repeat_info = .{},
@@ -306,6 +308,7 @@ pub fn deinit(self: *Self) void {
     std.debug.assert(self.touch_resources.items.len == 0);
     std.debug.assert(self.cursor_surface_count == 0);
     std.debug.assert(self.virtual_keyboard_count == 0);
+    std.debug.assert(self.virtual_pointer_count == 0);
     std.debug.assert(self.keyboard_grab == null);
     std.debug.assert(self.repaint_listener == null);
     std.debug.assert(self.keyboard_focus_listeners.items.len == 0);
@@ -722,18 +725,46 @@ pub fn removeVirtualKeyboard(self: *Self) void {
 
 pub fn setPointerAvailable(self: *Self, available: bool) void {
     if (self.pointer_available == available) return;
-    if (!available) {
+    const old_capability = self.hasPointerCapability();
+    self.pointer_available = available;
+    const new_capability = self.hasPointerCapability();
+    if (old_capability and !new_capability) {
         self.pointerLeave();
         self.pressed_pointer_buttons.clearRetainingCapacity();
     }
-    self.pointer_available = available;
-    if (available) {
+    if (!old_capability and new_capability) {
         beginCapabilityGeneration(
             &self.pointer_capability_generation,
             &self.pointer_ever_available,
         );
     }
+    if (old_capability != new_capability) self.broadcastCapabilities();
+}
+
+pub fn addVirtualPointer(self: *Self) void {
+    const old_capability = self.hasPointerCapability();
+    self.virtual_pointer_count = std.math.add(usize, self.virtual_pointer_count, 1) catch
+        unreachable;
+    if (old_capability) return;
+    beginCapabilityGeneration(
+        &self.pointer_capability_generation,
+        &self.pointer_ever_available,
+    );
     self.broadcastCapabilities();
+}
+
+pub fn removeVirtualPointer(self: *Self) void {
+    std.debug.assert(self.virtual_pointer_count > 0);
+    const old_capability = self.hasPointerCapability();
+    self.virtual_pointer_count -= 1;
+    if (old_capability == self.hasPointerCapability()) return;
+    self.pointerLeave();
+    self.pressed_pointer_buttons.clearRetainingCapacity();
+    self.broadcastCapabilities();
+}
+
+pub fn hasVirtualPointers(self: *const Self) bool {
+    return self.virtual_pointer_count != 0;
 }
 
 pub fn setTouchAvailable(self: *Self, available: bool) void {
@@ -1561,6 +1592,10 @@ fn hasKeyboardCapability(self: *const Self) bool {
     return (self.keyboard_available or self.virtual_keyboard_count > 0) and self.keymap != null;
 }
 
+fn hasPointerCapability(self: *const Self) bool {
+    return self.pointer_available or self.virtual_pointer_count > 0;
+}
+
 fn keyboardResourceActive(self: *const Self, entry: KeyboardResource) bool {
     return capabilityResourceActive(
         self.hasKeyboardCapability(),
@@ -1571,7 +1606,7 @@ fn keyboardResourceActive(self: *const Self, entry: KeyboardResource) bool {
 
 fn pointerResourceActive(self: *const Self, entry: PointerResource) bool {
     return capabilityResourceActive(
-        self.pointer_available,
+        self.hasPointerCapability(),
         self.pointer_capability_generation,
         entry.capability_generation,
     );
@@ -1648,7 +1683,7 @@ fn touchResourceInSequence(generation: u64, max_generation: u64) bool {
 fn capabilities(self: *const Self) wl.Seat.Capability {
     return .{
         .keyboard = self.hasKeyboardCapability(),
-        .pointer = self.pointer_available,
+        .pointer = self.hasPointerCapability(),
         .touch = self.touch_available,
     };
 }
