@@ -213,6 +213,12 @@ pub const Image = struct {
     is_opaque: bool = false,
 };
 
+pub fn shadowBlurExtent(blur_radius: u32) u32 {
+    // The shadow shader uses half the blur radius as sigma, so three sigma
+    // lets the Gaussian tail dissipate before reaching the render boundary.
+    return blur_radius +| (blur_radius / 2 + blur_radius % 2);
+}
+
 pub const Shadow = struct {
     rect: Rect,
     corner_radius: u32,
@@ -377,6 +383,15 @@ test "fractional scale floors logical output dimensions" {
         error.InvalidDimensions,
         (Scale{ .numerator = 240 }).logicalSize(.{ .width = 1, .height = 1 }),
     );
+}
+
+test "shadow blur extent covers the three sigma tail" {
+    try std.testing.expectEqual(@as(u32, 0), shadowBlurExtent(0));
+    try std.testing.expectEqual(@as(u32, 2), shadowBlurExtent(1));
+    try std.testing.expectEqual(@as(u32, 3), shadowBlurExtent(2));
+    try std.testing.expectEqual(@as(u32, 5), shadowBlurExtent(3));
+    try std.testing.expectEqual(@as(u32, 36), shadowBlurExtent(24));
+    try std.testing.expectEqual(std.math.maxInt(u32), shadowBlurExtent(std.math.maxInt(u32)));
 }
 
 test "rectangle clipping handles negative and overflowing coordinates" {

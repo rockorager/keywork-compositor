@@ -3150,11 +3150,11 @@ fn compileDrawRuns(
             const shape_height = @as(i64, shadow.rect.height) + 2 * spread;
             if (shape_width <= 0 or shape_height <= 0) continue;
 
-            const blur: i64 = shadow.blur_radius;
-            const left = @max(shape_x - blur, 0);
-            const top = @max(shape_y - blur, 0);
-            const right = @min(shape_x + shape_width + blur, frame.size.width);
-            const bottom = @min(shape_y + shape_height + blur, frame.size.height);
+            const blur_extent: i64 = render.shadowBlurExtent(shadow.blur_radius);
+            const left = @max(shape_x - blur_extent, 0);
+            const top = @max(shape_y - blur_extent, 0);
+            const right = @min(shape_x + shape_width + blur_extent, frame.size.width);
+            const bottom = @min(shape_y + shape_height + blur_extent, frame.size.height);
             if (left >= right or top >= bottom) continue;
             var clipped: render.Rect = .{
                 .x = @intCast(left),

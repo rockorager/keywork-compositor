@@ -129,11 +129,11 @@ fn drawShadow(
     const shape_height = @as(i64, shadow.rect.height) + 2 * spread;
     if (shape_width <= 0 or shape_height <= 0) return;
 
-    const blur: i64 = shadow.blur_radius;
-    const mask_x = shape_x - blur;
-    const mask_y = shape_y - blur;
-    const mask_width = shape_width + 2 * blur;
-    const mask_height = shape_height + 2 * blur;
+    const blur_extent: i64 = render_types.shadowBlurExtent(shadow.blur_radius);
+    const mask_x = shape_x - blur_extent;
+    const mask_y = shape_y - blur_extent;
+    const mask_width = shape_width + 2 * blur_extent;
+    const mask_height = shape_height + 2 * blur_extent;
     const mask_right = mask_x + mask_width;
     const mask_bottom = mask_y + mask_height;
     if (mask_right <= 0 or mask_bottom <= 0 or
@@ -1141,6 +1141,8 @@ test "CPU renderer draws blurred rounded shadows" {
 
     const center_alpha: u8 = @truncate(output.pixel(4, 4) >> 24);
     try std.testing.expect(center_alpha > 0);
+    const tail_alpha: u8 = @truncate(output.pixel(4, 0) >> 24);
+    try std.testing.expect(tail_alpha > 0);
     try std.testing.expectEqual(@as(u32, 0), output.pixel(3, 4));
     try std.testing.expectEqual(@as(u32, 0), output.pixel(5, 4));
     try std.testing.expectEqual(@as(u32, 0), output.pixel(8, 8));

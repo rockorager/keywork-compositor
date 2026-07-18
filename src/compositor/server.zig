@@ -5352,13 +5352,14 @@ fn shadowDamageRect(rectangle: render.Rect, shadow: Scene.Shadow) render.Rect {
         @intCast(-@as(i64, shadow.offset.y))
     else
         @intCast(shadow.offset.y);
-    const amount = shadow.blur_radius +| spread +| @max(offset_x, offset_y);
+    const amount = render.shadowBlurExtent(shadow.blur_radius) +|
+        spread +| @max(offset_x, offset_y);
     return expandDamageRect(rectangle, amount);
 }
 
 test "shadow damage includes blur spread and offset" {
     try std.testing.expectEqual(
-        render.Rect{ .x = -8, .y = 2, .width = 66, .height = 76 },
+        render.Rect{ .x = -14, .y = -4, .width = 78, .height = 88 },
         shadowDamageRect(
             .{ .x = 10, .y = 20, .width = 30, .height = 40 },
             .{
