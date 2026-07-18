@@ -84,8 +84,8 @@ pub const default_effects: Effects = .{
     .blur = .{ .radius = 16 },
     .shadow = .{
         .offset = .{},
-        .blur_radius = 24,
-        .spread = 3,
+        .blur_radius = 20,
+        .spread = 0,
         .color = render.Color.rgba(0x11, 0x11, 0x13, 0x80),
     },
 };

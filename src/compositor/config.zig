@@ -185,7 +185,7 @@ pub const GeneralSettings = struct {
     outer_gap: u32 = 16,
     blur_radius: u32 = 16,
     shadow_enabled: bool = true,
-    shadow_blur_radius: u32 = 24,
+    shadow_blur_radius: u32 = 20,
     shadow_color: Color = .{ .red = 0x11, .green = 0x11, .blue = 0x13, .alpha = 0x80 },
     focused_shadow_color: Color = .{ .red = 0x11, .green = 0x11, .blue = 0x13, .alpha = 0x80 },
     focused_border_width: u32 = 2,
