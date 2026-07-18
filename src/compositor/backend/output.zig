@@ -184,12 +184,11 @@ pub fn powered(self: *const Self) bool {
     };
 }
 
-pub fn repaintDelayMilliseconds(self: *const Self) i32 {
+pub fn repaintDelayMilliseconds(self: *const Self) ?i32 {
     return switch (self.backend) {
-        .drm => 1,
+        // Presentation-backed outputs only defer until the current event batch is complete.
+        .drm, .nested => null,
         .headless => 16,
-        // A zero-delay libwayland timer is disarmed rather than immediate.
-        .nested => 1,
     };
 }
 

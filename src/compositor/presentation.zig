@@ -17,6 +17,10 @@ pub const Timestamp = struct {
         };
     }
 
+    pub fn toNanoseconds(self: Timestamp) i96 {
+        return @as(i96, self.seconds) * std.time.ns_per_s + self.nanoseconds;
+    }
+
     pub fn highSeconds(self: Timestamp) u32 {
         return @truncate(self.seconds >> 32);
     }
@@ -81,10 +85,10 @@ test "presentation timestamps split protocol fields and wrap frame time" {
 }
 
 test "presentation timestamp converts monotonic nanoseconds" {
-    try std.testing.expectEqual(
-        Timestamp{ .seconds = 12, .nanoseconds = 345_678_901 },
-        Timestamp.fromNanoseconds(12_345_678_901),
-    );
+    const nanoseconds = 12_345_678_901;
+    const timestamp = Timestamp.fromNanoseconds(nanoseconds);
+    try std.testing.expectEqual(Timestamp{ .seconds = 12, .nanoseconds = 345_678_901 }, timestamp);
+    try std.testing.expectEqual(@as(i96, nanoseconds), timestamp.toNanoseconds());
 }
 
 test "presentation refresh converts to output millihertz" {

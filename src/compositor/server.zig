@@ -176,6 +176,7 @@ const RenderOutput = struct {
     backend: OutputBackend,
     protocol_id: OutputLayout.Id,
     timer: ?*wl.EventSource,
+    repaint_idle: ?*wl.EventSource,
     damage: Region,
     damage_rectangles: std.ArrayList(render.Rect),
     repaint_needed: bool,
@@ -218,9 +219,15 @@ const RenderOutput = struct {
     fn presentFrame(self: *RenderOutput, info: presentation.Info) void {
         const pending = self.pending_frame orelse return;
         self.pending_frame = null;
+        const dispatched_nanoseconds = nowNanoseconds(self.server.io);
+        const presented_nanoseconds = if (self.backend.presentationClockId() ==
+            presentation.monotonic_clock_id)
+            info.timestamp.toNanoseconds()
+        else
+            dispatched_nanoseconds;
         self.frame_statistics.recordPresentation(
             pending,
-            nowNanoseconds(self.server.io),
+            presented_nanoseconds,
             presentationRefreshNanoseconds(info, self.backend.refreshMillihertz()),
         );
     }
@@ -1299,6 +1306,7 @@ fn addRenderOutput(
         .backend = undefined,
         .protocol_id = undefined,
         .timer = null,
+        .repaint_idle = null,
         .damage = Region.init(),
         .damage_rectangles = .empty,
         .repaint_needed = false,
@@ -1338,11 +1346,13 @@ fn addRenderOutput(
         .model = render_output.backend.model(config.model),
     });
     errdefer std.debug.assert(self.outputs.remove(render_output.protocol_id));
-    render_output.timer = try self.display.getEventLoop().addTimer(
-        *RenderOutput,
-        handleRenderTimer,
-        render_output,
-    );
+    if (render_output.backend.repaintDelayMilliseconds() != null) {
+        render_output.timer = try self.display.getEventLoop().addTimer(
+            *RenderOutput,
+            handleRenderTimer,
+            render_output,
+        );
+    }
     errdefer stopRenderOutput(render_output);
     const id = try self.render_outputs.insert(self.allocator, render_output);
     errdefer std.debug.assert(self.render_outputs.remove(id) != null);
@@ -1979,8 +1989,12 @@ fn stopRenderOutput(render_output: *RenderOutput) void {
     if (render_output.timer) |timer| {
         timer.remove();
         render_output.timer = null;
-        render_output.render_scheduled = false;
     }
+    if (render_output.repaint_idle) |idle| {
+        idle.remove();
+        render_output.repaint_idle = null;
+    }
+    render_output.render_scheduled = false;
 }
 
 pub fn listen(self: *Self) ![:0]const u8 {
@@ -2637,12 +2651,25 @@ fn primaryRenderOutput(self: *Self) *RenderOutput {
 
 fn scheduleRepaint(self: *Self, output: *RenderOutput) void {
     if (!output.repaint_needed or output.render_scheduled or !output.backend.ready()) return;
-    const timer = output.timer orelse return;
-    timer.timerUpdate(output.backend.repaintDelayMilliseconds()) catch |err| {
-        log.err("failed to schedule repaint: {t}", .{err});
-        self.terminate();
-        return;
-    };
+    if (output.backend.repaintDelayMilliseconds()) |delay| {
+        const timer = output.timer orelse unreachable;
+        timer.timerUpdate(delay) catch |err| {
+            log.err("failed to schedule repaint: {t}", .{err});
+            self.terminate();
+            return;
+        };
+    } else {
+        std.debug.assert(output.timer == null and output.repaint_idle == null);
+        output.repaint_idle = self.display.getEventLoop().addIdle(
+            *RenderOutput,
+            handleRenderIdle,
+            output,
+        ) catch |err| {
+            log.err("failed to schedule repaint: {t}", .{err});
+            self.terminate();
+            return;
+        };
+    }
     output.render_scheduled = true;
 }
 
@@ -5157,9 +5184,20 @@ test "capture bounds include negative child offsets" {
 }
 
 fn handleRenderTimer(output_context: *RenderOutput) c_int {
+    handleScheduledRender(output_context);
+    return 0;
+}
+
+fn handleRenderIdle(output_context: *RenderOutput) void {
+    std.debug.assert(output_context.repaint_idle != null);
+    output_context.repaint_idle = null;
+    handleScheduledRender(output_context);
+}
+
+fn handleScheduledRender(output_context: *RenderOutput) void {
     const self = output_context.server;
     output_context.render_scheduled = false;
-    if (!output_context.repaint_needed or !output_context.backend.ready()) return 0;
+    if (!output_context.repaint_needed or !output_context.backend.ready()) return;
     std.debug.assert(!output_context.damage.isEmpty());
     output_context.repaint_needed = false;
     self.renderFrame(output_context) catch |err| {
@@ -5167,7 +5205,6 @@ fn handleRenderTimer(output_context: *RenderOutput) c_int {
         self.terminate();
     };
     self.scheduleRepaint(output_context);
-    return 0;
 }
 
 const BackdropBlurArea = struct {
