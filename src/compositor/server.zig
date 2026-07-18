@@ -49,6 +49,7 @@ const LinuxDmabuf = @import("wayland/linux_dmabuf.zig");
 const LinuxDrmSyncobj = @import("wayland/linux_drm_syncobj.zig");
 const TearingControl = @import("wayland/tearing_control.zig");
 const Fifo = @import("wayland/fifo.zig");
+const CommitTiming = @import("wayland/commit_timing.zig");
 const XdgActivation = @import("wayland/xdg_activation.zig");
 const Output = @import("wayland/output.zig");
 const OutputLayout = @import("wayland/output_layout.zig");
@@ -167,6 +168,7 @@ linux_dmabuf: LinuxDmabuf,
 linux_drm_syncobj: LinuxDrmSyncobj,
 tearing_control: TearingControl,
 fifo: Fifo,
+commit_timing: CommitTiming,
 xdg_activation: XdgActivation,
 viewporter: Viewporter,
 window_manager: WindowManager,
@@ -732,6 +734,7 @@ pub fn createWithVirtualOutput(
         .linux_drm_syncobj = undefined,
         .tearing_control = undefined,
         .fifo = undefined,
+        .commit_timing = undefined,
         .xdg_activation = undefined,
         .viewporter = undefined,
         .window_manager = undefined,
@@ -942,6 +945,14 @@ pub fn createWithVirtualOutput(
     errdefer self.tearing_control.deinit();
     try self.fifo.init(allocator, display);
     errdefer self.fifo.deinit();
+    try self.commit_timing.init(
+        allocator,
+        display,
+        self.compositor.surfaceStore(),
+        render_output.backend.presentationClockId(),
+        .{ .context = self, .failed = commitTimingFailed },
+    );
+    errdefer self.commit_timing.deinit();
     try self.subcompositor.init(allocator, display, self.compositor.surfaceStore());
     errdefer self.subcompositor.deinit();
     self.scene.init(allocator);
@@ -1333,6 +1344,7 @@ pub fn destroy(self: *Self) void {
     self.gtk_shell.deinit();
     self.scene.deinit();
     self.subcompositor.deinit();
+    self.commit_timing.deinit();
     self.fifo.deinit();
     self.tearing_control.deinit();
     self.linux_drm_syncobj.deinit();
@@ -2807,6 +2819,11 @@ fn outputDiscarded(context: *anyopaque) void {
         self.outputs.get(output.protocol_id).?,
     );
     requestRepaint(self);
+}
+
+fn commitTimingFailed(context: *anyopaque) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.terminate();
 }
 
 fn closeOutput(context: *anyopaque) void {

@@ -20,6 +20,7 @@ pub fn build(b: *std.Build) void {
     scanner.addSystemProtocol("staging/linux-drm-syncobj/linux-drm-syncobj-v1.xml");
     scanner.addSystemProtocol("staging/tearing-control/tearing-control-v1.xml");
     scanner.addSystemProtocol("staging/fifo/fifo-v1.xml");
+    scanner.addSystemProtocol("staging/commit-timing/commit-timing-v1.xml");
     scanner.addSystemProtocol("staging/xdg-activation/xdg-activation-v1.xml");
     scanner.addSystemProtocol("staging/single-pixel-buffer/single-pixel-buffer-v1.xml");
     scanner.addSystemProtocol("staging/cursor-shape/cursor-shape-v1.xml");
@@ -70,6 +71,7 @@ pub fn build(b: *std.Build) void {
     scanner.generate("wp_linux_drm_syncobj_manager_v1", 1);
     scanner.generate("wp_tearing_control_manager_v1", 1);
     scanner.generate("wp_fifo_manager_v1", 1);
+    scanner.generate("wp_commit_timing_manager_v1", 1);
     scanner.generate("xdg_activation_v1", 1);
     scanner.generate("wp_single_pixel_buffer_manager_v1", 1);
     scanner.generate("wp_cursor_shape_manager_v1", 2);

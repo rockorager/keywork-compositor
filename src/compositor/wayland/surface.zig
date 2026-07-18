@@ -28,6 +28,7 @@ viewport_handler: ?ViewportHandler,
 content_type_handler: ?ContentTypeHandler,
 tearing_control_handler: ?TearingControlHandler,
 fifo_handler: ?FifoHandler,
+commit_timer_handler: ?CommitTimerHandler,
 background_effect_handler: ?BackgroundEffectHandler,
 explicit_sync_handler: ?ExplicitSyncHandler,
 commit_listeners: std.ArrayList(*CommitListener),
@@ -55,6 +56,8 @@ pub const State = struct {
     pending_fifo_wait: bool,
     fifo_barrier: bool,
     fifo_barrier_output: ?*anyopaque,
+    pending_commit_timestamp: ?i96,
+    pending_timing_ready: bool,
     pending_blur_region: Region,
     pending_blur_region_changed: bool,
     current_blur_region: Region,
@@ -103,6 +106,8 @@ pub const State = struct {
             .pending_fifo_wait = false,
             .fifo_barrier = false,
             .fifo_barrier_output = null,
+            .pending_commit_timestamp = null,
+            .pending_timing_ready = true,
             .pending_blur_region = Region.init(),
             .pending_blur_region_changed = false,
             .current_blur_region = Region.init(),
@@ -189,6 +194,7 @@ pub fn create(
         .content_type_handler = null,
         .tearing_control_handler = null,
         .fifo_handler = null,
+        .commit_timer_handler = null,
         .background_effect_handler = null,
         .explicit_sync_handler = null,
         .commit_listeners = .empty,
@@ -356,6 +362,37 @@ pub fn setPendingFifoWait(self: *Self) void {
     self.state().pending_fifo_wait = true;
 }
 
+pub const CommitTimerHandler = struct {
+    context: *anyopaque,
+    surface_destroyed: *const fn (*anyopaque) void,
+};
+
+pub fn setCommitTimerHandler(
+    self: *Self,
+    handler: CommitTimerHandler,
+) error{AlreadyExists}!void {
+    if (self.commit_timer_handler != null) return error.AlreadyExists;
+    self.commit_timer_handler = handler;
+}
+
+pub fn clearCommitTimerHandler(self: *Self, context: *anyopaque) void {
+    const handler = self.commit_timer_handler orelse unreachable;
+    std.debug.assert(handler.context == context);
+    self.commit_timer_handler = null;
+}
+
+pub fn setPendingCommitTimestamp(
+    self: *Self,
+    target_nanoseconds: i96,
+    ready: bool,
+) error{AlreadyExists}!void {
+    std.debug.assert(self.commit_timer_handler != null);
+    const surface_state = self.state();
+    if (surface_state.pending_commit_timestamp != null) return error.AlreadyExists;
+    surface_state.pending_commit_timestamp = target_nanoseconds;
+    surface_state.pending_timing_ready = ready;
+}
+
 pub const BackgroundEffectHandler = struct {
     context: *anyopaque,
     surface_destroyed: *const fn (*anyopaque) void,
@@ -455,6 +492,8 @@ const CachedCommit = struct {
     fifo_set: bool,
     fifo_wait: bool,
     fifo_wait_ignored: bool,
+    target_timestamp: ?i96,
+    timing_ready: bool,
     buffer: ?BufferSnapshot,
     attachment_changed: bool,
     has_buffer: bool,
@@ -640,6 +679,7 @@ fn applyReadyCached(self: *Self) void {
     while (surface_state.cached_commits.items.len > 0) {
         const first = surface_state.cached_commits.items[0];
         if (!first.role_ready or !first.sync_ready or
+            !first.timing_ready or
             !fifoCommitReady(first.fifo_wait, first.fifo_wait_ignored, surface_state.fifo_barrier))
         {
             break;
@@ -813,6 +853,51 @@ pub fn clearFifoBarriersForOutput(store: *Store, output_context: *anyopaque) voi
     }
 }
 
+pub fn releaseTimedCommits(store: *Store, now_nanoseconds: i96) void {
+    var surfaces = store.iterator();
+    while (surfaces.next()) |entry| {
+        const surface_state = entry.value;
+        if (releaseTimedCommitState(surface_state, now_nanoseconds)) {
+            applyReadyCached(Self.fromResource(surface_state.resource));
+        }
+    }
+}
+
+fn releaseTimedCommitState(surface_state: *State, now_nanoseconds: i96) bool {
+    var cached_changed = false;
+    if (surface_state.pending_commit_timestamp) |target| {
+        if (!surface_state.pending_timing_ready and target <= now_nanoseconds) {
+            surface_state.pending_timing_ready = true;
+        }
+    }
+    for (surface_state.cached_commits.items) |*cached| {
+        const target = cached.target_timestamp orelse continue;
+        if (cached.timing_ready or target > now_nanoseconds) continue;
+        cached.timing_ready = true;
+        cached_changed = true;
+    }
+    return cached_changed;
+}
+
+pub fn earliestCommitTimestamp(store: *Store) ?i96 {
+    var earliest: ?i96 = null;
+    var surfaces = store.iterator();
+    while (surfaces.next()) |entry| {
+        const surface_state = entry.value;
+        if (!surface_state.pending_timing_ready) {
+            if (surface_state.pending_commit_timestamp) |target| {
+                earliest = if (earliest) |current| @min(current, target) else target;
+            }
+        }
+        for (surface_state.cached_commits.items) |cached| {
+            if (cached.timing_ready) continue;
+            const target = cached.target_timestamp orelse continue;
+            earliest = if (earliest) |current| @min(current, target) else target;
+        }
+    }
+    return earliest;
+}
+
 pub fn discardUnsubmittedFeedback(store: *Store) void {
     var surfaces = store.iterator();
     while (surfaces.next()) |entry| {
@@ -963,6 +1048,7 @@ fn commit(self: *Self) void {
         false,
         surface_state.fifo_barrier,
     );
+    const timing_ready = surface_state.pending_timing_ready;
 
     const commit_info = pendingCommitInfo(self);
     const action = if (self.role_handler) |handler|
@@ -972,7 +1058,7 @@ fn commit(self: *Self) void {
 
     switch (action) {
         .apply => {
-            if (!acquire_ready or !fifo_ready or self.hasCachedCommit()) {
+            if (!acquire_ready or !fifo_ready or !timing_ready or self.hasCachedCommit()) {
                 if (cachePending(self, true)) {
                     notifyCommitted(self);
                     applyReadyCached(self);
@@ -1094,6 +1180,8 @@ fn applyPending(self: *Self, commit_info: CommitInfo) void {
     applyFifoSet(surface_state, surface_state.pending_fifo_set);
     surface_state.pending_fifo_set = false;
     surface_state.pending_fifo_wait = false;
+    surface_state.pending_commit_timestamp = null;
+    surface_state.pending_timing_ready = true;
     surface_state.pending_blur_region_changed = false;
     surface_state.pending_surface_damage.clear();
     surface_state.pending_buffer_damage.clear();
@@ -1152,6 +1240,8 @@ fn cachePending(self: *Self, role_ready: bool) bool {
         .fifo_set = surface_state.pending_fifo_set,
         .fifo_wait = surface_state.pending_fifo_wait,
         .fifo_wait_ignored = false,
+        .target_timestamp = surface_state.pending_commit_timestamp,
+        .timing_ready = surface_state.pending_timing_ready,
         .buffer = snapshot,
         .attachment_changed = self.has_pending_attachment,
         .has_buffer = if (self.has_pending_attachment)
@@ -1219,6 +1309,8 @@ fn cachePending(self: *Self, role_ready: bool) bool {
     surface_state.pending_offset_y = 0;
     surface_state.pending_fifo_set = false;
     surface_state.pending_fifo_wait = false;
+    surface_state.pending_commit_timestamp = null;
+    surface_state.pending_timing_ready = true;
     surface_state.pending_blur_region_changed = false;
     surface_state.pending_surface_damage.clear();
     surface_state.pending_buffer_damage.clear();
@@ -1503,6 +1595,10 @@ fn handleDestroy(_: *wl.Surface, self: *Self) void {
     }
     if (self.fifo_handler) |handler| {
         self.fifo_handler = null;
+        handler.surface_destroyed(handler.context);
+    }
+    if (self.commit_timer_handler) |handler| {
+        self.commit_timer_handler = null;
         handler.surface_destroyed(handler.context);
     }
     if (self.background_effect_handler) |handler| {
@@ -2639,6 +2735,155 @@ test "FIFO barriers attach to one visible output until replaced" {
     try std.testing.expect(surface_state.fifo_barrier_output == null);
 }
 
+fn testCachedCommit(
+    sequence: u64,
+    role_ready: bool,
+    target_timestamp: ?i96,
+    timing_ready: bool,
+) CachedCommit {
+    return .{
+        .sequence = sequence,
+        .role_ready = role_ready,
+        .sync_ready = true,
+        .fifo_set = false,
+        .fifo_wait = false,
+        .fifo_wait_ignored = false,
+        .target_timestamp = target_timestamp,
+        .timing_ready = timing_ready,
+        .buffer = null,
+        .attachment_changed = false,
+        .has_buffer = false,
+        .offset_x = 0,
+        .offset_y = 0,
+        .scale = 1,
+        .transform = .normal,
+        .viewport = .{},
+        .content_type = .none,
+        .presentation_hint = .vsync,
+        .blur_region = Region.init(),
+        .blur_region_changed = false,
+        .surface_damage = Region.init(),
+        .buffer_damage = Region.init(),
+        .opaque_region = Region.init(),
+        .input = InputRegion.init(),
+    };
+}
+
+test "commit timing finds the earliest pending or cached target" {
+    var store: Store = .{};
+    defer store.deinit(std.testing.allocator);
+    const id = try store.insert(std.testing.allocator, State.init(undefined));
+    defer {
+        var removed = store.remove(id).?;
+        removed.deinit(std.testing.allocator);
+    }
+
+    const surface_state = store.get(id).?;
+    surface_state.pending_commit_timestamp = 50;
+    surface_state.pending_timing_ready = false;
+    try surface_state.cached_commits.append(
+        std.testing.allocator,
+        testCachedCommit(1, true, 20, true),
+    );
+    try surface_state.cached_commits.append(
+        std.testing.allocator,
+        testCachedCommit(2, true, 30, false),
+    );
+
+    try std.testing.expectEqual(@as(?i96, 30), earliestCommitTimestamp(&store));
+    surface_state.cached_commits.items[1].timing_ready = true;
+    try std.testing.expectEqual(@as(?i96, 50), earliestCommitTimestamp(&store));
+    surface_state.pending_timing_ready = true;
+    try std.testing.expectEqual(@as(?i96, null), earliestCommitTimestamp(&store));
+}
+
+test "commit timing preserves synchronized and ordered application" {
+    var store: Store = .{};
+    defer store.deinit(std.testing.allocator);
+    const id = try store.insert(std.testing.allocator, State.init(undefined));
+    var surface: Self = .{
+        .allocator = std.testing.allocator,
+        .store = &store,
+        .id = id,
+        .resource = undefined,
+        .pending_attachment = .{},
+        .has_pending_attachment = false,
+        .role_handler = null,
+        .viewport_handler = null,
+        .content_type_handler = null,
+        .tearing_control_handler = null,
+        .fifo_handler = null,
+        .commit_timer_handler = null,
+        .background_effect_handler = null,
+        .explicit_sync_handler = null,
+        .commit_listeners = .empty,
+    };
+    defer surface.commit_listeners.deinit(std.testing.allocator);
+    defer {
+        var removed = store.remove(id).?;
+        removed.deinit(std.testing.allocator);
+    }
+
+    const surface_state = store.get(id).?;
+    try surface_state.cached_commits.append(
+        std.testing.allocator,
+        testCachedCommit(1, false, 20, false),
+    );
+    try surface_state.cached_commits.append(
+        std.testing.allocator,
+        testCachedCommit(2, false, null, true),
+    );
+
+    surface.applyCachedUpTo(std.math.maxInt(u64));
+    try std.testing.expectEqual(@as(usize, 2), surface_state.cached_commits.items.len);
+    try std.testing.expect(!releaseTimedCommitState(surface_state, 19));
+    try std.testing.expectEqual(@as(usize, 2), surface_state.cached_commits.items.len);
+    try std.testing.expect(releaseTimedCommitState(surface_state, 20));
+    applyReadyCached(&surface);
+    try std.testing.expectEqual(@as(usize, 0), surface_state.cached_commits.items.len);
+}
+
+test "commit timing moves a pending target to exactly one cached commit" {
+    var store: Store = .{};
+    defer store.deinit(std.testing.allocator);
+    const id = try store.insert(std.testing.allocator, State.init(undefined));
+    var surface: Self = .{
+        .allocator = std.testing.allocator,
+        .store = &store,
+        .id = id,
+        .resource = undefined,
+        .pending_attachment = .{},
+        .has_pending_attachment = false,
+        .role_handler = null,
+        .viewport_handler = null,
+        .content_type_handler = null,
+        .tearing_control_handler = null,
+        .fifo_handler = null,
+        .commit_timer_handler = null,
+        .background_effect_handler = null,
+        .explicit_sync_handler = null,
+        .commit_listeners = .empty,
+    };
+    defer surface.commit_listeners.deinit(std.testing.allocator);
+    defer {
+        var removed = store.remove(id).?;
+        removed.deinit(std.testing.allocator);
+    }
+
+    const surface_state = store.get(id).?;
+    surface_state.pending_commit_timestamp = 42;
+    surface_state.pending_timing_ready = false;
+    try std.testing.expect(cachePending(&surface, false));
+    try std.testing.expectEqual(@as(?i96, null), surface_state.pending_commit_timestamp);
+    try std.testing.expect(surface_state.pending_timing_ready);
+    try std.testing.expectEqual(@as(usize, 1), surface_state.cached_commits.items.len);
+    try std.testing.expectEqual(
+        @as(?i96, 42),
+        surface_state.cached_commits.items[0].target_timestamp,
+    );
+    try std.testing.expect(!surface_state.cached_commits.items[0].timing_ready);
+}
+
 test "synchronized application ignores FIFO waits while desynchronized application blocks" {
     var store: Store = .{};
     defer store.deinit(std.testing.allocator);
@@ -2655,6 +2900,7 @@ test "synchronized application ignores FIFO waits while desynchronized applicati
         .content_type_handler = null,
         .tearing_control_handler = null,
         .fifo_handler = null,
+        .commit_timer_handler = null,
         .background_effect_handler = null,
         .explicit_sync_handler = null,
         .commit_listeners = .empty,
@@ -2674,6 +2920,8 @@ test "synchronized application ignores FIFO waits while desynchronized applicati
         .fifo_set = false,
         .fifo_wait = true,
         .fifo_wait_ignored = false,
+        .target_timestamp = null,
+        .timing_ready = true,
         .buffer = null,
         .attachment_changed = false,
         .has_buffer = false,

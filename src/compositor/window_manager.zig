@@ -1399,7 +1399,9 @@ fn windowCommitted(context: *anyopaque, id: XdgShell.WindowId, serial: ?u32) boo
     if (self.isFloating(window)) self.relayout();
     if (serial != null and window.serial == serial) {
         window.serial = null;
-        if (self.transaction.configured()) self.publish();
+        const complete = self.transaction.configured();
+        // A gated commit may arrive after the configure barrier timed out.
+        if (complete or self.transaction.state != .inflight) self.publish();
     }
     return true;
 }

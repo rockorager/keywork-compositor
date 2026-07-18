@@ -1030,15 +1030,16 @@
       "interfaces": [
         {
           "name": "wp_commit_timing_manager_v1",
-          "current_version": null,
+          "current_version": 1,
           "target_version": 1
         }
       ],
-      "status": "not_started",
+      "status": "done",
       "privileged": false,
       "blocked_by": [
         "presentation-time"
-      ]
+      ],
+      "status_detail": "Version 1 implements manager and per-surface timer lifecycles and errors plus one-shot presentation-clock timestamps integrated as a readiness gate in the ordered commit cache. Future targets use a shared event-loop timer with rounded-up scheduling, preserve role, explicit-sync, FIFO, and synchronized-subsurface ordering, and cannot be bypassed by later untimed commits. Protocol errors and delayed multi-commit presentation are exercised end to end with CPU and Vulkan renderers."
     },
     {
       "id": "xdg-toplevel-drag",
