@@ -141,8 +141,8 @@ pub const GeneralSettings = struct {
     blur_radius: u32 = 16,
     shadow_enabled: bool = true,
     shadow_blur_radius: u32 = 24,
-    shadow_color: Color = .{ .red = 0, .green = 0, .blue = 0, .alpha = 160 },
-    focused_shadow_color: Color = .{ .red = 0, .green = 0, .blue = 0, .alpha = 160 },
+    shadow_color: Color = .{ .red = 0x11, .green = 0x11, .blue = 0x13, .alpha = 0x80 },
+    focused_shadow_color: Color = .{ .red = 0x69, .green = 0x6e, .blue = 0x77, .alpha = 0x80 },
 };
 
 pub const Snapshot = struct {
@@ -988,7 +988,7 @@ test "valid empty configuration disables configured bindings" {
         .diagnostic => return error.UnexpectedDiagnostic,
     };
     defer snapshot.deinit();
-    try std.testing.expect(snapshot.general.focus_follows_mouse);
+    try std.testing.expectEqual(GeneralSettings{}, snapshot.general);
     try std.testing.expectEqual(@as(usize, 0), snapshot.bindings.len);
     try std.testing.expectEqual(@as(usize, 0), snapshot.input_rules.len);
 }
@@ -996,7 +996,7 @@ test "valid empty configuration disables configured bindings" {
 test "embedded default configuration is valid and complete" {
     var snapshot = try defaultSnapshot(std.testing.allocator);
     defer snapshot.deinit();
-    try std.testing.expect(snapshot.general.focus_follows_mouse);
+    try std.testing.expectEqual(GeneralSettings{}, snapshot.general);
     try std.testing.expectEqual(@as(usize, 33), snapshot.bindings.len);
     try std.testing.expectEqual(@as(usize, 0), snapshot.input_rules.len);
     try std.testing.expectEqual(Direction.left, snapshot.bindings[0].action.command.focus_direction);

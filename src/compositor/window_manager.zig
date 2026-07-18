@@ -57,6 +57,7 @@ const Window = struct {
     scene_id: Scene.Id,
     surface_id: Surface.Id,
     workspace: usize,
+    fixed_size_floating: bool = false,
     tags: workspace_mod.TagSet = .{},
     serial: ?u32 = null,
     placement: ?types.LayoutPlan = null,
@@ -231,6 +232,15 @@ fn transientParent(self: *Self, window: *const Window) ?WindowId {
     return self.findXdg(parent);
 }
 
+fn fixedSizeWantsFloating(minimum: XdgShell.SizeHint, maximum: XdgShell.SizeHint) bool {
+    return minimum.width != 0 and minimum.height != 0 and
+        (minimum.width == maximum.width or minimum.height == maximum.height);
+}
+
+fn automaticallyFloating(self: *Self, window: *const Window) bool {
+    return window.fixed_size_floating or self.transientParent(window) != null;
+}
+
 fn transientDepth(self: *Self, window: *const Window) usize {
     var depth: usize = 0;
     var candidate = window;
@@ -283,7 +293,13 @@ fn addXdg(self: *Self, xdg_id: XdgShell.WindowId) !WindowId {
             self.workspaceFor(self.default_output) orelse 0
     else
         self.workspaceFor(self.default_output) orelse 0;
-    const id = try self.windows.insert(self.allocator, .{ .backend = .{ .xdg = xdg_id }, .scene_id = info.scene_id, .surface_id = surface_id, .workspace = workspace });
+    const id = try self.windows.insert(self.allocator, .{
+        .backend = .{ .xdg = xdg_id },
+        .scene_id = info.scene_id,
+        .surface_id = surface_id,
+        .workspace = workspace,
+        .fixed_size_floating = fixedSizeWantsFloating(info.min_size, info.max_size),
+    });
     errdefer _ = self.windows.remove(id);
     _ = try self.workspaces.items[workspace].workspace.insert(self.allocator, neutral(id));
     _ = self.workspaces.items[workspace].workspace.focus(neutral(id));
@@ -551,10 +567,10 @@ fn needsXdgConfigure(
 fn requestedXdgDimensions(
     current: ?XdgShell.Dimensions,
     placement: XdgShell.Dimensions,
-    transient: bool,
+    floating: bool,
     fullscreen: bool,
 ) XdgShell.Dimensions {
-    if (transient and !fullscreen and current == null) return .{ .width = 0, .height = 0 };
+    if (floating and !fullscreen and current == null) return .{ .width = 0, .height = 0 };
     return placement;
 }
 
@@ -743,7 +759,7 @@ fn relayout(self: *Self) void {
         for (entry.workspace.members.items) |member| {
             const window = self.windows.get(internal(member)) orelse continue;
             if (window.minimized or window.fullscreen_output != null or
-                self.transientParent(window) != null) continue;
+                self.automaticallyFloating(window)) continue;
             const current = self.currentDimensions(window);
             inputs.append(self.allocator, .{ .id = member, .current = types.Size.init(@intCast(@max(1, current.width)), @intCast(@max(1, current.height))) }) catch return;
         }
@@ -782,6 +798,33 @@ fn relayout(self: *Self) void {
             };
         }
     }
+    for (self.workspaces.items) |*entry| {
+        if (!entry.active) continue;
+        const area = self.layer_shell.usableAreaFor(entry.output) orelse continue;
+        if (area.width <= 0 or area.height <= 0) continue;
+        const bounds: types.Rect = .{
+            .x = area.x,
+            .y = area.y,
+            .size = types.Size.init(@intCast(area.width), @intCast(area.height)),
+        };
+        for (entry.workspace.members.items) |member| {
+            const window = self.windows.get(internal(member)) orelse continue;
+            if (window.placement != null or window.fullscreen_output != null or
+                !window.fixed_size_floating or self.transientParent(window) != null) continue;
+            const current = self.currentDimensions(window);
+            window.placement = .{
+                .id = member,
+                .rect = centeredRect(
+                    bounds,
+                    types.Size.init(
+                        @intCast(@max(1, current.width)),
+                        @intCast(@max(1, current.height)),
+                    ),
+                ),
+                .visible = true,
+            };
+        }
+    }
     var remaining = self.windows.len();
     while (remaining > 0) : (remaining -= 1) {
         var changed = false;
@@ -815,7 +858,7 @@ fn relayout(self: *Self) void {
         for (entry.workspace.members.items) |member| {
             const window = self.windows.get(internal(member)) orelse continue;
             const output = self.outputs.get(entry.output) orelse continue;
-            const transient_parent = self.transientParent(window);
+            const floating = self.automaticallyFloating(window);
             const plan = window.placement;
             const current_dimensions = self.currentDimensions(window);
             const dimensions: XdgShell.Dimensions = if (plan) |placement| .{
@@ -853,7 +896,7 @@ fn relayout(self: *Self) void {
                     const configure_dimensions = requestedXdgDimensions(
                         info.dimensions,
                         dimensions,
-                        transient_parent != null,
+                        floating,
                         window.fullscreen_output != null,
                     );
                     const configuration: XdgShell.ToplevelConfigure = .{
@@ -1039,11 +1082,13 @@ const DirectionalScore = struct {
     off_axis: bool,
     primary: u64,
     secondary: u64,
+    secondary_start: i64,
 
     fn lessThan(self: DirectionalScore, other: DirectionalScore) bool {
         if (self.off_axis != other.off_axis) return !self.off_axis;
         if (self.primary != other.primary) return self.primary < other.primary;
-        return self.secondary < other.secondary;
+        if (self.secondary != other.secondary) return self.secondary < other.secondary;
+        return self.secondary_start < other.secondary_start;
     }
 };
 
@@ -1060,6 +1105,12 @@ fn directionalScore(origin: types.Rect, candidate: types.Rect, direction: Direct
     };
     if (primary_delta <= 0) return null;
     const horizontal = direction == .left or direction == .right;
+    const primary_gap: i64 = switch (direction) {
+        .left => @as(i64, origin.x) - (@as(i64, candidate.x) + candidate.size.width),
+        .right => @as(i64, candidate.x) - (@as(i64, origin.x) + origin.size.width),
+        .up => @as(i64, origin.y) - (@as(i64, candidate.y) + candidate.size.height),
+        .down => @as(i64, candidate.y) - (@as(i64, origin.y) + origin.size.height),
+    };
     const secondary_delta = if (horizontal)
         absoluteDifference(origin_y, candidate_y)
     else
@@ -1070,8 +1121,9 @@ fn directionalScore(origin: types.Rect, candidate: types.Rect, direction: Direct
         rangesOverlap(origin.x, origin.size.width, candidate.x, candidate.size.width);
     return .{
         .off_axis = !overlap,
-        .primary = @intCast(primary_delta),
+        .primary = @intCast(@max(0, primary_gap)),
         .secondary = secondary_delta,
+        .secondary_start = if (horizontal) candidate.y else candidate.x,
     };
 }
 
@@ -1116,7 +1168,7 @@ fn windowCommitted(context: *anyopaque, id: XdgShell.WindowId, serial: ?u32) boo
     const self: *Self = @ptrCast(@alignCast(context));
     const window = self.windows.get(self.findXdg(id) orelse return false) orelse return false;
     window.mapped = true;
-    if (self.transientParent(window) != null) self.relayout();
+    if (self.automaticallyFloating(window)) self.relayout();
     if (serial != null and window.serial == serial) {
         window.serial = null;
         if (self.transaction.configured()) self.publish();
@@ -1129,8 +1181,13 @@ fn windowUnmapped(context: *anyopaque, id: XdgShell.WindowId) void {
 fn windowDestroyed(context: *anyopaque, id: XdgShell.WindowId) void {
     removeXdg(@ptrCast(@alignCast(context)), id);
 }
-fn windowMetadataChanged(context: *anyopaque, _: XdgShell.WindowId) bool {
+fn windowMetadataChanged(context: *anyopaque, id: XdgShell.WindowId) bool {
     const self: *Self = @ptrCast(@alignCast(context));
+    const window = self.windows.get(self.findXdg(id) orelse return false) orelse return false;
+    if (!window.mapped) {
+        const info = self.xdg_shell.windowInfo(id) orelse return false;
+        window.fixed_size_floating = fixedSizeWantsFloating(info.min_size, info.max_size);
+    }
     self.relayout();
     return true;
 }
@@ -1319,7 +1376,7 @@ test "XDG configure is sent only for initial or changed state" {
     ));
 }
 
-test "unmapped transient XDG toplevel chooses its natural size" {
+test "unmapped floating XDG toplevel chooses its natural size" {
     const placement: XdgShell.Dimensions = .{ .width = 640, .height = 480 };
     try std.testing.expectEqual(
         XdgShell.Dimensions{ .width = 0, .height = 0 },
@@ -1331,6 +1388,25 @@ test "unmapped transient XDG toplevel chooses its natural size" {
     );
     try std.testing.expectEqual(placement, requestedXdgDimensions(null, placement, false, false));
     try std.testing.expectEqual(placement, requestedXdgDimensions(null, placement, true, true));
+}
+
+test "XDG toplevel with one fixed dimension wants floating" {
+    try std.testing.expect(fixedSizeWantsFloating(
+        .{ .width = 784, .height = 400 },
+        .{ .width = 784, .height = std.math.maxInt(i32) },
+    ));
+    try std.testing.expect(fixedSizeWantsFloating(
+        .{ .width = 784, .height = 400 },
+        .{ .width = std.math.maxInt(i32), .height = 400 },
+    ));
+    try std.testing.expect(!fixedSizeWantsFloating(
+        .{ .width = 784, .height = 400 },
+        .{ .width = std.math.maxInt(i32), .height = std.math.maxInt(i32) },
+    ));
+    try std.testing.expect(!fixedSizeWantsFloating(
+        .{ .width = 784, .height = 0 },
+        .{ .width = 784, .height = 0 },
+    ));
 }
 
 test "transient toplevel is centered over its parent" {
@@ -1363,4 +1439,17 @@ test "directional navigation prefers aligned neighbors then distance" {
     try std.testing.expect(closer_aligned_score.lessThan(aligned_score));
     try std.testing.expect(directionalScore(origin, right, .left) == null);
     try std.testing.expect(directionalScore(origin, right, .right) != null);
+}
+
+test "directional navigation uses facing edges for split neighbors" {
+    const origin: types.Rect = .{ .x = 0, .y = 0, .size = types.Size.init(40, 100) };
+    const upper_right: types.Rect = .{ .x = 40, .y = 0, .size = types.Size.init(60, 50) };
+    const lower_right: types.Rect = .{ .x = 40, .y = 50, .size = types.Size.init(30, 50) };
+    const far_lower_right: types.Rect = .{ .x = 70, .y = 50, .size = types.Size.init(30, 50) };
+
+    const upper_score = directionalScore(origin, upper_right, .right).?;
+    const lower_score = directionalScore(origin, lower_right, .right).?;
+    const far_lower_score = directionalScore(origin, far_lower_right, .right).?;
+    try std.testing.expect(upper_score.lessThan(lower_score));
+    try std.testing.expect(upper_score.lessThan(far_lower_score));
 }

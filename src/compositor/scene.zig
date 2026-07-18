@@ -86,7 +86,7 @@ pub const default_effects: Effects = .{
         .offset = .{},
         .blur_radius = 24,
         .spread = 3,
-        .color = render.Color.rgba(0, 0, 0, 160),
+        .color = render.Color.rgba(0x11, 0x11, 0x13, 0x80),
     },
 };
 

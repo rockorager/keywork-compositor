@@ -795,6 +795,7 @@ fn handlePageFlip(
         self.device_access.fail(self.device_access.context, error.UnexpectedPageFlip);
         return;
     }
+    const zero_copy = self.direct_pending != null;
     if (self.direct_pending) |direct| {
         if (self.direct_displayed) |displayed| displayed.release();
         self.direct_displayed = direct;
@@ -820,6 +821,7 @@ fn handlePageFlip(
             .vsync = true,
             .hardware_clock = true,
             .hardware_completion = true,
+            .zero_copy = zero_copy,
         },
     });
     listener.ready(listener.context);

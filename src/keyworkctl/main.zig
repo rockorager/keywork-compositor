@@ -11,7 +11,7 @@ const usage =
     \\commands: focus DIRECTION | move-focused DIRECTION | set-layout LAYOUT
     \\          close TARGET
     \\          switch-workspace WORKSPACE | move-focused-to-workspace WORKSPACE
-    \\          reload | quit
+    \\          stats [--reset] | reload | quit
     \\directions: next, previous, left, down, up, right
     \\targets: focused
     \\layouts: master-stack, dwindle, scrolling
@@ -25,8 +25,13 @@ const Command = union(enum) {
     set_layout: control.Layout,
     switch_workspace: i64,
     move_to_workspace: i64,
+    stats: bool,
     reload,
     quit,
+};
+
+const StatisticsParameters = struct {
+    outputs: []control.OutputStatistics,
 };
 
 pub fn main(init: std.process.Init) void {
@@ -81,6 +86,7 @@ fn run(init: std.process.Init) !void {
         .set_layout => |layout| try client.call(control.set_layout_method, .{ .layout = layout }),
         .switch_workspace => |workspace| try client.call(control.switch_workspace_method, .{ .workspace = workspace }),
         .move_to_workspace => |workspace| try client.call(control.move_focused_to_workspace_method, .{ .workspace = workspace }),
+        .stats => |reset| try client.call(control.get_performance_statistics_method, .{ .reset = reset }),
         .reload => try client.call(control.reload_configuration_method, Empty{}),
         .quit => unreachable,
     };
@@ -97,6 +103,100 @@ fn run(init: std.process.Init) !void {
         return error.RemoteError;
     }
     if (reply.value.continues) return error.UnexpectedContinuation;
+    switch (command) {
+        .stats => try printStatistics(init.io, init.gpa, reply.value.parameters),
+        else => {},
+    }
+}
+
+fn printStatistics(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    parameters: ?std.json.Value,
+) !void {
+    const parsed = try parseStatisticsParameters(allocator, parameters);
+    defer parsed.deinit();
+    var buffer: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(io, &buffer);
+    defer stdout.interface.flush() catch {};
+    try writeStatistics(&stdout.interface, parsed.value.outputs);
+}
+
+fn parseStatisticsParameters(
+    allocator: std.mem.Allocator,
+    parameters: ?std.json.Value,
+) !std.json.Parsed(StatisticsParameters) {
+    return std.json.parseFromValue(
+        StatisticsParameters,
+        allocator,
+        parameters orelse return error.MissingStatistics,
+        .{},
+    );
+}
+
+fn writeStatistics(writer: *std.Io.Writer, outputs: []const control.OutputStatistics) !void {
+    if (outputs.len == 0) return writer.writeAll("No active outputs.\n");
+    for (outputs, 0..) |output, index| {
+        if (index != 0) try writer.writeByte('\n');
+        try writer.print("{s} {d}x{d} ({d}.", .{
+            output.name,
+            output.width,
+            output.height,
+            @divTrunc(output.refresh_millihertz, 1000),
+        });
+        const fractional_refresh = @mod(output.refresh_millihertz, 1000);
+        if (fractional_refresh < 10) {
+            try writer.print("00{d}", .{fractional_refresh});
+        } else if (fractional_refresh < 100) {
+            try writer.print("0{d}", .{fractional_refresh});
+        } else {
+            try writer.print("{d}", .{fractional_refresh});
+        }
+        try writer.writeAll(" Hz)\n");
+        try writer.print(
+            "  frames: requested {d}, started {d}, presented {d}, discarded {d}\n",
+            .{
+                output.frames_requested,
+                output.frames_started,
+                output.frames_presented,
+                output.frames_discarded,
+            },
+        );
+        try writer.print(
+            "  paths: composited {d}, direct scanout {d}/{d} candidates\n",
+            .{
+                output.composited_frames,
+                output.direct_scanout_frames,
+                output.direct_scanout_candidates,
+            },
+        );
+        try writer.print("  acquire retries: {d}, frames over budget: {d}\n", .{
+            output.acquire_retries,
+            output.frames_over_budget,
+        });
+        try writeLatency(writer, "request -> presentation", output.request_to_presentation);
+        try writeLatency(writer, "request -> render", output.request_to_render);
+        try writeLatency(writer, "render -> commit", output.render_to_commit);
+        try writeLatency(writer, "commit -> presentation", output.commit_to_presentation);
+    }
+}
+
+fn writeLatency(
+    writer: *std.Io.Writer,
+    label: []const u8,
+    latency: control.LatencyStatistics,
+) !void {
+    try writer.print(
+        "  {s}: p50 {d}us, p95 {d}us, p99 {d}us, max {d}us ({d} samples)\n",
+        .{
+            label,
+            latency.p50_microseconds,
+            latency.p95_microseconds,
+            latency.p99_microseconds,
+            latency.maximum_microseconds,
+            latency.samples,
+        },
+    );
 }
 
 fn controlAddress(allocator: std.mem.Allocator, runtime_directory: []const u8) ![]u8 {
@@ -131,6 +231,9 @@ fn printUsage(io: std.Io, err: anyerror) anyerror {
 }
 
 fn parse(arguments: []const []const u8) !Command {
+    if (arguments.len == 1 and std.mem.eql(u8, arguments[0], "stats")) return .{ .stats = false };
+    if (arguments.len == 2 and std.mem.eql(u8, arguments[0], "stats") and
+        std.mem.eql(u8, arguments[1], "--reset")) return .{ .stats = true };
     if (arguments.len == 1 and std.mem.eql(u8, arguments[0], "reload")) return .reload;
     if (arguments.len == 1 and std.mem.eql(u8, arguments[0], "quit")) return .quit;
     if (arguments.len != 2) return error.InvalidArguments;
@@ -173,6 +276,8 @@ test "CLI parsing maps wire values and validates workspaces" {
     try std.testing.expectEqual(control.WindowTarget.focused, (try parse(&.{ "close", "focused" })).close);
     try std.testing.expectEqual(control.Layout.master_stack, (try parse(&.{ "set-layout", "master-stack" })).set_layout);
     try std.testing.expectEqual(@as(i64, 10), (try parse(&.{ "switch-workspace", "10" })).switch_workspace);
+    try std.testing.expect(!(try parse(&.{"stats"})).stats);
+    try std.testing.expect((try parse(&.{ "stats", "--reset" })).stats);
     try std.testing.expectEqual(Command.reload, try parse(&.{"reload"}));
     try std.testing.expectEqual(Command.quit, try parse(&.{"quit"}));
     try std.testing.expectError(error.InvalidWorkspace, parse(&.{ "switch-workspace", "11" }));
@@ -219,4 +324,27 @@ test "configuration reload errors expose their message" {
         remoteErrorMessage(parsed.value.@"error".?, parsed.value.parameters).?,
     );
     try std.testing.expect(remoteErrorMessage("org.varlink.service.MethodNotFound", parsed.value.parameters) == null);
+}
+
+test "performance statistics decode and render human-readable output" {
+    var reply = try std.json.parseFromSlice(varlink.Reply, std.testing.allocator,
+        \\{"parameters":{"outputs":[{"name":"eDP-1","width":2880,"height":1800,"refresh_millihertz":120000,"frames_requested":10,"frames_started":9,"frames_presented":8,"frames_discarded":1,"acquire_retries":2,"composited_frames":7,"direct_scanout_candidates":3,"direct_scanout_frames":1,"frames_over_budget":2,"request_to_presentation":{"samples":8,"p50_microseconds":8200,"p95_microseconds":9100,"p99_microseconds":16700,"maximum_microseconds":25000},"request_to_render":{"samples":8,"p50_microseconds":1000,"p95_microseconds":1200,"p99_microseconds":1400,"maximum_microseconds":1600},"render_to_commit":{"samples":8,"p50_microseconds":1100,"p95_microseconds":2800,"p99_microseconds":5600,"maximum_microseconds":7000},"commit_to_presentation":{"samples":8,"p50_microseconds":6800,"p95_microseconds":8000,"p99_microseconds":14900,"maximum_microseconds":18000}}]}}
+    , .{});
+    defer reply.deinit();
+    const parsed = try parseStatisticsParameters(std.testing.allocator, reply.value.parameters);
+    defer parsed.deinit();
+    var writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer writer.deinit();
+    try writeStatistics(&writer.writer, parsed.value.outputs);
+    try std.testing.expectEqualStrings(
+        \\eDP-1 2880x1800 (120.000 Hz)
+        \\  frames: requested 10, started 9, presented 8, discarded 1
+        \\  paths: composited 7, direct scanout 1/3 candidates
+        \\  acquire retries: 2, frames over budget: 2
+        \\  request -> presentation: p50 8200us, p95 9100us, p99 16700us, max 25000us (8 samples)
+        \\  request -> render: p50 1000us, p95 1200us, p99 1400us, max 1600us (8 samples)
+        \\  render -> commit: p50 1100us, p95 2800us, p99 5600us, max 7000us (8 samples)
+        \\  commit -> presentation: p50 6800us, p95 8000us, p99 14900us, max 18000us (8 samples)
+        \\
+    , writer.written());
 }

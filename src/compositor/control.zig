@@ -39,6 +39,11 @@ clients: std.ArrayList(*Client),
 pub const Executor = struct {
     context: *anyopaque,
     execute: *const fn (*anyopaque, command.Command) void,
+    statistics: *const fn (
+        *anyopaque,
+        std.mem.Allocator,
+        bool,
+    ) anyerror![]control.OutputStatistics,
     reload: *const fn (*anyopaque) ?[]const u8,
     quit: *const fn (*anyopaque) void,
 };
@@ -457,6 +462,23 @@ fn handleMessage(
         if (!call.oneway) try writeSuccess(allocator, output);
         return;
     }
+    if (std.mem.eql(u8, call.method, control.get_performance_statistics_method)) {
+        const parameters = parseParameters(struct { reset: bool }, allocator, call.parameters) catch {
+            if (!call.oneway) try writeInvalidParameter(allocator, output, "reset");
+            return;
+        };
+        defer parameters.deinit();
+        const statistics = try executor.statistics(
+            executor.context,
+            allocator,
+            parameters.value.reset,
+        );
+        defer allocator.free(statistics);
+        if (!call.oneway) try writeMessage(allocator, output, .{
+            .parameters = .{ .outputs = statistics },
+        });
+        return;
+    }
     if (std.mem.eql(u8, call.method, control.reload_configuration_method)) {
         if (!emptyParameters(call.parameters)) {
             if (!call.oneway) try writeInvalidParameter(allocator, output, "parameters");
@@ -570,6 +592,8 @@ fn writeMessage(
 
 const Recorder = struct {
     commands: std.ArrayList(command.Command) = .empty,
+    statistics_count: usize = 0,
+    statistics_reset: bool = false,
     reload_count: usize = 0,
     reload_failure: ?[]const u8 = null,
     quit_count: usize = 0,
@@ -579,12 +603,56 @@ const Recorder = struct {
     }
 
     fn executor(self: *Recorder) Executor {
-        return .{ .context = self, .execute = execute, .reload = reload, .quit = quit };
+        return .{
+            .context = self,
+            .execute = execute,
+            .statistics = statistics,
+            .reload = reload,
+            .quit = quit,
+        };
     }
 
     fn execute(context: *anyopaque, value: command.Command) void {
         const self: *Recorder = @ptrCast(@alignCast(context));
         self.commands.append(std.testing.allocator, value) catch unreachable;
+    }
+
+    fn statistics(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        reset: bool,
+    ) ![]control.OutputStatistics {
+        const self: *Recorder = @ptrCast(@alignCast(context));
+        self.statistics_count += 1;
+        self.statistics_reset = reset;
+        const result = try allocator.alloc(control.OutputStatistics, 1);
+        const latency: control.LatencyStatistics = .{
+            .samples = 4,
+            .p50_microseconds = 100,
+            .p95_microseconds = 200,
+            .p99_microseconds = 300,
+            .maximum_microseconds = 400,
+        };
+        result[0] = .{
+            .name = "HEADLESS-1",
+            .width = 1280,
+            .height = 720,
+            .refresh_millihertz = 60_000,
+            .frames_requested = 5,
+            .frames_started = 5,
+            .frames_presented = 4,
+            .frames_discarded = 1,
+            .acquire_retries = 0,
+            .composited_frames = 3,
+            .direct_scanout_candidates = 2,
+            .direct_scanout_frames = 1,
+            .frames_over_budget = 1,
+            .request_to_presentation = latency,
+            .request_to_render = latency,
+            .render_to_commit = latency,
+            .commit_to_presentation = latency,
+        };
+        return result;
     }
 
     fn reload(context: *anyopaque) ?[]const u8 {
@@ -700,6 +768,36 @@ test "configuration reload returns success or a typed failure" {
         "{\"error\":\"dev.rockorager.keywork.compositor.ConfigurationReloadFailed\",\"parameters\":{\"message\":\"/home/test/.config/keywork/config:3: unknown general setting\"}}\x00",
         output.items,
     );
+}
+
+test "performance statistics return typed output snapshots and forward reset" {
+    var recorder: Recorder = .{};
+    defer recorder.deinit();
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(std.testing.allocator);
+    var quit_requested = false;
+
+    try handleMessage(
+        std.testing.allocator,
+        recorder.executor(),
+        "{\"method\":\"dev.rockorager.keywork.compositor.GetPerformanceStatistics\",\"parameters\":{\"reset\":true}}",
+        &output,
+        &quit_requested,
+    );
+    try std.testing.expectEqual(@as(usize, 1), recorder.statistics_count);
+    try std.testing.expect(recorder.statistics_reset);
+    const parsed = try std.json.parseFromSlice(
+        struct { parameters: struct { outputs: []control.OutputStatistics } },
+        std.testing.allocator,
+        output.items[0 .. output.items.len - 1],
+        .{},
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.parameters.outputs.len);
+    const statistics = parsed.value.parameters.outputs[0];
+    try std.testing.expectEqualStrings("HEADLESS-1", statistics.name);
+    try std.testing.expectEqual(@as(i64, 4), statistics.frames_presented);
+    try std.testing.expectEqual(@as(i64, 300), statistics.request_to_presentation.p99_microseconds);
 }
 
 test "standard service introspection returns the control interface" {

@@ -10,6 +10,36 @@ type WindowTarget (focused)
 # A built-in tiling layout.
 type Layout (master_stack, dwindle, scrolling)
 
+# Rolling latency distribution in microseconds.
+type LatencyStatistics (
+    samples: int,
+    p50_microseconds: int,
+    p95_microseconds: int,
+    p99_microseconds: int,
+    maximum_microseconds: int
+)
+
+# Per-output frame processing and presentation statistics.
+type OutputStatistics (
+    name: string,
+    width: int,
+    height: int,
+    refresh_millihertz: int,
+    frames_requested: int,
+    frames_started: int,
+    frames_presented: int,
+    frames_discarded: int,
+    acquire_retries: int,
+    composited_frames: int,
+    direct_scanout_candidates: int,
+    direct_scanout_frames: int,
+    frames_over_budget: int,
+    request_to_presentation: LatencyStatistics,
+    request_to_render: LatencyStatistics,
+    render_to_commit: LatencyStatistics,
+    commit_to_presentation: LatencyStatistics
+)
+
 # Change focus within the active workspace.
 method Focus (direction: Direction) -> ()
 
@@ -27,6 +57,9 @@ method SwitchWorkspace (workspace: int) -> ()
 
 # Move the focused window to a numbered workspace on the focused output.
 method MoveFocusedToWorkspace (workspace: int) -> ()
+
+# Return a snapshot of per-output frame statistics, then optionally reset them.
+method GetPerformanceStatistics (reset: bool) -> (outputs: []OutputStatistics)
 
 # Parse and atomically apply the selected configuration.
 method ReloadConfiguration () -> ()

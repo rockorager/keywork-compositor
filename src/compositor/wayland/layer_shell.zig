@@ -216,6 +216,11 @@ pub fn pointerPressed(self: *Self, id: ?Surface.Id) void {
         ((state.current.layer == .background or state.current.layer == .bottom) and state.current.keyboard == .exclusive))) self.regular_focus = state.surface_id;
 }
 
+pub fn castsShadow(self: *Self, surface_id: Surface.Id) bool {
+    const state = self.findSurface(surface_id) orelse return false;
+    return stateCastsShadow(state.current);
+}
+
 fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
     const resource = zwlr.LayerShellV1.create(client, version, id) catch {
         client.postNoMemory();
@@ -502,6 +507,9 @@ fn validExclusive(s: StateValue) bool {
     const bits: u32 = @bitCast(s.exclusive_edge);
     return bits == 0 or (bits & (bits - 1) == 0 and bits <= 8 and (bits & @as(u32, @bitCast(s.anchor))) != 0);
 }
+fn stateCastsShadow(s: StateValue) bool {
+    return s.zone == 0;
+}
 fn postStateError(r: *zwlr.LayerSurfaceV1, s: StateValue) void {
     if (@as(u32, @bitCast(s.anchor)) > 15) {
         r.postError(.invalid_anchor, "invalid anchor");
@@ -626,6 +634,19 @@ test "geometry validation inference and usable area" {
     s.width = 0;
     s.anchor.right = false;
     try std.testing.expect(!validState(s));
+}
+
+test "only zero-zone layer surfaces cast shadows" {
+    const state: StateValue = .{ .layer = .overlay };
+    try std.testing.expect(stateCastsShadow(state));
+
+    var bar = state;
+    bar.zone = 32;
+    try std.testing.expect(!stateCastsShadow(bar));
+
+    var background = state;
+    background.zone = -1;
+    try std.testing.expect(!stateCastsShadow(background));
 }
 
 test "geometry ignores margins on unanchored edges" {

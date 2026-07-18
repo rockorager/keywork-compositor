@@ -66,6 +66,7 @@ const Command = @import("command.zig").Command;
 const Config = @import("config.zig");
 const Launcher = @import("launcher.zig");
 const Control = @import("control.zig");
+const ControlProtocol = @import("keywork-control");
 const WindowManager = @import("window_manager.zig");
 
 const wl = wayland.server.wl;
@@ -77,7 +78,7 @@ display: *wl.Server,
 control: Control,
 control_initialized: bool,
 configuration: ?Config.Store,
-layer_shell_blur_radius: u32,
+layer_shell_effects: Scene.Effects,
 session: Session,
 session_initialized: bool,
 drm_device: DrmDevice,
@@ -180,8 +181,55 @@ const RenderOutput = struct {
     repaint_needed: bool,
     render_scheduled: bool,
     lock_frame_pending: bool,
+    frame_statistics: FrameStatistics,
+    request_started_nanoseconds: ?i96,
+    pending_frame: ?PendingFrame,
 
     const Point = struct { x: f64, y: f64 };
+
+    fn requestFrame(self: *RenderOutput) void {
+        if (self.repaint_needed) return;
+        self.request_started_nanoseconds = nowNanoseconds(self.server.io);
+        increment(&self.frame_statistics.frames_requested);
+        self.repaint_needed = true;
+    }
+
+    fn beginFrame(self: *RenderOutput) void {
+        std.debug.assert(self.pending_frame == null);
+        const now = nowNanoseconds(self.server.io);
+        self.pending_frame = .{
+            .request_nanoseconds = self.request_started_nanoseconds orelse now,
+            .render_nanoseconds = now,
+        };
+        self.request_started_nanoseconds = null;
+        increment(&self.frame_statistics.frames_started);
+    }
+
+    fn commitFrame(self: *RenderOutput, path: FramePath) void {
+        const pending = if (self.pending_frame) |*frame| frame else unreachable;
+        std.debug.assert(pending.commit_nanoseconds == null);
+        pending.commit_nanoseconds = nowNanoseconds(self.server.io);
+        switch (path) {
+            .composited => increment(&self.frame_statistics.composited_frames),
+            .direct_scanout => increment(&self.frame_statistics.direct_scanout_frames),
+        }
+    }
+
+    fn presentFrame(self: *RenderOutput, info: presentation.Info) void {
+        const pending = self.pending_frame orelse return;
+        self.pending_frame = null;
+        self.frame_statistics.recordPresentation(
+            pending,
+            nowNanoseconds(self.server.io),
+            presentationRefreshNanoseconds(info, self.backend.refreshMillihertz()),
+        );
+    }
+
+    fn discardFrame(self: *RenderOutput) void {
+        if (self.pending_frame == null) return;
+        self.pending_frame = null;
+        increment(&self.frame_statistics.frames_discarded);
+    }
 
     fn globalPoint(self: *RenderOutput, x: f64, y: f64) Point {
         const position = self.server.outputs.get(self.protocol_id).?.logicalPosition();
@@ -191,6 +239,236 @@ const RenderOutput = struct {
         };
     }
 };
+
+const frame_latency_capacity = 1024;
+const frame_budget_tolerance_nanoseconds = std.time.ns_per_ms;
+
+const FramePath = enum { composited, direct_scanout };
+
+const PendingFrame = struct {
+    request_nanoseconds: i96,
+    render_nanoseconds: i96,
+    commit_nanoseconds: ?i96 = null,
+};
+
+const FrameLatency = struct {
+    request_to_presentation_microseconds: u64,
+    request_to_render_microseconds: u64,
+    render_to_commit_microseconds: u64,
+    commit_to_presentation_microseconds: u64,
+};
+
+const LatencyKind = enum {
+    request_to_presentation,
+    request_to_render,
+    render_to_commit,
+    commit_to_presentation,
+};
+
+const FrameStatistics = struct {
+    frames_requested: u64 = 0,
+    frames_started: u64 = 0,
+    frames_presented: u64 = 0,
+    frames_discarded: u64 = 0,
+    acquire_retries: u64 = 0,
+    composited_frames: u64 = 0,
+    direct_scanout_candidates: u64 = 0,
+    direct_scanout_frames: u64 = 0,
+    frames_over_budget: u64 = 0,
+    latency_samples: [frame_latency_capacity]FrameLatency = undefined,
+    latency_count: usize = 0,
+    latency_next: usize = 0,
+
+    fn recordPresentation(
+        self: *FrameStatistics,
+        pending: PendingFrame,
+        presented_nanoseconds: i96,
+        refresh_nanoseconds: u64,
+    ) void {
+        const commit_nanoseconds = pending.commit_nanoseconds orelse unreachable;
+        const request_to_presentation = elapsedNanoseconds(
+            pending.request_nanoseconds,
+            presented_nanoseconds,
+        );
+        self.addLatency(.{
+            .request_to_presentation_microseconds = nanosecondsToMicroseconds(request_to_presentation),
+            .request_to_render_microseconds = nanosecondsToMicroseconds(elapsedNanoseconds(
+                pending.request_nanoseconds,
+                pending.render_nanoseconds,
+            )),
+            .render_to_commit_microseconds = nanosecondsToMicroseconds(elapsedNanoseconds(
+                pending.render_nanoseconds,
+                commit_nanoseconds,
+            )),
+            .commit_to_presentation_microseconds = nanosecondsToMicroseconds(elapsedNanoseconds(
+                commit_nanoseconds,
+                presented_nanoseconds,
+            )),
+        });
+        increment(&self.frames_presented);
+        if (request_to_presentation > refresh_nanoseconds +| frame_budget_tolerance_nanoseconds) {
+            increment(&self.frames_over_budget);
+        }
+    }
+
+    fn addLatency(self: *FrameStatistics, latency: FrameLatency) void {
+        self.latency_samples[self.latency_next] = latency;
+        self.latency_next = (self.latency_next + 1) % frame_latency_capacity;
+        self.latency_count = @min(self.latency_count + 1, frame_latency_capacity);
+    }
+
+    fn snapshot(
+        self: *const FrameStatistics,
+        name: []const u8,
+        size: render.Size,
+        refresh_millihertz: i32,
+    ) ControlProtocol.OutputStatistics {
+        return .{
+            .name = name,
+            .width = @intCast(size.width),
+            .height = @intCast(size.height),
+            .refresh_millihertz = refresh_millihertz,
+            .frames_requested = wireInteger(self.frames_requested),
+            .frames_started = wireInteger(self.frames_started),
+            .frames_presented = wireInteger(self.frames_presented),
+            .frames_discarded = wireInteger(self.frames_discarded),
+            .acquire_retries = wireInteger(self.acquire_retries),
+            .composited_frames = wireInteger(self.composited_frames),
+            .direct_scanout_candidates = wireInteger(self.direct_scanout_candidates),
+            .direct_scanout_frames = wireInteger(self.direct_scanout_frames),
+            .frames_over_budget = wireInteger(self.frames_over_budget),
+            .request_to_presentation = self.latencySummary(.request_to_presentation),
+            .request_to_render = self.latencySummary(.request_to_render),
+            .render_to_commit = self.latencySummary(.render_to_commit),
+            .commit_to_presentation = self.latencySummary(.commit_to_presentation),
+        };
+    }
+
+    fn latencySummary(
+        self: *const FrameStatistics,
+        comptime kind: LatencyKind,
+    ) ControlProtocol.LatencyStatistics {
+        if (self.latency_count == 0) return .{
+            .samples = 0,
+            .p50_microseconds = 0,
+            .p95_microseconds = 0,
+            .p99_microseconds = 0,
+            .maximum_microseconds = 0,
+        };
+        var values: [frame_latency_capacity]u64 = undefined;
+        for (self.latency_samples[0..self.latency_count], 0..) |sample, index| {
+            values[index] = switch (kind) {
+                .request_to_presentation => sample.request_to_presentation_microseconds,
+                .request_to_render => sample.request_to_render_microseconds,
+                .render_to_commit => sample.render_to_commit_microseconds,
+                .commit_to_presentation => sample.commit_to_presentation_microseconds,
+            };
+        }
+        const sorted = values[0..self.latency_count];
+        std.mem.sort(u64, sorted, {}, std.sort.asc(u64));
+        return .{
+            .samples = @intCast(sorted.len),
+            .p50_microseconds = wireInteger(percentile(sorted, 50)),
+            .p95_microseconds = wireInteger(percentile(sorted, 95)),
+            .p99_microseconds = wireInteger(percentile(sorted, 99)),
+            .maximum_microseconds = wireInteger(sorted[sorted.len - 1]),
+        };
+    }
+
+    fn reset(self: *FrameStatistics) void {
+        self.* = .{};
+    }
+};
+
+fn nowNanoseconds(io: std.Io) i96 {
+    return std.Io.Clock.awake.now(io).nanoseconds;
+}
+
+fn elapsedNanoseconds(start: i96, end: i96) u64 {
+    if (end <= start) return 0;
+    return @intCast(end - start);
+}
+
+fn nanosecondsToMicroseconds(nanoseconds: u64) u64 {
+    return nanoseconds / std.time.ns_per_us;
+}
+
+fn presentationRefreshNanoseconds(info: presentation.Info, refresh_millihertz: i32) u64 {
+    if (info.refresh_nanoseconds != 0) return info.refresh_nanoseconds;
+    if (refresh_millihertz <= 0) return presentation.nominal_refresh_nanoseconds;
+    const frequency: u64 = @intCast(refresh_millihertz);
+    return (std.time.ns_per_s * 1000 + frequency / 2) / frequency;
+}
+
+fn percentile(sorted: []const u64, percentage: u8) u64 {
+    std.debug.assert(sorted.len > 0 and percentage > 0 and percentage <= 100);
+    const rank = (sorted.len * @as(usize, percentage) + 99) / 100;
+    return sorted[rank - 1];
+}
+
+fn wireInteger(value: u64) i64 {
+    return @intCast(@min(value, @as(u64, std.math.maxInt(i64))));
+}
+
+fn increment(value: *u64) void {
+    value.* +|= 1;
+}
+
+test "frame statistics summarize rolling latency and classify over-budget frames" {
+    var statistics: FrameStatistics = .{};
+    statistics.addLatency(.{
+        .request_to_presentation_microseconds = 100,
+        .request_to_render_microseconds = 5,
+        .render_to_commit_microseconds = 10,
+        .commit_to_presentation_microseconds = 90,
+    });
+    statistics.addLatency(.{
+        .request_to_presentation_microseconds = 200,
+        .request_to_render_microseconds = 10,
+        .render_to_commit_microseconds = 20,
+        .commit_to_presentation_microseconds = 180,
+    });
+    statistics.addLatency(.{
+        .request_to_presentation_microseconds = 300,
+        .request_to_render_microseconds = 15,
+        .render_to_commit_microseconds = 30,
+        .commit_to_presentation_microseconds = 270,
+    });
+    statistics.addLatency(.{
+        .request_to_presentation_microseconds = 400,
+        .request_to_render_microseconds = 20,
+        .render_to_commit_microseconds = 40,
+        .commit_to_presentation_microseconds = 360,
+    });
+    const summary = statistics.latencySummary(.request_to_presentation);
+    try std.testing.expectEqual(@as(i64, 4), summary.samples);
+    try std.testing.expectEqual(@as(i64, 200), summary.p50_microseconds);
+    try std.testing.expectEqual(@as(i64, 400), summary.p95_microseconds);
+    try std.testing.expectEqual(@as(i64, 400), summary.p99_microseconds);
+    try std.testing.expectEqual(@as(i64, 400), summary.maximum_microseconds);
+
+    statistics.recordPresentation(.{
+        .request_nanoseconds = 0,
+        .render_nanoseconds = std.time.ns_per_ms,
+        .commit_nanoseconds = 2 * std.time.ns_per_ms,
+    }, 20 * std.time.ns_per_ms, 10 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(u64, 1), statistics.frames_presented);
+    try std.testing.expectEqual(@as(u64, 1), statistics.frames_over_budget);
+
+    statistics.reset();
+    try std.testing.expectEqual(@as(usize, 0), statistics.latency_count);
+    try std.testing.expectEqual(@as(u64, 0), statistics.frames_presented);
+
+    for (0..frame_latency_capacity + 1) |value| statistics.addLatency(.{
+        .request_to_presentation_microseconds = value,
+        .request_to_render_microseconds = value,
+        .render_to_commit_microseconds = value,
+        .commit_to_presentation_microseconds = value,
+    });
+    const rolling = statistics.latencySummary(.request_to_presentation);
+    try std.testing.expectEqual(@as(i64, frame_latency_capacity), rolling.samples);
+    try std.testing.expectEqual(@as(i64, frame_latency_capacity), rolling.maximum_microseconds);
+}
 
 const RoutedKey = struct {
     device_id: NativeInput.DeviceId,
@@ -296,7 +574,7 @@ pub fn createWithVirtualOutput(
         .control = undefined,
         .control_initialized = false,
         .configuration = null,
-        .layer_shell_blur_radius = Scene.default_effects.blur.?.radius,
+        .layer_shell_effects = Scene.default_effects,
         .session = undefined,
         .session_initialized = false,
         .drm_device = undefined,
@@ -1016,6 +1294,9 @@ fn addRenderOutput(
         .repaint_needed = false,
         .render_scheduled = false,
         .lock_frame_pending = false,
+        .frame_statistics = .{},
+        .request_started_nanoseconds = null,
+        .pending_frame = null,
     };
     errdefer render_output.damage.deinit();
     errdefer render_output.damage_rectangles.deinit(self.allocator);
@@ -1588,6 +1869,7 @@ pub fn listenControl(self: *Self, runtime_directory: []const u8) !void {
         .{
             .context = self,
             .execute = executeControlCommand,
+            .statistics = controlPerformanceStatistics,
             .reload = reloadControlConfiguration,
             .quit = quitControlSession,
         },
@@ -1599,6 +1881,28 @@ pub fn listenControl(self: *Self, runtime_directory: []const u8) !void {
 fn executeControlCommand(context: *anyopaque, command: Command) void {
     const self: *Self = @ptrCast(@alignCast(context));
     self.window_manager.execute(command);
+}
+
+fn controlPerformanceStatistics(
+    context: *anyopaque,
+    allocator: std.mem.Allocator,
+    reset: bool,
+) ![]ControlProtocol.OutputStatistics {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const result = try allocator.alloc(ControlProtocol.OutputStatistics, self.render_outputs.count);
+    var index: usize = 0;
+    var outputs = self.render_outputs.iterator();
+    while (outputs.next()) |entry| : (index += 1) {
+        const render_output = entry.value.*;
+        const protocol_output = self.outputs.get(render_output.protocol_id).?;
+        result[index] = render_output.frame_statistics.snapshot(
+            protocol_output.name(),
+            render_output.backend.modeSize(),
+            render_output.backend.refreshMillihertz(),
+        );
+        if (reset) render_output.frame_statistics.reset();
+    }
+    return result;
 }
 
 fn reloadControlConfiguration(context: *anyopaque) ?[]const u8 {
@@ -1650,12 +1954,13 @@ pub fn reloadConfiguration(self: *Self) !void {
 fn applyGeneralConfiguration(self: *Self, general: Config.GeneralSettings) void {
     self.window_manager.setFocusFollowsMouse(general.focus_follows_mouse);
     self.window_manager.setGaps(general.inner_gap, general.outer_gap);
+    const normal_effects = windowEffects(general, general.shadow_color);
     self.window_manager.setWindowEffects(
-        windowEffects(general, general.shadow_color),
+        normal_effects,
         windowEffects(general, general.focused_shadow_color),
     );
-    if (self.layer_shell_blur_radius != general.blur_radius) {
-        self.layer_shell_blur_radius = general.blur_radius;
+    if (!std.meta.eql(self.layer_shell_effects, normal_effects)) {
+        self.layer_shell_effects = normal_effects;
         requestRepaint(self);
     }
 }
@@ -1968,6 +2273,8 @@ fn surfaceChanged(context: *anyopaque, surface_id: Surface.Id) void {
     const offset = self.subcompositor.surfaceOffset(surface_id);
     const damage = Surface.currentDamage(surfaces, surface_id) orelse
         return requestRepaint(self);
+    const layer_shadow = if (std.meta.eql(surface_id, root) and
+        self.layer_shell.castsShadow(root)) self.layer_shell_effects.shadow else null;
     if (damage.isEmpty()) {
         var bounds: ?render.Rect = null;
         self.addSurfaceTreeBounds(root, root_position.x, root_position.y, &bounds) catch
@@ -1978,12 +2285,16 @@ fn surfaceChanged(context: *anyopaque, surface_id: Surface.Id) void {
 
     var rectangles = damage.rectangleIterator();
     while (rectangles.next()) |rectangle| {
-        self.damageGlobalRect(.{
+        const global: render.Rect = .{
             .x = root_position.x +| offset.x +| rectangle.x,
             .y = root_position.y +| offset.y +| rectangle.y,
             .width = rectangle.width,
             .height = rectangle.height,
-        });
+        };
+        self.damageGlobalRect(if (layer_shadow) |shadow|
+            shadowDamageRect(global, shadow)
+        else
+            global);
     }
 }
 
@@ -2035,7 +2346,7 @@ fn damageGlobalRect(self: *Self, rectangle: render.Rect) void {
             self.damageFullOutput(render_output);
             continue;
         };
-        render_output.repaint_needed = true;
+        render_output.requestFrame();
         self.scheduleRepaint(render_output);
     }
 }
@@ -2077,7 +2388,7 @@ fn scaleDamageRect(
 fn damageFullOutput(self: *Self, output: *RenderOutput) void {
     const size = output.backend.modeSize();
     output.damage.setRectangle(0, 0, size.width, size.height);
-    output.repaint_needed = true;
+    output.requestFrame();
     self.scheduleRepaint(output);
 }
 
@@ -2198,6 +2509,7 @@ fn outputReady(context: *anyopaque) void {
 fn outputPresented(context: *anyopaque, info: presentation.Info) void {
     const output: *RenderOutput = @ptrCast(@alignCast(context));
     const self = output.server;
+    output.presentFrame(info);
     const protocol_output = self.outputs.get(output.protocol_id).?;
     protocol_output.setRefresh(info);
     Surface.finishPresentation(self.compositor.surfaceStore(), protocol_output, info);
@@ -2210,6 +2522,7 @@ fn outputPresented(context: *anyopaque, info: presentation.Info) void {
 fn outputDiscarded(context: *anyopaque) void {
     const output: *RenderOutput = @ptrCast(@alignCast(context));
     const self = output.server;
+    output.discardFrame();
     output.lock_frame_pending = false;
     Surface.discardPresentation(
         self.compositor.surfaceStore(),
@@ -4769,12 +5082,13 @@ fn layerSurfaceBackdropBlurArea(
     output: *const Output,
     layer_surface: *const Scene.LayerSurface,
 ) ?BackdropBlurArea {
+    const blur = self.layer_shell_effects.blur orelse return null;
     const logical = self.layerSurfaceBackdropBlurRect(layer_surface) orelse return null;
     return backdropBlurArea(
         render_output,
         output,
         logical,
-        self.layer_shell_blur_radius,
+        blur.radius,
     );
 }
 
@@ -4782,7 +5096,7 @@ fn layerSurfaceBackdropBlurRect(
     self: *Self,
     layer_surface: *const Scene.LayerSurface,
 ) ?render.Rect {
-    if (!layer_surface.mapped or self.layer_shell_blur_radius == 0) return null;
+    if (self.layer_shell_effects.blur == null) return null;
     const buffer = Surface.currentBuffer(
         self.compositor.surfaceStore(),
         layer_surface.surface_id,
@@ -4793,11 +5107,19 @@ fn layerSurfaceBackdropBlurRect(
             self.compositor.surfaceStore(),
             layer_surface.surface_id,
         )) return null;
+    return layerSurfaceRect(layer_surface, buffer.logical_size);
+}
+
+fn layerSurfaceRect(
+    layer_surface: *const Scene.LayerSurface,
+    size: render.Size,
+) ?render.Rect {
+    if (!layer_surface.mapped or size.width == 0 or size.height == 0) return null;
     return .{
         .x = layer_surface.position.x,
         .y = layer_surface.position.y,
-        .width = buffer.logical_size.width,
-        .height = buffer.logical_size.height,
+        .width = size.width,
+        .height = size.height,
     };
 }
 
@@ -4836,6 +5158,35 @@ fn expandDamageRect(rectangle: anytype, amount: u32) render.Rect {
         .width = @intCast(@min(right - left, std.math.maxInt(u32))),
         .height = @intCast(@min(bottom - top, std.math.maxInt(u32))),
     };
+}
+
+fn shadowDamageRect(rectangle: render.Rect, shadow: Scene.Shadow) render.Rect {
+    const spread: u32 = if (shadow.spread > 0) @intCast(shadow.spread) else 0;
+    const offset_x: u32 = if (shadow.offset.x < 0)
+        @intCast(-@as(i64, shadow.offset.x))
+    else
+        @intCast(shadow.offset.x);
+    const offset_y: u32 = if (shadow.offset.y < 0)
+        @intCast(-@as(i64, shadow.offset.y))
+    else
+        @intCast(shadow.offset.y);
+    const amount = shadow.blur_radius +| spread +| @max(offset_x, offset_y);
+    return expandDamageRect(rectangle, amount);
+}
+
+test "shadow damage includes blur spread and offset" {
+    try std.testing.expectEqual(
+        render.Rect{ .x = -8, .y = 2, .width = 66, .height = 76 },
+        shadowDamageRect(
+            .{ .x = 10, .y = 20, .width = 30, .height = 40 },
+            .{
+                .offset = .{ .x = 3, .y = -2 },
+                .blur_radius = 12,
+                .spread = 3,
+                .color = render.Color.rgba(0, 0, 0, 128),
+            },
+        ),
+    );
 }
 
 fn expandBackdropBlurDamage(
@@ -4926,10 +5277,13 @@ test "backdrop blur damage expands transitively across overlapping effects" {
 
 fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Renderer.Error!void {
     const render_target = render_output.backend.acquire() orelse {
+        increment(&render_output.frame_statistics.acquire_retries);
         render_output.repaint_needed = true;
         return;
     };
     errdefer render_output.backend.cancel();
+    render_output.beginFrame();
+    errdefer render_output.pending_frame = null;
     const output = self.outputs.get(render_output.protocol_id).?;
     output.beginFrame();
     errdefer output.cancelFrame();
@@ -4976,11 +5330,13 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
     var presented: ?presentation.Info = null;
     var direct_scanout = false;
     if (self.renderer.directScanoutCandidate()) |candidate| {
+        increment(&render_output.frame_statistics.direct_scanout_candidates);
         const result = render_output.backend.tryDirectScanout(candidate);
         if (result.accepted) {
             self.renderer.cancelFrame();
             renderer_frame_active = false;
             direct_scanout = true;
+            render_output.commitFrame(.direct_scanout);
         }
     }
     if (!direct_scanout) {
@@ -4991,6 +5347,7 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
         };
         presented = render_output.backend.present(&frame_damage, render_fence_fd) catch
             return error.InvalidTarget;
+        render_output.commitFrame(.composited);
     }
     output.endFrame();
     self.foreign_toplevel_list.syncOutput(render_output.protocol_id);
@@ -5110,6 +5467,7 @@ fn presentSessionLockFrame(
         render_fence_fd,
     ) catch
         return error.InvalidTarget;
+    frame.render_output.commitFrame(.composited);
     frame.render_output.lock_frame_pending = true;
     frame.output.endFrame();
     self.foreign_toplevel_list.syncOutput(frame.render_output.protocol_id);
@@ -5286,10 +5644,29 @@ fn renderLayerSurfaces(
                 .{ .backdrop_blur = .{
                     .rect = rect,
                     .corner_radius = 0,
-                    .radius = self.layer_shell_blur_radius,
+                    .radius = self.layer_shell_effects.blur.?.radius,
                 } },
             };
             try self.renderCommands(frame, &blur_command);
+        }
+        if (self.layer_shell.castsShadow(layer_surface.surface_id)) {
+            if (self.layer_shell_effects.shadow) |shadow| {
+                const buffer = Surface.currentBuffer(
+                    self.compositor.surfaceStore(),
+                    layer_surface.surface_id,
+                );
+                if (buffer) |root_buffer| {
+                    if (layerSurfaceRect(layer_surface, root_buffer.logical_size)) |rect| {
+                        try self.renderShadow(
+                            frame,
+                            rect,
+                            self.layer_shell_effects.corner_radius,
+                            shadow,
+                            null,
+                        );
+                    }
+                }
+            }
         }
         try self.renderSurfaceTree(
             frame,
@@ -5369,6 +5746,31 @@ fn renderCommands(
     try self.renderer.append(commands);
 }
 
+fn renderShadow(
+    self: *Self,
+    frame: *const OutputFrame,
+    rect: render.Rect,
+    corner_radius: u32,
+    shadow: Scene.Shadow,
+    clip: ?render.Rect,
+) renderer_types.Renderer.Error!void {
+    const shadow_command = [_]render.Command{
+        .{ .shadow = .{
+            .rect = rect.translated(shadow.offset.x, shadow.offset.y),
+            .corner_radius = corner_radius,
+            .blur_radius = shadow.blur_radius,
+            .spread = shadow.spread,
+            .color = shadow.color,
+            .cutout = .{
+                .rect = rect,
+                .radius = corner_radius,
+            },
+            .clip = clip,
+        } },
+    };
+    try self.renderCommands(frame, &shadow_command);
+}
+
 fn renderWindow(
     self: *Self,
     frame: *const OutputFrame,
@@ -5403,26 +5805,13 @@ fn renderWindow(
         try self.renderCommands(frame, &blur_command);
     }
     if (window.effects.shadow) |shadow| {
-        const shadow_command = [_]render.Command{
-            .{ .shadow = .{
-                .rect = .{
-                    .x = content_rect.x +| shadow.offset.x,
-                    .y = content_rect.y +| shadow.offset.y,
-                    .width = content_rect.width,
-                    .height = content_rect.height,
-                },
-                .corner_radius = window.effects.corner_radius,
-                .blur_radius = shadow.blur_radius,
-                .spread = shadow.spread,
-                .color = shadow.color,
-                .cutout = .{
-                    .rect = content_rect,
-                    .radius = window.effects.corner_radius,
-                },
-                .clip = shadow_clip,
-            } },
-        };
-        try self.renderCommands(frame, &shadow_command);
+        try self.renderShadow(
+            frame,
+            content_rect,
+            window.effects.corner_radius,
+            shadow,
+            shadow_clip,
+        );
     }
     try self.renderWindowDecorations(frame, id, window, .below, window_clip);
     var content_visible = true;
