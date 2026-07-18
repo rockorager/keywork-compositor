@@ -136,8 +136,8 @@ pub const Color = struct {
 
 pub const GeneralSettings = struct {
     focus_follows_mouse: bool = true,
-    inner_gap: u32 = 8,
-    outer_gap: u32 = 8,
+    inner_gap: u32 = 16,
+    outer_gap: u32 = 16,
     blur_radius: u32 = 16,
     shadow_enabled: bool = true,
     shadow_blur_radius: u32 = 24,

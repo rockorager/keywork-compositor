@@ -211,8 +211,8 @@ pub const Tiled = union(enum) {
 pub const MasterStack = struct {
     master_count: u32 = 1,
     master_ratio_percent: u8 = 60,
-    outer_gap: u32 = 8,
-    inner_gap: u32 = 8,
+    outer_gap: u32 = 16,
+    inner_gap: u32 = 16,
 
     pub fn setMasterCount(self: *MasterStack, count: u32) void {
         self.master_count = count;
@@ -270,8 +270,8 @@ pub const Dwindle = struct {
     root: ?NodeIndex = null,
     last_usable: ?types.Rect = null,
     split_ratio_percent: u8 = 50,
-    outer_gap: u32 = 8,
-    inner_gap: u32 = 8,
+    outer_gap: u32 = 16,
+    inner_gap: u32 = 16,
 
     const NodeIndex = u32;
     const Axis = enum { horizontal, vertical };
@@ -560,8 +560,8 @@ pub const Dwindle = struct {
 
 pub const Scrolling = struct {
     offset: u32 = 0,
-    outer_gap: u32 = 8,
-    inner_gap: u32 = 8,
+    outer_gap: u32 = 16,
+    inner_gap: u32 = 16,
 
     fn arrange(
         self: *Scrolling,
