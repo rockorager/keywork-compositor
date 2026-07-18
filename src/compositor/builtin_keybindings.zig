@@ -3,6 +3,7 @@
 const Self = @This();
 
 const std = @import("std");
+const wayland = @import("wayland");
 const NativeInput = @import("backend/native_input.zig");
 const Config = @import("config.zig");
 const Launcher = @import("launcher.zig");
@@ -11,6 +12,7 @@ const InputManager = @import("input_manager.zig");
 const WindowManager = @import("window_manager.zig");
 
 const log = std.log.scoped(.keybindings);
+const wl = wayland.server.wl;
 
 allocator: std.mem.Allocator,
 manager: *WindowManager,
@@ -21,6 +23,8 @@ launcher: ?*Launcher = null,
 bindings: []const Config.Binding = &.{},
 device_listener: InputManager.DeviceListener,
 held_keys: std.ArrayList(HeldKey) = .empty,
+repeat_timer: *wl.EventSource,
+repeat: ?RepeatIdentity = null,
 
 const HeldKey = struct {
     device_id: NativeInput.DeviceId,
@@ -28,7 +32,14 @@ const HeldKey = struct {
     disposition: NativeInput.KeyboardEventDisposition,
 };
 
-pub fn init(self: *Self, allocator: std.mem.Allocator, manager: *WindowManager, input_manager: *InputManager, shortcuts_inhibit: *KeyboardShortcutsInhibit, native_input: ?*NativeInput) !void {
+const RepeatIdentity = struct {
+    device_id: NativeInput.DeviceId,
+    key_code: u32,
+    modifiers: u32,
+    keysym: u32,
+};
+
+pub fn init(self: *Self, allocator: std.mem.Allocator, display: *wl.Server, manager: *WindowManager, input_manager: *InputManager, shortcuts_inhibit: *KeyboardShortcutsInhibit, native_input: ?*NativeInput) !void {
     self.* = .{
         .allocator = allocator,
         .manager = manager,
@@ -36,18 +47,21 @@ pub fn init(self: *Self, allocator: std.mem.Allocator, manager: *WindowManager, 
         .shortcuts_inhibit = shortcuts_inhibit,
         .native_input = native_input,
         .device_listener = .{ .context = self, .added = deviceAdded, .removed = deviceRemoved },
+        .repeat_timer = undefined,
     };
     errdefer self.held_keys.deinit(allocator);
+    self.repeat_timer = try display.getEventLoop().addTimer(*Self, repeatTimer, self);
+    errdefer self.repeat_timer.remove();
     try input_manager.addDeviceListener(&self.device_listener);
     errdefer input_manager.removeDeviceListener(&self.device_listener);
     if (native_input) |input| input.setKeyboardEventListener(.{ .context = self, .key = keyboardKey, .modifiers = modifiersChanged });
 }
 
 pub fn detachNativeInput(self: *Self) void {
-    const input = self.native_input orelse return;
-    input.clearKeyboardEventListener();
+    if (self.native_input) |input| input.clearKeyboardEventListener();
     self.native_input = null;
     self.held_keys.clearRetainingCapacity();
+    self.cancelRepeat();
 }
 
 pub fn setLauncher(self: *Self, launcher: *Launcher) void {
@@ -61,6 +75,7 @@ pub fn setConfiguredBindings(self: *Self, bindings: []const Config.Binding) void
 pub fn deinit(self: *Self) void {
     self.detachNativeInput();
     self.input_manager.removeDeviceListener(&self.device_listener);
+    self.repeat_timer.remove();
     self.held_keys.deinit(self.allocator);
     self.* = undefined;
 }
@@ -93,24 +108,18 @@ fn keyPressed(self: *Self, event: NativeInput.KeyboardEvent) NativeInput.Keyboar
             return held.disposition;
         }
     }
+    self.cancelRepeat();
     const disposition: NativeInput.KeyboardEventDisposition = if (self.shortcuts_inhibit.inhibitsSeatNamed(device.seat_name))
         .shortcuts_inhibited
     else if (matchBinding(self.bindings, event.modifiers, event.keysyms)) |binding| blk: {
-        switch (binding.action) {
-            .command => |command| self.manager.execute(command),
-            .run => |argv| {
-                const launcher = self.launcher orelse {
-                    log.err("cannot launch {s}: launcher is unavailable", .{argv[0]});
-                    break :blk .captured;
-                };
-                launcher.launch(argv) catch |err| {
-                    log.err("failed to launch {s}: {t}", .{ argv[0], err });
-                };
-            },
-        }
+        self.executeAction(binding.action);
+        self.armRepeat(event, binding.keysym);
         break :blk .captured;
     } else .forwarded;
-    self.held_keys.append(self.allocator, .{ .device_id = event.device_id, .key_code = event.key_code, .disposition = disposition }) catch return .captured;
+    self.held_keys.append(self.allocator, .{ .device_id = event.device_id, .key_code = event.key_code, .disposition = disposition }) catch {
+        self.cancelRepeat();
+        return .captured;
+    };
     return disposition;
 }
 
@@ -118,9 +127,92 @@ fn keyReleased(self: *Self, event: NativeInput.KeyboardEvent) NativeInput.Keyboa
     for (self.held_keys.items, 0..) |held, index| {
         if (held.device_id != event.device_id or held.key_code != event.key_code) continue;
         _ = self.held_keys.orderedRemove(index);
+        if (repeatMatchesKey(self.repeat, event.device_id, event.key_code)) self.cancelRepeat();
         return held.disposition;
     }
     return .forwarded;
+}
+
+fn executeAction(self: *Self, action: Config.Action) void {
+    switch (action) {
+        .command => |command| self.manager.execute(command),
+        .run => |argv| {
+            const launcher = self.launcher orelse {
+                log.err("cannot launch {s}: launcher is unavailable", .{argv[0]});
+                return;
+            };
+            launcher.launch(argv) catch |err| log.err("failed to launch {s}: {t}", .{ argv[0], err });
+        },
+    }
+}
+
+fn armRepeat(self: *Self, event: NativeInput.KeyboardEvent, keysym: u32) void {
+    const input = self.native_input orelse return;
+    const info = input.deviceRepeatInfo(event.device_id) orelse return;
+    if (repeatInterval(info.rate) == null) return;
+    self.repeat = .{
+        .device_id = event.device_id,
+        .key_code = event.key_code,
+        .modifiers = event.modifiers,
+        .keysym = keysym,
+    };
+    self.updateRepeatTimer(@max(info.delay, 1));
+}
+
+fn repeatTimer(self: *Self) c_int {
+    const identity = self.repeat orelse return 0;
+    const input = self.native_input orelse {
+        self.cancelRepeat();
+        return 0;
+    };
+    const info = input.deviceRepeatInfo(identity.device_id) orelse {
+        self.cancelRepeat();
+        return 0;
+    };
+    const interval = repeatInterval(info.rate) orelse {
+        self.cancelRepeat();
+        return 0;
+    };
+    const device = self.input_manager.findDevice(identity.device_id) orelse {
+        self.cancelRepeat();
+        return 0;
+    };
+    if (self.shortcuts_inhibit.inhibitsSeatNamed(device.seat_name)) {
+        self.cancelRepeat();
+        return 0;
+    }
+    const binding = matchBinding(self.bindings, identity.modifiers, &.{identity.keysym}) orelse {
+        self.cancelRepeat();
+        return 0;
+    };
+    self.executeAction(binding.action);
+    self.updateRepeatTimer(interval);
+    return 0;
+}
+
+fn updateRepeatTimer(self: *Self, milliseconds: i32) void {
+    self.repeat_timer.timerUpdate(milliseconds) catch |err| {
+        log.err("failed to update key binding repeat timer: {t}", .{err});
+        self.repeat = null;
+    };
+}
+
+fn cancelRepeat(self: *Self) void {
+    if (self.repeat == null) return;
+    self.repeat = null;
+    self.repeat_timer.timerUpdate(0) catch |err| log.err("failed to cancel key binding repeat timer: {t}", .{err});
+}
+
+fn repeatInterval(rate: i32) ?i32 {
+    if (rate <= 0) return null;
+    const quotient = @divTrunc(1000, rate);
+    const rounded = quotient + @intFromBool(@rem(1000, rate) != 0);
+    return @max(rounded, 1);
+}
+
+fn repeatMatchesKey(repeat: ?RepeatIdentity, device_id: NativeInput.DeviceId, key_code: u32) bool {
+    const identity = repeat orelse return false;
+    return identity.device_id == device_id and identity.key_code == key_code;
 }
 
 fn matchBinding(bindings: []const Config.Binding, modifiers: u32, keysyms: []const u32) ?Config.Binding {
@@ -136,12 +228,15 @@ fn deviceRemoved(context: *anyopaque, device: *InputManager.Device) void {
     if (device.device_type == .keyboard) releaseDevice(@ptrCast(@alignCast(context)), device.id);
 }
 fn releaseDevice(self: *Self, id: NativeInput.DeviceId) void {
+    if (self.repeat != null and self.repeat.?.device_id == id) self.cancelRepeat();
     var index: usize = 0;
     while (index < self.held_keys.items.len) {
         if (self.held_keys.items[index].device_id == id) _ = self.held_keys.orderedRemove(index) else index += 1;
     }
 }
-fn modifiersChanged(_: *anyopaque, _: ?NativeInput.DeviceId, _: u32, _: u32) void {}
+fn modifiersChanged(context: *anyopaque, _: ?NativeInput.DeviceId, old: u32, new: u32) void {
+    if (old != new) (@as(*Self, @ptrCast(@alignCast(context)))).cancelRepeat();
+}
 
 test "binding matching checks every symbol and exact modifiers" {
     const test_bindings = [_]Config.Binding{
@@ -158,4 +253,18 @@ test "held key records press disposition for release" {
     try held.append(std.testing.allocator, .{ .device_id = 4, .key_code = 12, .disposition = .captured });
     const entry = held.orderedRemove(0);
     try std.testing.expectEqual(NativeInput.KeyboardEventDisposition.captured, entry.disposition);
+}
+
+test "repeat interval rounds up and rate zero disables repeat" {
+    try std.testing.expectEqual(@as(?i32, null), repeatInterval(0));
+    try std.testing.expectEqual(@as(?i32, 34), repeatInterval(30));
+    try std.testing.expectEqual(@as(?i32, 1), repeatInterval(2000));
+}
+
+test "repeat identity only matches its physical key" {
+    const identity: RepeatIdentity = .{ .device_id = 4, .key_code = 12, .modifiers = 3, .keysym = 'j' };
+    try std.testing.expect(repeatMatchesKey(identity, 4, 12));
+    try std.testing.expect(!repeatMatchesKey(identity, 5, 12));
+    try std.testing.expect(!repeatMatchesKey(identity, 4, 13));
+    try std.testing.expect(!repeatMatchesKey(null, 4, 12));
 }

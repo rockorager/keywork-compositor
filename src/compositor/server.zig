@@ -1139,6 +1139,7 @@ pub fn createWithVirtualOutput(
     errdefer self.input_manager.removeDeviceListener(&self.input_device_listener);
     try self.builtin_keybindings.init(
         allocator,
+        self.display,
         &self.window_manager,
         &self.input_manager,
         &self.keyboard_shortcuts_inhibit,
