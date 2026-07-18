@@ -151,6 +151,8 @@ pub const WindowState = struct {
     icon: ?ToplevelIcon = null,
     pending_icon: ?ToplevelIcon = null,
     pending_icon_changed: bool = false,
+    dialog: bool = false,
+    modal: bool = false,
     pending_min_size: SizeHint = .{},
     pending_max_size: SizeHint = .{},
     current_min_size: SizeHint = .{},
@@ -321,6 +323,8 @@ pub const WindowInfo = struct {
     title: ?[:0]const u8,
     app_id: ?[:0]const u8,
     icon: ?ToplevelIconInfo,
+    dialog: bool,
+    modal: bool,
     parent: ?WindowId,
     min_size: SizeHint,
     max_size: SizeHint,
@@ -485,6 +489,8 @@ pub fn windowInfo(self: *Self, id: WindowId) ?WindowInfo {
             .name = icon.name,
             .buffers = icon.buffers,
         } else null,
+        .dialog = window.dialog,
+        .modal = window.modal,
         .parent = window.parent,
         .min_size = window.current_min_size,
         .max_size = window.current_max_size,
@@ -513,6 +519,15 @@ pub fn setPendingToplevelIcon(self: *Self, id: WindowId, icon: ?ToplevelIcon) vo
     if (window.pending_icon) |*pending| pending.deinit(self.allocator);
     window.pending_icon = icon;
     window.pending_icon_changed = true;
+}
+
+pub fn setDialogState(self: *Self, id: WindowId, dialog: bool, modal: bool) void {
+    std.debug.assert(dialog or !modal);
+    const window = self.windows.get(id) orelse return;
+    if (window.dialog == dialog and window.modal == modal) return;
+    window.dialog = dialog;
+    window.modal = modal;
+    _ = self.notifyWindowMetadataChanged(id);
 }
 
 pub const AttachPopupError = error{

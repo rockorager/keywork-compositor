@@ -1092,15 +1092,16 @@
       "interfaces": [
         {
           "name": "xdg_wm_dialog_v1",
-          "current_version": null,
+          "current_version": 1,
           "target_version": 1
         }
       ],
-      "status": "not_started",
+      "status": "done",
       "privileged": false,
       "blocked_by": [
         "xdg-shell"
-      ]
+      ],
+      "status_detail": "Version 1 implements one dialog object per XDG toplevel, dialog and modal metadata updates, effect removal on dialog destruction, inert objects after toplevel destruction, and manager-independent child lifetimes. Dialog hints persist across unmap and combine with existing parent-relative transient placement and stacking; clients retain the protocol-defined responsibility for filtering parent events. Duplicate construction, recreation, manager destruction, and inert-object requests are exercised end to end."
     },
     {
       "id": "xdg-system-bell",
