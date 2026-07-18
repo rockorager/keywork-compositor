@@ -449,6 +449,7 @@ test {
     _ = @import("wayland/xdg_toplevel_icon.zig");
     _ = @import("wayland/xdg_dialog.zig");
     _ = @import("wayland/xdg_system_bell.zig");
+    _ = @import("wayland/xdg_toplevel_tag.zig");
     _ = @import("wayland/single_pixel_buffer.zig");
     _ = @import("wayland/content_type.zig");
     _ = @import("wayland/background_effect.zig");

@@ -148,6 +148,8 @@ pub const WindowState = struct {
     parent_owner: ?*anyopaque = null,
     title: ?[:0]u8 = null,
     app_id: ?[:0]u8 = null,
+    tag: ?[:0]u8 = null,
+    description: ?[:0]u8 = null,
     icon: ?ToplevelIcon = null,
     pending_icon: ?ToplevelIcon = null,
     pending_icon_changed: bool = false,
@@ -167,6 +169,8 @@ pub const WindowState = struct {
     fn deinit(self: *WindowState, allocator: std.mem.Allocator) void {
         if (self.title) |title| allocator.free(title);
         if (self.app_id) |app_id| allocator.free(app_id);
+        if (self.tag) |tag| allocator.free(tag);
+        if (self.description) |description| allocator.free(description);
         if (self.icon) |*icon| icon.deinit(allocator);
         if (self.pending_icon) |*icon| icon.deinit(allocator);
         self.* = undefined;
@@ -322,6 +326,8 @@ pub const WindowInfo = struct {
     unreliable_pid: i32,
     title: ?[:0]const u8,
     app_id: ?[:0]const u8,
+    tag: ?[:0]const u8,
+    description: ?[:0]const u8,
     icon: ?ToplevelIconInfo,
     dialog: bool,
     modal: bool,
@@ -485,6 +491,8 @@ pub fn windowInfo(self: *Self, id: WindowId) ?WindowInfo {
         .unreliable_pid = window.unreliable_pid,
         .title = window.title,
         .app_id = window.app_id,
+        .tag = window.tag,
+        .description = window.description,
         .icon = if (window.icon) |*icon| .{
             .name = icon.name,
             .buffers = icon.buffers,
@@ -527,6 +535,25 @@ pub fn setDialogState(self: *Self, id: WindowId, dialog: bool, modal: bool) void
     if (window.dialog == dialog and window.modal == modal) return;
     window.dialog = dialog;
     window.modal = modal;
+    _ = self.notifyWindowMetadataChanged(id);
+}
+
+pub const ToplevelTagField = enum { tag, description };
+
+pub fn setToplevelTag(
+    self: *Self,
+    id: WindowId,
+    field: ToplevelTagField,
+    value: []const u8,
+) error{OutOfMemory}!void {
+    const window = self.windows.get(id) orelse return;
+    const destination = switch (field) {
+        .tag => &window.tag,
+        .description => &window.description,
+    };
+    const copy = try self.allocator.dupeSentinel(u8, value, 0);
+    if (destination.*) |previous| self.allocator.free(previous);
+    destination.* = copy;
     _ = self.notifyWindowMetadataChanged(id);
 }
 

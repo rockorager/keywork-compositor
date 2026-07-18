@@ -1132,15 +1132,16 @@
       "interfaces": [
         {
           "name": "xdg_toplevel_tag_manager_v1",
-          "current_version": null,
+          "current_version": 1,
           "target_version": 1
         }
       ],
-      "status": "not_started",
+      "status": "done",
       "privileged": false,
       "blocked_by": [
         "xdg-shell"
-      ]
+      ],
+      "status_detail": "Version 1 stores allocator-owned untranslated tags and translated descriptions as XDG toplevel metadata, supports replacement at any point in the toplevel lifetime, preserves values across unmap, and notifies metadata observers for future policy and session-management consumers. Tag, description, replacement, manager destruction, and toplevel destruction are exercised end to end."
     },
     {
       "id": "xdg-session-management",

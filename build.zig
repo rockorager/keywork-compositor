@@ -25,6 +25,7 @@ pub fn build(b: *std.Build) void {
     scanner.addSystemProtocol("staging/xdg-toplevel-icon/xdg-toplevel-icon-v1.xml");
     scanner.addSystemProtocol("staging/xdg-dialog/xdg-dialog-v1.xml");
     scanner.addSystemProtocol("staging/xdg-system-bell/xdg-system-bell-v1.xml");
+    scanner.addSystemProtocol("staging/xdg-toplevel-tag/xdg-toplevel-tag-v1.xml");
     scanner.addSystemProtocol("staging/xdg-activation/xdg-activation-v1.xml");
     scanner.addSystemProtocol("staging/single-pixel-buffer/single-pixel-buffer-v1.xml");
     scanner.addSystemProtocol("staging/cursor-shape/cursor-shape-v1.xml");
@@ -80,6 +81,7 @@ pub fn build(b: *std.Build) void {
     scanner.generate("xdg_toplevel_icon_manager_v1", 1);
     scanner.generate("xdg_wm_dialog_v1", 1);
     scanner.generate("xdg_system_bell_v1", 1);
+    scanner.generate("xdg_toplevel_tag_manager_v1", 1);
     scanner.generate("xdg_activation_v1", 1);
     scanner.generate("wp_single_pixel_buffer_manager_v1", 1);
     scanner.generate("wp_cursor_shape_manager_v1", 2);
