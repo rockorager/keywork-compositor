@@ -77,6 +77,7 @@ display: *wl.Server,
 control: Control,
 control_initialized: bool,
 configuration: ?Config.Store,
+layer_shell_blur_radius: u32,
 session: Session,
 session_initialized: bool,
 drm_device: DrmDevice,
@@ -295,6 +296,7 @@ pub fn createWithVirtualOutput(
         .control = undefined,
         .control_initialized = false,
         .configuration = null,
+        .layer_shell_blur_radius = Scene.default_effects.blur.?.radius,
         .session = undefined,
         .session_initialized = false,
         .drm_device = undefined,
@@ -1652,6 +1654,10 @@ fn applyGeneralConfiguration(self: *Self, general: Config.GeneralSettings) void 
         windowEffects(general, general.shadow_color),
         windowEffects(general, general.focused_shadow_color),
     );
+    if (self.layer_shell_blur_radius != general.blur_radius) {
+        self.layer_shell_blur_radius = general.blur_radius;
+        requestRepaint(self);
+    }
 }
 
 fn windowEffects(general: Config.GeneralSettings, shadow_color: Config.Color) Scene.Effects {
@@ -4711,6 +4717,28 @@ const BackdropBlurArea = struct {
     radius: u32,
 };
 
+fn backdropBlurArea(
+    render_output: *const RenderOutput,
+    output: *const Output,
+    logical_rect: render.Rect,
+    radius: u32,
+) ?BackdropBlurArea {
+    if (radius == 0) return null;
+    const output_rect = output.logicalRect();
+    const logical = logical_rect.intersection(output_rect) orelse return null;
+    const physical = scaleDamageRect(.{
+        .x = logical.x -| output_rect.x,
+        .y = logical.y -| output_rect.y,
+        .width = logical.width,
+        .height = logical.height,
+    }, render_output.backend.renderScale(), render_output.backend.modeSize()) orelse return null;
+    const scale = render_output.backend.renderScale();
+    const scaled_radius = (@as(u64, radius) * scale.numerator +
+        render.Scale.denominator / 2) / render.Scale.denominator;
+    if (scaled_radius == 0) return null;
+    return .{ .rect = physical, .radius = @intCast(scaled_radius) };
+}
+
 fn windowBackdropBlurArea(
     self: *Self,
     render_output: *const RenderOutput,
@@ -4732,19 +4760,45 @@ fn windowBackdropBlurArea(
             clip_box.translated(window.position.x, window.position.y),
         ) orelse return null;
     }
-    const output_rect = output.logicalRect();
-    logical = logical.intersection(output_rect) orelse return null;
-    const physical = scaleDamageRect(.{
-        .x = logical.x -| output_rect.x,
-        .y = logical.y -| output_rect.y,
-        .width = logical.width,
-        .height = logical.height,
-    }, render_output.backend.renderScale(), render_output.backend.modeSize()) orelse return null;
-    const scale = render_output.backend.renderScale();
-    const scaled_radius = (@as(u64, blur.radius) * scale.numerator +
-        render.Scale.denominator / 2) / render.Scale.denominator;
-    if (scaled_radius == 0) return null;
-    return .{ .rect = physical, .radius = @intCast(scaled_radius) };
+    return backdropBlurArea(render_output, output, logical, blur.radius);
+}
+
+fn layerSurfaceBackdropBlurArea(
+    self: *Self,
+    render_output: *const RenderOutput,
+    output: *const Output,
+    layer_surface: *const Scene.LayerSurface,
+) ?BackdropBlurArea {
+    const logical = self.layerSurfaceBackdropBlurRect(layer_surface) orelse return null;
+    return backdropBlurArea(
+        render_output,
+        output,
+        logical,
+        self.layer_shell_blur_radius,
+    );
+}
+
+fn layerSurfaceBackdropBlurRect(
+    self: *Self,
+    layer_surface: *const Scene.LayerSurface,
+) ?render.Rect {
+    if (!layer_surface.mapped or self.layer_shell_blur_radius == 0) return null;
+    const buffer = Surface.currentBuffer(
+        self.compositor.surfaceStore(),
+        layer_surface.surface_id,
+    ) orelse return null;
+    const pixel_buffer = buffer.pixelBuffer();
+    if ((pixel_buffer.dmabuf != null and pixel_buffer.dmabuf.?.force_opaque) or
+        Surface.currentOpaqueCoversBuffer(
+            self.compositor.surfaceStore(),
+            layer_surface.surface_id,
+        )) return null;
+    return .{
+        .x = layer_surface.position.x,
+        .y = layer_surface.position.y,
+        .width = buffer.logical_size.width,
+        .height = buffer.logical_size.height,
+    };
 }
 
 fn addBackdropBlurDamage(
@@ -4807,6 +4861,28 @@ fn expandBackdropBlurDamage(
             },
             .shell_surface => {},
         };
+        inline for (.{
+            Scene.Layer.background,
+            Scene.Layer.bottom,
+            Scene.Layer.top,
+            Scene.Layer.overlay,
+        }) |layer| {
+            var surfaces = self.scene.layerSurfaceIterator(layer);
+            while (surfaces.next()) |entry| {
+                const blur = self.layerSurfaceBackdropBlurArea(
+                    render_output,
+                    output,
+                    entry.layer_surface,
+                ) orelse continue;
+                const footprint = self.renderer.backdropBlurFootprint(blur.radius);
+                changed = try addBackdropBlurDamage(
+                    damage,
+                    blur,
+                    render_output.backend.modeSize(),
+                    footprint,
+                ) or changed;
+            }
+        }
     }
 }
 
@@ -5205,6 +5281,16 @@ fn renderLayerSurfaces(
     while (surfaces.next()) |entry| {
         const layer_surface = entry.layer_surface;
         if (!layer_surface.mapped) continue;
+        if (self.layerSurfaceBackdropBlurRect(layer_surface)) |rect| {
+            const blur_command = [_]render.Command{
+                .{ .backdrop_blur = .{
+                    .rect = rect,
+                    .corner_radius = 0,
+                    .radius = self.layer_shell_blur_radius,
+                } },
+            };
+            try self.renderCommands(frame, &blur_command);
+        }
         try self.renderSurfaceTree(
             frame,
             layer_surface.surface_id,
