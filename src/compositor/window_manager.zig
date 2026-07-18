@@ -46,9 +46,29 @@ focused_window_effects: Scene.Effects = Scene.default_effects,
 focused_window_border: ?Scene.Borders = null,
 tiling_drag: ?TilingDrag = null,
 toplevel_drag: ?ToplevelDrag = null,
+session_listener: ?SessionListener = null,
+pending_session_restores: std.AutoHashMapUnmanaged(XdgShell.WindowId, SessionState) = .empty,
 
 const WindowStore = slot_map.SlotMap(Window, enum { builtin_window });
 pub const WindowId = WindowStore.Id;
+
+pub const SessionState = struct {
+    output_name: []const u8,
+    workspace: u8,
+    floating: bool,
+    position: ?Scene.Position,
+    size: types.Size,
+    maximized: bool,
+    fullscreen: bool,
+    minimized: bool,
+};
+
+pub const SessionListener = struct {
+    context: *anyopaque,
+    state_for_remap: *const fn (*anyopaque, XdgShell.WindowId) ?SessionState,
+    restored: *const fn (*anyopaque, XdgShell.WindowId) void,
+    changed: *const fn (*anyopaque, XdgShell.WindowId) void,
+};
 
 const TilingDrag = struct {
     source: WindowId,
@@ -198,6 +218,7 @@ pub fn init(
 }
 
 pub fn deinit(self: *Self) void {
+    std.debug.assert(self.session_listener == null);
     self.layer_shell.clearPolicyListener();
     self.xdg_shell.clearWindowListener();
     self.configure_timer.remove();
@@ -209,9 +230,66 @@ pub fn deinit(self: *Self) void {
     }
     self.windows.deinit(self.allocator);
     self.known_xwayland.deinit(self.allocator);
+    self.pending_session_restores.deinit(self.allocator);
     for (self.workspaces.items) |*entry| entry.workspace.deinit(self.allocator);
     self.workspaces.deinit(self.allocator);
     self.* = undefined;
+}
+
+pub fn setSessionListener(self: *Self, listener: SessionListener) void {
+    std.debug.assert(self.session_listener == null);
+    self.session_listener = listener;
+}
+
+pub fn clearSessionListener(self: *Self) void {
+    std.debug.assert(self.session_listener != null);
+    self.session_listener = null;
+}
+
+pub fn prepareSessionRestore(
+    self: *Self,
+    xdg_id: XdgShell.WindowId,
+    state: SessionState,
+) error{ InvalidWindow, AlreadyMapped, OutOfMemory }!void {
+    const info = self.xdg_shell.windowInfo(xdg_id) orelse return error.InvalidWindow;
+    if (info.ready or info.mapped or self.findXdg(xdg_id) != null) return error.AlreadyMapped;
+    if (self.pending_session_restores.contains(xdg_id)) return error.AlreadyMapped;
+    try self.pending_session_restores.put(self.allocator, xdg_id, state);
+}
+
+pub fn cancelSessionRestore(self: *Self, xdg_id: XdgShell.WindowId) void {
+    _ = self.pending_session_restores.remove(xdg_id);
+}
+
+pub fn sessionState(self: *Self, xdg_id: XdgShell.WindowId) ?SessionState {
+    const window = self.windows.get(self.findXdg(xdg_id) orelse return null) orelse return null;
+    const workspace = self.workspaces.items[window.workspace];
+    const output = self.outputs.get(workspace.output) orelse return null;
+    const dimensions = self.currentDimensions(window);
+    const size = window.floating_restore_size orelse if (window.placement) |placement|
+        placement.rect.size
+    else
+        types.Size.init(
+            @intCast(@max(1, dimensions.width)),
+            @intCast(@max(1, dimensions.height)),
+        );
+    const position: ?Scene.Position = if (self.isFloating(window))
+        window.floating_position orelse if (window.placement) |placement|
+            .{ .x = placement.rect.x, .y = placement.rect.y }
+        else
+            null
+    else
+        null;
+    return .{
+        .output_name = output.name(),
+        .workspace = workspace.number,
+        .floating = self.isFloating(window),
+        .position = position,
+        .size = size,
+        .maximized = window.maximized,
+        .fullscreen = window.fullscreen_output != null,
+        .minimized = window.minimized,
+    };
 }
 
 fn neutral(id: WindowId) types.WindowId {
@@ -319,24 +397,45 @@ fn addXdg(self: *Self, xdg_id: XdgShell.WindowId) !WindowId {
     if (self.findXdg(xdg_id)) |id| return id;
     const info = self.xdg_shell.windowInfo(xdg_id) orelse return error.OutOfMemory;
     const surface_id = self.xdg_shell.windowSurface(xdg_id) orelse return error.OutOfMemory;
-    const workspace = if (info.parent) |parent|
+    const restore = self.pending_session_restores.get(xdg_id);
+    const default_workspace = if (info.parent) |parent|
         if (self.findXdg(parent)) |parent_id|
             self.windows.get(parent_id).?.workspace
         else
             self.workspaceFor(self.default_output) orelse 0
     else
         self.workspaceFor(self.default_output) orelse 0;
+    const workspace = if (restore) |state|
+        if (self.outputNamed(state.output_name)) |output|
+            self.workspaceNumber(output, state.workspace) orelse default_workspace
+        else
+            default_workspace
+    else
+        default_workspace;
     const id = try self.windows.insert(self.allocator, .{
         .backend = .{ .xdg = xdg_id },
         .scene_id = info.scene_id,
         .surface_id = surface_id,
         .workspace = workspace,
         .fixed_size_floating = fixedSizeWantsFloating(info.min_size, info.max_size),
+        .floating_override = if (restore) |state| state.floating else null,
+        .floating_restore_size = if (restore) |state|
+            if (state.floating) state.size else null
+        else
+            null,
+        .floating_position = if (restore) |state| state.position else null,
+        .minimized = if (restore) |state| state.minimized else false,
+        .maximized = if (restore) |state| state.maximized else false,
+        .fullscreen_output = if (restore) |state|
+            if (state.fullscreen) self.workspaces.items[workspace].output else null
+        else
+            null,
     });
     errdefer _ = self.windows.remove(id);
     _ = try self.workspaces.items[workspace].workspace.insert(self.allocator, neutral(id));
     _ = self.workspaces.items[workspace].workspace.focus(neutral(id));
     self.reportWorkspaceOccupancy(workspace);
+    if (restore != null) std.debug.assert(self.pending_session_restores.remove(xdg_id));
     return id;
 }
 
@@ -396,6 +495,14 @@ fn workspaceNumber(self: *Self, output: OutputLayout.Id, number: u8) ?usize {
     if (number == 0 or number > workspace_count) return null;
     for (self.workspaces.items, 0..) |entry, i| {
         if (entry.number == number and std.meta.eql(entry.output, output)) return i;
+    }
+    return null;
+}
+
+fn outputNamed(self: *Self, name: []const u8) ?OutputLayout.Id {
+    var outputs = self.outputs.iterator();
+    while (outputs.next()) |entry| {
+        if (std.mem.eql(u8, entry.output.name(), name)) return entry.id;
     }
     return null;
 }
@@ -1331,6 +1438,13 @@ fn publish(self: *Self) void {
         }
     }
     self.xwayland.stacking_changed(self.xwayland.context);
+    if (self.session_listener) |listener| {
+        var windows = self.windows.iterator();
+        while (windows.next()) |entry| switch (entry.value.backend) {
+            .xdg => |id| listener.changed(listener.context, id),
+            .xwayland => {},
+        };
+    }
     if (self.transaction.consumeDirty()) self.relayout();
 }
 
@@ -1498,7 +1612,17 @@ fn handleOutOfMemory(self: *Self) void {
 
 fn windowReady(context: *anyopaque, id: XdgShell.WindowId) bool {
     const self: *Self = @ptrCast(@alignCast(context));
+    const restoring = self.pending_session_restores.contains(id);
+    if (!restoring) if (self.session_listener) |listener| {
+        if (listener.state_for_remap(listener.context, id)) |state| {
+            self.pending_session_restores.put(self.allocator, id, state) catch return false;
+        }
+    };
     _ = self.addXdg(id) catch return false;
+    if (restoring) {
+        std.debug.assert(!self.pending_session_restores.contains(id));
+        if (self.session_listener) |listener| listener.restored(listener.context, id);
+    }
     self.xdg_shell.setWindowVisible(id, false);
     self.relayout();
     return true;

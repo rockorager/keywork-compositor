@@ -1152,17 +1152,18 @@
       "interfaces": [
         {
           "name": "xdg_session_manager_v1",
-          "current_version": null,
+          "current_version": 1,
           "target_version": 1
         }
       ],
-      "status": "not_started",
+      "status": "done",
       "privileged": false,
       "blocked_by": [
         "workspace",
         "xdg-shell",
         "xdg-toplevel-tag"
-      ]
+      ],
+      "status_detail": "Version 1 implements durable session creation, takeover, removal, toplevel add/restore/remove/rename, and inert resource lifecycles. Per-instance state survives compositor restarts under XDG_RUNTIME_DIR and restores output/workspace, floating geometry, maximized, fullscreen, and minimized state before the initial XDG configure. Creation, rename, manager independence, cross-restart session and toplevel restoration ordering, and removal are exercised end to end."
     },
     {
       "id": "transient-seat",

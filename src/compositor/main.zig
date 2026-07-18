@@ -137,6 +137,10 @@ pub fn main(init: std.process.Init) !void {
     defer child_signal.remove();
 
     const socket_name = try server.listen();
+    try server.configureXdgSessionStorage(
+        init.environ_map.get("XDG_RUNTIME_DIR") orelse return error.MissingRuntimeDirectory,
+        if (native_session) "session" else socket_name,
+    );
     try init.environ_map.put("WAYLAND_DISPLAY", socket_name);
     try server.listenControl(
         init.environ_map.get("XDG_RUNTIME_DIR") orelse return error.MissingRuntimeDirectory,
@@ -450,6 +454,7 @@ test {
     _ = @import("wayland/xdg_dialog.zig");
     _ = @import("wayland/xdg_system_bell.zig");
     _ = @import("wayland/xdg_toplevel_tag.zig");
+    _ = @import("wayland/xdg_session_management.zig");
     _ = @import("wayland/single_pixel_buffer.zig");
     _ = @import("wayland/content_type.zig");
     _ = @import("wayland/background_effect.zig");

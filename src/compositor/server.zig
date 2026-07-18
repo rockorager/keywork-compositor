@@ -33,6 +33,7 @@ const XdgToplevelIcon = @import("wayland/xdg_toplevel_icon.zig");
 const XdgDialog = @import("wayland/xdg_dialog.zig");
 const XdgSystemBell = @import("wayland/xdg_system_bell.zig");
 const XdgToplevelTag = @import("wayland/xdg_toplevel_tag.zig");
+const XdgSessionManagement = @import("wayland/xdg_session_management.zig");
 const PrimarySelection = @import("wayland/primary_selection.zig");
 const DataControl = @import("wayland/data_control.zig");
 const ForeignToplevelList = @import("wayland/foreign_toplevel_list.zig");
@@ -145,6 +146,7 @@ xdg_toplevel_icon: XdgToplevelIcon,
 xdg_dialog: XdgDialog,
 xdg_system_bell: XdgSystemBell,
 xdg_toplevel_tag: XdgToplevelTag,
+xdg_session_management: XdgSessionManagement,
 primary_selection: PrimarySelection,
 data_control: DataControl,
 foreign_toplevel_list: ForeignToplevelList,
@@ -716,6 +718,7 @@ pub fn createWithVirtualOutput(
         .xdg_dialog = undefined,
         .xdg_system_bell = undefined,
         .xdg_toplevel_tag = undefined,
+        .xdg_session_management = undefined,
         .primary_selection = undefined,
         .data_control = undefined,
         .foreign_toplevel_list = undefined,
@@ -1120,6 +1123,14 @@ pub fn createWithVirtualOutput(
     errdefer self.xdg_system_bell.deinit();
     try self.xdg_toplevel_tag.init(display, &self.xdg_shell);
     errdefer self.xdg_toplevel_tag.deinit();
+    try self.xdg_session_management.init(
+        allocator,
+        io,
+        display,
+        &self.xdg_shell,
+        &self.window_manager,
+    );
+    errdefer self.xdg_session_management.deinit();
     self.workspace.setActivationListener(.{
         .context = self,
         .activate = workspaceActivationRequested,
@@ -1302,6 +1313,14 @@ pub fn createWithVirtualOutput(
     return self;
 }
 
+pub fn configureXdgSessionStorage(
+    self: *Self,
+    runtime_directory: []const u8,
+    instance_name: []const u8,
+) !void {
+    try self.xdg_session_management.configureStorage(runtime_directory, instance_name);
+}
+
 pub fn destroy(self: *Self) void {
     const allocator = self.allocator;
     if (self.control_initialized) {
@@ -1362,6 +1381,7 @@ pub fn destroy(self: *Self) void {
     self.foreign_toplevel_list.deinit();
     self.foreign_toplevel_list_initialized = false;
     self.workspace.clearActivationListener();
+    self.xdg_session_management.deinit();
     self.xdg_toplevel_tag.deinit();
     self.xdg_system_bell.deinit();
     self.xdg_dialog.deinit();
