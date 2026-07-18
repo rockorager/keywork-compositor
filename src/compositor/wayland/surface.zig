@@ -27,6 +27,7 @@ role_handler: ?RoleHandler,
 viewport_handler: ?ViewportHandler,
 content_type_handler: ?ContentTypeHandler,
 tearing_control_handler: ?TearingControlHandler,
+fifo_handler: ?FifoHandler,
 background_effect_handler: ?BackgroundEffectHandler,
 explicit_sync_handler: ?ExplicitSyncHandler,
 commit_listeners: std.ArrayList(*CommitListener),
@@ -50,6 +51,10 @@ pub const State = struct {
     current_content_type: ContentType,
     pending_presentation_hint: PresentationHint,
     current_presentation_hint: PresentationHint,
+    pending_fifo_set: bool,
+    pending_fifo_wait: bool,
+    fifo_barrier: bool,
+    fifo_barrier_output: ?*anyopaque,
     pending_blur_region: Region,
     pending_blur_region_changed: bool,
     current_blur_region: Region,
@@ -94,6 +99,10 @@ pub const State = struct {
             .current_content_type = .none,
             .pending_presentation_hint = .vsync,
             .current_presentation_hint = .vsync,
+            .pending_fifo_set = false,
+            .pending_fifo_wait = false,
+            .fifo_barrier = false,
+            .fifo_barrier_output = null,
             .pending_blur_region = Region.init(),
             .pending_blur_region_changed = false,
             .current_blur_region = Region.init(),
@@ -179,6 +188,7 @@ pub fn create(
         .viewport_handler = null,
         .content_type_handler = null,
         .tearing_control_handler = null,
+        .fifo_handler = null,
         .background_effect_handler = null,
         .explicit_sync_handler = null,
         .commit_listeners = .empty,
@@ -320,6 +330,32 @@ pub fn currentPresentationHint(store: *Store, id: Id) ?PresentationHint {
     return surface_state.current_presentation_hint;
 }
 
+pub const FifoHandler = struct {
+    context: *anyopaque,
+    surface_destroyed: *const fn (*anyopaque) void,
+};
+
+pub fn setFifoHandler(self: *Self, handler: FifoHandler) error{AlreadyExists}!void {
+    if (self.fifo_handler != null) return error.AlreadyExists;
+    self.fifo_handler = handler;
+}
+
+pub fn clearFifoHandler(self: *Self, context: *anyopaque) void {
+    const handler = self.fifo_handler orelse unreachable;
+    std.debug.assert(handler.context == context);
+    self.fifo_handler = null;
+}
+
+pub fn setPendingFifoBarrier(self: *Self) void {
+    std.debug.assert(self.fifo_handler != null);
+    self.state().pending_fifo_set = true;
+}
+
+pub fn setPendingFifoWait(self: *Self) void {
+    std.debug.assert(self.fifo_handler != null);
+    self.state().pending_fifo_wait = true;
+}
+
 pub const BackgroundEffectHandler = struct {
     context: *anyopaque,
     surface_destroyed: *const fn (*anyopaque) void,
@@ -416,6 +452,9 @@ const CachedCommit = struct {
     sequence: u64,
     role_ready: bool,
     sync_ready: bool,
+    fifo_set: bool,
+    fifo_wait: bool,
+    fifo_wait_ignored: bool,
     buffer: ?BufferSnapshot,
     attachment_changed: bool,
     has_buffer: bool,
@@ -576,14 +615,19 @@ pub fn removeCommitFeedback(store: *Store, id: Id, feedback: *CommitFeedback) vo
 }
 
 pub fn applyCachedCommit(self: *Self) void {
-    applyCachedUpTo(self, std.math.maxInt(u64));
+    markCachedReady(self, std.math.maxInt(u64), false);
 }
 
 pub fn applyCachedUpTo(self: *Self, sequence: u64) void {
+    markCachedReady(self, sequence, true);
+}
+
+fn markCachedReady(self: *Self, sequence: u64, ignore_fifo_wait: bool) void {
     const surface_state = self.state();
     for (surface_state.cached_commits.items) |*cached| {
         if (cached.sequence > sequence) break;
         cached.role_ready = true;
+        if (ignore_fifo_wait) cached.fifo_wait_ignored = true;
     }
     applyReadyCached(self);
 }
@@ -595,7 +639,11 @@ fn applyReadyCached(self: *Self) void {
     var applied = false;
     while (surface_state.cached_commits.items.len > 0) {
         const first = surface_state.cached_commits.items[0];
-        if (!first.role_ready or !first.sync_ready) break;
+        if (!first.role_ready or !first.sync_ready or
+            !fifoCommitReady(first.fifo_wait, first.fifo_wait_ignored, surface_state.fifo_barrier))
+        {
+            break;
+        }
         var cached = surface_state.cached_commits.orderedRemove(0);
         applyCached(self, &cached);
         cached.deinit();
@@ -735,6 +783,33 @@ pub fn submitPresentationFor(store: *Store, id: Id, output_context: *anyopaque) 
             feedback.sampled(feedback.context, output_context);
             feedback.state = .submitted;
         }
+    }
+}
+
+pub fn markFifoBarrierVisible(store: *Store, id: Id, output_context: *anyopaque) void {
+    const surface_state = store.get(id) orelse return;
+    if (!surface_state.fifo_barrier or surface_state.fifo_barrier_output != null) return;
+    surface_state.fifo_barrier_output = output_context;
+}
+
+pub fn hasFifoBarrierForOutput(store: *Store, output_context: *anyopaque) bool {
+    var surfaces = store.iterator();
+    while (surfaces.next()) |entry| {
+        if (entry.value.fifo_barrier and
+            entry.value.fifo_barrier_output == output_context) return true;
+    }
+    return false;
+}
+
+pub fn clearFifoBarriersForOutput(store: *Store, output_context: *anyopaque) void {
+    var surfaces = store.iterator();
+    while (surfaces.next()) |entry| {
+        const surface_state = entry.value;
+        if (!surface_state.fifo_barrier or
+            surface_state.fifo_barrier_output != output_context) continue;
+        surface_state.fifo_barrier = false;
+        surface_state.fifo_barrier_output = null;
+        applyReadyCached(Self.fromResource(surface_state.resource));
     }
 }
 
@@ -883,6 +958,11 @@ fn commit(self: *Self) void {
         if (!handler.validate_commit(handler.context, attachment)) return;
         break :ready attachment != .dmabuf or handler.pending_ready(handler.context);
     } else true;
+    const fifo_ready = fifoCommitReady(
+        surface_state.pending_fifo_wait,
+        false,
+        surface_state.fifo_barrier,
+    );
 
     const commit_info = pendingCommitInfo(self);
     const action = if (self.role_handler) |handler|
@@ -892,7 +972,7 @@ fn commit(self: *Self) void {
 
     switch (action) {
         .apply => {
-            if (!acquire_ready or self.hasCachedCommit()) {
+            if (!acquire_ready or !fifo_ready or self.hasCachedCommit()) {
                 if (cachePending(self, true)) {
                     notifyCommitted(self);
                     applyReadyCached(self);
@@ -1011,6 +1091,9 @@ fn applyPending(self: *Self, commit_info: CommitInfo) void {
     }
     surface_state.pending_offset_x = 0;
     surface_state.pending_offset_y = 0;
+    applyFifoSet(surface_state, surface_state.pending_fifo_set);
+    surface_state.pending_fifo_set = false;
+    surface_state.pending_fifo_wait = false;
     surface_state.pending_blur_region_changed = false;
     surface_state.pending_surface_damage.clear();
     surface_state.pending_buffer_damage.clear();
@@ -1066,6 +1149,9 @@ fn cachePending(self: *Self, role_ready: bool) bool {
         .sequence = sequence,
         .role_ready = role_ready,
         .sync_ready = if (snapshot) |*buffer| buffer.isReady() else true,
+        .fifo_set = surface_state.pending_fifo_set,
+        .fifo_wait = surface_state.pending_fifo_wait,
+        .fifo_wait_ignored = false,
         .buffer = snapshot,
         .attachment_changed = self.has_pending_attachment,
         .has_buffer = if (self.has_pending_attachment)
@@ -1131,6 +1217,8 @@ fn cachePending(self: *Self, role_ready: bool) bool {
 
     surface_state.pending_offset_x = 0;
     surface_state.pending_offset_y = 0;
+    surface_state.pending_fifo_set = false;
+    surface_state.pending_fifo_wait = false;
     surface_state.pending_blur_region_changed = false;
     surface_state.pending_surface_damage.clear();
     surface_state.pending_buffer_damage.clear();
@@ -1209,6 +1297,7 @@ fn applyCached(self: *Self, cached: *CachedCommit) void {
         offset_changed,
     );
     if (cached.blur_region_changed) surface_state.current_damage_precise = false;
+    applyFifoSet(surface_state, cached.fifo_set);
     if (surface_state.presentation_output != null) surface_state.commit_after_submission = true;
     discardCommitFeedbacks(surface_state, .active);
     for (surface_state.callbacks.items) |callback| {
@@ -1412,6 +1501,10 @@ fn handleDestroy(_: *wl.Surface, self: *Self) void {
         self.tearing_control_handler = null;
         handler.surface_destroyed(handler.context);
     }
+    if (self.fifo_handler) |handler| {
+        self.fifo_handler = null;
+        handler.surface_destroyed(handler.context);
+    }
     if (self.background_effect_handler) |handler| {
         self.background_effect_handler = null;
         handler.surface_destroyed(handler.context);
@@ -1445,6 +1538,16 @@ fn handleDestroy(_: *wl.Surface, self: *Self) void {
     var removed = self.store.remove(self.id) orelse unreachable;
     removed.deinit(self.allocator);
     self.allocator.destroy(self);
+}
+
+fn applyFifoSet(surface_state: *State, set_barrier: bool) void {
+    if (!set_barrier) return;
+    surface_state.fifo_barrier = true;
+    surface_state.fifo_barrier_output = null;
+}
+
+fn fifoCommitReady(wait_barrier: bool, wait_ignored: bool, barrier: bool) bool {
+    return !wait_barrier or wait_ignored or !barrier;
 }
 
 fn validTransform(transform: wl.Output.Transform) bool {
@@ -2504,4 +2607,93 @@ test "viewport source is validated and converted to buffer coordinates" {
             .{ .source = .{ .x = 0, .y = 0, .width = 128, .height = 256 } },
         ),
     );
+}
+
+test "FIFO waits block only while a relevant barrier is active" {
+    try std.testing.expect(fifoCommitReady(false, false, true));
+    try std.testing.expect(fifoCommitReady(true, false, false));
+    try std.testing.expect(!fifoCommitReady(true, false, true));
+    try std.testing.expect(fifoCommitReady(true, true, true));
+}
+
+test "FIFO barriers attach to one visible output until replaced" {
+    var store: Store = .{};
+    defer store.deinit(std.testing.allocator);
+    const id = try store.insert(std.testing.allocator, State.init(undefined));
+    defer {
+        var removed = store.remove(id).?;
+        removed.deinit(std.testing.allocator);
+    }
+    const surface_state = store.get(id).?;
+    applyFifoSet(surface_state, true);
+
+    var first_output: u8 = 0;
+    var second_output: u8 = 0;
+    markFifoBarrierVisible(&store, id, &first_output);
+    markFifoBarrierVisible(&store, id, &second_output);
+    try std.testing.expect(hasFifoBarrierForOutput(&store, &first_output));
+    try std.testing.expect(!hasFifoBarrierForOutput(&store, &second_output));
+
+    applyFifoSet(surface_state, true);
+    try std.testing.expect(!hasFifoBarrierForOutput(&store, &first_output));
+    try std.testing.expect(surface_state.fifo_barrier_output == null);
+}
+
+test "synchronized application ignores FIFO waits while desynchronized application blocks" {
+    var store: Store = .{};
+    defer store.deinit(std.testing.allocator);
+    const id = try store.insert(std.testing.allocator, State.init(undefined));
+    var surface: Self = .{
+        .allocator = std.testing.allocator,
+        .store = &store,
+        .id = id,
+        .resource = undefined,
+        .pending_attachment = .{},
+        .has_pending_attachment = false,
+        .role_handler = null,
+        .viewport_handler = null,
+        .content_type_handler = null,
+        .tearing_control_handler = null,
+        .fifo_handler = null,
+        .background_effect_handler = null,
+        .explicit_sync_handler = null,
+        .commit_listeners = .empty,
+    };
+    defer surface.commit_listeners.deinit(std.testing.allocator);
+    defer {
+        var removed = store.remove(id).?;
+        removed.deinit(std.testing.allocator);
+    }
+
+    const surface_state = store.get(id).?;
+    surface_state.fifo_barrier = true;
+    try surface_state.cached_commits.append(std.testing.allocator, .{
+        .sequence = 1,
+        .role_ready = false,
+        .sync_ready = true,
+        .fifo_set = false,
+        .fifo_wait = true,
+        .fifo_wait_ignored = false,
+        .buffer = null,
+        .attachment_changed = false,
+        .has_buffer = false,
+        .offset_x = 0,
+        .offset_y = 0,
+        .scale = 1,
+        .transform = .normal,
+        .viewport = .{},
+        .content_type = .none,
+        .presentation_hint = .vsync,
+        .blur_region = Region.init(),
+        .blur_region_changed = false,
+        .surface_damage = Region.init(),
+        .buffer_damage = Region.init(),
+        .opaque_region = Region.init(),
+        .input = InputRegion.init(),
+    });
+
+    surface.applyCachedCommit();
+    try std.testing.expectEqual(@as(usize, 1), surface_state.cached_commits.items.len);
+    surface.applyCachedUpTo(std.math.maxInt(u64));
+    try std.testing.expectEqual(@as(usize, 0), surface_state.cached_commits.items.len);
 }

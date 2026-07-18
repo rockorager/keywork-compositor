@@ -48,6 +48,7 @@ const Fixes = @import("wayland/fixes.zig");
 const LinuxDmabuf = @import("wayland/linux_dmabuf.zig");
 const LinuxDrmSyncobj = @import("wayland/linux_drm_syncobj.zig");
 const TearingControl = @import("wayland/tearing_control.zig");
+const Fifo = @import("wayland/fifo.zig");
 const XdgActivation = @import("wayland/xdg_activation.zig");
 const Output = @import("wayland/output.zig");
 const OutputLayout = @import("wayland/output_layout.zig");
@@ -165,6 +166,7 @@ fixes: Fixes,
 linux_dmabuf: LinuxDmabuf,
 linux_drm_syncobj: LinuxDrmSyncobj,
 tearing_control: TearingControl,
+fifo: Fifo,
 xdg_activation: XdgActivation,
 viewporter: Viewporter,
 window_manager: WindowManager,
@@ -729,6 +731,7 @@ pub fn createWithVirtualOutput(
         .linux_dmabuf = undefined,
         .linux_drm_syncobj = undefined,
         .tearing_control = undefined,
+        .fifo = undefined,
         .xdg_activation = undefined,
         .viewporter = undefined,
         .window_manager = undefined,
@@ -937,6 +940,8 @@ pub fn createWithVirtualOutput(
     errdefer self.linux_drm_syncobj.deinit();
     try self.tearing_control.init(allocator, display);
     errdefer self.tearing_control.deinit();
+    try self.fifo.init(allocator, display);
+    errdefer self.fifo.deinit();
     try self.subcompositor.init(allocator, display, self.compositor.surfaceStore());
     errdefer self.subcompositor.deinit();
     self.scene.init(allocator);
@@ -1328,6 +1333,7 @@ pub fn destroy(self: *Self) void {
     self.gtk_shell.deinit();
     self.scene.deinit();
     self.subcompositor.deinit();
+    self.fifo.deinit();
     self.tearing_control.deinit();
     self.linux_drm_syncobj.deinit();
     self.linux_dmabuf.deinit();
@@ -1632,6 +1638,7 @@ fn removeRenderOutput(self: *Self, id: RenderOutputId) bool {
     }
     if (self.workspace_initialized) self.workspace.removeOutput(render_output.protocol_id);
     Surface.discardPresentation(self.compositor.surfaceStore(), protocol_output);
+    Surface.clearFifoBarriersForOutput(self.compositor.surfaceStore(), protocol_output);
     if (self.xdg_output_initialized) self.xdg_output.removeOutput(protocol_output);
     std.debug.assert(self.outputs.remove(render_output.protocol_id));
     if (self.session_lock_initialized) {
@@ -5614,12 +5621,16 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
     }
 
     const top_fullscreen = try self.renderDesktopContents(&frame, true);
+    const fifo_barrier = Surface.hasFifoBarrierForOutput(
+        self.compositor.surfaceStore(),
+        output,
+    );
     const allow_tearing = if (top_fullscreen) |window_id|
         if (self.scene.windowSurface(window_id)) |surface_id|
             Surface.currentPresentationHint(
                 self.compositor.surfaceStore(),
                 surface_id,
-            ) == .async
+            ) == .async and !fifo_barrier
         else
             false
     else
@@ -5687,6 +5698,7 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
     if (drag_icon) |info| self.submitSurfaceTree(output, info.surface_id);
     self.submitSeatCursor(output, &self.seat, false);
     self.submitTabletCursors(output, false);
+    Surface.clearFifoBarriersForOutput(self.compositor.surfaceStore(), output);
     self.finishRepaintIfIdle();
     if (presented) |info| outputPresented(render_output, info);
     self.refreshKeyboardFocus();
@@ -5806,6 +5818,7 @@ fn presentSessionLockFrame(
     if (lock_surface) |info| self.submitSurfaceTree(frame.output, info.surface_id);
     self.submitSeatCursor(frame.output, &self.seat, true);
     self.submitTabletCursors(frame.output, true);
+    Surface.clearFifoBarriersForOutput(self.compositor.surfaceStore(), frame.output);
     self.finishRepaintIfIdle();
     if (presented) |info| outputPresented(frame.render_output, info);
     self.refreshKeyboardFocus();
@@ -6236,7 +6249,14 @@ fn renderSurfaceTree(
             if (clip) |clip_rect| {
                 if (visible_rect.intersection(clip_rect) == null) continue;
             }
-            if (frame.track_visibility) try frame.output.markSurfaceVisible(surface_id);
+            if (frame.track_visibility) {
+                try frame.output.markSurfaceVisible(surface_id);
+                Surface.markFifoBarrierVisible(
+                    self.compositor.surfaceStore(),
+                    surface_id,
+                    frame.output,
+                );
+            }
             try self.renderSurfaceBackgroundEffect(
                 frame,
                 surface_id,

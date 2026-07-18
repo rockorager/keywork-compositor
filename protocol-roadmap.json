@@ -1010,15 +1010,16 @@
       "interfaces": [
         {
           "name": "wp_fifo_manager_v1",
-          "current_version": null,
+          "current_version": 1,
           "target_version": 1
         }
       ],
-      "status": "not_started",
+      "status": "done",
       "privileged": false,
       "blocked_by": [
         "presentation-time"
-      ]
+      ],
+      "status_detail": "Version 1 implements per-surface lifecycle and errors plus one-shot, double-buffered set and wait barriers integrated with ordered cached commits and explicit synchronization. Visible barriers bind to an output, force the following latch to use non-tearing presentation, and unblock waiting commits only after the frozen frame is submitted and attributed; synchronized-subsurface waits are ignored as required, and output removal guarantees progress. Multi-refresh FIFO sequencing is exercised end to end with CPU and Vulkan renderers."
     },
     {
       "id": "commit-timing",

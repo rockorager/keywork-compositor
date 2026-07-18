@@ -356,7 +356,7 @@ fn applyLiveParentState(self: *Self, parent: *Parent) void {
             if (!self.effectivelySynchronized(id)) continue;
             const adapter = self.adapters.get(id) orelse continue;
             const surface = adapter.surface orelse continue;
-            surface.applyCachedCommit();
+            surface.applyCachedUpTo(std.math.maxInt(u64));
         },
     };
 }
