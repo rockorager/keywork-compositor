@@ -286,6 +286,9 @@ const FrameStatistics = struct {
     latency_samples: [frame_latency_capacity]FrameLatency = undefined,
     latency_count: usize = 0,
     latency_next: usize = 0,
+    gpu_execution_samples: [frame_latency_capacity]u64 = undefined,
+    gpu_execution_count: usize = 0,
+    gpu_execution_next: usize = 0,
 
     fn recordPresentation(
         self: *FrameStatistics,
@@ -325,6 +328,12 @@ const FrameStatistics = struct {
         self.latency_count = @min(self.latency_count + 1, frame_latency_capacity);
     }
 
+    fn addGpuExecution(self: *FrameStatistics, nanoseconds: u64) void {
+        self.gpu_execution_samples[self.gpu_execution_next] = nanosecondsToMicroseconds(nanoseconds);
+        self.gpu_execution_next = (self.gpu_execution_next + 1) % frame_latency_capacity;
+        self.gpu_execution_count = @min(self.gpu_execution_count + 1, frame_latency_capacity);
+    }
+
     fn snapshot(
         self: *const FrameStatistics,
         name: []const u8,
@@ -345,6 +354,7 @@ const FrameStatistics = struct {
             .direct_scanout_candidates = wireInteger(self.direct_scanout_candidates),
             .direct_scanout_frames = wireInteger(self.direct_scanout_frames),
             .frames_over_budget = wireInteger(self.frames_over_budget),
+            .gpu_execution = self.gpuExecutionSummary(),
             .request_to_presentation = self.latencySummary(.request_to_presentation),
             .request_to_render = self.latencySummary(.request_to_render),
             .render_to_commit = self.latencySummary(.render_to_commit),
@@ -373,6 +383,30 @@ const FrameStatistics = struct {
             };
         }
         const sorted = values[0..self.latency_count];
+        std.mem.sort(u64, sorted, {}, std.sort.asc(u64));
+        return .{
+            .samples = @intCast(sorted.len),
+            .p50_microseconds = wireInteger(percentile(sorted, 50)),
+            .p95_microseconds = wireInteger(percentile(sorted, 95)),
+            .p99_microseconds = wireInteger(percentile(sorted, 99)),
+            .maximum_microseconds = wireInteger(sorted[sorted.len - 1]),
+        };
+    }
+
+    fn gpuExecutionSummary(self: *const FrameStatistics) ControlProtocol.LatencyStatistics {
+        if (self.gpu_execution_count == 0) return .{
+            .samples = 0,
+            .p50_microseconds = 0,
+            .p95_microseconds = 0,
+            .p99_microseconds = 0,
+            .maximum_microseconds = 0,
+        };
+        var values: [frame_latency_capacity]u64 = undefined;
+        @memcpy(
+            values[0..self.gpu_execution_count],
+            self.gpu_execution_samples[0..self.gpu_execution_count],
+        );
+        const sorted = values[0..self.gpu_execution_count];
         std.mem.sort(u64, sorted, {}, std.sort.asc(u64));
         return .{
             .samples = @intCast(sorted.len),
@@ -455,6 +489,15 @@ test "frame statistics summarize rolling latency and classify over-budget frames
     try std.testing.expectEqual(@as(i64, 400), summary.p99_microseconds);
     try std.testing.expectEqual(@as(i64, 400), summary.maximum_microseconds);
 
+    statistics.addGpuExecution(1_100 * std.time.ns_per_us);
+    statistics.addGpuExecution(2_200 * std.time.ns_per_us);
+    statistics.addGpuExecution(3_300 * std.time.ns_per_us);
+    const gpu_summary = statistics.gpuExecutionSummary();
+    try std.testing.expectEqual(@as(i64, 3), gpu_summary.samples);
+    try std.testing.expectEqual(@as(i64, 2_200), gpu_summary.p50_microseconds);
+    try std.testing.expectEqual(@as(i64, 3_300), gpu_summary.p95_microseconds);
+    try std.testing.expectEqual(@as(i64, 3_300), gpu_summary.maximum_microseconds);
+
     statistics.recordPresentation(.{
         .request_nanoseconds = 0,
         .render_nanoseconds = std.time.ns_per_ms,
@@ -465,6 +508,7 @@ test "frame statistics summarize rolling latency and classify over-budget frames
 
     statistics.reset();
     try std.testing.expectEqual(@as(usize, 0), statistics.latency_count);
+    try std.testing.expectEqual(@as(usize, 0), statistics.gpu_execution_count);
     try std.testing.expectEqual(@as(u64, 0), statistics.frames_presented);
 
     for (0..frame_latency_capacity + 1) |value| statistics.addLatency(.{
@@ -2034,6 +2078,7 @@ fn controlPerformanceStatistics(
     reset: bool,
 ) ![]ControlProtocol.OutputStatistics {
     const self: *Self = @ptrCast(@alignCast(context));
+    self.collectGpuTimings();
     const result = try allocator.alloc(ControlProtocol.OutputStatistics, self.render_outputs.count);
     var index: usize = 0;
     var outputs = self.render_outputs.iterator();
@@ -2047,7 +2092,28 @@ fn controlPerformanceStatistics(
         );
         if (reset) render_output.frame_statistics.reset();
     }
+    if (reset) self.renderer.discardGpuTimings();
     return result;
+}
+
+fn outputStatisticsTag(id: OutputLayout.Id) u64 {
+    return @as(u64, id.generation) << 32 | id.index;
+}
+
+fn outputStatisticsId(tag: u64) OutputLayout.Id {
+    return .{
+        .index = @truncate(tag),
+        .generation = @truncate(tag >> 32),
+    };
+}
+
+fn collectGpuTimings(self: *Self) void {
+    while (self.renderer.takeGpuTiming()) |timing| {
+        const render_output = self.findProtocolRenderOutput(
+            outputStatisticsId(timing.tag),
+        ) orelse continue;
+        render_output.frame_statistics.addGpuExecution(timing.nanoseconds);
+    }
 }
 
 fn reloadControlConfiguration(context: *anyopaque) ?[]const u8 {
@@ -5558,7 +5624,10 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
     if (self.session_lock.isLocked()) {
         try self.renderSessionLockContents(&frame, true);
         renderer_frame_active = false;
-        const render_fence_fd = try self.renderer.finishFrameScanout();
+        const render_fence_fd = try self.renderer.finishFrameScanout(
+            outputStatisticsTag(render_output.protocol_id),
+        );
+        self.collectGpuTimings();
         defer if (render_fence_fd) |fd| {
             _ = std.c.close(fd);
         };
@@ -5580,7 +5649,10 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
     }
     if (!direct_scanout) {
         renderer_frame_active = false;
-        const render_fence_fd = try self.renderer.finishFrameScanout();
+        const render_fence_fd = try self.renderer.finishFrameScanout(
+            outputStatisticsTag(render_output.protocol_id),
+        );
+        self.collectGpuTimings();
         defer if (render_fence_fd) |fd| {
             _ = std.c.close(fd);
         };

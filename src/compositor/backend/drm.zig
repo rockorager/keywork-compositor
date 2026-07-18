@@ -426,7 +426,7 @@ pub fn present(
         };
     }
 
-    if (!self.queuePageFlip(fd, buffer.framebuffer_id, null)) return error.PageFlipFailed;
+    if (!self.queuePageFlip(fd, buffer.framebuffer_id, self.size, null)) return error.PageFlipFailed;
     self.pending = index;
     self.acquired = null;
     return null;
@@ -470,10 +470,10 @@ pub fn tryDirectScanout(self: *Self, buffer: render.PixelBuffer) DirectScanoutRe
     const source = buffer.dmabuf orelse return .{};
     const source_cache = buffer.source_cache orelse return .{};
     if (!self.mode_set or self.acquired == null or self.pending != null or
-        self.direct_pending != null or !std.meta.eql(buffer.size, self.size) or
-        source.y_inverted or
+        self.direct_pending != null or source.y_inverted or
         (source.format != c.DRM_FORMAT_ARGB8888 and source.format != c.DRM_FORMAT_XRGB8888) or
-        (self.atomic_plane == null and !self.legacyFramebufferLayoutMatches(buffer)))
+        (self.atomic_plane == null and (!std.meta.eql(buffer.size, self.size) or
+            !self.legacyFramebufferLayoutMatches(buffer))))
     {
         return .{};
     }
@@ -483,7 +483,7 @@ pub fn tryDirectScanout(self: *Self, buffer: render.PixelBuffer) DirectScanoutRe
     const framebuffer = self.directFramebuffer(fd, buffer) catch return .{};
 
     source.retain(source.context);
-    if (!self.queuePageFlip(fd, framebuffer.framebuffer_id, source)) {
+    if (!self.queuePageFlip(fd, framebuffer.framebuffer_id, buffer.size, source)) {
         source.release(source.context);
         return .{};
     }
@@ -1314,6 +1314,7 @@ fn queuePageFlip(
     self: *Self,
     fd: std.posix.fd_t,
     framebuffer_id: u32,
+    source_size: render.Size,
     source: ?render.DmabufSource,
 ) bool {
     const properties = self.atomic_plane orelse return c.drmModePageFlip(
@@ -1331,8 +1332,8 @@ fn queuePageFlip(
         !addAtomicProperty(request, plane_id, properties.crtc_id, self.crtc_id) or
         !addAtomicProperty(request, plane_id, properties.src_x, 0) or
         !addAtomicProperty(request, plane_id, properties.src_y, 0) or
-        !addAtomicProperty(request, plane_id, properties.src_w, @as(u64, self.size.width) << 16) or
-        !addAtomicProperty(request, plane_id, properties.src_h, @as(u64, self.size.height) << 16) or
+        !addAtomicProperty(request, plane_id, properties.src_w, @as(u64, source_size.width) << 16) or
+        !addAtomicProperty(request, plane_id, properties.src_h, @as(u64, source_size.height) << 16) or
         !addAtomicProperty(request, plane_id, properties.crtc_x, 0) or
         !addAtomicProperty(request, plane_id, properties.crtc_y, 0) or
         !addAtomicProperty(request, plane_id, properties.crtc_w, self.size.width) or
@@ -1885,7 +1886,7 @@ test "GBM Vulkan target accepts asynchronous render completion" {
     const completion_fd = try renderer.renderFrameScanout(.{
         .size = size,
         .commands = &.{.{ .clear = render.Color.rgba(12, 34, 56, 255) }},
-    }, .{ .dmabuf = .{ .id = selected.?.target_id, .size = size } });
+    }, .{ .dmabuf = .{ .id = selected.?.target_id, .size = size } }, null);
     if (completion_fd) |fence_fd| {
         defer _ = std.c.close(fence_fd);
         try std.testing.expect(importSyncFile(selected.?.buffer.fd, fence_fd));

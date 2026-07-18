@@ -18,6 +18,7 @@ pub const Renderer = struct {
     };
 
     pub const Error = CpuRenderer.Error || VulkanRenderer.Error;
+    pub const GpuTiming = VulkanRenderer.GpuTiming;
 
     const Backend = union(enum) {
         cpu: CpuRenderer,
@@ -149,7 +150,10 @@ pub const Renderer = struct {
     /// Returns an owned sync-file descriptor when rendering can complete
     /// asynchronously. The caller must close it after handing it to the
     /// display backend.
-    pub fn finishFrameScanout(self: *Renderer) Error!?std.posix.fd_t {
+    pub fn finishFrameScanout(
+        self: *Renderer,
+        gpu_sample_tag: ?u64,
+    ) Error!?std.posix.fd_t {
         const active = self.active_frame orelse unreachable;
         self.active_frame = null;
         defer self.commands.clearRetainingCapacity();
@@ -166,8 +170,26 @@ pub const Renderer = struct {
                 },
                 .offscreen, .dmabuf => error.InvalidTarget,
             },
-            .vulkan => |*renderer| renderer.renderFrameScanout(frame, active.target),
+            .vulkan => |*renderer| renderer.renderFrameScanout(
+                frame,
+                active.target,
+                gpu_sample_tag,
+            ),
         };
+    }
+
+    pub fn takeGpuTiming(self: *Renderer) ?GpuTiming {
+        return switch (self.backend) {
+            .cpu => null,
+            .vulkan => |*renderer| renderer.takeGpuTiming(),
+        };
+    }
+
+    pub fn discardGpuTimings(self: *Renderer) void {
+        switch (self.backend) {
+            .cpu => {},
+            .vulkan => |*renderer| renderer.discardGpuTimings(),
+        }
     }
 
     pub fn directScanoutCandidate(self: *Renderer) ?render_types.PixelBuffer {
@@ -180,7 +202,6 @@ pub const Renderer = struct {
         if (!image.is_opaque) return null;
         if (image.x != 0 or image.y != 0) return null;
         if (!std.meta.eql(image.size, active.target.size())) return null;
-        if (!std.meta.eql(image.buffer.size, active.target.size())) return null;
         if (image.source != null or image.transform != .normal or
             image.rounded_clip != null or image.clip != null) return null;
         if (image.buffer.dmabuf == null or image.buffer.dmabuf.?.y_inverted) return null;
@@ -531,6 +552,13 @@ test "direct scanout candidate requires a final exact opaque DMA-BUF image" {
     };
     try renderer.beginFrame(target, .{}, .{}, null);
     try renderer.append(&covered_commands);
+    try std.testing.expect(renderer.directScanoutCandidate() != null);
+    renderer.cancelFrame();
+
+    var scaled_commands = direct_commands;
+    scaled_commands[1].image.buffer.size = .{ .width = 3, .height = 3 };
+    try renderer.beginFrame(target, .{}, .{}, null);
+    try renderer.append(&scaled_commands);
     try std.testing.expect(renderer.directScanoutCandidate() != null);
     renderer.cancelFrame();
 

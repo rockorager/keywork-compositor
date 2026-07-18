@@ -671,6 +671,7 @@ const Recorder = struct {
             .direct_scanout_candidates = 2,
             .direct_scanout_frames = 1,
             .frames_over_budget = 1,
+            .gpu_execution = latency,
             .request_to_presentation = latency,
             .request_to_render = latency,
             .render_to_commit = latency,

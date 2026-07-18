@@ -27,6 +27,12 @@ command_buffer: vk.CommandBuffer,
 fence: vk.Fence,
 scanout_semaphore: vk.Semaphore,
 fence_pending: bool,
+timestamp_query_pool: vk.QueryPool,
+timestamp_valid_bits: u32,
+timestamp_period: f32,
+pending_gpu_sample_tag: ?u64,
+completed_gpu_timings: [2]GpuTiming,
+completed_gpu_timing_count: usize,
 format: vk.Format,
 swap_red_blue: bool,
 render_pass: vk.RenderPass,
@@ -248,6 +254,11 @@ pub const Error = CpuRenderer.Error || error{
     InvalidTarget,
     OutOfMemory,
     VulkanFailure,
+};
+
+pub const GpuTiming = struct {
+    tag: u64,
+    nanoseconds: u64,
 };
 
 const Graphics = struct {
@@ -770,6 +781,10 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
             break @as(u32, @intCast(index));
         }
     } else return error.NoQueueFamily;
+    const timestamp_valid_bits = queue_families[queue_family_index].timestamp_valid_bits;
+    const timestamp_period = instance_wrapper.getPhysicalDeviceProperties(
+        physical_device,
+    ).limits.timestamp_period;
 
     const queue_priority: f32 = 1.0;
     const queue_create_info: vk.DeviceQueueCreateInfo = .{
@@ -799,6 +814,19 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
         device,
         instance_wrapper.dispatch.vkGetDeviceProcAddr.?,
     );
+    const timestamp_query_pool = if (timestamp_valid_bits == 0)
+        vk.QueryPool.null_handle
+    else
+        device_wrapper.createQueryPool(device, &.{
+            .query_type = .timestamp,
+            .query_count = 2,
+        }, null) catch |err| pool: {
+            log.warn("failed to create Vulkan timestamp query pool: {t}", .{err});
+            break :pool vk.QueryPool.null_handle;
+        };
+    errdefer if (timestamp_query_pool != .null_handle) {
+        device_wrapper.destroyQueryPool(device, timestamp_query_pool, null);
+    };
     const command_pool = device_wrapper.createCommandPool(device, &.{
         .flags = .{ .reset_command_buffer_bit = true },
         .queue_family_index = queue_family_index,
@@ -934,6 +962,12 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
         .fence = fence,
         .scanout_semaphore = scanout_semaphore,
         .fence_pending = false,
+        .timestamp_query_pool = timestamp_query_pool,
+        .timestamp_valid_bits = timestamp_valid_bits,
+        .timestamp_period = timestamp_period,
+        .pending_gpu_sample_tag = null,
+        .completed_gpu_timings = undefined,
+        .completed_gpu_timing_count = 0,
         .format = format,
         .swap_red_blue = format == .r8g8b8a8_unorm,
         .render_pass = graphics.render_pass,
@@ -971,6 +1005,7 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
 pub fn deinit(self: *Self) void {
     self.device_wrapper.deviceWaitIdle(self.device) catch {};
     self.fence_pending = false;
+    self.pending_gpu_sample_tag = null;
     self.releasePendingResources();
     self.fallback.deinit();
     self.destroyCachedResources();
@@ -1003,6 +1038,9 @@ pub fn deinit(self: *Self) void {
     });
     if (self.scanout_semaphore != .null_handle) {
         self.device_wrapper.destroySemaphore(self.device, self.scanout_semaphore, null);
+    }
+    if (self.timestamp_query_pool != .null_handle) {
+        self.device_wrapper.destroyQueryPool(self.device, self.timestamp_query_pool, null);
     }
     self.device_wrapper.destroyFence(self.device, self.fence, null);
     self.device_wrapper.destroyCommandPool(self.device, self.command_pool, null);
@@ -1298,6 +1336,7 @@ fn drainPending(self: *Self) Error!void {
     if (!self.fence_pending) {
         std.debug.assert(self.pending_wait_semaphores.items.len == 0);
         std.debug.assert(self.pending_textures.items.len == 0);
+        std.debug.assert(self.pending_gpu_sample_tag == null);
         return;
     }
     const result = self.device_wrapper.waitForFences(
@@ -1308,17 +1347,82 @@ fn drainPending(self: *Self) Error!void {
     ) catch {
         self.device_wrapper.deviceWaitIdle(self.device) catch {};
         self.fence_pending = false;
+        self.pending_gpu_sample_tag = null;
         self.releasePendingResources();
         return error.VulkanFailure;
     };
     if (result != .success) {
         self.device_wrapper.deviceWaitIdle(self.device) catch {};
         self.fence_pending = false;
+        self.pending_gpu_sample_tag = null;
         self.releasePendingResources();
         return error.VulkanFailure;
     }
     self.fence_pending = false;
+    self.finishPendingGpuTiming();
     self.releasePendingResources();
+}
+
+fn finishPendingGpuTiming(self: *Self) void {
+    const tag = self.pending_gpu_sample_tag orelse return;
+    self.pending_gpu_sample_tag = null;
+    std.debug.assert(self.timestamp_query_pool != .null_handle);
+    var timestamps: [2]u64 = undefined;
+    const result = self.device_wrapper.getQueryPoolResults(
+        self.device,
+        self.timestamp_query_pool,
+        0,
+        timestamps.len,
+        @sizeOf(@TypeOf(timestamps)),
+        &timestamps,
+        @sizeOf(u64),
+        .{ .@"64_bit" = true },
+    ) catch |err| {
+        log.warn("failed to read Vulkan timestamp queries: {t}", .{err});
+        return;
+    };
+    if (result != .success) {
+        log.warn("Vulkan timestamp queries were unavailable after fence completion", .{});
+        return;
+    }
+    const ticks = timestampTickDelta(timestamps[0], timestamps[1], self.timestamp_valid_bits);
+    if (self.completed_gpu_timing_count == self.completed_gpu_timings.len) {
+        log.warn("dropping Vulkan GPU timestamp because the completion queue is full", .{});
+        return;
+    }
+    self.completed_gpu_timings[self.completed_gpu_timing_count] = .{
+        .tag = tag,
+        .nanoseconds = timestampNanoseconds(ticks, self.timestamp_period),
+    };
+    self.completed_gpu_timing_count += 1;
+}
+
+pub fn takeGpuTiming(self: *Self) ?GpuTiming {
+    if (self.completed_gpu_timing_count == 0) return null;
+    const timing = self.completed_gpu_timings[0];
+    if (self.completed_gpu_timing_count > 1) {
+        self.completed_gpu_timings[0] = self.completed_gpu_timings[1];
+    }
+    self.completed_gpu_timing_count -= 1;
+    return timing;
+}
+
+pub fn discardGpuTimings(self: *Self) void {
+    self.pending_gpu_sample_tag = null;
+    self.completed_gpu_timing_count = 0;
+}
+
+fn timestampTickDelta(start: u64, end: u64, valid_bits: u32) u64 {
+    std.debug.assert(valid_bits > 0 and valid_bits <= 64);
+    if (valid_bits == 64) return end -% start;
+    const mask = (@as(u64, 1) << @intCast(valid_bits)) - 1;
+    return ((end & mask) -% (start & mask)) & mask;
+}
+
+fn timestampNanoseconds(ticks: u64, period: f32) u64 {
+    if (!(period > 0)) return 0;
+    const nanoseconds = @as(f64, @floatFromInt(ticks)) * @as(f64, period);
+    return std.math.lossyCast(u64, nanoseconds);
 }
 
 fn releasePendingResources(self: *Self) void {
@@ -1337,15 +1441,16 @@ fn disableScanoutSemaphore(self: *Self) void {
 }
 
 pub fn renderFrame(self: *Self, frame: render.Frame, target: render.Target) Error!void {
-    _ = try self.renderFrameWithCompletion(frame, target, .wait);
+    _ = try self.renderFrameWithCompletion(frame, target, .wait, null);
 }
 
 pub fn renderFrameScanout(
     self: *Self,
     frame: render.Frame,
     target: render.Target,
+    gpu_sample_tag: ?u64,
 ) Error!?std.posix.fd_t {
-    return self.renderFrameWithCompletion(frame, target, .sync_fd);
+    return self.renderFrameWithCompletion(frame, target, .sync_fd, gpu_sample_tag);
 }
 
 const CompletionMode = enum {
@@ -1358,6 +1463,7 @@ fn renderFrameWithCompletion(
     frame: render.Frame,
     target: render.Target,
     completion_mode: CompletionMode,
+    gpu_sample_tag: ?u64,
 ) Error!?std.posix.fd_t {
     try self.drainPending();
     const required_pixels = try validateTarget(frame, target);
@@ -1398,6 +1504,7 @@ fn renderFrameWithCompletion(
     defer if (!frame_succeeded) {
         self.device_wrapper.deviceWaitIdle(self.device) catch {};
         self.fence_pending = false;
+        self.pending_gpu_sample_tag = null;
         self.releasePendingResources();
         self.resetCommandBufferForTarget(target_key);
         self.invalidateOutput(target_key);
@@ -1484,6 +1591,15 @@ fn renderFrameWithCompletion(
         self.device_wrapper.beginCommandBuffer(command_buffer, &.{
             .flags = if (reusable) .{} else .{ .one_time_submit_bit = true },
         }) catch return error.VulkanFailure;
+        if (self.timestamp_query_pool != .null_handle) {
+            self.device_wrapper.cmdResetQueryPool(command_buffer, self.timestamp_query_pool, 0, 2);
+            self.device_wrapper.cmdWriteTimestamp(
+                command_buffer,
+                .{ .top_of_pipe_bit = true },
+                self.timestamp_query_pool,
+                0,
+            );
+        }
 
         if (output.kind == .dmabuf) {
             self.transitionExternalToRender(command_buffer, output.*);
@@ -1802,6 +1918,14 @@ fn renderFrameWithCompletion(
             .{ .color_attachment_output_bit = true },
         );
         if (output.kind == .pixels) self.transferToHostBarrier(command_buffer);
+        if (self.timestamp_query_pool != .null_handle) {
+            self.device_wrapper.cmdWriteTimestamp(
+                command_buffer,
+                .{ .bottom_of_pipe_bit = true },
+                self.timestamp_query_pool,
+                1,
+            );
+        }
         self.device_wrapper.endCommandBuffer(command_buffer) catch return error.VulkanFailure;
         if (reusable) try self.rememberRecordedFrame(
             &output.recorded_frame,
@@ -1876,6 +2000,10 @@ fn renderFrameWithCompletion(
     self.device_wrapper.queueSubmit(self.queue, &.{submit_info}, self.fence) catch
         return error.VulkanFailure;
     self.fence_pending = true;
+    std.debug.assert(self.pending_gpu_sample_tag == null);
+    if (self.timestamp_query_pool != .null_handle) {
+        self.pending_gpu_sample_tag = gpu_sample_tag;
+    }
     for (self.prepared_images.items) |prepared| {
         if (prepared.cache_id == null) {
             self.pending_textures.appendAssumeCapacity(prepared.texture);
@@ -4627,4 +4755,34 @@ test "Vulkan renderer reuses and grows frame resources" {
     }, .{ .pixels = small });
     try std.testing.expectEqual(@as(usize, 4 * @sizeOf(u32)), renderer.work_capacity);
     try std.testing.expectEqual(@as(u32, 0xff0a0b0c), small_pixels[0]);
+}
+
+test "Vulkan renderer reports tagged GPU timestamps for cached frames" {
+    var renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
+        error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+    if (renderer.timestamp_query_pool == .null_handle) return error.SkipZigTest;
+
+    const target = try renderer.createOffscreenTarget(.{ .width = 1, .height = 1 });
+    defer renderer.releaseOutput(.{ .offscreen = target.id });
+    const frame: render.Frame = .{
+        .size = target.size,
+        .commands = &.{.{ .clear = render.Color.rgba(1, 2, 3, 255) }},
+    };
+    _ = try renderer.renderFrameScanout(frame, .{ .offscreen = target }, 17);
+    _ = try renderer.renderFrameScanout(frame, .{ .offscreen = target }, 18);
+    try std.testing.expectEqual(@as(u64, 17), renderer.takeGpuTiming().?.tag);
+    try std.testing.expectEqual(@as(u64, 18), renderer.takeGpuTiming().?.tag);
+    try std.testing.expect(renderer.takeGpuTiming() == null);
+}
+
+test "timestamp durations handle device counter wraparound" {
+    try std.testing.expectEqual(@as(u64, 11), timestampTickDelta(250, 5, 8));
+    try std.testing.expectEqual(
+        @as(u64, 10),
+        timestampTickDelta(std.math.maxInt(u64) - 4, 5, 64),
+    );
+    try std.testing.expectEqual(@as(u64, 16), timestampNanoseconds(11, 1.5));
 }

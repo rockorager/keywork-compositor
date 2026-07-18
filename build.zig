@@ -181,6 +181,10 @@ pub fn build(b: *std.Build) void {
         "share/wayland-sessions/keywork.desktop",
     );
     b.installFile(
+        "resources/keywork-portals.conf",
+        "share/xdg-desktop-portal/keywork-portals.conf",
+    );
+    b.installFile(
         "resources/keywork.conf",
         "share/keywork/keywork.conf",
     );
