@@ -48,7 +48,7 @@ pub fn init(
     switch (kind) {
         .drm => {
             const output = drm_output orelse return error.MissingDrmOutput;
-            output.attach(listener, dmabuf_renderer);
+            try output.attach(listener, dmabuf_renderer);
             self.backend = .{ .drm = output };
         },
         .headless => self.backend = .{ .headless = try HeadlessOutput.initForRenderer(

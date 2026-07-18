@@ -264,28 +264,22 @@ pub fn deinit(self: *Self) void {
     self.* = undefined;
 }
 
-pub fn attach(self: *Self, listener: Listener, dmabuf_renderer: ?render.DmabufRenderer) void {
+pub fn attach(self: *Self, listener: Listener, dmabuf_renderer: ?render.DmabufRenderer) !void {
     std.debug.assert(self.listener == null);
     std.debug.assert(dmabuf_renderer != null or self.buffers[0].render_target_id == null);
     self.dmabuf_renderer = dmabuf_renderer;
-    self.listener = listener;
-    if (dmabuf_renderer != null and self.buffers[0].render_target_id == null and
-        self.acquired == null and self.pending == null and self.displayed == null and
-        !self.mode_set and self.powered)
-    {
-        const fd = self.device_access.fd(self.device_access.context) orelse return;
-        var replacement = self.allocateGpuPair(fd, self.size) catch |err| {
-            log.warn("GPU scanout allocation failed, keeping CPU buffers: {t}", .{err});
-            return;
-        };
-        var old_buffers = self.buffers;
-        const old_shadow = self.shadow_pixels;
-        self.buffers = replacement.buffers;
-        self.shadow_pixels = replacement.shadow_pixels;
-        replacement = .{};
-        self.destroyPair(fd, &old_buffers, old_shadow);
+    errdefer self.dmabuf_renderer = null;
+    if (self.powered and self.buffers[0].framebuffer_id == 0) {
+        std.debug.assert(self.acquired == null and self.pending == null and self.displayed == null);
+        std.debug.assert(!self.mode_set and self.shadow_pixels.len == 0);
+        const fd = self.device_access.fd(self.device_access.context) orelse
+            return error.SessionInactive;
+        const pair = try self.allocatePair(fd, self.size);
+        self.buffers = pair.buffers;
+        self.shadow_pixels = pair.shadow_pixels;
         self.resetBufferDamage(self.size);
     }
+    self.listener = listener;
 }
 
 pub fn detach(self: *Self) void {
@@ -587,7 +581,9 @@ pub fn activate(self: *Self, fd: std.posix.fd_t, selection: Selection, device_pa
         if (c.drmModeSetCrtc(fd, self.crtc_id, 0, 0, 0, null, 0, null) != 0) {
             return error.DisableFailed;
         }
-    } else {
+    } else if (self.listener != null) {
+        // Initial discovery precedes renderer creation so Vulkan can target this DRM device.
+        // Its attach allocates the first buffers directly instead of replacing a CPU pair.
         const pair = try self.allocatePair(fd, self.size);
         self.buffers = pair.buffers;
         self.shadow_pixels = pair.shadow_pixels;
