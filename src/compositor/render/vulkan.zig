@@ -110,6 +110,7 @@ const Output = struct {
     recorded_frame: RecordedFrame = .{},
     blur: ?BlurScratch = null,
     blur_initialized: u16 = 0,
+    backdrop_cache: std.ArrayList(BackdropCache) = .empty,
 };
 
 const BlurImage = struct {
@@ -131,7 +132,23 @@ const BlurLevel = struct {
     b_framebuffer: vk.Framebuffer,
 };
 
+const BackdropCache = struct {
+    size: render.Size,
+    image: BlurImage,
+    framebuffer: vk.Framebuffer,
+    key: ?u64 = null,
+    initialized: bool = false,
+
+    fn matches(self: BackdropCache, key: ?u64) bool {
+        return self.initialized and key != null and self.key == key;
+    }
+};
+
 const blur_level_count = 6;
+
+comptime {
+    std.debug.assert(blur_level_count - 1 == render.maximum_blur_downsample_level);
+}
 
 const Texture = struct {
     image: vk.Image,
@@ -183,17 +200,30 @@ const PipelineKind = enum {
 
 const BlurOp = struct {
     run_index: u32,
+    cache_index: u32 = 0,
+    cache_key: ?u64 = null,
+    cache_hit: bool = false,
+    cache_only: bool = false,
+    reuse_op_index: ?u32 = null,
     level: u8 = 0,
-    low_radius: u8 = 0,
+    low_radius: u32 = 0,
     downsample_instances: [blur_level_count - 1]u32 = @splat(0),
     upsample_instances: [blur_level_count - 1]u32 = @splat(0),
-    horizontal_instance: u32,
+    horizontal_instance: u32 = 0,
     vertical_instance: u32 = 0,
     sample_rect: render.Rect,
     level_rects: [blur_level_count]render.Rect = @splat(.{ .x = 0, .y = 0, .width = 0, .height = 0 }),
     upsample_rects: [blur_level_count]render.Rect = @splat(.{ .x = 0, .y = 0, .width = 0, .height = 0 }),
     horizontal_rect: render.Rect,
     vertical_rect: render.Rect = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
+};
+
+const BaseBackdropCache = struct {
+    command_index: usize,
+    op_index: u32,
+    radius: u32,
+    downsample_level: ?u8,
+    key: ?u64,
 };
 
 const DrawRun = struct {
@@ -427,7 +457,6 @@ fn initGraphics(
         .p_code = &shaders.blur_vertical_paired,
     }, null);
     defer wrapper.destroyShaderModule(device, blur_vertical_shader, null);
-
     const replace_pipeline = createPipeline(
         wrapper,
         device,
@@ -488,7 +517,6 @@ fn initGraphics(
     errdefer wrapper.destroyPipeline(device, blur_vertical_pipeline, null);
     const blur_composite_pipeline = try createPipeline(wrapper, device, render_pass, pipeline_layout, vertex_shader, image_shader, true);
     errdefer wrapper.destroyPipeline(device, blur_composite_pipeline, null);
-
     return .{
         .render_pass = render_pass,
         .scratch_render_pass = scratch_render_pass,
@@ -1526,26 +1554,24 @@ fn renderFrameWithCompletion(
         else => {},
     };
 
-    try self.compileDrawRuns(frame, self.prepared_images.items);
-    const instance_bytes = std.mem.sliceAsBytes(self.instances.items);
-    try self.ensureInstanceBuffer(instance_bytes.len);
-    if (instance_bytes.len > 0) {
-        @memcpy(self.instance_mapped.?[0..instance_bytes.len], instance_bytes);
-    }
     try self.ensureWorkBuffer(work_size);
     const output = try self.getOutput(target_key);
     if (!std.meta.eql(output.size, frame.size)) return error.InvalidTarget;
     output.last_used = self.frame_number;
-    if (self.blur_ops.items.len != 0) {
-        if (output.blur == null) output.blur = .{};
-        for (self.blur_ops.items) |blur_op| {
-            if (output.descriptor_set == .null_handle or blur_op.level == 0) {
-                try self.ensureBlurLevel(&output.blur.?, output.size, 0);
-            }
-            for (1..@as(usize, blur_op.level) + 1) |level| {
-                try self.ensureBlurLevel(&output.blur.?, output.size, level);
-            }
-        }
+    var compiled_frame = frame;
+    try self.compileDrawRuns(compiled_frame, self.prepared_images.items);
+    if (try self.prepareBackdropCaches(output, frame.commands) and frame.damage != null) {
+        self.instances.clearRetainingCapacity();
+        self.draw_runs.clearRetainingCapacity();
+        self.blur_ops.clearRetainingCapacity();
+        compiled_frame.damage = null;
+        try self.compileDrawRuns(compiled_frame, self.prepared_images.items);
+        _ = try self.prepareBackdropCaches(output, frame.commands);
+    }
+    const instance_bytes = std.mem.sliceAsBytes(self.instances.items);
+    try self.ensureInstanceBuffer(instance_bytes.len);
+    if (instance_bytes.len > 0) {
+        @memcpy(self.instance_mapped.?[0..instance_bytes.len], instance_bytes);
     }
     var blur_initialized = output.blur_initialized;
     if (!output.initialized and output.kind == .pixels) {
@@ -1577,7 +1603,7 @@ fn renderFrameWithCompletion(
         return error.VulkanFailure;
     const reusable = output.kind != .pixels;
     const full_output: render.Rect = .{ .x = 0, .y = 0, .width = frame.size.width, .height = frame.size.height };
-    const frame_render_area = damageBounds(frame.damage, full_output) orelse full_output;
+    const frame_render_area = damageBounds(compiled_frame.damage, full_output) orelse full_output;
     const cache_hit = reusable and self.recordedFrameMatches(
         &output.recorded_frame,
         output.initialized,
@@ -1747,85 +1773,104 @@ fn renderFrameWithCompletion(
         var bound_descriptor: ?vk.DescriptorSet = null;
         for (self.draw_runs.items, 0..) |run, run_index| {
             if (self.blurOpAt(run_index)) |blur_op| {
-                const scratch = output.blur.?;
-                self.device_wrapper.cmdEndRenderPass(command_buffer);
-                const sample_output = output.descriptor_set != .null_handle;
-                if (sample_output) {
-                    self.transitionImage(command_buffer, output.image, .color_attachment_optimal, .shader_read_only_optimal, .{ .color_attachment_write_bit = true }, .{ .shader_read_bit = true }, .{ .color_attachment_output_bit = true }, .{ .fragment_shader_bit = true });
-                } else {
-                    self.transitionImage(command_buffer, output.image, .color_attachment_optimal, .transfer_src_optimal, .{ .color_attachment_write_bit = true }, .{ .transfer_read_bit = true }, .{ .color_attachment_output_bit = true }, .{ .transfer_bit = true });
-                    const level_zero = scratch.levels[0].?;
-                    const level_zero_bit: u16 = 1;
-                    self.transitionScratchForWrite(command_buffer, level_zero.a.image, blur_initialized & level_zero_bit != 0, .transfer_dst_optimal, .{ .transfer_write_bit = true }, .{ .transfer_bit = true });
-                    const offset: vk.Offset3D = .{ .x = blur_op.sample_rect.x, .y = blur_op.sample_rect.y, .z = 0 };
-                    self.device_wrapper.cmdCopyImage(command_buffer, output.image, .transfer_src_optimal, level_zero.a.image, .transfer_dst_optimal, &.{.{
-                        .src_subresource = colorSubresourceLayers(),
-                        .src_offset = offset,
-                        .dst_subresource = colorSubresourceLayers(),
-                        .dst_offset = offset,
-                        .extent = extent(.{ .width = blur_op.sample_rect.width, .height = blur_op.sample_rect.height }),
-                    }});
-                    self.transitionScratchToRead(command_buffer, level_zero.a.image, .transfer_dst_optimal, .{ .transfer_write_bit = true }, .{ .transfer_bit = true });
-                    blur_initialized |= level_zero_bit;
-                }
+                const backdrop_cache = output.backdrop_cache.items[blur_op.cache_index];
+                if (!blur_op.cache_hit) {
+                    const scratch = output.blur.?;
+                    self.device_wrapper.cmdEndRenderPass(command_buffer);
+                    const sample_output = output.descriptor_set != .null_handle;
+                    if (sample_output) {
+                        self.transitionImage(command_buffer, output.image, .color_attachment_optimal, .shader_read_only_optimal, .{ .color_attachment_write_bit = true }, .{ .shader_read_bit = true }, .{ .color_attachment_output_bit = true }, .{ .fragment_shader_bit = true });
+                    } else {
+                        self.transitionImage(command_buffer, output.image, .color_attachment_optimal, .transfer_src_optimal, .{ .color_attachment_write_bit = true }, .{ .transfer_read_bit = true }, .{ .color_attachment_output_bit = true }, .{ .transfer_bit = true });
+                        const level_zero = scratch.levels[0].?;
+                        const level_zero_bit: u16 = 1;
+                        self.transitionScratchForWrite(command_buffer, level_zero.a.image, blur_initialized & level_zero_bit != 0, .transfer_dst_optimal, .{ .transfer_write_bit = true }, .{ .transfer_bit = true });
+                        const offset: vk.Offset3D = .{ .x = blur_op.sample_rect.x, .y = blur_op.sample_rect.y, .z = 0 };
+                        self.device_wrapper.cmdCopyImage(command_buffer, output.image, .transfer_src_optimal, level_zero.a.image, .transfer_dst_optimal, &.{.{
+                            .src_subresource = colorSubresourceLayers(),
+                            .src_offset = offset,
+                            .dst_subresource = colorSubresourceLayers(),
+                            .dst_offset = offset,
+                            .extent = extent(.{ .width = blur_op.sample_rect.width, .height = blur_op.sample_rect.height }),
+                        }});
+                        self.transitionScratchToRead(command_buffer, level_zero.a.image, .transfer_dst_optimal, .{ .transfer_write_bit = true }, .{ .transfer_bit = true });
+                        blur_initialized |= level_zero_bit;
+                    }
 
-                for (0..blur_op.level) |index| {
-                    const destination_level = scratch.levels[index + 1].?;
-                    const destination_bit: u16 = @as(u16, 1) << @intCast((index + 1) * 2);
-                    self.transitionScratchForWrite(command_buffer, destination_level.a.image, blur_initialized & destination_bit != 0, .color_attachment_optimal, .{ .color_attachment_write_bit = true }, .{ .color_attachment_output_bit = true });
-                    const source_descriptor = if (index == 0)
+                    for (0..blur_op.level) |index| {
+                        const destination_level = scratch.levels[index + 1].?;
+                        const destination_bit: u16 = @as(u16, 1) << @intCast((index + 1) * 2);
+                        self.transitionScratchForWrite(command_buffer, destination_level.a.image, blur_initialized & destination_bit != 0, .color_attachment_optimal, .{ .color_attachment_write_bit = true }, .{ .color_attachment_output_bit = true });
+                        const source_descriptor = if (index == 0)
+                            if (sample_output) output.descriptor_set else scratch.levels[0].?.a.descriptor_set
+                        else
+                            scratch.levels[index].?.a.descriptor_set;
+                        const source_size = if (index == 0)
+                            frame.size
+                        else
+                            scratch.levels[index].?.size;
+                        self.drawScratchPass(command_buffer, destination_level.a_framebuffer, destination_level.size, blur_op.level_rects[index + 1], .downsample, source_descriptor, source_size, blur_op.downsample_instances[index]);
+                        self.transitionScratchToRead(command_buffer, destination_level.a.image, .color_attachment_optimal, .{ .color_attachment_write_bit = true }, .{ .color_attachment_output_bit = true });
+                        blur_initialized |= destination_bit;
+                    }
+
+                    const final_level = scratch.levels[blur_op.level].?;
+                    const blur_source_descriptor = if (blur_op.level == 0)
                         if (sample_output) output.descriptor_set else scratch.levels[0].?.a.descriptor_set
                     else
-                        scratch.levels[index].?.a.descriptor_set;
-                    const source_size = if (index == 0)
-                        frame.size
+                        final_level.a.descriptor_set;
+                    const b_bit: u16 = @as(u16, 1) << @intCast(@as(usize, blur_op.level) * 2 + 1);
+                    self.transitionScratchForWrite(command_buffer, final_level.b.image, blur_initialized & b_bit != 0, .color_attachment_optimal, .{ .color_attachment_write_bit = true }, .{ .color_attachment_output_bit = true });
+                    self.drawScratchPass(command_buffer, final_level.b_framebuffer, final_level.size, blur_op.horizontal_rect, .blur_horizontal, blur_source_descriptor, final_level.size, blur_op.horizontal_instance);
+                    self.transitionScratchToRead(command_buffer, final_level.b.image, .color_attachment_optimal, .{ .color_attachment_write_bit = true }, .{ .color_attachment_output_bit = true });
+                    blur_initialized |= b_bit;
+
+                    const a_bit: u16 = @as(u16, 1) << @intCast(@as(usize, blur_op.level) * 2);
+                    const vertical_image = if (blur_op.level <= 1)
+                        backdrop_cache.image.image
                     else
-                        scratch.levels[index].?.size;
-                    self.drawScratchPass(command_buffer, destination_level.a_framebuffer, destination_level.size, blur_op.level_rects[index + 1], .downsample, source_descriptor, source_size, blur_op.downsample_instances[index]);
-                    self.transitionScratchToRead(command_buffer, destination_level.a.image, .color_attachment_optimal, .{ .color_attachment_write_bit = true }, .{ .color_attachment_output_bit = true });
-                    blur_initialized |= destination_bit;
-                }
-
-                const final_level = scratch.levels[blur_op.level].?;
-                const blur_source_descriptor = if (blur_op.level == 0)
-                    if (sample_output) output.descriptor_set else scratch.levels[0].?.a.descriptor_set
-                else
-                    final_level.a.descriptor_set;
-                const b_bit: u16 = @as(u16, 1) << @intCast(@as(usize, blur_op.level) * 2 + 1);
-                self.transitionScratchForWrite(command_buffer, final_level.b.image, blur_initialized & b_bit != 0, .color_attachment_optimal, .{ .color_attachment_write_bit = true }, .{ .color_attachment_output_bit = true });
-                self.drawScratchPass(command_buffer, final_level.b_framebuffer, final_level.size, blur_op.horizontal_rect, .blur_horizontal, blur_source_descriptor, final_level.size, blur_op.horizontal_instance);
-                self.transitionScratchToRead(command_buffer, final_level.b.image, .color_attachment_optimal, .{ .color_attachment_write_bit = true }, .{ .color_attachment_output_bit = true });
-                blur_initialized |= b_bit;
-
-                const a_bit: u16 = @as(u16, 1) << @intCast(@as(usize, blur_op.level) * 2);
-                self.transitionScratchForWrite(command_buffer, final_level.a.image, blur_initialized & a_bit != 0, .color_attachment_optimal, .{ .color_attachment_write_bit = true }, .{ .color_attachment_output_bit = true });
-                self.drawScratchPass(command_buffer, final_level.a_framebuffer, final_level.size, blur_op.vertical_rect, .blur_vertical, final_level.b.descriptor_set, final_level.size, blur_op.vertical_instance);
-                self.transitionScratchToRead(command_buffer, final_level.a.image, .color_attachment_optimal, .{ .color_attachment_write_bit = true }, .{ .color_attachment_output_bit = true });
-                blur_initialized |= a_bit;
-
-                var source_level: usize = blur_op.level;
-                while (source_level > 1) : (source_level -= 1) {
-                    const destination_index = source_level - 1;
-                    const destination_level = scratch.levels[destination_index].?;
-                    const destination_bit: u16 = @as(u16, 1) << @intCast(destination_index * 2 + 1);
-                    self.transitionScratchForWrite(command_buffer, destination_level.b.image, blur_initialized & destination_bit != 0, .color_attachment_optimal, .{ .color_attachment_write_bit = true }, .{ .color_attachment_output_bit = true });
-                    const source_descriptor = if (source_level == blur_op.level)
-                        final_level.a.descriptor_set
+                        final_level.a.image;
+                    const vertical_framebuffer = if (blur_op.level <= 1)
+                        backdrop_cache.framebuffer
                     else
-                        scratch.levels[source_level].?.b.descriptor_set;
-                    self.drawScratchPass(command_buffer, destination_level.b_framebuffer, destination_level.size, blur_op.upsample_rects[destination_index], .downsample, source_descriptor, scratch.levels[source_level].?.size, blur_op.upsample_instances[destination_index]);
-                    self.transitionScratchToRead(command_buffer, destination_level.b.image, .color_attachment_optimal, .{ .color_attachment_write_bit = true }, .{ .color_attachment_output_bit = true });
-                    blur_initialized |= destination_bit;
+                        final_level.a_framebuffer;
+                    self.transitionScratchForWrite(command_buffer, vertical_image, if (blur_op.level <= 1) backdrop_cache.initialized else blur_initialized & a_bit != 0, .color_attachment_optimal, .{ .color_attachment_write_bit = true }, .{ .color_attachment_output_bit = true });
+                    self.drawScratchPass(command_buffer, vertical_framebuffer, final_level.size, blur_op.vertical_rect, .blur_vertical, final_level.b.descriptor_set, final_level.size, blur_op.vertical_instance);
+                    self.transitionScratchToRead(command_buffer, vertical_image, .color_attachment_optimal, .{ .color_attachment_write_bit = true }, .{ .color_attachment_output_bit = true });
+                    if (blur_op.level > 1) blur_initialized |= a_bit;
+
+                    var source_level: usize = blur_op.level;
+                    while (source_level > 1) : (source_level -= 1) {
+                        const destination_index = source_level - 1;
+                        const destination_level = scratch.levels[destination_index].?;
+                        const destination_bit: u16 = @as(u16, 1) << @intCast(destination_index * 2 + 1);
+                        const destination_image = if (destination_index == 1)
+                            backdrop_cache.image.image
+                        else
+                            destination_level.b.image;
+                        const destination_framebuffer = if (destination_index == 1)
+                            backdrop_cache.framebuffer
+                        else
+                            destination_level.b_framebuffer;
+                        self.transitionScratchForWrite(command_buffer, destination_image, if (destination_index == 1) backdrop_cache.initialized else blur_initialized & destination_bit != 0, .color_attachment_optimal, .{ .color_attachment_write_bit = true }, .{ .color_attachment_output_bit = true });
+                        const source_descriptor = if (source_level == blur_op.level)
+                            final_level.a.descriptor_set
+                        else
+                            scratch.levels[source_level].?.b.descriptor_set;
+                        self.drawScratchPass(command_buffer, destination_framebuffer, destination_level.size, blur_op.upsample_rects[destination_index], .downsample, source_descriptor, scratch.levels[source_level].?.size, blur_op.upsample_instances[destination_index]);
+                        self.transitionScratchToRead(command_buffer, destination_image, .color_attachment_optimal, .{ .color_attachment_write_bit = true }, .{ .color_attachment_output_bit = true });
+                        if (destination_index != 1) blur_initialized |= destination_bit;
+                    }
+                    if (sample_output) {
+                        self.transitionImage(command_buffer, output.image, .shader_read_only_optimal, .color_attachment_optimal, .{ .shader_read_bit = true }, .{ .color_attachment_read_bit = true, .color_attachment_write_bit = true }, .{ .fragment_shader_bit = true }, .{ .color_attachment_output_bit = true });
+                    } else {
+                        self.transitionImage(command_buffer, output.image, .transfer_src_optimal, .color_attachment_optimal, .{ .transfer_read_bit = true }, .{ .color_attachment_read_bit = true, .color_attachment_write_bit = true }, .{ .transfer_bit = true }, .{ .color_attachment_output_bit = true });
+                    }
+                    self.device_wrapper.cmdBeginRenderPass(command_buffer, &render_pass_info, .@"inline");
+                    self.setViewportAndScissor(command_buffer, frame.size);
+                    bound_pipeline = null;
+                    bound_descriptor = null;
                 }
-                if (sample_output) {
-                    self.transitionImage(command_buffer, output.image, .shader_read_only_optimal, .color_attachment_optimal, .{ .shader_read_bit = true }, .{ .color_attachment_read_bit = true, .color_attachment_write_bit = true }, .{ .fragment_shader_bit = true }, .{ .color_attachment_output_bit = true });
-                } else {
-                    self.transitionImage(command_buffer, output.image, .transfer_src_optimal, .color_attachment_optimal, .{ .transfer_read_bit = true }, .{ .color_attachment_read_bit = true, .color_attachment_write_bit = true }, .{ .transfer_bit = true }, .{ .color_attachment_output_bit = true });
-                }
-                self.device_wrapper.cmdBeginRenderPass(command_buffer, &render_pass_info, .@"inline");
-                self.setViewportAndScissor(command_buffer, frame.size);
-                bound_pipeline = null;
-                bound_descriptor = null;
             }
             if (bound_pipeline != run.pipeline) {
                 self.device_wrapper.cmdBindPipeline(
@@ -1837,10 +1882,7 @@ fn renderFrameWithCompletion(
             }
             const run_descriptor = if (run.pipeline == .blur_composite) blk: {
                 const blur_op = self.blurOpAt(run_index).?;
-                break :blk if (blur_op.level > 1)
-                    output.blur.?.levels[1].?.b.descriptor_set
-                else
-                    output.blur.?.levels[blur_op.level].?.a.descriptor_set;
+                break :blk output.backdrop_cache.items[blur_op.cache_index].image.descriptor_set;
             } else run.descriptor_set;
             if (run_descriptor) |descriptor_set| {
                 if (bound_descriptor != descriptor_set) {
@@ -2012,6 +2054,12 @@ fn renderFrameWithCompletion(
     temporary_textures_pending = true;
     output.initialized = true;
     if (self.blur_ops.items.len != 0) output.blur_initialized = blur_initialized;
+    for (self.blur_ops.items) |blur_op| {
+        if (blur_op.cache_hit) continue;
+        const cache = &output.backdrop_cache.items[blur_op.cache_index];
+        cache.key = blur_op.cache_key;
+        cache.initialized = true;
+    }
     for (self.prepared_images.items) |prepared| {
         if (prepared.cache_id) |cache_id| {
             const texture = self.textures.getPtr(cache_id) orelse continue;
@@ -2361,6 +2409,10 @@ fn invalidateOutput(self: *Self, key: TargetKey) void {
         if (output.kind != .pixels) {
             output.initialized = false;
             output.blur_initialized = 0;
+            for (output.backdrop_cache.items) |*cache| {
+                cache.key = null;
+                cache.initialized = false;
+            }
             output.recorded_frame.valid = false;
             return;
         }
@@ -2382,6 +2434,8 @@ fn resetCommandBufferForTarget(self: *Self, key: TargetKey) void {
 fn destroyOutput(self: *Self, value: Output) void {
     var output = value;
     if (output.blur) |blur| self.destroyBlurScratch(blur);
+    for (output.backdrop_cache.items) |cache| self.destroyBackdropCache(cache);
+    output.backdrop_cache.deinit(self.allocator);
     output.recorded_frame.deinit(self.allocator);
     if (output.command_buffer != .null_handle) {
         self.device_wrapper.freeCommandBuffers(
@@ -2443,6 +2497,120 @@ fn ensureBlurLevel(self: *Self, scratch: *BlurScratch, output_size: render.Size,
     errdefer self.device_wrapper.destroyFramebuffer(self.device, a_framebuffer, null);
     const b_framebuffer = self.device_wrapper.createFramebuffer(self.device, &.{ .render_pass = self.scratch_render_pass, .attachment_count = 1, .p_attachments = @ptrCast(&b.view), .width = level_size.width, .height = level_size.height, .layers = 1 }, null) catch return error.VulkanFailure;
     scratch.levels[index] = .{ .size = level_size, .a = a, .b = b, .a_framebuffer = a_framebuffer, .b_framebuffer = b_framebuffer };
+}
+
+fn prepareBackdropCaches(
+    self: *Self,
+    output: *Output,
+    commands: []const render.Command,
+) Error!bool {
+    var cache_changed = false;
+    var next_cache_index: usize = 0;
+    var base_cache_miss = false;
+    for (self.blur_ops.items, 0..) |*blur_op, op_index| {
+        if (blur_op.reuse_op_index) |source_index| {
+            std.debug.assert(source_index < op_index);
+            blur_op.cache_index = self.blur_ops.items[source_index].cache_index;
+            blur_op.cache_hit = true;
+            continue;
+        }
+
+        const cache_size = blurLevelSize(output.size, @min(blur_op.level, 1));
+        blur_op.cache_index = @intCast(next_cache_index);
+        cache_changed = selectBackdropCache(
+            output,
+            next_cache_index,
+            cache_size,
+            blur_op.cache_key,
+        ) or cache_changed;
+        const cache = try self.ensureBackdropCache(output, next_cache_index, cache_size);
+        blur_op.cache_hit = cache.matches(blur_op.cache_key);
+        next_cache_index += 1;
+        if (blur_op.cache_only and !blur_op.cache_hit) base_cache_miss = true;
+        if (blur_op.cache_hit) continue;
+
+        if (output.blur == null) output.blur = .{};
+        if (output.descriptor_set == .null_handle or blur_op.level == 0) {
+            try self.ensureBlurLevel(&output.blur.?, output.size, 0);
+        }
+        for (1..@as(usize, blur_op.level) + 1) |level| {
+            try self.ensureBlurLevel(&output.blur.?, output.size, level);
+        }
+    }
+
+    const cache_limit = backdropBlurCommandCount(commands);
+    while (output.backdrop_cache.items.len > cache_limit) {
+        self.destroyBackdropCache(output.backdrop_cache.pop().?);
+        cache_changed = true;
+    }
+    if (cache_changed) output.recorded_frame.valid = false;
+    return base_cache_miss;
+}
+
+fn ensureBackdropCache(
+    self: *Self,
+    output: *Output,
+    index: usize,
+    size: render.Size,
+) Error!*BackdropCache {
+    while (output.backdrop_cache.items.len <= index) {
+        const cache = try self.createBackdropCache(size);
+        output.backdrop_cache.append(self.allocator, cache) catch |err| {
+            self.destroyBackdropCache(cache);
+            return err;
+        };
+        output.recorded_frame.valid = false;
+    }
+    const cache = &output.backdrop_cache.items[index];
+    if (std.meta.eql(cache.size, size)) return cache;
+    const replacement = try self.createBackdropCache(size);
+    self.destroyBackdropCache(cache.*);
+    cache.* = replacement;
+    output.recorded_frame.valid = false;
+    return cache;
+}
+
+fn selectBackdropCache(
+    output: *Output,
+    index: usize,
+    size: render.Size,
+    key: ?u64,
+) bool {
+    const stable_key = key orelse return false;
+    if (index >= output.backdrop_cache.items.len) return false;
+    for (output.backdrop_cache.items[index..], index..) |cache, candidate| {
+        if (!std.meta.eql(cache.size, size) or !cache.matches(stable_key)) continue;
+        if (candidate == index) return false;
+        std.mem.swap(
+            BackdropCache,
+            &output.backdrop_cache.items[index],
+            &output.backdrop_cache.items[candidate],
+        );
+        return true;
+    }
+    return false;
+}
+
+fn createBackdropCache(self: *Self, size: render.Size) Error!BackdropCache {
+    const image = try self.createBlurImage(size, .{
+        .color_attachment_bit = true,
+        .sampled_bit = true,
+    });
+    errdefer self.destroyBlurImage(image);
+    const framebuffer = self.device_wrapper.createFramebuffer(self.device, &.{
+        .render_pass = self.scratch_render_pass,
+        .attachment_count = 1,
+        .p_attachments = @ptrCast(&image.view),
+        .width = size.width,
+        .height = size.height,
+        .layers = 1,
+    }, null) catch return error.VulkanFailure;
+    return .{ .size = size, .image = image, .framebuffer = framebuffer };
+}
+
+fn destroyBackdropCache(self: *Self, cache: BackdropCache) void {
+    self.device_wrapper.destroyFramebuffer(self.device, cache.framebuffer, null);
+    self.destroyBlurImage(cache.image);
 }
 
 fn destroyBlurImage(self: *Self, image: BlurImage) void {
@@ -3179,13 +3347,258 @@ fn advanceResourceEpoch(self: *Self) void {
     if (self.resource_epoch == 0) self.resource_epoch = 1;
 }
 
+fn backdropCacheKey(commands: []const render.Command) ?u64 {
+    var hasher = std.hash.Wyhash.init(0x6b6579776f726b);
+    for (commands) |command| {
+        if (!hashRenderCommand(&hasher, command)) return null;
+    }
+    return hasher.final();
+}
+
+fn backdropBlurCommandCount(commands: []const render.Command) usize {
+    var count: usize = 0;
+    for (commands) |command| switch (command) {
+        .backdrop_blur => |blur| {
+            if (blur.radius != 0 and blur.rect.width != 0 and blur.rect.height != 0) count += 1;
+        },
+        else => {},
+    };
+    return count;
+}
+
+fn hashRenderCommand(hasher: *std.hash.Wyhash, command: render.Command) bool {
+    switch (command) {
+        .clear => |color| {
+            hashScalar(hasher, @as(u8, 0));
+            hashColor(hasher, color);
+        },
+        .solid_rect => |solid| {
+            hashScalar(hasher, @as(u8, 1));
+            hashRect(hasher, solid.rect);
+            hashColor(hasher, solid.color);
+            hashOptionalRect(hasher, solid.clip);
+        },
+        .shadow => |shadow| {
+            hashScalar(hasher, @as(u8, 2));
+            hashRect(hasher, shadow.rect);
+            hashScalar(hasher, shadow.corner_radius);
+            hashScalar(hasher, shadow.blur_radius);
+            hashScalar(hasher, shadow.spread);
+            hashColor(hasher, shadow.color);
+            hashOptionalRoundedClip(hasher, shadow.cutout);
+            hashOptionalRect(hasher, shadow.clip);
+        },
+        .backdrop_blur => |blur| {
+            hashScalar(hasher, @as(u8, 3));
+            hashRect(hasher, blur.rect);
+            hashScalar(hasher, blur.corner_radius);
+            hashScalar(hasher, blur.radius);
+            hashOptionalScalar(hasher, blur.downsample_level);
+            hashOptionalRect(hasher, blur.clip);
+            hashScalar(hasher, @intFromBool(blur.cache_only));
+        },
+        .image => |image| {
+            const source_cache = image.buffer.source_cache orelse return false;
+            hashScalar(hasher, @as(u8, 4));
+            hashScalar(hasher, image.x);
+            hashScalar(hasher, image.y);
+            hashSize(hasher, image.size);
+            hashSize(hasher, image.buffer.size);
+            hashScalar(hasher, image.buffer.stride_pixels);
+            hashScalar(hasher, source_cache.id);
+            hashScalar(hasher, source_cache.version);
+            hashOptionalSourceRect(hasher, image.source);
+            hashScalar(hasher, @intFromEnum(image.transform));
+            hashOptionalRoundedClip(hasher, image.rounded_clip);
+            hashOptionalRect(hasher, image.clip);
+            hashScalar(hasher, @intFromBool(image.is_opaque));
+            if (image.buffer.dmabuf) |dmabuf| {
+                hashScalar(hasher, @as(u8, 1));
+                hashScalar(hasher, dmabuf.format);
+                hashScalar(hasher, dmabuf.modifier);
+                hashScalar(hasher, dmabuf.stride);
+                hashScalar(hasher, dmabuf.offset);
+                hashScalar(hasher, @intFromBool(dmabuf.y_inverted));
+                hashScalar(hasher, @intFromBool(dmabuf.force_opaque));
+            } else {
+                hashScalar(hasher, @as(u8, 0));
+            }
+        },
+    }
+    return true;
+}
+
+fn hashScalar(hasher: *std.hash.Wyhash, value: anytype) void {
+    var copy = value;
+    hasher.update(std.mem.asBytes(&copy));
+}
+
+fn hashSize(hasher: *std.hash.Wyhash, size: render.Size) void {
+    hashScalar(hasher, size.width);
+    hashScalar(hasher, size.height);
+}
+
+fn hashRect(hasher: *std.hash.Wyhash, rect: render.Rect) void {
+    hashScalar(hasher, rect.x);
+    hashScalar(hasher, rect.y);
+    hashScalar(hasher, rect.width);
+    hashScalar(hasher, rect.height);
+}
+
+fn hashColor(hasher: *std.hash.Wyhash, color: render.Color) void {
+    hashScalar(hasher, color.red);
+    hashScalar(hasher, color.green);
+    hashScalar(hasher, color.blue);
+    hashScalar(hasher, color.alpha);
+}
+
+fn hashOptionalScalar(hasher: *std.hash.Wyhash, value: anytype) void {
+    if (value) |present| {
+        hashScalar(hasher, @as(u8, 1));
+        hashScalar(hasher, present);
+    } else {
+        hashScalar(hasher, @as(u8, 0));
+    }
+}
+
+fn hashOptionalRect(hasher: *std.hash.Wyhash, rect: ?render.Rect) void {
+    if (rect) |present| {
+        hashScalar(hasher, @as(u8, 1));
+        hashRect(hasher, present);
+    } else {
+        hashScalar(hasher, @as(u8, 0));
+    }
+}
+
+fn hashOptionalRoundedClip(hasher: *std.hash.Wyhash, clip: ?render.RoundedClip) void {
+    if (clip) |present| {
+        hashScalar(hasher, @as(u8, 1));
+        hashRect(hasher, present.rect);
+        hashScalar(hasher, present.radius);
+    } else {
+        hashScalar(hasher, @as(u8, 0));
+    }
+}
+
+fn hashOptionalSourceRect(hasher: *std.hash.Wyhash, rect: ?render.SourceRect) void {
+    if (rect) |present| {
+        hashScalar(hasher, @as(u8, 1));
+        hashScalar(hasher, @as(u64, @bitCast(present.x)));
+        hashScalar(hasher, @as(u64, @bitCast(present.y)));
+        hashScalar(hasher, @as(u64, @bitCast(present.width)));
+        hashScalar(hasher, @as(u64, @bitCast(present.height)));
+    } else {
+        hashScalar(hasher, @as(u8, 0));
+    }
+}
+
+fn commandsAffectRect(
+    commands: []const render.Command,
+    rect: render.Rect,
+    frame_size: render.Size,
+) bool {
+    for (commands) |command| {
+        const visible = commandVisibleRect(command, frame_size) orelse continue;
+        if (visible.intersection(rect) != null) return true;
+    }
+    return false;
+}
+
+fn commandVisibleRect(command: render.Command, frame_size: render.Size) ?render.Rect {
+    return switch (command) {
+        .clear => .{ .x = 0, .y = 0, .width = frame_size.width, .height = frame_size.height },
+        .solid_rect => |solid| clipped: {
+            var rect = solid.rect.clipTo(frame_size) orelse break :clipped null;
+            if (solid.clip) |clip| rect = rect.intersection(clip) orelse break :clipped null;
+            break :clipped rect;
+        },
+        .image => |image| clipped: {
+            var rect = (render.Rect{
+                .x = image.x,
+                .y = image.y,
+                .width = image.size.width,
+                .height = image.size.height,
+            }).clipTo(frame_size) orelse break :clipped null;
+            if (image.clip) |clip| rect = rect.intersection(clip) orelse break :clipped null;
+            if (image.rounded_clip) |clip| {
+                rect = rect.intersection(clip.rect) orelse break :clipped null;
+            }
+            break :clipped rect;
+        },
+        .shadow => |shadow| shadowVisibleRect(shadow, frame_size),
+        .backdrop_blur => |blur| clipped: {
+            if (blur.cache_only) break :clipped null;
+            var rect = blur.rect.clipTo(frame_size) orelse break :clipped null;
+            if (blur.clip) |clip| rect = rect.intersection(clip) orelse break :clipped null;
+            break :clipped rect;
+        },
+    };
+}
+
+fn shadowVisibleRect(shadow: render.Shadow, frame_size: render.Size) ?render.Rect {
+    if (shadow.color.alpha == 0 or shadow.rect.width == 0 or shadow.rect.height == 0) {
+        return null;
+    }
+    const spread: i64 = shadow.spread;
+    const shape_x = @as(i64, shadow.rect.x) - spread;
+    const shape_y = @as(i64, shadow.rect.y) - spread;
+    const shape_width = @as(i64, shadow.rect.width) + 2 * spread;
+    const shape_height = @as(i64, shadow.rect.height) + 2 * spread;
+    if (shape_width <= 0 or shape_height <= 0) return null;
+    const blur_extent: i64 = render.shadowBlurExtent(shadow.blur_radius);
+    const left = @max(shape_x - blur_extent, 0);
+    const top = @max(shape_y - blur_extent, 0);
+    const right = @min(shape_x + shape_width + blur_extent, frame_size.width);
+    const bottom = @min(shape_y + shape_height + blur_extent, frame_size.height);
+    if (left >= right or top >= bottom) return null;
+    var rect: render.Rect = .{
+        .x = @intCast(left),
+        .y = @intCast(top),
+        .width = @intCast(right - left),
+        .height = @intCast(bottom - top),
+    };
+    if (shadow.clip) |clip| rect = rect.intersection(clip) orelse return null;
+    return rect;
+}
+
+fn baseBackdropCacheUsed(
+    commands: []const render.Command,
+    marker_index: usize,
+    marker: render.BackdropBlur,
+    frame_size: render.Size,
+    damage: ?[]const render.Rect,
+) bool {
+    for (commands[marker_index + 1 ..], marker_index + 1..) |command, command_index| {
+        const blur = switch (command) {
+            .backdrop_blur => |blur| blur,
+            else => continue,
+        };
+        if (blur.cache_only or blur.radius != marker.radius or
+            blur.downsample_level != marker.downsample_level) continue;
+        var clipped = blur.rect.clipTo(frame_size) orelse continue;
+        if (blur.clip) |clip| clipped = clipped.intersection(clip) orelse continue;
+        _ = damageBounds(damage, clipped) orelse continue;
+        const level = configuredBlurLevel(blur.radius, blur.downsample_level);
+        const scale: u32 = @as(u32, 1) << @intCast(level);
+        const sample_radius = (ceilDiv(blur.radius, scale) + 2) * scale;
+        const sample_rect = blurSampleRect(clipped, sample_radius, level, frame_size);
+        if (!commandsAffectRect(
+            commands[marker_index + 1 .. command_index],
+            sample_rect,
+            frame_size,
+        )) return true;
+    }
+    return false;
+}
+
 fn compileDrawRuns(
     self: *Self,
     frame: render.Frame,
     prepared_images: []const PreparedImage,
 ) Error!void {
     var prepared_index: usize = 0;
-    for (frame.commands) |command| switch (command) {
+    var base_backdrop: ?BaseBackdropCache = null;
+    for (frame.commands, 0..) |command, command_index| switch (command) {
         .clear => |color| {
             const rect: render.Rect = .{
                 .x = 0,
@@ -3323,14 +3736,37 @@ fn compileDrawRuns(
         },
         .backdrop_blur => |blur| {
             if (blur.radius == 0 or blur.rect.width == 0 or blur.rect.height == 0) continue;
+            if (blur.cache_only and !baseBackdropCacheUsed(
+                frame.commands,
+                command_index,
+                blur,
+                frame.size,
+                frame.damage,
+            )) continue;
             var clipped = blur.rect.clipTo(frame.size) orelse continue;
             if (blur.clip) |clip| clipped = clipped.intersection(clip) orelse continue;
-            clipped = damageBounds(frame.damage, clipped) orelse continue;
-            const level = blurLevel(blur.radius);
+            if (!blur.cache_only) _ = damageBounds(frame.damage, clipped) orelse continue;
+            const level = configuredBlurLevel(blur.radius, blur.downsample_level);
             const scale: u32 = @as(u32, 1) << @intCast(level);
-            const low_radius: u8 = @intCast(ceilDiv(blur.radius, scale));
-            const sample_radius = (@as(u32, low_radius) + 2) * scale;
+            const low_radius = ceilDiv(blur.radius, scale);
+            const sample_radius = (low_radius + 2) * scale;
             const sample_rect = blurSampleRect(clipped, sample_radius, level, frame.size);
+            const own_cache_key = backdropCacheKey(frame.commands[0 .. command_index + 1]);
+            const reuse_op_index = if (!blur.cache_only) reuse: {
+                const base = base_backdrop orelse break :reuse null;
+                if (base.radius != blur.radius or
+                    base.downsample_level != blur.downsample_level or
+                    commandsAffectRect(
+                        frame.commands[base.command_index + 1 .. command_index],
+                        sample_rect,
+                        frame.size,
+                    )) break :reuse null;
+                break :reuse base.op_index;
+            } else null;
+            const cache_key = if (reuse_op_index != null)
+                base_backdrop.?.key
+            else
+                own_cache_key;
             var level_rects: [blur_level_count]render.Rect = undefined;
             for (&level_rects, 0..) |*rect, index| rect.* = scaleRect(sample_rect, @intCast(index));
             const low_clipped = scaleRect(clipped, level);
@@ -3384,25 +3820,31 @@ fn compileDrawRuns(
                 .parameters = .{ @floatFromInt(radius), 0, 0, 0 },
             };
             var composite_count: u32 = 0;
-            if (frame.damage) |damage| {
-                for (damage) |damaged| {
-                    const damaged_clip = damaged.clipTo(frame.size) orelse continue;
-                    const composite_clip = clipped.intersection(damaged_clip) orelse continue;
+            if (!blur.cache_only) {
+                if (frame.damage) |damage| {
+                    for (damage) |damaged| {
+                        const damaged_clip = damaged.clipTo(frame.size) orelse continue;
+                        const composite_clip = clipped.intersection(damaged_clip) orelse continue;
+                        var instance = composite;
+                        instance.clip = rectFloats(composite_clip);
+                        try self.instances.append(self.allocator, instance);
+                        composite_count = std.math.add(u32, composite_count, 1) catch
+                            return error.InvalidTarget;
+                    }
+                } else {
                     var instance = composite;
-                    instance.clip = rectFloats(composite_clip);
+                    instance.clip = rectFloats(clipped);
                     try self.instances.append(self.allocator, instance);
-                    composite_count = std.math.add(u32, composite_count, 1) catch
-                        return error.InvalidTarget;
+                    composite_count = 1;
                 }
-            } else {
-                var instance = composite;
-                instance.clip = rectFloats(clipped);
-                try self.instances.append(self.allocator, instance);
-                composite_count = 1;
+                std.debug.assert(composite_count > 0);
             }
-            std.debug.assert(composite_count > 0);
+            const op_index: u32 = @intCast(self.blur_ops.items.len);
             try self.blur_ops.append(self.allocator, .{
                 .run_index = @intCast(self.draw_runs.items.len),
+                .cache_key = cache_key,
+                .cache_only = blur.cache_only,
+                .reuse_op_index = reuse_op_index,
                 .level = level,
                 .low_radius = low_radius,
                 .downsample_instances = downsample_instances,
@@ -3415,7 +3857,20 @@ fn compileDrawRuns(
                 .horizontal_rect = horizontal_rect,
                 .vertical_rect = vertical_rect,
             });
-            try self.draw_runs.append(self.allocator, .{ .pipeline = .blur_composite, .descriptor_set = null, .texture_size = blurLevelSize(frame.size, composite_level), .first_instance = composite_instance, .instance_count = composite_count });
+            if (blur.cache_only) base_backdrop = .{
+                .command_index = command_index,
+                .op_index = op_index,
+                .radius = blur.radius,
+                .downsample_level = blur.downsample_level,
+                .key = own_cache_key,
+            };
+            try self.draw_runs.append(self.allocator, .{
+                .pipeline = .blur_composite,
+                .descriptor_set = null,
+                .texture_size = blurLevelSize(frame.size, composite_level),
+                .first_instance = composite_instance,
+                .instance_count = composite_count,
+            });
         },
     };
     std.debug.assert(prepared_index == prepared_images.len);
@@ -3524,9 +3979,14 @@ fn blurLevel(radius: u32) u8 {
     return level;
 }
 
-pub fn backdropBlurFootprint(radius: u32) u32 {
+fn configuredBlurLevel(radius: u32, configured: ?u8) u8 {
+    std.debug.assert(configured == null or configured.? < blur_level_count);
+    return configured orelse blurLevel(radius);
+}
+
+pub fn backdropBlurFootprint(radius: u32, downsample_level: ?u8) u32 {
     if (radius == 0) return 0;
-    const level = blurLevel(radius);
+    const level = configuredBlurLevel(radius, downsample_level);
     const scale: u32 = @as(u32, 1) << @intCast(level);
     return (ceilDiv(radius, scale) + 3) * scale;
 }
@@ -3585,7 +4045,7 @@ fn expandRectWithin(rect: render.Rect, amount: u32, bounds: render.Rect) render.
     return .{ .x = @intCast(left), .y = @intCast(top), .width = @intCast(right - left), .height = @intCast(bottom - top) };
 }
 
-fn blurInstance(rect: render.Rect, radius: u8) Instance {
+fn blurInstance(rect: render.Rect, radius: u32) Instance {
     return .{ .destination = rectFloats(rect), .source = rectFloats(rect), .clip = rectFloats(rect), .color = .{ 1, 1, 1, 1 }, .rounded = .{ 0, 0, 0, 0 }, .parameters = .{ @floatFromInt(radius), 0, 0, 0 } };
 }
 
@@ -4110,11 +4570,27 @@ test "backdrop blur level keeps low resolution radius bounded" {
         try std.testing.expect(ceilDiv(case.radius, @as(u32, 1) << @intCast(case.level)) <= 2 or case.level == blur_level_count - 1);
     }
 
-    try std.testing.expectEqual(@as(u32, 0), backdropBlurFootprint(0));
-    try std.testing.expectEqual(@as(u32, 4), backdropBlurFootprint(1));
-    try std.testing.expectEqual(@as(u32, 10), backdropBlurFootprint(3));
-    try std.testing.expectEqual(@as(u32, 40), backdropBlurFootprint(16));
-    try std.testing.expectEqual(@as(u32, 192), backdropBlurFootprint(65));
+    try std.testing.expectEqual(@as(u8, 3), configuredBlurLevel(16, null));
+    try std.testing.expectEqual(@as(u8, 0), configuredBlurLevel(16, 0));
+    try std.testing.expectEqual(@as(u8, 5), configuredBlurLevel(16, 5));
+
+    try std.testing.expectEqual(@as(u32, 0), backdropBlurFootprint(0, null));
+    try std.testing.expectEqual(@as(u32, 4), backdropBlurFootprint(1, null));
+    try std.testing.expectEqual(@as(u32, 10), backdropBlurFootprint(3, null));
+    try std.testing.expectEqual(@as(u32, 40), backdropBlurFootprint(16, null));
+    try std.testing.expectEqual(@as(u32, 192), backdropBlurFootprint(65, null));
+    try std.testing.expectEqual(@as(u32, 19), backdropBlurFootprint(16, 0));
+    try std.testing.expectEqual(@as(u32, 128), backdropBlurFootprint(16, 5));
+
+    for (0..blur_level_count) |level_index| {
+        const level: u8 = @intCast(level_index);
+        const scale: u32 = @as(u32, 1) << @intCast(level);
+        for (1..257) |radius_index| {
+            const radius: u32 = @intCast(radius_index);
+            const sample_radius = (ceilDiv(radius, scale) + 2) * scale;
+            try std.testing.expect(backdropBlurFootprint(radius, level) >= sample_radius);
+        }
+    }
 }
 
 test "backdrop blur geometry scales odd rectangles and clips aligned edges" {
@@ -4123,6 +4599,137 @@ test "backdrop blur geometry scales odd rectangles and clips aligned edges" {
     try std.testing.expectEqual(render.Rect{ .x = 0, .y = 0, .width = 17, .height = 13 }, blurSampleRect(.{ .x = 1, .y = 3, .width = 15, .height = 9 }, 9, 1, .{ .width = 17, .height = 13 }));
     try std.testing.expectEqual(render.Rect{ .x = 8, .y = 4, .width = 16, .height = 16 }, blurSampleRect(.{ .x = 13, .y = 9, .width = 5, .height = 5 }, 3, 2, .{ .width = 31, .height = 23 }));
     try std.testing.expectEqual(render.Rect{ .x = 4, .y = 0, .width = 27, .height = 23 }, blurSampleRect(.{ .x = 17, .y = 9, .width = 1, .height = 1 }, 12, 2, .{ .width = 31, .height = 23 }));
+}
+
+test "backdrop cache keys ignore owner changes and track lower content" {
+    var lower_pixels = [_]u32{0xff112233};
+    var owner_pixels = [_]u32{0x80112233};
+    var commands = [_]render.Command{
+        .{ .clear = render.Color.rgba(0, 0, 0, 255) },
+        .{ .image = .{
+            .x = 0,
+            .y = 0,
+            .size = .{ .width = 1, .height = 1 },
+            .buffer = .{
+                .size = .{ .width = 1, .height = 1 },
+                .stride_pixels = 1,
+                .pixels = &lower_pixels,
+                .source_cache = .{ .id = 1, .version = 1 },
+            },
+        } },
+        .{ .backdrop_blur = .{
+            .rect = .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+            .corner_radius = 0,
+            .radius = 8,
+        } },
+        .{ .image = .{
+            .x = 0,
+            .y = 0,
+            .size = .{ .width = 1, .height = 1 },
+            .buffer = .{
+                .size = .{ .width = 1, .height = 1 },
+                .stride_pixels = 1,
+                .pixels = &owner_pixels,
+                .source_cache = .{ .id = 2, .version = 1 },
+            },
+        } },
+    };
+    const original = backdropCacheKey(commands[0..3]).?;
+
+    commands[3].image.buffer.source_cache.?.version = 2;
+    try std.testing.expectEqual(original, backdropCacheKey(commands[0..3]).?);
+
+    commands[1].image.buffer.source_cache.?.version = 2;
+    try std.testing.expect(original != backdropCacheKey(commands[0..3]).?);
+    commands[1].image.buffer.source_cache.?.version = 1;
+
+    commands[2].backdrop_blur.radius = 9;
+    try std.testing.expect(original != backdropCacheKey(commands[0..3]).?);
+    commands[1].image.buffer.source_cache = null;
+    try std.testing.expectEqual(@as(?u64, null), backdropCacheKey(commands[0..3]));
+}
+
+test "base backdrop cache is shared only across untouched regions" {
+    var renderer: Self = undefined;
+    renderer.allocator = std.testing.allocator;
+    renderer.instances = .empty;
+    defer renderer.instances.deinit(std.testing.allocator);
+    renderer.draw_runs = .empty;
+    defer renderer.draw_runs.deinit(std.testing.allocator);
+    renderer.blur_ops = .empty;
+    defer renderer.blur_ops.deinit(std.testing.allocator);
+
+    var commands = [_]render.Command{
+        .{ .clear = render.Color.rgba(0, 0, 0, 255) },
+        .{ .backdrop_blur = .{
+            .rect = .{ .x = 0, .y = 0, .width = 64, .height = 32 },
+            .corner_radius = 0,
+            .radius = 8,
+            .cache_only = true,
+        } },
+        .{ .solid_rect = .{
+            .rect = .{ .x = 0, .y = 0, .width = 4, .height = 4 },
+            .color = render.Color.rgba(255, 255, 255, 255),
+        } },
+        .{ .backdrop_blur = .{
+            .rect = .{ .x = 48, .y = 8, .width = 8, .height = 8 },
+            .corner_radius = 0,
+            .radius = 8,
+        } },
+    };
+    var frame: render.Frame = .{
+        .size = .{ .width = 64, .height = 32 },
+        .commands = &commands,
+    };
+    try renderer.compileDrawRuns(frame, &.{});
+    try std.testing.expectEqual(@as(usize, 2), renderer.blur_ops.items.len);
+    try std.testing.expectEqual(@as(?u32, 0), renderer.blur_ops.items[1].reuse_op_index);
+
+    renderer.instances.clearRetainingCapacity();
+    renderer.draw_runs.clearRetainingCapacity();
+    renderer.blur_ops.clearRetainingCapacity();
+    const unrelated_damage = [_]render.Rect{.{ .x = 0, .y = 0, .width = 4, .height = 4 }};
+    frame.damage = &unrelated_damage;
+    try renderer.compileDrawRuns(frame, &.{});
+    try std.testing.expectEqual(@as(usize, 0), renderer.blur_ops.items.len);
+
+    renderer.instances.clearRetainingCapacity();
+    renderer.draw_runs.clearRetainingCapacity();
+    renderer.blur_ops.clearRetainingCapacity();
+    frame.damage = null;
+    commands[2].solid_rect.rect.x = 40;
+    try renderer.compileDrawRuns(frame, &.{});
+    try std.testing.expectEqual(@as(usize, 1), renderer.blur_ops.items.len);
+    try std.testing.expectEqual(@as(?u32, null), renderer.blur_ops.items[0].reuse_op_index);
+}
+
+test "backdrop caches only reuse initialized stable keys" {
+    var cache: BackdropCache = .{
+        .size = .{ .width = 1, .height = 1 },
+        .image = undefined,
+        .framebuffer = .null_handle,
+        .key = 42,
+    };
+    try std.testing.expect(!cache.matches(42));
+    cache.initialized = true;
+    try std.testing.expect(cache.matches(42));
+    try std.testing.expect(!cache.matches(43));
+    try std.testing.expect(!cache.matches(null));
+
+    var output: Output = undefined;
+    output.backdrop_cache = .empty;
+    defer output.backdrop_cache.deinit(std.testing.allocator);
+    try output.backdrop_cache.append(std.testing.allocator, cache);
+    cache.key = 84;
+    try output.backdrop_cache.append(std.testing.allocator, cache);
+    try std.testing.expect(selectBackdropCache(
+        &output,
+        0,
+        .{ .width = 1, .height = 1 },
+        84,
+    ));
+    try std.testing.expectEqual(@as(?u64, 84), output.backdrop_cache.items[0].key);
+    try std.testing.expectEqual(@as(?u64, 42), output.backdrop_cache.items[1].key);
 }
 
 test "recorded Vulkan frames match only identical command topology" {
@@ -4255,6 +4862,87 @@ test "Vulkan renderer applies ordered backdrop blurs on GPU" {
     const blurred = pixels[2] & 0xff;
     try std.testing.expect(blurred >= 27 and blurred <= 29);
     try std.testing.expectEqual(@as(u32, 0xff000000), pixels[3]);
+}
+
+test "Vulkan base backdrop cache survives partial background and owner changes" {
+    var renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
+        error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+    var reference = Self.init(std.testing.allocator, null) catch |err| switch (err) {
+        error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
+        else => return err,
+    };
+    defer reference.deinit();
+
+    const size: render.Size = .{ .width = 32, .height = 16 };
+    var cached_pixels = [_]u32{0} ** (size.width * size.height);
+    var reference_pixels = [_]u32{0} ** (size.width * size.height);
+    const cached_target: render.PixelBuffer = .{
+        .size = size,
+        .stride_pixels = size.width,
+        .pixels = &cached_pixels,
+    };
+    const reference_target: render.PixelBuffer = .{
+        .size = size,
+        .stride_pixels = size.width,
+        .pixels = &reference_pixels,
+    };
+    var commands = [_]render.Command{
+        .{ .clear = render.Color.rgba(0, 0, 0, 255) },
+        .{ .solid_rect = .{
+            .rect = .{ .x = 22, .y = 7, .width = 1, .height = 1 },
+            .color = render.Color.rgba(255, 255, 255, 255),
+        } },
+        .{ .backdrop_blur = .{
+            .rect = .{ .x = 0, .y = 0, .width = size.width, .height = size.height },
+            .corner_radius = 0,
+            .radius = 2,
+            .cache_only = true,
+        } },
+        .{ .backdrop_blur = .{
+            .rect = .{ .x = 20, .y = 4, .width = 8, .height = 8 },
+            .corner_radius = 0,
+            .radius = 2,
+        } },
+        .{ .solid_rect = .{
+            .rect = .{ .x = 20, .y = 4, .width = 8, .height = 8 },
+            .color = render.Color.rgba(255, 0, 0, 64),
+        } },
+    };
+    try renderer.renderFrame(
+        .{ .size = size, .commands = &commands },
+        .{ .pixels = cached_target },
+    );
+    const output = renderer.outputs.getPtr(targetKey(.{ .pixels = cached_target })).?;
+    try std.testing.expectEqual(@as(usize, 1), output.backdrop_cache.items.len);
+    const original_key = output.backdrop_cache.items[0].key.?;
+
+    commands[1].solid_rect.color = render.Color.rgba(255, 0, 0, 255);
+    try renderer.renderFrame(
+        .{
+            .size = size,
+            .commands = &commands,
+            .damage = &.{.{ .x = 22, .y = 7, .width = 1, .height = 1 }},
+        },
+        .{ .pixels = cached_target },
+    );
+    const changed_key = output.backdrop_cache.items[0].key.?;
+    try std.testing.expect(original_key != changed_key);
+
+    commands[4].solid_rect.color = render.Color.rgba(0, 0, 255, 64);
+    const owner_damage = [_]render.Rect{.{ .x = 20, .y = 4, .width = 8, .height = 8 }};
+    try renderer.renderFrame(
+        .{ .size = size, .commands = &commands, .damage = &owner_damage },
+        .{ .pixels = cached_target },
+    );
+    try reference.renderFrame(
+        .{ .size = size, .commands = &commands },
+        .{ .pixels = reference_target },
+    );
+    try std.testing.expectEqual(changed_key, output.backdrop_cache.items[0].key.?);
+    try std.testing.expectEqualSlices(u32, &reference_pixels, &cached_pixels);
 }
 
 test "Vulkan partial backdrop blur matches a full redraw" {

@@ -46,7 +46,8 @@ pub fn render(self: *Self, frame: render_types.Frame, target: render_types.Pixel
                 try fill(destination, clipped, solid.color, pixman.PIXMAN_OP_OVER);
             },
             .shadow => |shadow| try drawShadow(destination, frame.size, shadow),
-            .backdrop_blur => |blur| try self.drawBackdropBlur(target, blur, frame.damage),
+            .backdrop_blur => |blur| if (!blur.cache_only)
+                try self.drawBackdropBlur(target, blur, frame.damage),
             .image => |image| try composite(destination, frame.size, image),
         }
     }

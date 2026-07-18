@@ -68,10 +68,14 @@ pub const Renderer = struct {
         };
     }
 
-    pub fn backdropBlurFootprint(self: *const Renderer, radius: u32) u32 {
+    pub fn backdropBlurFootprint(
+        self: *const Renderer,
+        radius: u32,
+        downsample_level: ?u8,
+    ) u32 {
         return switch (self.backend) {
             .cpu => radius,
-            .vulkan => VulkanRenderer.backdropBlurFootprint(radius),
+            .vulkan => VulkanRenderer.backdropBlurFootprint(radius, downsample_level),
         };
     }
 
@@ -296,7 +300,9 @@ fn translateCommand(
             .rect = translateRect(blur.rect, origin),
             .corner_radius = blur.corner_radius,
             .radius = blur.radius,
+            .downsample_level = blur.downsample_level,
             .clip = if (blur.clip) |clip| translateRect(clip, origin) else null,
+            .cache_only = blur.cache_only,
         } },
         .image => |image| .{ .image = .{
             .x = translateCoordinate(image.x, origin.x),
@@ -357,7 +363,9 @@ fn scaleCommand(command: render_types.Command, scale: render_types.Scale) render
             .rect = scaleRect(blur.rect, scale),
             .corner_radius = scaleUnsigned(blur.corner_radius, scale),
             .radius = scaleUnsigned(blur.radius, scale),
+            .downsample_level = blur.downsample_level,
             .clip = if (blur.clip) |clip| scaleRect(clip, scale) else null,
+            .cache_only = blur.cache_only,
         } },
         .image => |image| scaled: {
             const rect = scaleRect(.{

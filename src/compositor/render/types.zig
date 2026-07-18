@@ -233,8 +233,13 @@ pub const BackdropBlur = struct {
     rect: Rect,
     corner_radius: u32,
     radius: u32,
+    downsample_level: ?u8 = null,
     clip: ?Rect = null,
+    /// Populate a reusable backdrop without compositing it into the target.
+    cache_only: bool = false,
 };
+
+pub const maximum_blur_downsample_level: u8 = 5;
 
 pub const Command = union(enum) {
     clear: Color,

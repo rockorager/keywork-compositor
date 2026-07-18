@@ -64,6 +64,7 @@ pub const ContentGeometry = struct {
 
 pub const Blur = struct {
     radius: u32,
+    downsample_level: ?u8 = null,
 };
 
 pub const Shadow = struct {
