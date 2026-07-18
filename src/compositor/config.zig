@@ -7,7 +7,6 @@ const Direction = command.Direction;
 const WindowTarget = command.WindowTarget;
 const Launcher = @import("launcher.zig");
 const NativeInput = @import("backend/native_input.zig");
-const render = @import("render/types.zig");
 
 const c = @cImport({
     @cInclude("xkbcommon/xkbcommon.h");
@@ -184,8 +183,6 @@ pub const GeneralSettings = struct {
     focus_follows_mouse: bool = true,
     inner_gap: u32 = 16,
     outer_gap: u32 = 16,
-    blur_radius: u32 = 16,
-    blur_downsample_level: ?u8 = null,
     shadow_enabled: bool = true,
     shadow_blur_radius: u32 = 20,
     shadow_color: Color = .{ .red = 0x11, .green = 0x11, .blue = 0x13, .alpha = 0x80 },
@@ -559,8 +556,6 @@ const GeneralSetting = enum {
     focus_follows_mouse,
     inner_gap,
     outer_gap,
-    blur_radius,
-    blur_downsample_level,
     shadow,
     shadow_blur_radius,
     shadow_color,
@@ -587,8 +582,6 @@ fn parseGeneralSetting(
         .focus_follows_mouse => general.settings.focus_follows_mouse = try parseGeneralToggle(value),
         .inner_gap => general.settings.inner_gap = try parseGeneralSize(value),
         .outer_gap => general.settings.outer_gap = try parseGeneralSize(value),
-        .blur_radius => general.settings.blur_radius = try parseGeneralSize(value),
-        .blur_downsample_level => general.settings.blur_downsample_level = try parseBlurDownsampleLevel(value),
         .shadow => general.settings.shadow_enabled = try parseGeneralToggle(value),
         .shadow_blur_radius => general.settings.shadow_blur_radius = try parseGeneralSize(value),
         .shadow_color => general.settings.shadow_color = try parseColor(value),
@@ -610,14 +603,6 @@ fn parseGeneralSize(value: []const u8) GeneralSettingError!u32 {
         return error.InvalidGeneralSetting;
     if (size > 256) return error.InvalidGeneralSetting;
     return size;
-}
-
-fn parseBlurDownsampleLevel(value: []const u8) GeneralSettingError!?u8 {
-    if (std.mem.eql(u8, value, "auto")) return null;
-    const level = std.fmt.parseInt(u8, value, 10) catch
-        return error.InvalidGeneralSetting;
-    if (level > render.maximum_blur_downsample_level) return error.InvalidGeneralSetting;
-    return level;
 }
 
 fn parseColor(value: []const u8) GeneralSettingError!Color {
@@ -1285,8 +1270,6 @@ test "general settings parse and reject invalid directives" {
         \\focus-follows-mouse=disabled
         \\inner-gap=12
         \\outer-gap=16
-        \\blur-radius=32
-        \\blur-downsample-level=4
         \\shadow=disabled
         \\shadow-blur-radius=48
         \\shadow-color=#10203040
@@ -1302,8 +1285,6 @@ test "general settings parse and reject invalid directives" {
     try std.testing.expect(!snapshot.general.focus_follows_mouse);
     try std.testing.expectEqual(@as(u32, 12), snapshot.general.inner_gap);
     try std.testing.expectEqual(@as(u32, 16), snapshot.general.outer_gap);
-    try std.testing.expectEqual(@as(u32, 32), snapshot.general.blur_radius);
-    try std.testing.expectEqual(@as(?u8, 4), snapshot.general.blur_downsample_level);
     try std.testing.expect(!snapshot.general.shadow_enabled);
     try std.testing.expectEqual(@as(u32, 48), snapshot.general.shadow_blur_radius);
     try std.testing.expectEqual(Color{ .red = 0x10, .green = 0x20, .blue = 0x30, .alpha = 0x40 }, snapshot.general.shadow_color);
@@ -1311,20 +1292,8 @@ test "general settings parse and reject invalid directives" {
     try std.testing.expectEqual(@as(u32, 3), snapshot.general.focused_border_width);
     try std.testing.expectEqual(Color{ .red = 0x7a, .green = 0xa2, .blue = 0xf7, .alpha = 0x80 }, snapshot.general.focused_border_color);
 
-    const automatic_result = try parse(std.testing.allocator, "[general]\nblur-downsample-level=auto\n");
-    var automatic = switch (automatic_result) {
-        .snapshot => |automatic| automatic,
-        .diagnostic => return error.UnexpectedDiagnostic,
-    };
-    defer automatic.deinit();
-    try std.testing.expectEqual(@as(?u8, null), automatic.general.blur_downsample_level);
-
     const invalid = try parse(std.testing.allocator, "[general]\nfocus-follows-mouse=sometimes\n");
     try std.testing.expectEqual(Problem.invalid_general_setting, invalid.diagnostic.problem);
-    const invalid_radius = try parse(std.testing.allocator, "[general]\nblur-radius=257\n");
-    try std.testing.expectEqual(Problem.invalid_general_setting, invalid_radius.diagnostic.problem);
-    const invalid_level = try parse(std.testing.allocator, "[general]\nblur-downsample-level=6\n");
-    try std.testing.expectEqual(Problem.invalid_general_setting, invalid_level.diagnostic.problem);
     const invalid_gap = try parse(std.testing.allocator, "[general]\ninner-gap=257\n");
     try std.testing.expectEqual(Problem.invalid_general_setting, invalid_gap.diagnostic.problem);
     const invalid_border_width = try parse(std.testing.allocator, "[general]\nfocused-border-width=257\n");

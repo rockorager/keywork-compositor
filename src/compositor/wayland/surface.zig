@@ -25,6 +25,7 @@ has_pending_attachment: bool,
 role_handler: ?RoleHandler,
 viewport_handler: ?ViewportHandler,
 content_type_handler: ?ContentTypeHandler,
+background_effect_handler: ?BackgroundEffectHandler,
 commit_listeners: std.ArrayList(*CommitListener),
 
 pub const Store = slot_map.SlotMap(State, enum { surface });
@@ -44,6 +45,9 @@ pub const State = struct {
     current_viewport: ViewportState,
     pending_content_type: ContentType,
     current_content_type: ContentType,
+    pending_blur_region: Region,
+    pending_blur_region_changed: bool,
+    current_blur_region: Region,
     pending_surface_damage: Region,
     pending_buffer_damage: Region,
     current_damage: Region,
@@ -83,6 +87,9 @@ pub const State = struct {
             .current_viewport = .{},
             .pending_content_type = .none,
             .current_content_type = .none,
+            .pending_blur_region = Region.init(),
+            .pending_blur_region_changed = false,
+            .current_blur_region = Region.init(),
             .pending_surface_damage = Region.init(),
             .pending_buffer_damage = Region.init(),
             .current_damage = Region.init(),
@@ -122,6 +129,8 @@ pub const State = struct {
         self.pending_surface_damage.deinit();
         self.pending_buffer_damage.deinit();
         self.current_damage.deinit();
+        self.pending_blur_region.deinit();
+        self.current_blur_region.deinit();
         self.pending_opaque.deinit();
         self.current_opaque.deinit();
         self.pending_input.deinit();
@@ -162,6 +171,7 @@ pub fn create(
         .role_handler = null,
         .viewport_handler = null,
         .content_type_handler = null,
+        .background_effect_handler = null,
         .commit_listeners = .empty,
     };
 
@@ -269,6 +279,45 @@ pub fn currentContentType(store: *Store, id: Id) ?ContentType {
     return surface_state.current_content_type;
 }
 
+pub const BackgroundEffectHandler = struct {
+    context: *anyopaque,
+    surface_destroyed: *const fn (*anyopaque) void,
+};
+
+pub fn setBackgroundEffectHandler(
+    self: *Self,
+    handler: BackgroundEffectHandler,
+) error{AlreadyExists}!void {
+    if (self.background_effect_handler != null) return error.AlreadyExists;
+    self.background_effect_handler = handler;
+}
+
+pub fn clearBackgroundEffectHandler(self: *Self) void {
+    std.debug.assert(self.background_effect_handler != null);
+    self.background_effect_handler = null;
+    const surface_state = self.state();
+    surface_state.pending_blur_region.clear();
+    surface_state.pending_blur_region_changed = true;
+}
+
+pub fn setPendingBlurRegion(self: *Self, region: ?*const Region) Region.Error!void {
+    std.debug.assert(self.background_effect_handler != null);
+    const surface_state = self.state();
+    if (region) |value|
+        try surface_state.pending_blur_region.copyFrom(value)
+    else
+        surface_state.pending_blur_region.clear();
+    surface_state.pending_blur_region_changed = true;
+}
+
+/// The returned region is borrowed until the surface's next applied commit or
+/// any store insertion that reallocates its slots.
+pub fn currentBlurRegion(store: *Store, id: Id) ?*const Region {
+    const surface_state = store.get(id) orelse return null;
+    if (surface_state.current_blur_region.isEmpty()) return null;
+    return &surface_state.current_blur_region;
+}
+
 pub const Role = enum {
     xdg_toplevel,
     xdg_popup,
@@ -300,6 +349,8 @@ const CachedCommit = struct {
     transform: wl.Output.Transform,
     viewport: ViewportState,
     content_type: ContentType,
+    blur_region: Region,
+    blur_region_changed: bool,
     surface_damage: Region,
     buffer_damage: Region,
     opaque_region: Region,
@@ -309,6 +360,7 @@ const CachedCommit = struct {
         if (self.buffer) |*buffer| buffer.deinit();
         self.surface_damage.deinit();
         self.buffer_damage.deinit();
+        self.blur_region.deinit();
         self.opaque_region.deinit();
         self.input.deinit();
         self.* = undefined;
@@ -792,6 +844,10 @@ fn applyPending(self: *Self, commit_info: CommitInfo) void {
     const offset_changed = surface_state.pending_offset_x != 0 or
         surface_state.pending_offset_y != 0;
 
+    surface_state.current_blur_region.copyFrom(&surface_state.pending_blur_region) catch {
+        self.resource.postNoMemory();
+        return;
+    };
     surface_state.current_opaque.copyFrom(&surface_state.pending_opaque) catch {
         self.resource.postNoMemory();
         return;
@@ -844,8 +900,12 @@ fn applyPending(self: *Self, commit_info: CommitInfo) void {
         &surface_state.pending_buffer_damage,
         offset_changed,
     );
+    if (surface_state.pending_blur_region_changed) {
+        surface_state.current_damage_precise = false;
+    }
     surface_state.pending_offset_x = 0;
     surface_state.pending_offset_y = 0;
+    surface_state.pending_blur_region_changed = false;
     surface_state.pending_surface_damage.clear();
     surface_state.pending_buffer_damage.clear();
     surface_state.has_committed = true;
@@ -912,6 +972,8 @@ fn cachePending(self: *Self) bool {
         .transform = surface_state.pending_transform,
         .viewport = surface_state.pending_viewport,
         .content_type = surface_state.pending_content_type,
+        .blur_region = Region.init(),
+        .blur_region_changed = surface_state.pending_blur_region_changed,
         .surface_damage = Region.init(),
         .buffer_damage = Region.init(),
         .opaque_region = Region.init(),
@@ -921,6 +983,10 @@ fn cachePending(self: *Self) bool {
     var cached_owned = false;
     defer if (!cached_owned) cached.deinit();
 
+    cached.blur_region.copyFrom(&surface_state.pending_blur_region) catch {
+        self.resource.postNoMemory();
+        return false;
+    };
     cached.opaque_region.copyFrom(&surface_state.pending_opaque) catch {
         self.resource.postNoMemory();
         return false;
@@ -951,6 +1017,7 @@ fn cachePending(self: *Self) bool {
 
     surface_state.pending_offset_x = 0;
     surface_state.pending_offset_y = 0;
+    surface_state.pending_blur_region_changed = false;
     surface_state.pending_surface_damage.clear();
     surface_state.pending_buffer_damage.clear();
     surface_state.has_committed = true;
@@ -987,6 +1054,10 @@ fn applyCached(self: *Self, cached: *CachedCommit) void {
         .offset_y = cached.offset_y,
     };
 
+    surface_state.current_blur_region.copyFrom(&cached.blur_region) catch {
+        self.resource.postNoMemory();
+        return;
+    };
     surface_state.current_opaque.copyFrom(&cached.opaque_region) catch {
         self.resource.postNoMemory();
         return;
@@ -1022,6 +1093,7 @@ fn applyCached(self: *Self, cached: *CachedCommit) void {
         &cached.buffer_damage,
         offset_changed,
     );
+    if (cached.blur_region_changed) surface_state.current_damage_precise = false;
     if (surface_state.presentation_output != null) surface_state.commit_after_submission = true;
     discardCommitFeedbacks(surface_state, .active);
     for (surface_state.callbacks.items) |callback| {
@@ -1215,6 +1287,10 @@ fn handleDestroy(_: *wl.Surface, self: *Self) void {
     }
     if (self.content_type_handler) |handler| {
         self.content_type_handler = null;
+        handler.surface_destroyed(handler.context);
+    }
+    if (self.background_effect_handler) |handler| {
+        self.background_effect_handler = null;
         handler.surface_destroyed(handler.context);
     }
     while (self.commit_listeners.items.len > 0) {

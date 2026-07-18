@@ -14,6 +14,7 @@ const XdgForeign = @import("wayland/xdg_foreign.zig");
 const LayerShell = @import("wayland/layer_shell.zig");
 const SinglePixelBuffer = @import("wayland/single_pixel_buffer.zig");
 const ContentType = @import("wayland/content_type.zig");
+const BackgroundEffect = @import("wayland/background_effect.zig");
 const SecurityContext = @import("wayland/security_context.zig");
 const SessionLock = @import("wayland/session_lock.zig");
 const CursorShape = @import("wayland/cursor_shape.zig");
@@ -101,6 +102,7 @@ output_power: OutputPower,
 output_power_initialized: bool,
 single_pixel_buffer: SinglePixelBuffer,
 content_type: ContentType,
+background_effect: BackgroundEffect,
 security_context: SecurityContext,
 session_lock: SessionLock,
 session_lock_initialized: bool,
@@ -657,6 +659,7 @@ pub fn createWithVirtualOutput(
         .output_power_initialized = false,
         .single_pixel_buffer = undefined,
         .content_type = undefined,
+        .background_effect = undefined,
         .security_context = undefined,
         .session_lock = undefined,
         .session_lock_initialized = false,
@@ -835,6 +838,8 @@ pub fn createWithVirtualOutput(
     errdefer self.single_pixel_buffer.deinit();
     try self.content_type.init(allocator, display);
     errdefer self.content_type.deinit();
+    try self.background_effect.init(allocator, display);
+    errdefer self.background_effect.deinit();
     try self.session_lock.init(
         allocator,
         display,
@@ -1316,6 +1321,7 @@ pub fn destroy(self: *Self) void {
     self.session_lock.deinit();
     self.session_lock_initialized = false;
     self.security_context.deinit();
+    self.background_effect.deinit();
     self.content_type.deinit();
     self.single_pixel_buffer.deinit();
     self.xdg_output.deinit();
@@ -2185,10 +2191,6 @@ fn windowEffects(general: Config.GeneralSettings, shadow_color: Config.Color) Sc
     const defaults = Scene.default_effects;
     return .{
         .corner_radius = defaults.corner_radius,
-        .blur = if (general.blur_radius == 0) null else .{
-            .radius = general.blur_radius,
-            .downsample_level = general.blur_downsample_level,
-        },
         .shadow = if (general.shadow_enabled) .{
             .offset = defaults.shadow.?.offset,
             .blur_radius = general.shadow_blur_radius,
@@ -5365,80 +5367,6 @@ fn backdropBlurArea(
     };
 }
 
-fn windowBackdropBlurArea(
-    self: *Self,
-    render_output: *const RenderOutput,
-    output: *const Output,
-    window: *const Scene.Window,
-) ?BackdropBlurArea {
-    if (!window.mapped) return null;
-    const blur = window.effects.blur orelse return null;
-    const buffer = Surface.currentBuffer(
-        self.compositor.surfaceStore(),
-        window.surface_id,
-    ) orelse return null;
-    const geometry = window.content_geometry orelse Scene.ContentGeometry{
-        .size = buffer.logical_size,
-    };
-    const content_rect = windowContentRect(window, geometry.size) orelse return null;
-    const window_clip = if (window.clip_box) |clip_box|
-        clip_box.translated(window.position.x, window.position.y)
-    else
-        null;
-    if (self.opaqueWindowRootCoversBackdrop(
-        window,
-        buffer,
-        geometry,
-        content_rect,
-        window_clip,
-    )) return null;
-    const logical = if (window_clip) |clip|
-        content_rect.intersection(clip) orelse return null
-    else
-        content_rect;
-    return backdropBlurArea(
-        render_output,
-        output,
-        logical,
-        blur.radius,
-        blur.downsample_level,
-    );
-}
-
-fn layerSurfaceBackdropBlurArea(
-    self: *Self,
-    render_output: *const RenderOutput,
-    output: *const Output,
-    layer_surface: *const Scene.LayerSurface,
-) ?BackdropBlurArea {
-    const blur = self.layer_shell_effects.blur orelse return null;
-    const logical = self.layerSurfaceBackdropBlurRect(layer_surface) orelse return null;
-    return backdropBlurArea(
-        render_output,
-        output,
-        logical,
-        blur.radius,
-        blur.downsample_level,
-    );
-}
-
-fn layerSurfaceBackdropBlurRect(
-    self: *Self,
-    layer_surface: *const Scene.LayerSurface,
-) ?render.Rect {
-    if (self.layer_shell_effects.blur == null) return null;
-    const buffer = Surface.currentBuffer(
-        self.compositor.surfaceStore(),
-        layer_surface.surface_id,
-    ) orelse return null;
-    if (buffer.force_opaque or
-        Surface.currentOpaqueCoversBuffer(
-            self.compositor.surfaceStore(),
-            layer_surface.surface_id,
-        )) return null;
-    return layerSurfaceRect(layer_surface, buffer.logical_size);
-}
-
 fn layerSurfaceRect(
     layer_surface: *const Scene.LayerSurface,
     size: render.Size,
@@ -5525,38 +5453,33 @@ fn expandBackdropBlurDamage(
     output: *const Output,
     damage: *Region,
 ) Region.Error!void {
+    const surface_blur = Scene.background_blur;
     var changed = true;
     while (changed) {
         changed = false;
-        var nodes = self.scene.nodeIterator();
-        while (nodes.next()) |entry| switch (entry) {
-            .window => |window_entry| {
-                const blur = self.windowBackdropBlurArea(render_output, output, window_entry.window) orelse continue;
-                const footprint = self.renderer.backdropBlurFootprint(
-                    blur.radius,
-                    blur.downsample_level,
-                );
-                changed = try addBackdropBlurDamage(
-                    damage,
-                    blur,
-                    render_output.backend.modeSize(),
-                    footprint,
-                ) or changed;
-            },
-            .shell_surface => {},
-        };
-        inline for (.{
-            Scene.Layer.background,
-            Scene.Layer.bottom,
-            Scene.Layer.top,
-            Scene.Layer.overlay,
-        }) |layer| {
-            var surfaces = self.scene.layerSurfaceIterator(layer);
-            while (surfaces.next()) |entry| {
-                const blur = self.layerSurfaceBackdropBlurArea(
+        const surfaces = self.compositor.surfaceStore();
+        var surface_iterator = surfaces.iterator();
+        while (surface_iterator.next()) |surface_entry| {
+            const region = Surface.currentBlurRegion(surfaces, surface_entry.id) orelse continue;
+            const buffer = Surface.currentBuffer(surfaces, surface_entry.id) orelse continue;
+            if (buffer.force_opaque or
+                Surface.currentOpaqueCoversBuffer(surfaces, surface_entry.id)) continue;
+            const root = self.subcompositor.rootSurface(surface_entry.id);
+            if (!self.scene.surfaceMapped(root)) continue;
+            const root_position = self.scene.surfacePosition(root) orelse continue;
+            const offset = self.subcompositor.surfaceOffset(surface_entry.id);
+            var rectangles = region.rectangleIterator();
+            while (rectangles.next()) |rectangle| {
+                const local = surfaceEffectRect(rectangle, buffer.logical_size) orelse continue;
+                const blur = backdropBlurArea(
                     render_output,
                     output,
-                    entry.layer_surface,
+                    local.translated(
+                        root_position.x +| offset.x,
+                        root_position.y +| offset.y,
+                    ),
+                    surface_blur.radius,
+                    surface_blur.downsample_level,
                 ) orelse continue;
                 const footprint = self.renderer.backdropBlurFootprint(
                     blur.radius,
@@ -5737,7 +5660,8 @@ fn renderDesktopContents(
     paint_cursors: bool,
 ) renderer_types.Renderer.Error!?Scene.Id {
     try self.renderLayerSurfaces(frame, .background);
-    if (self.layer_shell_effects.blur) |blur| {
+    if (self.hasBackgroundEffect()) {
+        const blur = Scene.background_blur;
         const cache_command = [_]render.Command{.{ .backdrop_blur = .{
             .rect = frame.visible_rect,
             .corner_radius = 0,
@@ -5810,6 +5734,19 @@ fn renderDesktopContents(
         try self.renderTabletCursors(frame, false);
     }
     return top_fullscreen;
+}
+
+fn hasBackgroundEffect(self: *Self) bool {
+    const surfaces = self.compositor.surfaceStore();
+    var iterator = surfaces.iterator();
+    while (iterator.next()) |entry| {
+        if (Surface.currentBlurRegion(surfaces, entry.id) == null) continue;
+        const buffer = Surface.currentBuffer(surfaces, entry.id) orelse continue;
+        if (!buffer.force_opaque and !Surface.currentOpaqueCoversBuffer(surfaces, entry.id)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 fn presentSessionLockFrame(
@@ -5995,18 +5932,6 @@ fn renderLayerSurfaces(
     while (surfaces.next()) |entry| {
         const layer_surface = entry.layer_surface;
         if (!layer_surface.mapped) continue;
-        if (self.layerSurfaceBackdropBlurRect(layer_surface)) |rect| {
-            const blur = self.layer_shell_effects.blur.?;
-            const blur_command = [_]render.Command{
-                .{ .backdrop_blur = .{
-                    .rect = rect,
-                    .corner_radius = 0,
-                    .radius = blur.radius,
-                    .downsample_level = blur.downsample_level,
-                } },
-            };
-            try self.renderCommands(frame, &blur_command);
-        }
         if (self.layer_shell.castsShadow(layer_surface.surface_id)) {
             if (self.layer_shell_effects.shadow) |shadow| {
                 const buffer = Surface.currentBuffer(
@@ -6176,26 +6101,6 @@ fn renderWindow(
         clip_box.translated(window.position.x, window.position.y)
     else
         null;
-    if (window.effects.blur) |blur| {
-        if (!self.opaqueWindowRootCoversBackdrop(
-            window,
-            root_buffer,
-            content_geometry,
-            content_rect,
-            window_clip,
-        )) {
-            const blur_command = [_]render.Command{
-                .{ .backdrop_blur = .{
-                    .rect = content_rect,
-                    .corner_radius = window.effects.corner_radius,
-                    .radius = blur.radius,
-                    .downsample_level = blur.downsample_level,
-                    .clip = window_clip,
-                } },
-            };
-            try self.renderCommands(frame, &blur_command);
-        }
-    }
     if (window.effects.shadow) |shadow| {
         try self.renderShadow(
             frame,
@@ -6235,75 +6140,6 @@ fn renderWindow(
     try self.renderWindowBorders(frame, window, content_rect, window_clip);
     try self.renderWindowDecorations(frame, id, window, .above, window_clip);
     try self.renderWindowPopups(frame, id);
-}
-
-fn opaqueWindowRootCoversBackdrop(
-    self: *Self,
-    window: *const Scene.Window,
-    root_buffer: *const Surface.BufferSnapshot,
-    content_geometry: Scene.ContentGeometry,
-    content_rect: render.Rect,
-    window_clip: ?render.Rect,
-) bool {
-    const root_opaque = root_buffer.force_opaque or Surface.currentOpaqueCoversBuffer(
-        self.compositor.surfaceStore(),
-        window.surface_id,
-    );
-    const visible_blur = if (window_clip) |clip|
-        content_rect.intersection(clip) orelse return true
-    else
-        content_rect;
-    const root_rect: render.Rect = .{
-        .x = window.position.x -| content_geometry.offset.x,
-        .y = window.position.y -| content_geometry.offset.y,
-        .width = root_buffer.logical_size.width,
-        .height = root_buffer.logical_size.height,
-    };
-    return opaqueRootCoversBackdrop(
-        root_opaque,
-        window.effects.corner_radius,
-        root_rect,
-        visible_blur,
-    );
-}
-
-fn opaqueRootCoversBackdrop(
-    root_opaque: bool,
-    corner_radius: u32,
-    root_rect: render.Rect,
-    backdrop_rect: render.Rect,
-) bool {
-    if (!root_opaque or corner_radius != 0) return false;
-    const intersection = root_rect.intersection(backdrop_rect) orelse return false;
-    return std.meta.eql(intersection, backdrop_rect);
-}
-
-test "opaque square window roots hide backdrop blur" {
-    const backdrop: render.Rect = .{ .x = 10, .y = 20, .width = 100, .height = 80 };
-    try std.testing.expect(opaqueRootCoversBackdrop(
-        true,
-        0,
-        .{ .x = 0, .y = 0, .width = 200, .height = 200 },
-        backdrop,
-    ));
-    try std.testing.expect(!opaqueRootCoversBackdrop(
-        false,
-        0,
-        .{ .x = 0, .y = 0, .width = 200, .height = 200 },
-        backdrop,
-    ));
-    try std.testing.expect(!opaqueRootCoversBackdrop(
-        true,
-        12,
-        .{ .x = 0, .y = 0, .width = 200, .height = 200 },
-        backdrop,
-    ));
-    try std.testing.expect(!opaqueRootCoversBackdrop(
-        true,
-        0,
-        .{ .x = 10, .y = 20, .width = 99, .height = 80 },
-        backdrop,
-    ));
 }
 
 fn renderWindowPopups(
@@ -6362,6 +6198,15 @@ fn renderSurfaceTree(
                 if (visible_rect.intersection(clip_rect) == null) continue;
             }
             if (frame.track_visibility) try frame.output.markSurfaceVisible(surface_id);
+            try self.renderSurfaceBackgroundEffect(
+                frame,
+                surface_id,
+                x,
+                y,
+                buffer.logical_size,
+                rounded_clip,
+                clip,
+            );
             const pixel_buffer = buffer.pixelBuffer();
             const image_command = [_]render.Command{
                 .{ .image = .{
@@ -6391,6 +6236,67 @@ fn renderSurfaceTree(
             clip,
         ),
     };
+}
+
+fn renderSurfaceBackgroundEffect(
+    self: *Self,
+    frame: *const OutputFrame,
+    surface_id: Surface.Id,
+    x: i32,
+    y: i32,
+    size: render.Size,
+    rounded_clip: ?render.RoundedClip,
+    clip: ?render.Rect,
+) renderer_types.Renderer.Error!void {
+    const blur = Scene.background_blur;
+    const surfaces = self.compositor.surfaceStore();
+    const buffer = Surface.currentBuffer(surfaces, surface_id) orelse return;
+    if (buffer.force_opaque or Surface.currentOpaqueCoversBuffer(surfaces, surface_id)) return;
+    const region = Surface.currentBlurRegion(surfaces, surface_id) orelse return;
+    var rectangles = region.rectangleIterator();
+    while (rectangles.next()) |rectangle| {
+        var effect_rect = surfaceEffectRect(rectangle, size) orelse continue;
+        effect_rect = effect_rect.translated(x, y);
+        var corner_radius: u32 = 0;
+        if (rounded_clip) |rounded| {
+            effect_rect = effect_rect.intersection(rounded.rect) orelse continue;
+            if (std.meta.eql(effect_rect, rounded.rect)) corner_radius = rounded.radius;
+        }
+        const command = [_]render.Command{.{ .backdrop_blur = .{
+            .rect = effect_rect,
+            .corner_radius = corner_radius,
+            .radius = blur.radius,
+            .downsample_level = blur.downsample_level,
+            .clip = clip,
+        } }};
+        try self.renderCommands(frame, &command);
+    }
+}
+
+fn surfaceEffectRect(rectangle: Region.Rectangle, size: render.Size) ?render.Rect {
+    return (render.Rect{
+        .x = rectangle.x,
+        .y = rectangle.y,
+        .width = rectangle.width,
+        .height = rectangle.height,
+    }).clipTo(size);
+}
+
+test "background effect rectangles are clipped to the surface" {
+    try std.testing.expectEqual(
+        render.Rect{ .x = 0, .y = 4, .width = 6, .height = 4 },
+        surfaceEffectRect(
+            .{ .x = -2, .y = 4, .width = 8, .height = 10 },
+            .{ .width = 10, .height = 8 },
+        ).?,
+    );
+    try std.testing.expectEqual(
+        @as(?render.Rect, null),
+        surfaceEffectRect(
+            .{ .x = 10, .y = 0, .width = 1, .height = 1 },
+            .{ .width = 10, .height = 8 },
+        ),
+    );
 }
 
 fn renderBufferTransform(transform: wl.Output.Transform) render.BufferTransform {
@@ -6625,7 +6531,7 @@ test "server creates and destroys protocol globals" {
     try std.testing.expect(server.window_manager_initialized);
 }
 
-test "general configuration maps window blur and shadow effects" {
+test "general configuration maps window shadows" {
     const defaults: Config.GeneralSettings = .{};
     try std.testing.expect(std.meta.eql(
         Scene.default_effects,
@@ -6644,18 +6550,9 @@ test "general configuration maps window blur and shadow effects" {
         focused.shadow.?.color,
     );
 
-    var configured = defaults;
-    configured.blur_downsample_level = 2;
-    const configured_blur = windowEffects(configured, configured.shadow_color).blur.?;
-    try std.testing.expectEqual(
-        @as(?u8, 2),
-        configured_blur.downsample_level,
-    );
     var disabled = defaults;
-    disabled.blur_radius = 0;
     disabled.shadow_enabled = false;
     const effects = windowEffects(disabled, disabled.shadow_color);
-    try std.testing.expect(effects.blur == null);
     try std.testing.expect(effects.shadow == null);
 }
 

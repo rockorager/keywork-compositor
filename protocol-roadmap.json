@@ -1301,16 +1301,16 @@
       "interfaces": [
         {
           "name": "ext_background_effect_manager_v1",
-          "current_version": null,
+          "current_version": 1,
           "target_version": 1
         }
       ],
-      "status": "not_started",
+      "status": "done",
       "privileged": false,
       "blocked_by": [
-        "alpha-modifier",
-        "color-management"
-      ]
+        "wl-compositor"
+      ],
+      "status_detail": "Version 1 always advertises blur availability, enforces one effect object per wl_surface, copies and double-buffers blur regions through synchronized subsurface commits, makes effect objects inert when their surface disappears, and blurs only requested regions with compositor-defined parameters."
     },
     {
       "id": "wlr-gamma-control",

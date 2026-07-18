@@ -443,6 +443,7 @@ test {
     _ = @import("wayland/linux_dmabuf.zig");
     _ = @import("wayland/single_pixel_buffer.zig");
     _ = @import("wayland/content_type.zig");
+    _ = @import("wayland/background_effect.zig");
     _ = @import("wayland/security_context.zig");
     _ = @import("wayland/session_lock.zig");
     _ = @import("wayland/cursor_shape.zig");

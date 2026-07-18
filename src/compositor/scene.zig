@@ -76,13 +76,13 @@ pub const Shadow = struct {
 
 pub const Effects = struct {
     corner_radius: u32 = 0,
-    blur: ?Blur = null,
     shadow: ?Shadow = null,
 };
 
+pub const background_blur: Blur = .{ .radius = 16 };
+
 pub const default_effects: Effects = .{
     .corner_radius = 12,
-    .blur = .{ .radius = 16 },
     .shadow = .{
         .offset = .{},
         .blur_radius = 20,
