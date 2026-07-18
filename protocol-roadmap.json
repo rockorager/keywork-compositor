@@ -1071,16 +1071,17 @@
       "interfaces": [
         {
           "name": "xdg_toplevel_icon_manager_v1",
-          "current_version": null,
+          "current_version": 1,
           "target_version": 1
         }
       ],
-      "status": "not_started",
+      "status": "done",
       "privileged": false,
       "blocked_by": [
         "wl-shm",
         "xdg-shell"
-      ]
+      ],
+      "status_detail": "Version 1 implements named and multi-scale SHM icon objects, square-buffer validation, size-and-scale replacement, immutable assignment, destroyed-buffer errors, and manager-independent child lifetimes. Assignments are deep-copied into double-buffered XDG toplevel metadata on surface commit, so icons persist after their source icon and buffers are destroyed; null and empty icons restore the default. The compositor advertises no preferred icon sizes. Protocol errors, replacement, persistence, and manager destruction are exercised end to end."
     },
     {
       "id": "xdg-dialog",

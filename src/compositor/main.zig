@@ -446,6 +446,7 @@ test {
     _ = @import("wayland/fifo.zig");
     _ = @import("wayland/commit_timing.zig");
     _ = @import("wayland/xdg_toplevel_drag.zig");
+    _ = @import("wayland/xdg_toplevel_icon.zig");
     _ = @import("wayland/single_pixel_buffer.zig");
     _ = @import("wayland/content_type.zig");
     _ = @import("wayland/background_effect.zig");

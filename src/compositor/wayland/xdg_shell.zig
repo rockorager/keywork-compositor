@@ -148,6 +148,9 @@ pub const WindowState = struct {
     parent_owner: ?*anyopaque = null,
     title: ?[:0]u8 = null,
     app_id: ?[:0]u8 = null,
+    icon: ?ToplevelIcon = null,
+    pending_icon: ?ToplevelIcon = null,
+    pending_icon_changed: bool = false,
     pending_min_size: SizeHint = .{},
     pending_max_size: SizeHint = .{},
     current_min_size: SizeHint = .{},
@@ -162,14 +165,23 @@ pub const WindowState = struct {
     fn deinit(self: *WindowState, allocator: std.mem.Allocator) void {
         if (self.title) |title| allocator.free(title);
         if (self.app_id) |app_id| allocator.free(app_id);
+        if (self.icon) |*icon| icon.deinit(allocator);
+        if (self.pending_icon) |*icon| icon.deinit(allocator);
         self.* = undefined;
     }
 
-    fn commit(self: *WindowState) bool {
-        const changed = !std.meta.eql(self.current_min_size, self.pending_min_size) or
+    fn commit(self: *WindowState, allocator: std.mem.Allocator) bool {
+        var changed = !std.meta.eql(self.current_min_size, self.pending_min_size) or
             !std.meta.eql(self.current_max_size, self.pending_max_size);
         self.current_min_size = self.pending_min_size;
         self.current_max_size = self.pending_max_size;
+        if (self.pending_icon_changed) {
+            if (self.icon) |*icon| icon.deinit(allocator);
+            self.icon = self.pending_icon;
+            self.pending_icon = null;
+            self.pending_icon_changed = false;
+            changed = true;
+        }
         return changed;
     }
 
@@ -194,6 +206,31 @@ pub const WindowState = struct {
 pub const Dimensions = struct {
     width: i32,
     height: i32,
+};
+
+pub const ToplevelIconBuffer = struct {
+    size: u32,
+    scale: i32,
+    format: u32,
+    stride: u32,
+    data: []u8,
+};
+
+pub const ToplevelIcon = struct {
+    name: ?[:0]u8,
+    buffers: []ToplevelIconBuffer,
+
+    pub fn deinit(self: *ToplevelIcon, allocator: std.mem.Allocator) void {
+        if (self.name) |name| allocator.free(name);
+        for (self.buffers) |buffer| allocator.free(buffer.data);
+        allocator.free(self.buffers);
+        self.* = undefined;
+    }
+};
+
+pub const ToplevelIconInfo = struct {
+    name: ?[:0]const u8,
+    buffers: []const ToplevelIconBuffer,
 };
 
 fn windowCommitNeedsNotification(
@@ -283,6 +320,7 @@ pub const WindowInfo = struct {
     unreliable_pid: i32,
     title: ?[:0]const u8,
     app_id: ?[:0]const u8,
+    icon: ?ToplevelIconInfo,
     parent: ?WindowId,
     min_size: SizeHint,
     max_size: SizeHint,
@@ -443,6 +481,10 @@ pub fn windowInfo(self: *Self, id: WindowId) ?WindowInfo {
         .unreliable_pid = window.unreliable_pid,
         .title = window.title,
         .app_id = window.app_id,
+        .icon = if (window.icon) |*icon| .{
+            .name = icon.name,
+            .buffers = icon.buffers,
+        } else null,
         .parent = window.parent,
         .min_size = window.current_min_size,
         .max_size = window.current_max_size,
@@ -464,6 +506,13 @@ pub fn windowSurface(self: *Self, id: WindowId) ?Surface.Id {
 pub fn requestWindow(self: *Self, id: WindowId, request: WindowRequest) void {
     if (self.windows.get(id) == null) return;
     if (self.window_listener) |listener| listener.request(listener.context, id, request);
+}
+
+pub fn setPendingToplevelIcon(self: *Self, id: WindowId, icon: ?ToplevelIcon) void {
+    const window = self.windows.get(id) orelse unreachable;
+    if (window.pending_icon) |*pending| pending.deinit(self.allocator);
+    window.pending_icon = icon;
+    window.pending_icon_changed = true;
 }
 
 pub const AttachPopupError = error{
@@ -1744,7 +1793,7 @@ const XdgSurfaceResource = struct {
         info: Surface.CommitInfo,
     ) void {
         const window = self.shell.windows.get(window_id) orelse return;
-        if (window.commit()) {
+        if (window.commit(self.allocator)) {
             _ = self.shell.notifyWindowMetadataChanged(window_id);
         }
 
@@ -2762,6 +2811,29 @@ test "xdg pixel-only window commits do not notify policy" {
         .{ .width = 801, .height = 600 },
     ));
     try std.testing.expect(!windowCommitNeedsNotification(true, null, dimensions, dimensions));
+}
+
+test "toplevel icon assignment is applied on commit and can be reset" {
+    const allocator = std.testing.allocator;
+    var window: WindowState = .{
+        .xdg_surface_id = undefined,
+        .scene_id = undefined,
+        .unreliable_pid = 0,
+    };
+    defer window.deinit(allocator);
+
+    window.pending_icon = .{
+        .name = try allocator.dupeSentinel(u8, "document", 0),
+        .buffers = try allocator.alloc(ToplevelIconBuffer, 0),
+    };
+    window.pending_icon_changed = true;
+    try std.testing.expect(window.icon == null);
+    try std.testing.expect(window.commit(allocator));
+    try std.testing.expectEqualStrings("document", window.icon.?.name.?);
+
+    window.pending_icon_changed = true;
+    try std.testing.expect(window.commit(allocator));
+    try std.testing.expect(window.icon == null);
 }
 
 test "xdg positioner derives popup geometry from anchor and gravity" {
