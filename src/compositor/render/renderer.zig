@@ -172,12 +172,8 @@ pub const Renderer = struct {
 
     pub fn directScanoutCandidate(self: *Renderer) ?render_types.PixelBuffer {
         const active = self.active_frame orelse return null;
-        if (self.commands.items.len != 2) return null;
-        switch (self.commands.items[0]) {
-            .clear => {},
-            else => return null,
-        }
-        const image = switch (self.commands.items[1]) {
+        const last_command = self.commands.getLastOrNull() orelse return null;
+        const image = switch (last_command) {
             .image => |image| image,
             else => return null,
         };
@@ -464,7 +460,7 @@ test "cancelled renderer frame does not leak commands" {
     try std.testing.expectEqual(@as(u32, 0xff0000ff), output.pixel(0, 0));
 }
 
-test "direct scanout candidate requires one exact opaque DMA-BUF image" {
+test "direct scanout candidate requires a final exact opaque DMA-BUF image" {
     const NoopSource = struct {
         fn retain(_: *anyopaque) void {}
         fn release(_: *anyopaque) void {}
@@ -523,6 +519,18 @@ test "direct scanout candidate requires one exact opaque DMA-BUF image" {
     defer renderer.deinit();
     try renderer.beginFrame(target, .{}, .{}, null);
     try renderer.append(&direct_commands);
+    try std.testing.expect(renderer.directScanoutCandidate() != null);
+    renderer.cancelFrame();
+
+    const covered_commands = [_]render_types.Command{
+        .{ .solid_rect = .{
+            .rect = .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+            .color = render_types.Color.rgba(255, 255, 255, 255),
+        } },
+        direct_commands[1],
+    };
+    try renderer.beginFrame(target, .{}, .{}, null);
+    try renderer.append(&covered_commands);
     try std.testing.expect(renderer.directScanoutCandidate() != null);
     renderer.cancelFrame();
 
