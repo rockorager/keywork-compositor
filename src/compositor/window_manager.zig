@@ -529,11 +529,40 @@ pub fn setFocusedWindowBorder(self: *Self, border: ?Scene.Borders) void {
         const window = entry.value;
         const focused = self.workspaces.items[window.workspace].workspace.focused != null and
             neutral(entry.id).eql(self.workspaces.items[window.workspace].workspace.focused.?);
-        self.scene.setBorders(
-            window.scene_id,
-            if (window.fullscreen_output == null and focused) border else null,
-        );
+        self.scene.setBorders(window.scene_id, self.borderForWindow(window, focused));
     }
+}
+
+fn borderForWindow(self: *Self, window: *const Window, focused: bool) ?Scene.Borders {
+    const fullscreen = window.fullscreen_output != null;
+    const floating = self.isFloating(window);
+    const visible_window_count = if (focused and !fullscreen and !floating)
+        self.visibleWindowCount(window.workspace)
+    else
+        0;
+    return if (shouldShowFocusedBorder(focused, fullscreen, floating, visible_window_count))
+        self.focused_window_border
+    else
+        null;
+}
+
+fn visibleWindowCount(self: *Self, workspace_index: usize) usize {
+    const workspace = &self.workspaces.items[workspace_index];
+    var count: usize = 0;
+    for (workspace.workspace.members.items) |member| {
+        const window = self.windows.get(internal(member)) orelse continue;
+        if (displayed(window.mapped, window.minimized, workspace.active, window.placement)) count += 1;
+    }
+    return count;
+}
+
+fn shouldShowFocusedBorder(
+    focused: bool,
+    fullscreen: bool,
+    floating: bool,
+    visible_window_count: usize,
+) bool {
+    return focused and !fullscreen and !floating and visible_window_count > 1;
 }
 
 pub fn focusedSurface(self: *Self) ?Surface.Id {
@@ -1128,13 +1157,7 @@ fn publish(self: *Self) void {
             neutral(entry.id).eql(self.workspaces.items[window.workspace].workspace.focused.?);
         self.scene.setFocused(window.scene_id, focused);
         self.scene.setFullscreen(window.scene_id, window.fullscreen_output != null);
-        self.scene.setBorders(
-            window.scene_id,
-            if (window.fullscreen_output == null and focused)
-                self.focused_window_border
-            else
-                null,
-        );
+        self.scene.setBorders(window.scene_id, self.borderForWindow(window, focused));
         switch (window.backend) {
             .xdg => |id| {
                 self.xdg_shell.setWindowFocused(id, focused);
@@ -1557,6 +1580,14 @@ test "Xwayland does not enter configure barrier and hidden workspaces are invisi
     const plan: types.LayoutPlan = .{ .id = types.id(1), .rect = .{ .x = 0, .y = 0, .size = types.Size.init(1, 1) }, .visible = true };
     try std.testing.expect(!displayed(true, false, false, plan));
     try std.testing.expect(displayed(true, false, true, plan));
+}
+
+test "focused borders are smart and exclude floating windows" {
+    try std.testing.expect(!shouldShowFocusedBorder(true, false, false, 1));
+    try std.testing.expect(shouldShowFocusedBorder(true, false, false, 2));
+    try std.testing.expect(!shouldShowFocusedBorder(true, false, true, 2));
+    try std.testing.expect(!shouldShowFocusedBorder(true, true, false, 2));
+    try std.testing.expect(!shouldShowFocusedBorder(false, false, false, 2));
 }
 
 test "XDG configure is sent only for initial or changed state" {
