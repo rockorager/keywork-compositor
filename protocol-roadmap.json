@@ -1174,16 +1174,17 @@
       "interfaces": [
         {
           "name": "ext_transient_seat_manager_v1",
-          "current_version": null,
+          "current_version": 1,
           "target_version": 1
         }
       ],
-      "status": "not_started",
+      "status": "done",
       "privileged": true,
       "blocked_by": [
         "security-context",
         "wl-seat"
-      ]
+      ],
+      "status_detail": "Version 1 lets privileged clients create independent capability-free wl_seat globals with unique names. Seats are removed with their transient handles, become inert for attached virtual keyboards, and remain allocated only while existing seat resources drain. The manager is hidden from security-context clients, and creation, binding, capability updates through virtual-keyboard-v1, global removal, inert input, child-resource draining, and compositor shutdown are exercised end to end."
     },
     {
       "id": "wlr-virtual-pointer",

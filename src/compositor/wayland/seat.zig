@@ -17,6 +17,7 @@ global_removed: bool,
 name_value: [:0]const u8,
 surface_store: *Surface.Store,
 seat_resources: std.ArrayList(*wl.Seat),
+seat_resource_listener: ?SeatResourceListener,
 keyboard_resources: std.ArrayList(KeyboardResource),
 pointer_resources: std.ArrayList(PointerResource),
 touch_resources: std.ArrayList(TouchResource),
@@ -210,6 +211,11 @@ pub const KeyboardFocusListener = struct {
     changed: *const fn (*anyopaque, ?*wl.Client) void,
 };
 
+pub const SeatResourceListener = struct {
+    context: *anyopaque,
+    changed: *const fn (*anyopaque, usize) void,
+};
+
 pub const KeyboardGrab = struct {
     context: *anyopaque,
     token: u64,
@@ -238,6 +244,7 @@ pub fn init(
         .name_value = seat_name,
         .surface_store = surface_store,
         .seat_resources = .empty,
+        .seat_resource_listener = null,
         .keyboard_resources = .empty,
         .pointer_resources = .empty,
         .touch_resources = .empty,
@@ -302,7 +309,8 @@ pub fn deinit(self: *Self) void {
     std.debug.assert(self.keyboard_grab == null);
     std.debug.assert(self.repaint_listener == null);
     std.debug.assert(self.keyboard_focus_listeners.items.len == 0);
-    if (!self.global_removed) self.global.destroy();
+    std.debug.assert(self.seat_resource_listener == null);
+    self.global.destroy();
     if (self.keymap) |keymap| keymap.file.close(self.io);
     self.keyboard_focus_listeners.deinit(self.allocator);
     self.grabbed_keys.deinit(self.allocator);
@@ -325,7 +333,7 @@ pub fn globalName(self: *const Self, client: *const wl.Client) u32 {
 /// Stop advertising this seat while keeping existing client resources alive.
 pub fn removeGlobal(self: *Self) void {
     std.debug.assert(!self.global_removed);
-    self.global.destroy();
+    self.global.remove();
     self.global_removed = true;
 }
 
@@ -340,6 +348,16 @@ pub fn ownsResource(self: *Self, resource: *wl.Seat) bool {
 pub fn fromResource(resource: *wl.Seat) *Self {
     const data = resource.getUserData() orelse unreachable;
     return @ptrCast(@alignCast(data));
+}
+
+pub fn setSeatResourceListener(self: *Self, listener: SeatResourceListener) void {
+    std.debug.assert(self.seat_resource_listener == null);
+    self.seat_resource_listener = listener;
+}
+
+pub fn clearSeatResourceListener(self: *Self) void {
+    std.debug.assert(self.seat_resource_listener != null);
+    self.seat_resource_listener = null;
 }
 
 pub fn pointerBinding(resource: *wl.Pointer) ?PointerBinding {
@@ -1323,6 +1341,7 @@ fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
         return;
     };
     resource.setHandler(*Self, handleRequest, handleSeatDestroy, self);
+    self.notifySeatResourceCount();
     if (version >= wl.Seat.name_since_version) resource.sendName(self.name_value);
     resource.sendCapabilities(self.capabilities());
 }
@@ -1349,9 +1368,23 @@ fn handleSeatDestroy(resource: *wl.Seat, self: *Self) void {
     for (self.seat_resources.items, 0..) |candidate, index| {
         if (candidate != resource) continue;
         _ = self.seat_resources.orderedRemove(index);
+        self.notifySeatResourceCount();
         return;
     }
     unreachable;
+}
+
+fn notifySeatResourceCount(self: *Self) void {
+    const listener = self.seat_resource_listener orelse return;
+    // The listener may deinitialize this seat once the count reaches zero, so
+    // destruction handlers must not access self after notifying it.
+    listener.changed(
+        listener.context,
+        self.seat_resources.items.len +
+            self.keyboard_resources.items.len +
+            self.pointer_resources.items.len +
+            self.touch_resources.items.len,
+    );
 }
 
 fn createKeyboard(self: *Self, seat: *wl.Seat, id: u32) void {
@@ -1369,6 +1402,7 @@ fn createKeyboard(self: *Self, seat: *wl.Seat, id: u32) void {
         return;
     };
     resource.setHandler(*Self, handleKeyboardRequest, handleKeyboardDestroy, self);
+    self.notifySeatResourceCount();
     if (!self.keyboardResourceActive(entry)) return;
     if (self.keymap == null) return;
     self.sendKeymap(resource);
@@ -1399,6 +1433,7 @@ fn createPointer(self: *Self, seat: *wl.Seat, id: u32) void {
     };
     self.next_pointer_resource_generation = std.math.add(u64, generation, 1) catch unreachable;
     resource.setHandler(*Self, handlePointerRequest, handlePointerDestroy, self);
+    self.notifySeatResourceCount();
     if (!self.pointerResourceActive(entry)) return;
     const surface = self.pointerSurface() orelse return;
     if (resource.getClient() == surface.getClient()) {
@@ -1429,6 +1464,7 @@ fn createTouch(self: *Self, seat: *wl.Seat, id: u32) void {
     };
     self.next_touch_resource_generation = std.math.add(u64, generation, 1) catch unreachable;
     resource.setHandler(*Self, handleTouchRequest, handleTouchDestroy, self);
+    self.notifySeatResourceCount();
 }
 
 fn handleKeyboardRequest(resource: *wl.Keyboard, request: wl.Keyboard.Request, _: *Self) void {
@@ -1441,6 +1477,7 @@ fn handleKeyboardDestroy(resource: *wl.Keyboard, self: *Self) void {
     for (self.keyboard_resources.items, 0..) |candidate, index| {
         if (candidate.resource != resource) continue;
         _ = self.keyboard_resources.orderedRemove(index);
+        self.notifySeatResourceCount();
         return;
     }
     unreachable;
@@ -1463,6 +1500,7 @@ fn handlePointerDestroy(resource: *wl.Pointer, self: *Self) void {
     for (self.pointer_resources.items, 0..) |candidate, index| {
         if (candidate.resource != resource) continue;
         _ = self.pointer_resources.orderedRemove(index);
+        self.notifySeatResourceCount();
         return;
     }
     unreachable;
@@ -1484,13 +1522,20 @@ fn handleTouchDestroy(resource: *wl.Touch, self: *Self) void {
     for (self.touch_resources.items, 0..) |candidate, index| {
         if (candidate.resource != resource) continue;
         _ = self.touch_resources.orderedRemove(index);
+        var client_has_resource = false;
         for (self.touch_resources.items) |remaining| {
-            if (remaining.resource.getClient() == client) return;
+            if (remaining.resource.getClient() == client) {
+                client_has_resource = true;
+                break;
+            }
         }
-        for (self.touch_points.items) |*point| {
-            const target = point.target orelse continue;
-            if (target.client == client) point.target = null;
+        if (!client_has_resource) {
+            for (self.touch_points.items) |*point| {
+                const target = point.target orelse continue;
+                if (target.client == client) point.target = null;
+            }
         }
+        self.notifySeatResourceCount();
         return;
     }
     unreachable;

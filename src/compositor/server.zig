@@ -34,6 +34,7 @@ const XdgDialog = @import("wayland/xdg_dialog.zig");
 const XdgSystemBell = @import("wayland/xdg_system_bell.zig");
 const XdgToplevelTag = @import("wayland/xdg_toplevel_tag.zig");
 const XdgSessionManagement = @import("wayland/xdg_session_management.zig");
+const TransientSeat = @import("wayland/transient_seat.zig");
 const PrimarySelection = @import("wayland/primary_selection.zig");
 const DataControl = @import("wayland/data_control.zig");
 const ForeignToplevelList = @import("wayland/foreign_toplevel_list.zig");
@@ -134,6 +135,7 @@ gtk_shell: GtkShell,
 xdg_foreign: XdgForeign,
 layer_shell: LayerShell,
 seat: Seat,
+transient_seat: TransientSeat,
 input_device_listener: InputManager.DeviceListener,
 routed_keys: std.ArrayList(RoutedKey),
 routed_buttons: std.ArrayList(RoutedButton),
@@ -702,6 +704,7 @@ pub fn createWithVirtualOutput(
         .xdg_foreign = undefined,
         .layer_shell = undefined,
         .seat = undefined,
+        .transient_seat = undefined,
         .input_device_listener = .{
             .context = self,
             .added = inputDeviceAdded,
@@ -804,6 +807,14 @@ pub fn createWithVirtualOutput(
     errdefer self.outputs.deinit();
     try self.seat.init(allocator, io, display, "default", self.compositor.surfaceStore());
     errdefer self.seat.deinit();
+    try self.transient_seat.init(
+        allocator,
+        io,
+        display,
+        self.compositor.surfaceStore(),
+        &self.security_context,
+    );
+    errdefer self.transient_seat.deinit();
     var render_output_id: RenderOutputId = undefined;
     errdefer {
         var it = self.render_outputs.iterator();
@@ -1066,6 +1077,7 @@ pub fn createWithVirtualOutput(
         display,
         &self.security_context,
         &self.seat,
+        &self.transient_seat,
     );
     errdefer self.virtual_keyboard.deinit();
     try self.workspace.init(allocator, display, &self.security_context, &self.outputs);
@@ -1392,6 +1404,7 @@ pub fn destroy(self: *Self) void {
     self.workspace.deinit();
     self.workspace_initialized = false;
     self.virtual_keyboard.deinit();
+    self.transient_seat.deinit();
     self.input_method.deinit();
     self.text_input.deinit();
     self.data_control.deinit();

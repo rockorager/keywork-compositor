@@ -6,6 +6,7 @@ const std = @import("std");
 const wayland = @import("wayland");
 const SecurityContext = @import("security_context.zig");
 const Seat = @import("seat.zig");
+const TransientSeat = @import("transient_seat.zig");
 
 const wl = wayland.server.wl;
 const zwp = wayland.server.zwp;
@@ -17,9 +18,9 @@ io: std.Io,
 global: *wl.Global,
 security_context: *SecurityContext,
 seat: *Seat,
+transient_seat: *TransientSeat,
 devices: std.ArrayList(*Device),
 inhibited: bool,
-deferred_keymap: ?DeferredKeymap,
 
 const DeferredKeymap = struct {
     fd: std.posix.fd_t,
@@ -33,6 +34,7 @@ pub fn init(
     display: *wl.Server,
     security_context: *SecurityContext,
     seat: *Seat,
+    transient_seat: *TransientSeat,
 ) !void {
     self.* = .{
         .allocator = allocator,
@@ -47,22 +49,24 @@ pub fn init(
         ),
         .security_context = security_context,
         .seat = seat,
+        .transient_seat = transient_seat,
         .devices = .empty,
         .inhibited = false,
-        .deferred_keymap = null,
     };
     errdefer self.global.destroy();
     try security_context.restrictGlobal(self.global);
+    errdefer security_context.unrestrictGlobal(self.global);
+    try transient_seat.addSeatListener(.{
+        .context = self,
+        .removed = transientSeatRemoved,
+    });
 }
 
 pub fn deinit(self: *Self) void {
     std.debug.assert(self.devices.items.len == 0);
+    self.transient_seat.removeSeatListener(self);
     self.security_context.unrestrictGlobal(self.global);
     self.global.destroy();
-    if (self.deferred_keymap) |keymap| {
-        const file: std.Io.File = .{ .handle = keymap.fd, .flags = .{ .nonblocking = false } };
-        file.close(self.io);
-    }
     self.devices.deinit(self.allocator);
     self.* = undefined;
 }
@@ -71,16 +75,16 @@ pub fn setInhibited(self: *Self, inhibited: bool) void {
     if (self.inhibited == inhibited) return;
     self.inhibited = inhibited;
     if (!inhibited) {
-        if (self.deferred_keymap) |keymap| {
-            self.deferred_keymap = null;
-            self.seat.setKeymap(.xkb_v1, keymap.fd, keymap.size);
-        }
+        for (self.devices.items) |device| device.applyDeferredKeymap();
         return;
     }
+    for (self.devices.items) |device| device.releasePressedKeys();
+}
+
+fn transientSeatRemoved(context: *anyopaque, seat: *Seat) void {
+    const self: *Self = @ptrCast(@alignCast(context));
     for (self.devices.items) |device| {
-        while (device.pressed_keys.pop()) |key_code| {
-            self.seat.virtualKey(0, key_code, .released) catch unreachable;
-        }
+        if (device.seat == seat) device.deactivate();
     }
 }
 
@@ -99,11 +103,15 @@ fn handleManagerRequest(
 ) void {
     switch (request) {
         .create_virtual_keyboard => |create| {
+            const seat = if (self.seat.ownsResource(create.seat))
+                self.seat
+            else
+                self.transient_seat.seatForResource(create.seat);
             Device.create(
                 self,
                 resource,
                 create.id,
-                self.seat.ownsResource(create.seat),
+                seat,
             ) catch resource.postNoMemory();
         },
     }
@@ -113,15 +121,18 @@ const Device = struct {
     manager: *Self,
     resource: *zwp.VirtualKeyboardV1,
     active: bool,
+    seat: ?*Seat,
+    retained_transient_seat: bool,
     has_keymap: bool,
     registered: bool,
+    deferred_keymap: ?DeferredKeymap,
     pressed_keys: std.ArrayList(u32),
 
     fn create(
         manager: *Self,
         manager_resource: *zwp.VirtualKeyboardManagerV1,
         id: u32,
-        active: bool,
+        seat: ?*Seat,
     ) !void {
         const resource = try zwp.VirtualKeyboardV1.create(
             manager_resource.getClient(),
@@ -131,12 +142,23 @@ const Device = struct {
         errdefer resource.destroy();
         const self = try manager.allocator.create(Device);
         errdefer manager.allocator.destroy(self);
+        const retained_transient_seat = if (seat) |target|
+            target != manager.seat and manager.transient_seat.retainSeat(target)
+        else
+            false;
+        errdefer if (retained_transient_seat) manager.transient_seat.releaseSeat(seat.?);
+        if (seat) |target| {
+            std.debug.assert(target == manager.seat or retained_transient_seat);
+        }
         self.* = .{
             .manager = manager,
             .resource = resource,
-            .active = active,
+            .active = seat != null,
+            .seat = seat,
+            .retained_transient_seat = retained_transient_seat,
             .has_keymap = false,
             .registered = false,
+            .deferred_keymap = null,
             .pressed_keys = .empty,
         };
         errdefer self.pressed_keys.deinit(manager.allocator);
@@ -170,7 +192,7 @@ const Device = struct {
             .modifiers => |modifiers| {
                 if (!self.requireKeymap(resource)) return;
                 if (self.manager.inhibited) return;
-                self.manager.seat.setVirtualModifiers(
+                self.seat.?.setVirtualModifiers(
                     modifiers.mods_depressed,
                     modifiers.mods_latched,
                     modifiers.mods_locked,
@@ -199,21 +221,15 @@ const Device = struct {
             return;
         }
         if (self.manager.inhibited) {
-            if (self.manager.deferred_keymap) |old| {
-                const old_file: std.Io.File = .{
-                    .handle = old.fd,
-                    .flags = .{ .nonblocking = false },
-                };
-                old_file.close(self.manager.io);
-            }
-            self.manager.deferred_keymap = .{ .fd = fd, .size = size };
+            self.closeDeferredKeymap();
+            self.deferred_keymap = .{ .fd = fd, .size = size };
         } else {
-            self.manager.seat.setKeymap(.xkb_v1, fd, size);
+            self.seat.?.setKeymap(.xkb_v1, fd, size);
         }
         self.has_keymap = true;
         if (!self.registered) {
             self.registered = true;
-            self.manager.seat.addVirtualKeyboard();
+            self.seat.?.addVirtualKeyboard();
         }
     }
 
@@ -241,7 +257,7 @@ const Device = struct {
                     resource.postNoMemory();
                     return;
                 };
-                self.manager.seat.virtualKey(time, key_code, state) catch {
+                self.seat.?.virtualKey(time, key_code, state) catch {
                     _ = self.pressed_keys.pop();
                     resource.postNoMemory();
                 };
@@ -250,7 +266,7 @@ const Device = struct {
                 for (self.pressed_keys.items, 0..) |pressed, index| {
                     if (pressed != key_code) continue;
                     _ = self.pressed_keys.orderedRemove(index);
-                    self.manager.seat.virtualKey(time, key_code, state) catch unreachable;
+                    self.seat.?.virtualKey(time, key_code, state) catch unreachable;
                     return;
                 }
             },
@@ -264,11 +280,52 @@ const Device = struct {
         return false;
     }
 
-    fn handleDestroy(_: *zwp.VirtualKeyboardV1, self: *Device) void {
-        while (self.pressed_keys.pop()) |key_code| {
-            self.manager.seat.virtualKey(0, key_code, .released) catch unreachable;
+    fn applyDeferredKeymap(self: *Device) void {
+        const keymap = self.deferred_keymap orelse return;
+        self.deferred_keymap = null;
+        if (self.active) {
+            self.seat.?.setKeymap(.xkb_v1, keymap.fd, keymap.size);
+        } else {
+            closeKeymap(self.manager.io, keymap);
         }
-        if (self.registered) self.manager.seat.removeVirtualKeyboard();
+    }
+
+    fn closeDeferredKeymap(self: *Device) void {
+        const keymap = self.deferred_keymap orelse return;
+        self.deferred_keymap = null;
+        closeKeymap(self.manager.io, keymap);
+    }
+
+    fn releasePressedKeys(self: *Device) void {
+        const seat = self.seat orelse {
+            self.pressed_keys.clearRetainingCapacity();
+            return;
+        };
+        while (self.pressed_keys.pop()) |key_code| {
+            seat.virtualKey(0, key_code, .released) catch unreachable;
+        }
+    }
+
+    fn deactivate(self: *Device) void {
+        if (!self.active) return;
+        const seat = self.seat orelse unreachable;
+        self.releasePressedKeys();
+        if (self.registered) {
+            seat.removeVirtualKeyboard();
+            self.registered = false;
+        }
+        self.closeDeferredKeymap();
+        self.active = false;
+        self.seat = null;
+        if (self.retained_transient_seat) {
+            self.retained_transient_seat = false;
+            self.manager.transient_seat.releaseSeat(seat);
+        }
+    }
+
+    fn handleDestroy(_: *zwp.VirtualKeyboardV1, self: *Device) void {
+        self.deactivate();
+        self.closeDeferredKeymap();
         for (self.manager.devices.items, 0..) |device, index| {
             if (device != self) continue;
             _ = self.manager.devices.orderedRemove(index);
@@ -279,6 +336,11 @@ const Device = struct {
         unreachable;
     }
 };
+
+fn closeKeymap(io: std.Io, keymap: DeferredKeymap) void {
+    const file: std.Io.File = .{ .handle = keymap.fd, .flags = .{ .nonblocking = false } };
+    file.close(io);
+}
 
 fn validKeymap(io: std.Io, file: std.Io.File, size: u32) bool {
     if (size == 0 or size > maximum_keymap_size) return false;
