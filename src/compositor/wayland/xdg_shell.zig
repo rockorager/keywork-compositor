@@ -11,6 +11,7 @@ const slot_map = @import("../slot_map.zig");
 const Surface = @import("surface.zig");
 const Subcompositor = @import("subcompositor.zig");
 const OutputLayout = @import("output_layout.zig");
+const GtkShell = @import("gtk_shell.zig");
 
 const wl = wayland.server.wl;
 const xdg = wayland.server.xdg;
@@ -24,6 +25,7 @@ scene: *Scene,
 seat: *Seat,
 outputs: *OutputLayout,
 default_output_id: OutputLayout.Id,
+gtk_shell: *GtkShell,
 global: *wl.Global,
 decoration_global: *wl.Global,
 bindings: BindingStore,
@@ -339,6 +341,7 @@ pub fn init(
     seat: *Seat,
     outputs: *OutputLayout,
     default_output_id: OutputLayout.Id,
+    gtk_shell: *GtkShell,
 ) !void {
     self.* = .{
         .allocator = allocator,
@@ -349,6 +352,7 @@ pub fn init(
         .seat = seat,
         .outputs = outputs,
         .default_output_id = default_output_id,
+        .gtk_shell = gtk_shell,
         .global = undefined,
         .decoration_global = undefined,
         .bindings = .{},
@@ -670,6 +674,12 @@ pub fn configureWindowState(
         decoration.configure_sent = true;
         window.decoration_configure_requested = false;
     }
+    self.gtk_shell.configureSurface(state.surface_id, .{
+        .top = configuration.tiled.top,
+        .right = configuration.tiled.right,
+        .bottom = configuration.tiled.bottom,
+        .left = configuration.tiled.left,
+    });
     toplevel.sendConfigure(dimensions.width, dimensions.height, &states_array);
     adapter.xdg_surface_resource.resource.sendConfigure(serial);
     state.initial_configure_sent = true;

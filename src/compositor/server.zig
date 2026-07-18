@@ -10,6 +10,7 @@ const Compositor = @import("wayland/compositor.zig");
 const Subcompositor = @import("wayland/subcompositor.zig");
 const XdgOutput = @import("wayland/xdg_output.zig");
 const XdgShell = @import("wayland/xdg_shell.zig");
+const GtkShell = @import("wayland/gtk_shell.zig");
 const XdgForeign = @import("wayland/xdg_foreign.zig");
 const LayerShell = @import("wayland/layer_shell.zig");
 const SinglePixelBuffer = @import("wayland/single_pixel_buffer.zig");
@@ -119,6 +120,7 @@ compositor: Compositor,
 subcompositor: Subcompositor,
 scene: Scene,
 xdg_shell: XdgShell,
+gtk_shell: GtkShell,
 xdg_foreign: XdgForeign,
 layer_shell: LayerShell,
 seat: Seat,
@@ -676,6 +678,7 @@ pub fn createWithVirtualOutput(
         .subcompositor = undefined,
         .scene = undefined,
         .xdg_shell = undefined,
+        .gtk_shell = undefined,
         .xdg_foreign = undefined,
         .layer_shell = undefined,
         .seat = undefined,
@@ -932,6 +935,8 @@ pub fn createWithVirtualOutput(
         self.idle_notify.deinit();
         self.idle_notify_initialized = false;
     }
+    try self.gtk_shell.init(allocator, display, &self.seat);
+    errdefer self.gtk_shell.deinit();
     try self.xdg_shell.init(
         allocator,
         display,
@@ -941,6 +946,7 @@ pub fn createWithVirtualOutput(
         &self.seat,
         &self.outputs,
         render_output.protocol_id,
+        &self.gtk_shell,
     );
     errdefer self.xdg_shell.deinit();
     try self.xdg_foreign.init(allocator, io, display, &self.xdg_shell);
@@ -1304,6 +1310,7 @@ pub fn destroy(self: *Self) void {
     self.layer_shell.deinit();
     self.xdg_foreign.deinit();
     self.xdg_shell.deinit();
+    self.gtk_shell.deinit();
     self.scene.deinit();
     self.subcompositor.deinit();
     self.linux_dmabuf.deinit();

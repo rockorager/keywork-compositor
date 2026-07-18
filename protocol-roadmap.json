@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "updated": "2026-07-17",
+  "updated": "2026-07-18",
   "baseline": {
     "wayland": "1.25.0",
     "wayland_protocols": "1.49"
@@ -949,15 +949,16 @@
       "interfaces": [
         {
           "name": "gtk_shell1",
-          "current_version": null,
+          "current_version": 5,
           "target_version": 5
         }
       ],
-      "status": "not_started",
+      "status": "done",
       "privileged": false,
       "blocked_by": [
         "xdg-shell"
-      ]
+      ],
+      "status_detail": "Version 5 implements shell and per-surface resource lifecycles, validated startup and D-Bus metadata, modal state, conservative focus and bell policy, version-correct tiled and resizable-edge configures synchronized before each XDG toplevel configure, the release destructor, and titlebar gesture enum, seat, and pointer-serial validation. No global menu, menu bar, or desktop-icon capabilities are advertised."
     },
     {
       "id": "linux-drm-syncobj",

@@ -45,6 +45,7 @@ pub fn build(b: *std.Build) void {
     scanner.addCustomProtocol(b.path("protocol/wlr-foreign-toplevel-management-unstable-v1.xml"));
     scanner.addCustomProtocol(b.path("protocol/wlr-output-management-unstable-v1.xml"));
     scanner.addCustomProtocol(b.path("protocol/wlr-screencopy-unstable-v1.xml"));
+    scanner.addCustomProtocol(b.path("protocol/gtk-shell.xml"));
     scanner.addCustomProtocol(b.path("protocol/upstream/virtual-keyboard-unstable-v1.xml"));
     scanner.addCustomProtocol(b.path("protocol/upstream/wlr-layer-shell-unstable-v1.xml"));
     scanner.addCustomProtocol(b.path("protocol/upstream/wlr-output-power-management-unstable-v1.xml"));
@@ -94,6 +95,7 @@ pub fn build(b: *std.Build) void {
     scanner.generate("zwlr_foreign_toplevel_manager_v1", 3);
     scanner.generate("zwlr_output_manager_v1", 4);
     scanner.generate("zwlr_screencopy_manager_v1", 3);
+    scanner.generate("gtk_shell1", 5);
     scanner.generate("zwlr_layer_shell_v1", 5);
     scanner.generate("zwlr_output_power_manager_v1", 1);
 
