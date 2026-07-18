@@ -1216,16 +1216,17 @@
       "interfaces": [
         {
           "name": "wp_pointer_warp_v1",
-          "current_version": null,
+          "current_version": 1,
           "target_version": 1
         }
       ],
-      "status": "not_started",
+      "status": "done",
       "privileged": false,
       "blocked_by": [
         "pointer-constraints",
         "wl-seat"
-      ]
+      ],
+      "status_detail": "Version 1 validates enter serials against the requested active wl_pointer, requires pointer focus on an in-bounds surface owned by the same client, and warps logical and native cursor state without emitting synthetic pointer motion. Per-resource serial tracking preserves wl_pointer lifetime and capability-generation boundaries. Valid, wrong-serial, out-of-bounds, no-motion, subsequent-motion, and implicit-grab behavior are exercised end to end."
     },
     {
       "id": "drm-lease",

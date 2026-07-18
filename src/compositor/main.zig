@@ -467,6 +467,7 @@ test {
     _ = @import("wayland/pointer_gestures.zig");
     _ = @import("wayland/relative_pointer.zig");
     _ = @import("wayland/pointer_constraints.zig");
+    _ = @import("wayland/pointer_warp.zig");
     _ = @import("wayland/idle_inhibit.zig");
     _ = @import("wayland/keyboard_shortcuts_inhibit.zig");
     _ = @import("wayland/idle_notify.zig");

@@ -124,6 +124,7 @@ const PointerResource = struct {
     resource: *wl.Pointer,
     generation: u64,
     capability_generation: u64,
+    enter_serial: ?u32,
 };
 
 const PressedPointerButton = struct {
@@ -386,6 +387,24 @@ pub fn pointerHandleIsActive(self: *const Self, handle: PointerHandle) bool {
         if (entry.resource == handle.resource and entry.generation == handle.generation) {
             return self.pointerResourceActive(entry);
         }
+    }
+    return false;
+}
+
+pub fn acceptsPointerEnterSerial(
+    self: *const Self,
+    handle: PointerHandle,
+    surface_id: Surface.Id,
+    serial: u32,
+) bool {
+    const focus = self.pointer_focus orelse return false;
+    if (!std.meta.eql(focus.surface_id, surface_id)) return false;
+    const surface = Surface.resourceFor(self.surface_store, surface_id) orelse return false;
+    for (self.pointer_resources.items) |entry| {
+        if (entry.resource != handle.resource or entry.generation != handle.generation) continue;
+        if (!self.pointerResourceActive(entry)) return false;
+        if (entry.resource.getClient() != surface.getClient()) return false;
+        return entry.enter_serial == serial;
     }
     return false;
 }
@@ -1044,6 +1063,25 @@ pub fn pointerMotion(self: *Self, time: u32, x: f64, y: f64, focus: ?PointerFocu
     self.updatePointerFocus(focus, time);
 }
 
+pub fn warpPointer(
+    self: *Self,
+    surface_id: Surface.Id,
+    surface_x: f64,
+    surface_y: f64,
+) ?struct { x: f64, y: f64 } {
+    const focus = self.pointer_focus orelse return null;
+    if (!std.meta.eql(focus.surface_id, surface_id)) return null;
+    const position = self.pointer_position orelse return null;
+    const warped = PointerPosition{
+        .x = position.x + surface_x - focus.x,
+        .y = position.y + surface_y - focus.y,
+    };
+    self.setPointerPosition(warped.x, warped.y);
+    self.pointer_focus.?.x = surface_x;
+    self.pointer_focus.?.y = surface_y;
+    return .{ .x = warped.x, .y = warped.y };
+}
+
 pub fn pointerLeave(self: *Self) void {
     const fallback_visible = self.active_cursor == null and self.cursorInfo() != null;
     self.clearCursor();
@@ -1456,6 +1494,7 @@ fn createPointer(self: *Self, seat: *wl.Seat, id: u32) void {
         .resource = resource,
         .generation = generation,
         .capability_generation = self.pointer_capability_generation,
+        .enter_serial = null,
     };
     self.pointer_resources.append(self.allocator, entry) catch {
         resource.postNoMemory();
@@ -1465,7 +1504,8 @@ fn createPointer(self: *Self, seat: *wl.Seat, id: u32) void {
     self.next_pointer_resource_generation = std.math.add(u64, generation, 1) catch unreachable;
     resource.setHandler(*Self, handlePointerRequest, handlePointerDestroy, self);
     self.notifySeatResourceCount();
-    if (!self.pointerResourceActive(entry)) return;
+    const stored = &self.pointer_resources.items[self.pointer_resources.items.len - 1];
+    if (!self.pointerResourceActive(stored.*)) return;
     const surface = self.pointerSurface() orelse return;
     if (resource.getClient() == surface.getClient()) {
         const serial = self.display.nextSerial();
@@ -1473,7 +1513,7 @@ fn createPointer(self: *Self, seat: *wl.Seat, id: u32) void {
             .client = surface.getClient(),
             .serial = serial,
         };
-        self.sendPointerEnterTo(resource, surface, serial);
+        self.sendPointerEnterTo(stored, surface, serial);
         if (resource.getVersion() >= wl.Pointer.frame_since_version) resource.sendFrame();
     }
 }
@@ -1782,32 +1822,35 @@ fn sendPointerEnter(self: *Self) void {
         .client = surface.getClient(),
         .serial = serial,
     };
-    for (self.pointer_resources.items) |entry| {
-        if (!self.pointerResourceActive(entry)) continue;
+    for (self.pointer_resources.items) |*entry| {
+        if (!self.pointerResourceActive(entry.*)) continue;
         const resource = entry.resource;
         if (resource.getClient() == surface.getClient()) {
-            self.sendPointerEnterTo(resource, surface, serial);
+            self.sendPointerEnterTo(entry, surface, serial);
         }
     }
 }
 
 fn sendPointerEnterTo(
     self: *const Self,
-    resource: *wl.Pointer,
+    entry: *PointerResource,
     surface: *wl.Surface,
     serial: u32,
 ) void {
     const position = self.pointer_focus orelse return;
+    entry.enter_serial = serial;
+    const resource = entry.resource;
     resource.sendEnter(serial, surface, fixed(position.x), fixed(position.y));
 }
 
 fn sendPointerLeave(self: *Self) void {
     const surface = self.pointerSurface() orelse return;
     const serial = self.display.nextSerial();
-    for (self.pointer_resources.items) |entry| {
-        if (!self.pointerResourceActive(entry)) continue;
+    for (self.pointer_resources.items) |*entry| {
+        if (!self.pointerResourceActive(entry.*)) continue;
         const resource = entry.resource;
         if (resource.getClient() != surface.getClient()) continue;
+        entry.enter_serial = null;
         resource.sendLeave(serial, surface);
         if (resource.getVersion() >= wl.Pointer.frame_since_version) resource.sendFrame();
     }

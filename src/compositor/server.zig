@@ -23,6 +23,7 @@ const Tablet = @import("wayland/tablet.zig");
 const RelativePointer = @import("wayland/relative_pointer.zig");
 const PointerGestures = @import("wayland/pointer_gestures.zig");
 const PointerConstraints = @import("wayland/pointer_constraints.zig");
+const PointerWarp = @import("wayland/pointer_warp.zig");
 const IdleInhibit = @import("wayland/idle_inhibit.zig");
 const KeyboardShortcutsInhibit = @import("wayland/keyboard_shortcuts_inhibit.zig");
 const IdleNotify = @import("wayland/idle_notify.zig");
@@ -124,6 +125,7 @@ tablet: Tablet,
 relative_pointer: RelativePointer,
 pointer_gestures: PointerGestures,
 pointer_constraints: PointerConstraints,
+pointer_warp: PointerWarp,
 idle_inhibit: IdleInhibit,
 keyboard_shortcuts_inhibit: KeyboardShortcutsInhibit,
 idle_notify: IdleNotify,
@@ -699,6 +701,7 @@ pub fn createWithVirtualOutput(
         .relative_pointer = undefined,
         .pointer_gestures = undefined,
         .pointer_constraints = undefined,
+        .pointer_warp = undefined,
         .idle_inhibit = undefined,
         .keyboard_shortcuts_inhibit = undefined,
         .idle_notify = undefined,
@@ -938,6 +941,13 @@ pub fn createWithVirtualOutput(
         self.compositor.surfaceStore(),
     );
     errdefer self.pointer_constraints.deinit();
+    try self.pointer_warp.init(
+        display,
+        &self.seat,
+        self.compositor.surfaceStore(),
+        .{ .context = self, .warp = pointerWarp },
+    );
+    errdefer self.pointer_warp.deinit();
     try self.idle_inhibit.init(allocator, display, .{
         .context = self,
         .changed = idleInhibitorsChanged,
@@ -1449,6 +1459,7 @@ pub fn destroy(self: *Self) void {
     self.presentation_protocol.deinit();
     self.keyboard_shortcuts_inhibit.deinit();
     self.idle_inhibit.deinit();
+    self.pointer_warp.deinit();
     self.pointer_constraints.deinit();
     self.pointer_gestures.deinit();
     self.relative_pointer.deinit();
@@ -3892,6 +3903,16 @@ fn synchronizeBackendPointer(self: *Self, output: *RenderOutput, x: f64, y: f64)
     self.native_input.setPointerPosition(
         x - @as(f64, @floatFromInt(position.x)),
         y - @as(f64, @floatFromInt(position.y)),
+    );
+}
+
+fn pointerWarp(context: *anyopaque, surface_id: Surface.Id, x: f64, y: f64) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const position = self.seat.warpPointer(surface_id, x, y) orelse return;
+    self.synchronizeBackendPointer(
+        self.primaryRenderOutput(),
+        position.x,
+        position.y,
     );
 }
 
