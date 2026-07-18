@@ -222,11 +222,67 @@ fn findXwayland(self: *Self, xwayland_id: Xwm.WindowId) ?WindowId {
     return null;
 }
 
+fn transientParent(self: *Self, window: *const Window) ?WindowId {
+    const xdg_id = switch (window.backend) {
+        .xdg => |id| id,
+        .xwayland => return null,
+    };
+    const parent = (self.xdg_shell.windowInfo(xdg_id) orelse return null).parent orelse return null;
+    return self.findXdg(parent);
+}
+
+fn transientDepth(self: *Self, window: *const Window) usize {
+    var depth: usize = 0;
+    var candidate = window;
+    while (self.transientParent(candidate)) |parent_id| {
+        depth += 1;
+        candidate = self.windows.get(parent_id) orelse break;
+    }
+    return depth;
+}
+
+fn transientIsVisible(self: *Self, window: *const Window) bool {
+    if (self.transientParent(window) == null) return true;
+    return window.placement != null and window.placement.?.visible;
+}
+
+fn syncTransientWorkspaces(self: *Self) error{OutOfMemory}!void {
+    var remaining = self.windows.len();
+    while (remaining > 0) : (remaining -= 1) {
+        var changed = false;
+        var it = self.windows.iterator();
+        while (it.next()) |entry| {
+            const parent = self.windows.get(self.transientParent(entry.value) orelse continue) orelse continue;
+            const source = entry.value.workspace;
+            const target = parent.workspace;
+            if (source == target) continue;
+            const moved = try workspace_mod.Workspace.moveWindow(
+                self.allocator,
+                &self.workspaces.items[source].workspace,
+                &self.workspaces.items[target].workspace,
+                neutral(entry.id),
+            );
+            std.debug.assert(moved);
+            entry.value.workspace = target;
+            self.reportWorkspaceOccupancy(source);
+            self.reportWorkspaceOccupancy(target);
+            changed = true;
+        }
+        if (!changed) return;
+    }
+}
+
 fn addXdg(self: *Self, xdg_id: XdgShell.WindowId) !WindowId {
     if (self.findXdg(xdg_id)) |id| return id;
     const info = self.xdg_shell.windowInfo(xdg_id) orelse return error.OutOfMemory;
     const surface_id = self.xdg_shell.windowSurface(xdg_id) orelse return error.OutOfMemory;
-    const workspace = self.workspaceFor(self.default_output) orelse 0;
+    const workspace = if (info.parent) |parent|
+        if (self.findXdg(parent)) |parent_id|
+            self.windows.get(parent_id).?.workspace
+        else
+            self.workspaceFor(self.default_output) orelse 0
+    else
+        self.workspaceFor(self.default_output) orelse 0;
     const id = try self.windows.insert(self.allocator, .{ .backend = .{ .xdg = xdg_id }, .scene_id = info.scene_id, .surface_id = surface_id, .workspace = workspace });
     errdefer _ = self.windows.remove(id);
     _ = try self.workspaces.items[workspace].workspace.insert(self.allocator, neutral(id));
@@ -492,6 +548,16 @@ fn needsXdgConfigure(
         !std.meta.eql(current_configuration, configuration);
 }
 
+fn requestedXdgDimensions(
+    current: ?XdgShell.Dimensions,
+    placement: XdgShell.Dimensions,
+    transient: bool,
+    fullscreen: bool,
+) XdgShell.Dimensions {
+    if (transient and !fullscreen and current == null) return .{ .width = 0, .height = 0 };
+    return placement;
+}
+
 pub fn execute(self: *Self, command: Command) void {
     switch (command) {
         .focus_next => self.focusNext(),
@@ -624,7 +690,7 @@ fn cycleFocus(self: *Self, reverse: bool) void {
     for (0..ws.members.items.len) |_| {
         candidate = ws.nextWindow(candidate, reverse) orelse return;
         const window = self.windows.get(internal(candidate)) orelse continue;
-        if (window.minimized) continue;
+        if (window.minimized or !self.transientIsVisible(window)) continue;
         ws.focused = candidate;
         break;
     }
@@ -664,6 +730,7 @@ fn directionalNeighbor(
 }
 
 fn relayout(self: *Self) void {
+    self.syncTransientWorkspaces() catch return;
     if (!self.transaction.change()) return;
     var planned: std.ArrayList(types.LayoutPlan) = .empty;
     defer planned.deinit(self.allocator);
@@ -675,7 +742,8 @@ fn relayout(self: *Self) void {
         defer inputs.deinit(self.allocator);
         for (entry.workspace.members.items) |member| {
             const window = self.windows.get(internal(member)) orelse continue;
-            if (window.minimized or window.fullscreen_output != null) continue;
+            if (window.minimized or window.fullscreen_output != null or
+                self.transientParent(window) != null) continue;
             const current = self.currentDimensions(window);
             inputs.append(self.allocator, .{ .id = member, .current = types.Size.init(@intCast(@max(1, current.width)), @intCast(@max(1, current.height))) }) catch return;
         }
@@ -696,24 +764,58 @@ fn relayout(self: *Self) void {
     }
     for (self.workspaces.items) |*entry| {
         if (!entry.active) continue;
+        for (entry.workspace.members.items) |member| {
+            const window = self.windows.get(internal(member)) orelse continue;
+            const fullscreen_output_id = window.fullscreen_output orelse continue;
+            const output = self.outputs.get(entry.output) orelse continue;
+            const fullscreen_output = self.outputs.get(fullscreen_output_id) orelse output;
+            const position = fullscreen_output.logicalPosition();
+            const size = fullscreen_output.logicalSize();
+            window.placement = .{
+                .id = member,
+                .rect = .{
+                    .x = position.x,
+                    .y = position.y,
+                    .size = types.Size.init(size.width, size.height),
+                },
+                .visible = true,
+            };
+        }
+    }
+    var remaining = self.windows.len();
+    while (remaining > 0) : (remaining -= 1) {
+        var changed = false;
+        for (self.workspaces.items) |*entry| {
+            if (!entry.active) continue;
+            for (entry.workspace.members.items) |member| {
+                const window = self.windows.get(internal(member)) orelse continue;
+                if (window.placement != null or window.fullscreen_output != null) continue;
+                const parent = self.windows.get(self.transientParent(window) orelse continue) orelse continue;
+                const parent_placement = parent.placement orelse continue;
+                const current = self.currentDimensions(window);
+                window.placement = .{
+                    .id = member,
+                    .rect = centeredRect(
+                        parent_placement.rect,
+                        types.Size.init(
+                            @intCast(@max(1, current.width)),
+                            @intCast(@max(1, current.height)),
+                        ),
+                    ),
+                    .visible = parent_placement.visible,
+                };
+                changed = true;
+            }
+        }
+        if (!changed) break;
+    }
+    for (self.workspaces.items) |*entry| {
+        if (!entry.active) continue;
         self.normalizeFocus(entry);
         for (entry.workspace.members.items) |member| {
             const window = self.windows.get(internal(member)) orelse continue;
             const output = self.outputs.get(entry.output) orelse continue;
-            if (window.fullscreen_output != null) {
-                const fullscreen_output = self.outputs.get(window.fullscreen_output.?) orelse output;
-                const position = fullscreen_output.logicalPosition();
-                const size = fullscreen_output.logicalSize();
-                window.placement = .{
-                    .id = member,
-                    .rect = .{
-                        .x = position.x,
-                        .y = position.y,
-                        .size = types.Size.init(size.width, size.height),
-                    },
-                    .visible = true,
-                };
-            }
+            const transient_parent = self.transientParent(window);
             const plan = window.placement;
             const current_dimensions = self.currentDimensions(window);
             const dimensions: XdgShell.Dimensions = if (plan) |placement| .{
@@ -748,6 +850,12 @@ fn relayout(self: *Self) void {
                 },
                 .xdg => |id| configure: {
                     const info = self.xdg_shell.windowInfo(id) orelse break :configure null;
+                    const configure_dimensions = requestedXdgDimensions(
+                        info.dimensions,
+                        dimensions,
+                        transient_parent != null,
+                        window.fullscreen_output != null,
+                    );
                     const configuration: XdgShell.ToplevelConfigure = .{
                         .activated = !window.minimized and entry.workspace.focused != null and
                             member.eql(entry.workspace.focused.?),
@@ -768,12 +876,12 @@ fn relayout(self: *Self) void {
                         info.dimensions,
                         info.configuration,
                         info.decoration_configure_requested,
-                        dimensions,
+                        configure_dimensions,
                         configuration,
                     )) break :configure null;
                     break :configure self.xdg_shell.configureWindowState(
                         id,
-                        dimensions,
+                        configure_dimensions,
                         configuration,
                     ) catch null;
                 },
@@ -798,7 +906,7 @@ fn normalizeFocus(self: *Self, entry: *OutputWorkspace) void {
     var candidate = workspace.focused orelse workspace.members.items[0];
     for (0..workspace.members.items.len) |_| {
         if (self.windows.get(internal(candidate))) |window| {
-            if (!window.minimized) {
+            if (!window.minimized and self.transientIsVisible(window)) {
                 workspace.focused = candidate;
                 return;
             }
@@ -887,12 +995,44 @@ fn publish(self: *Self) void {
             }
         }
     }
+    var depth: usize = 1;
+    while (depth <= self.windows.len()) : (depth += 1) {
+        for (self.workspaces.items) |workspace| {
+            if (!workspace.active) continue;
+            var index = workspace.workspace.members.items.len;
+            while (index > 0) {
+                index -= 1;
+                const window = self.windows.get(internal(workspace.workspace.members.items[index])) orelse continue;
+                if (window.placement == null or window.fullscreen_output != null or
+                    self.transientDepth(window) != depth) continue;
+                const parent = self.windows.get(self.transientParent(window) orelse continue) orelse continue;
+                if (parent.placement != null) self.scene.placeAbove(window.scene_id, parent.scene_id);
+            }
+        }
+    }
     self.xwayland.stacking_changed(self.xwayland.context);
     if (self.transaction.consumeDirty()) self.relayout();
 }
 
 fn clampI16(value: i32) i16 {
     return @intCast(std.math.clamp(value, std.math.minInt(i16), std.math.maxInt(i16)));
+}
+
+fn centeredRect(parent: types.Rect, size: types.Size) types.Rect {
+    return .{
+        .x = centeredCoordinate(parent.x, parent.size.width, size.width),
+        .y = centeredCoordinate(parent.y, parent.size.height, size.height),
+        .size = size,
+    };
+}
+
+fn centeredCoordinate(parent_start: i32, parent_length: u32, child_length: u32) i32 {
+    const doubled = 2 * @as(i64, parent_start) + parent_length - child_length;
+    return @intCast(std.math.clamp(
+        @divFloor(doubled, 2),
+        std.math.minInt(i32),
+        std.math.maxInt(i32),
+    ));
 }
 
 const DirectionalScore = struct {
@@ -976,6 +1116,7 @@ fn windowCommitted(context: *anyopaque, id: XdgShell.WindowId, serial: ?u32) boo
     const self: *Self = @ptrCast(@alignCast(context));
     const window = self.windows.get(self.findXdg(id) orelse return false) orelse return false;
     window.mapped = true;
+    if (self.transientParent(window) != null) self.relayout();
     if (serial != null and window.serial == serial) {
         window.serial = null;
         if (self.transaction.configured()) self.publish();
@@ -1176,6 +1317,36 @@ test "XDG configure is sent only for initial or changed state" {
         dimensions,
         configuration,
     ));
+}
+
+test "unmapped transient XDG toplevel chooses its natural size" {
+    const placement: XdgShell.Dimensions = .{ .width = 640, .height = 480 };
+    try std.testing.expectEqual(
+        XdgShell.Dimensions{ .width = 0, .height = 0 },
+        requestedXdgDimensions(null, placement, true, false),
+    );
+    try std.testing.expectEqual(
+        placement,
+        requestedXdgDimensions(.{ .width = 420, .height = 240 }, placement, true, false),
+    );
+    try std.testing.expectEqual(placement, requestedXdgDimensions(null, placement, false, false));
+    try std.testing.expectEqual(placement, requestedXdgDimensions(null, placement, true, true));
+}
+
+test "transient toplevel is centered over its parent" {
+    const parent: types.Rect = .{
+        .x = 100,
+        .y = 50,
+        .size = types.Size.init(800, 600),
+    };
+    try std.testing.expectEqual(
+        types.Rect{ .x = 250, .y = 200, .size = types.Size.init(500, 300) },
+        centeredRect(parent, types.Size.init(500, 300)),
+    );
+    try std.testing.expectEqual(
+        types.Rect{ .x = 0, .y = 0, .size = types.Size.init(1000, 700) },
+        centeredRect(parent, types.Size.init(1000, 700)),
+    );
 }
 
 test "directional navigation prefers aligned neighbors then distance" {
