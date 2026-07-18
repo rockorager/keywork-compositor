@@ -441,6 +441,7 @@ test {
     _ = @import("wayland/fractional_scale.zig");
     _ = @import("wayland/fixes.zig");
     _ = @import("wayland/linux_dmabuf.zig");
+    _ = @import("wayland/linux_drm_syncobj.zig");
     _ = @import("wayland/single_pixel_buffer.zig");
     _ = @import("wayland/content_type.zig");
     _ = @import("wayland/background_effect.zig");

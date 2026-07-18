@@ -17,6 +17,7 @@ pub fn build(b: *std.Build) void {
     scanner.addSystemProtocol("staging/fractional-scale/fractional-scale-v1.xml");
     scanner.addSystemProtocol("stable/presentation-time/presentation-time.xml");
     scanner.addSystemProtocol("stable/linux-dmabuf/linux-dmabuf-v1.xml");
+    scanner.addSystemProtocol("staging/linux-drm-syncobj/linux-drm-syncobj-v1.xml");
     scanner.addSystemProtocol("staging/xdg-activation/xdg-activation-v1.xml");
     scanner.addSystemProtocol("staging/single-pixel-buffer/single-pixel-buffer-v1.xml");
     scanner.addSystemProtocol("staging/cursor-shape/cursor-shape-v1.xml");
@@ -64,6 +65,7 @@ pub fn build(b: *std.Build) void {
     scanner.generate("wp_fractional_scale_manager_v1", 1);
     scanner.generate("wp_presentation", 2);
     scanner.generate("zwp_linux_dmabuf_v1", 6);
+    scanner.generate("wp_linux_drm_syncobj_manager_v1", 1);
     scanner.generate("xdg_activation_v1", 1);
     scanner.generate("wp_single_pixel_buffer_manager_v1", 1);
     scanner.generate("wp_cursor_shape_manager_v1", 2);

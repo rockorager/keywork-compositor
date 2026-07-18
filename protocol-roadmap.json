@@ -969,15 +969,16 @@
       "interfaces": [
         {
           "name": "wp_linux_drm_syncobj_manager_v1",
-          "current_version": null,
+          "current_version": 1,
           "target_version": 1
         }
       ],
-      "status": "not_started",
+      "status": "done",
       "privileged": false,
       "blocked_by": [
         "linux-dmabuf"
-      ]
+      ],
+      "status_detail": "Version 1 is advertised only when a usable DRM timeline-syncobj device supports eventfd waits and sync-file transfer. It implements timeline import, per-surface acquire and release points, protocol validation and teardown, acquire-gated DMA-BUF commits within the existing ordered commit cache, and release signaling after all renderer and direct-scanout users finish. The lifecycle is exercised end to end with both CPU and Vulkan renderers."
     },
     {
       "id": "tearing-control",

@@ -4,6 +4,7 @@ const Self = @This();
 
 const std = @import("std");
 const wayland = @import("wayland");
+const DrmSyncobj = @import("../drm_syncobj.zig");
 const presentation = @import("../presentation.zig");
 const Region = @import("../region.zig");
 const render_types = @import("../render/types.zig");
@@ -26,6 +27,7 @@ role_handler: ?RoleHandler,
 viewport_handler: ?ViewportHandler,
 content_type_handler: ?ContentTypeHandler,
 background_effect_handler: ?BackgroundEffectHandler,
+explicit_sync_handler: ?ExplicitSyncHandler,
 commit_listeners: std.ArrayList(*CommitListener),
 
 pub const Store = slot_map.SlotMap(State, enum { surface });
@@ -172,6 +174,7 @@ pub fn create(
         .viewport_handler = null,
         .content_type_handler = null,
         .background_effect_handler = null,
+        .explicit_sync_handler = null,
         .commit_listeners = .empty,
     };
 
@@ -300,6 +303,39 @@ pub fn clearBackgroundEffectHandler(self: *Self) void {
     surface_state.pending_blur_region_changed = true;
 }
 
+pub const PendingAttachment = enum {
+    none,
+    null_buffer,
+    dmabuf,
+    unsupported,
+};
+
+pub const ExplicitSyncHandler = struct {
+    context: *anyopaque,
+    validate_commit: *const fn (*anyopaque, PendingAttachment) bool,
+    pending_ready: *const fn (*anyopaque) bool,
+    take_pending: *const fn (*anyopaque) DrmSyncobj.Commit,
+    surface_destroyed: *const fn (*anyopaque) void,
+};
+
+pub fn hasExplicitSyncHandler(self: *const Self) bool {
+    return self.explicit_sync_handler != null;
+}
+
+pub fn setExplicitSyncHandler(
+    self: *Self,
+    handler: ExplicitSyncHandler,
+) error{AlreadyExists}!void {
+    if (self.explicit_sync_handler != null) return error.AlreadyExists;
+    self.explicit_sync_handler = handler;
+}
+
+pub fn clearExplicitSyncHandler(self: *Self, context: *anyopaque) void {
+    const handler = self.explicit_sync_handler orelse unreachable;
+    std.debug.assert(handler.context == context);
+    self.explicit_sync_handler = null;
+}
+
 pub fn setPendingBlurRegion(self: *Self, region: ?*const Region) Region.Error!void {
     std.debug.assert(self.background_effect_handler != null);
     const surface_state = self.state();
@@ -340,6 +376,8 @@ pub const CommitInfo = struct {
 
 const CachedCommit = struct {
     sequence: u64,
+    role_ready: bool,
+    sync_ready: bool,
     buffer: ?BufferSnapshot,
     attachment_changed: bool,
     has_buffer: bool,
@@ -504,12 +542,21 @@ pub fn applyCachedCommit(self: *Self) void {
 
 pub fn applyCachedUpTo(self: *Self, sequence: u64) void {
     const surface_state = self.state();
+    for (surface_state.cached_commits.items) |*cached| {
+        if (cached.sequence > sequence) break;
+        cached.role_ready = true;
+    }
+    applyReadyCached(self);
+}
+
+fn applyReadyCached(self: *Self) void {
+    const surface_state = self.state();
     var accumulated_damage = Region.init();
     defer accumulated_damage.deinit();
     var applied = false;
-    while (surface_state.cached_commits.items.len > 0 and
-        surface_state.cached_commits.items[0].sequence <= sequence)
-    {
+    while (surface_state.cached_commits.items.len > 0) {
+        const first = surface_state.cached_commits.items[0];
+        if (!first.role_ready or !first.sync_ready) break;
         var cached = surface_state.cached_commits.orderedRemove(0);
         applyCached(self, &cached);
         cached.deinit();
@@ -792,6 +839,12 @@ fn commit(self: *Self) void {
         return;
     }
 
+    const attachment = pendingAttachment(self);
+    const acquire_ready = if (self.explicit_sync_handler) |handler| ready: {
+        if (!handler.validate_commit(handler.context, attachment)) return;
+        break :ready attachment != .dmabuf or handler.pending_ready(handler.context);
+    } else true;
+
     const commit_info = pendingCommitInfo(self);
     const action = if (self.role_handler) |handler|
         handler.before_commit(handler.context, commit_info)
@@ -800,19 +853,32 @@ fn commit(self: *Self) void {
 
     switch (action) {
         .apply => {
-            std.debug.assert(!self.hasCachedCommit());
-            notifyCommitted(self);
-            applyPending(self, commit_info);
+            if (!acquire_ready or self.hasCachedCommit()) {
+                if (cachePending(self, true)) {
+                    notifyCommitted(self);
+                    applyReadyCached(self);
+                }
+            } else {
+                notifyCommitted(self);
+                applyPending(self, commit_info);
+            }
         },
-        .cache => if (cachePending(self)) notifyCommitted(self),
+        .cache => if (cachePending(self, false)) notifyCommitted(self),
         .apply_cached => {
-            if (cachePending(self)) {
+            if (cachePending(self, true)) {
                 notifyCommitted(self);
                 applyCachedCommit(self);
             }
         },
         .reject => discardCommitFeedbacks(self.state(), .pending),
     }
+}
+
+fn pendingAttachment(self: *const Self) PendingAttachment {
+    if (!self.has_pending_attachment) return .none;
+    if (!self.pending_attachment.hasBuffer()) return .null_buffer;
+    if (self.pending_attachment.dmabuf != null) return .dmabuf;
+    return .unsupported;
 }
 
 fn notifyCommitted(self: *Self) void {
@@ -924,7 +990,7 @@ fn applyPending(self: *Self, commit_info: CommitInfo) void {
     finishApplied(self, applied_info);
 }
 
-fn cachePending(self: *Self) bool {
+fn cachePending(self: *Self, role_ready: bool) bool {
     const surface_state = self.state();
     var snapshot: ?BufferSnapshot = null;
     defer if (snapshot) |*buffer| buffer.deinit();
@@ -958,6 +1024,8 @@ fn cachePending(self: *Self) bool {
     const sequence = surface_state.next_cached_sequence;
     var cached: CachedCommit = .{
         .sequence = sequence,
+        .role_ready = role_ready,
+        .sync_ready = if (snapshot) |*buffer| buffer.isReady() else true,
         .buffer = snapshot,
         .attachment_changed = self.has_pending_attachment,
         .has_buffer = if (self.has_pending_attachment)
@@ -1009,6 +1077,11 @@ fn cachePending(self: *Self) bool {
     };
     cached_owned = true;
     surface_state.next_cached_sequence +%= 1;
+
+    const stored = &surface_state.cached_commits.items[surface_state.cached_commits.items.len - 1];
+    if (!stored.sync_ready) {
+        stored.buffer.?.dmabuf.?.setAcquireReadyTarget(self.store, self.id, sequence);
+    }
 
     if (self.has_pending_attachment) {
         const retains_client_buffer = if (cached.buffer) |value| value.retainsClientBuffer() else false;
@@ -1160,6 +1233,10 @@ fn snapshotPendingAttachment(
             surface_state.pending_scale,
             surface_state.pending_transform,
             surface_state.pending_viewport,
+            if (self.explicit_sync_handler) |handler|
+                handler.take_pending(handler.context)
+            else
+                null,
         )
     else if (self.pending_attachment.single_pixel) |pixel|
         try BufferSnapshot.copySinglePixel(
@@ -1291,6 +1368,10 @@ fn handleDestroy(_: *wl.Surface, self: *Self) void {
     }
     if (self.background_effect_handler) |handler| {
         self.background_effect_handler = null;
+        handler.surface_destroyed(handler.context);
+    }
+    if (self.explicit_sync_handler) |handler| {
+        self.explicit_sync_handler = null;
         handler.surface_destroyed(handler.context);
     }
     while (self.commit_listeners.items.len > 0) {
@@ -1627,19 +1708,83 @@ const DmabufUse = struct {
     allocator: std.mem.Allocator,
     reference_count: usize,
     buffer: *LinuxDmabuf.Buffer,
+    synchronization: ?DrmSyncobj.Commit,
+    acquire_ready: bool,
+    acquire_waiter: ?*DrmSyncobj.Waiter,
+    acquire_store: ?*Store,
+    acquire_surface_id: Id = undefined,
+    acquire_cached_sequence: u64,
+    gpu_accessed: bool,
     release_store: ?*Store = null,
     release_surface_id: Id = undefined,
     release_generation: u64 = 0,
 
-    fn create(buffer: *LinuxDmabuf.Buffer) error{OutOfMemory}!*DmabufUse {
+    fn create(
+        buffer: *LinuxDmabuf.Buffer,
+        synchronization: ?DrmSyncobj.Commit,
+    ) error{OutOfMemory}!*DmabufUse {
         const self = buffer.manager.allocator.create(DmabufUse) catch return error.OutOfMemory;
         buffer.retainSnapshot();
         self.* = .{
             .allocator = buffer.manager.allocator,
             .reference_count = 1,
             .buffer = buffer,
+            .synchronization = synchronization,
+            .acquire_ready = synchronization == null or synchronization.?.acquire.signaled(),
+            .acquire_waiter = null,
+            .acquire_store = null,
+            .acquire_cached_sequence = 0,
+            .gpu_accessed = false,
         };
+        if (!self.acquire_ready) {
+            self.acquire_waiter = synchronization.?.acquire.wait(self, acquireReady) catch {
+                buffer.releaseSnapshot();
+                self.allocator.destroy(self);
+                return error.OutOfMemory;
+            };
+        }
         return self;
+    }
+
+    fn isReady(self: *DmabufUse) bool {
+        if (self.acquire_ready) return true;
+        if (!self.synchronization.?.acquire.signaled()) return false;
+        if (self.acquire_waiter) |waiter| {
+            self.acquire_waiter = null;
+            waiter.destroy();
+        }
+        self.acquire_ready = true;
+        return true;
+    }
+
+    fn setAcquireReadyTarget(
+        self: *DmabufUse,
+        store: *Store,
+        surface_id: Id,
+        sequence: u64,
+    ) void {
+        std.debug.assert(!self.acquire_ready and self.acquire_store == null);
+        self.acquire_store = store;
+        self.acquire_surface_id = surface_id;
+        self.acquire_cached_sequence = sequence;
+    }
+
+    fn acquireReady(context: *anyopaque, ready: bool) void {
+        const self: *DmabufUse = @ptrCast(@alignCast(context));
+        self.acquire_waiter = null;
+        if (!ready) {
+            log.warn("DRM syncobj acquire waiter failed", .{});
+            return;
+        }
+        self.acquire_ready = true;
+        const store = self.acquire_store orelse return;
+        const surface_state = store.get(self.acquire_surface_id) orelse return;
+        for (surface_state.cached_commits.items) |*cached| {
+            if (cached.sequence != self.acquire_cached_sequence) continue;
+            cached.sync_ready = true;
+            applyReadyCached(Self.fromResource(surface_state.resource));
+            return;
+        }
     }
 
     fn setRelease(self: *DmabufUse, store: *Store, surface_id: Id, generation: u64) void {
@@ -1658,6 +1803,20 @@ const DmabufUse = struct {
         std.debug.assert(self.reference_count > 0);
         self.reference_count -= 1;
         if (self.reference_count != 0) return;
+        if (self.acquire_waiter) |waiter| waiter.destroy();
+        if (self.synchronization) |*synchronization| {
+            const release_succeeded = if (self.gpu_accessed) completed: {
+                const source = self.buffer.renderSource();
+                const sync_file_fd = source.export_read_fence(source.context) orelse
+                    break :completed false;
+                defer _ = std.c.close(sync_file_fd);
+                break :completed synchronization.release.importSyncFile(sync_file_fd);
+            } else synchronization.release.signal();
+            if (!release_succeeded) {
+                log.warn("failed to signal DRM syncobj release point", .{});
+            }
+            synchronization.deinit();
+        }
         self.buffer.releaseSnapshot();
         if (self.release_store) |store| {
             finishBufferReleaseCallbacks(store, self.release_surface_id, self.release_generation);
@@ -1688,6 +1847,7 @@ const DmabufUse = struct {
 
     fn beginCpuReadCallback(context: *anyopaque) bool {
         const self: *DmabufUse = @ptrCast(@alignCast(context));
+        if (!self.isReady()) return false;
         const source = self.buffer.renderSource();
         return source.begin_cpu_read(source.context);
     }
@@ -1700,6 +1860,11 @@ const DmabufUse = struct {
 
     fn exportReadFenceCallback(context: *anyopaque) ?std.posix.fd_t {
         const self: *DmabufUse = @ptrCast(@alignCast(context));
+        if (self.synchronization) |synchronization| {
+            if (!self.isReady()) return null;
+            self.gpu_accessed = true;
+            return synchronization.acquire.exportSyncFile();
+        }
         const source = self.buffer.renderSource();
         return source.export_read_fence(source.context);
     }
@@ -1814,10 +1979,14 @@ pub const BufferSnapshot = struct {
         scale: i32,
         transform: wl.Output.Transform,
         viewport: ViewportState,
+        synchronization: ?DrmSyncobj.Commit,
     ) Error!BufferSnapshot {
+        var owned_synchronization = synchronization;
+        errdefer if (owned_synchronization) |*sync| sync.deinit();
         const buffer_size = buffer.size();
         const geometry = try viewportGeometry(buffer_size, scale, transform, viewport);
-        const dmabuf = try DmabufUse.create(buffer);
+        const dmabuf = try DmabufUse.create(buffer, owned_synchronization);
+        owned_synchronization = null;
 
         return .{
             .allocator = buffer.manager.allocator,
@@ -1897,6 +2066,10 @@ pub const BufferSnapshot = struct {
 
     fn retainsClientBuffer(self: *const BufferSnapshot) bool {
         return self.dmabuf != null;
+    }
+
+    fn isReady(self: *BufferSnapshot) bool {
+        return if (self.dmabuf) |dmabuf| dmabuf.isReady() else true;
     }
 
     pub fn pixelBuffer(self: *BufferSnapshot) render_types.PixelBuffer {

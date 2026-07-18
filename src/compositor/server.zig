@@ -46,6 +46,7 @@ const PresentationProtocol = @import("wayland/presentation.zig");
 const FractionalScale = @import("wayland/fractional_scale.zig");
 const Fixes = @import("wayland/fixes.zig");
 const LinuxDmabuf = @import("wayland/linux_dmabuf.zig");
+const LinuxDrmSyncobj = @import("wayland/linux_drm_syncobj.zig");
 const XdgActivation = @import("wayland/xdg_activation.zig");
 const Output = @import("wayland/output.zig");
 const OutputLayout = @import("wayland/output_layout.zig");
@@ -161,6 +162,7 @@ presentation_protocol: PresentationProtocol,
 fractional_scale: FractionalScale,
 fixes: Fixes,
 linux_dmabuf: LinuxDmabuf,
+linux_drm_syncobj: LinuxDrmSyncobj,
 xdg_activation: XdgActivation,
 viewporter: Viewporter,
 window_manager: WindowManager,
@@ -723,6 +725,7 @@ pub fn createWithVirtualOutput(
         .fractional_scale = undefined,
         .fixes = undefined,
         .linux_dmabuf = undefined,
+        .linux_drm_syncobj = undefined,
         .xdg_activation = undefined,
         .viewporter = undefined,
         .window_manager = undefined,
@@ -922,6 +925,13 @@ pub fn createWithVirtualOutput(
         if (output_kind == .drm) self.drm_device.deviceId() else null,
     );
     errdefer self.linux_dmabuf.deinit();
+    try self.linux_drm_syncobj.init(
+        allocator,
+        io,
+        display,
+        self.renderer.dmabufDeviceId(),
+    );
+    errdefer self.linux_drm_syncobj.deinit();
     try self.subcompositor.init(allocator, display, self.compositor.surfaceStore());
     errdefer self.subcompositor.deinit();
     self.scene.init(allocator);
@@ -1313,6 +1323,7 @@ pub fn destroy(self: *Self) void {
     self.gtk_shell.deinit();
     self.scene.deinit();
     self.subcompositor.deinit();
+    self.linux_drm_syncobj.deinit();
     self.linux_dmabuf.deinit();
     self.fixes.deinit();
     self.fractional_scale.deinit();
