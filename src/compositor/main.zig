@@ -118,9 +118,10 @@ pub fn main(init: std.process.Init) !void {
     );
     try init.environ_map.put("KEYWORK_CONTROL", control_address);
     server.setLauncher(&launcher);
-    server.setXwaylandReadyListener(.{
+    server.setXwaylandDisplayListener(.{
         .context = &systemd,
-        .ready = xwaylandReady,
+        .available = xwaylandDisplayAvailable,
+        .unavailable = xwaylandDisplayUnavailable,
     });
     var buffer: [4096]u8 = undefined;
     var writer = std.Io.File.stdout().writer(init.io, &buffer);
@@ -151,10 +152,17 @@ fn parseArguments(arguments: anytype) !?[]const u8 {
     return path;
 }
 
-fn xwaylandReady(context: *anyopaque, display_name: []const u8) void {
+fn xwaylandDisplayAvailable(context: *anyopaque, display_name: []const u8) void {
     const systemd: *Systemd = @ptrCast(@alignCast(context));
     systemd.publishDisplay(display_name) catch |err| {
         log.warn("failed to publish DISPLAY to the activation environment: {t}", .{err});
+    };
+}
+
+fn xwaylandDisplayUnavailable(context: *anyopaque) void {
+    const systemd: *Systemd = @ptrCast(@alignCast(context));
+    systemd.unpublishDisplay() catch |err| {
+        log.warn("failed to remove DISPLAY from the activation environment: {t}", .{err});
     };
 }
 

@@ -161,11 +161,12 @@ window_manager_initialized: bool,
 renderer: renderer_types.Renderer,
 socket_buffer: [11]u8,
 listening: bool,
-xwayland_ready_listener: ?XwaylandReadyListener,
+xwayland_display_listener: ?XwaylandDisplayListener,
 
-pub const XwaylandReadyListener = struct {
+pub const XwaylandDisplayListener = struct {
     context: *anyopaque,
-    ready: *const fn (*anyopaque, []const u8) void,
+    available: *const fn (*anyopaque, []const u8) void,
+    unavailable: *const fn (*anyopaque) void,
 };
 
 const RenderOutput = struct {
@@ -382,7 +383,7 @@ pub fn createWithVirtualOutput(
         .renderer = undefined,
         .socket_buffer = undefined,
         .listening = false,
-        .xwayland_ready_listener = null,
+        .xwayland_display_listener = null,
     };
     errdefer self.routed_touches.deinit(allocator);
     errdefer self.routed_gestures.deinit(allocator);
@@ -804,6 +805,7 @@ pub fn createWithVirtualOutput(
             .context = self,
             .ready = xwaylandReady,
             .stopped = xwaylandStopped,
+            .unavailable = xwaylandUnavailable,
         },
     );
     self.xwayland_server_initialized = true;
@@ -1860,8 +1862,8 @@ fn reportInputStatus(device_name: []const u8, setting_name: []const u8, status: 
     }
 }
 
-pub fn setXwaylandReadyListener(self: *Self, listener: XwaylandReadyListener) void {
-    self.xwayland_ready_listener = listener;
+pub fn setXwaylandDisplayListener(self: *Self, listener: XwaylandDisplayListener) void {
+    self.xwayland_display_listener = listener;
 }
 
 pub fn setWindowBlurRadius(self: *Self, radius: u32) void {
@@ -1876,7 +1878,10 @@ pub fn startXwayland(
 ) void {
     self.xwayland_server.start(environ_map) catch |err| {
         log.warn("Xwayland is unavailable: {t}", .{err});
+        return;
     };
+    if (self.xwayland_display_listener) |listener|
+        listener.available(listener.context, self.xwayland_server.displayName());
 }
 
 pub fn eventLoop(self: *Self) *wl.EventLoop {
@@ -3626,9 +3631,6 @@ fn xwaylandReady(
     };
     self.xwm_initialized = true;
     log.info("X11 clients may use DISPLAY={s}", .{display_name});
-    if (self.xwayland_ready_listener) |listener| {
-        listener.ready(listener.context, display_name);
-    }
     return true;
 }
 
@@ -3638,7 +3640,13 @@ fn xwaylandStopped(context: *anyopaque) void {
         self.xwm.deinit();
         self.xwm_initialized = false;
     }
-    log.warn("Xwayland stopped", .{});
+    log.info("Xwayland stopped", .{});
+}
+
+fn xwaylandUnavailable(context: *anyopaque) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    if (self.xwayland_display_listener) |listener|
+        listener.unavailable(listener.context);
 }
 
 fn xwmFailed(context: *anyopaque) void {

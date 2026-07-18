@@ -14,6 +14,11 @@ const c = @import("xcb.zig").c;
 const wl = wayland.server.wl;
 const log = std.log.scoped(.xwm);
 
+const XfixesInfo = struct {
+    event_base: u8,
+    client_disconnect_mode: bool,
+};
+
 allocator: std.mem.Allocator,
 connection: *c.xcb_connection_t,
 screen: *c.xcb_screen_t,
@@ -354,7 +359,8 @@ pub fn init(
 
     try self.resolveAtoms();
     try self.checkComposite();
-    self.xfixes_event_base = try self.checkXfixes();
+    const xfixes = try self.checkXfixes();
+    self.xfixes_event_base = xfixes.event_base;
     self.xres_available = self.checkXres();
     self.wm_window = c.xcb_generate_id(connection);
     if (self.wm_window == c.XCB_WINDOW_NONE) return error.XidAllocationFailed;
@@ -462,6 +468,16 @@ pub fn init(
         },
     );
     errdefer self.dnd.deinit();
+    if (xfixes.client_disconnect_mode) {
+        // Mark the XWM only after claiming WM_S0 releases the public sockets,
+        // otherwise a fast first client can race Xwayland's startup barrier.
+        try checkRequest(connection, c.xcb_xfixes_set_client_disconnect_mode_checked(
+            connection,
+            c.XCB_XFIXES_CLIENT_DISCONNECT_FLAGS_TERMINATE,
+        ));
+    } else {
+        log.warn("XFixes 6 is unavailable; Xwayland cannot stop when idle", .{});
+    }
     if (c.xcb_flush(connection) <= 0) return error.XcbFlushFailed;
 
     const event_fd = c.xcb_get_file_descriptor(connection);
@@ -918,7 +934,7 @@ fn checkComposite(self: *Self) !void {
     }
 }
 
-fn checkXfixes(self: *Self) !u8 {
+fn checkXfixes(self: *Self) !XfixesInfo {
     const extension_name = "XFIXES";
     const extension = c.xcb_query_extension_reply(
         self.connection,
@@ -934,7 +950,11 @@ fn checkXfixes(self: *Self) !u8 {
     var x_error: ?*c.xcb_generic_error_t = null;
     const reply = c.xcb_xfixes_query_version_reply(
         self.connection,
-        c.xcb_xfixes_query_version(self.connection, 5, 0),
+        c.xcb_xfixes_query_version(
+            self.connection,
+            c.XCB_XFIXES_MAJOR_VERSION,
+            c.XCB_XFIXES_MINOR_VERSION,
+        ),
         &x_error,
     ) orelse {
         if (x_error) |err| {
@@ -949,7 +969,10 @@ fn checkXfixes(self: *Self) !u8 {
         std.c.free(err);
         return error.XfixesUnavailable;
     }
-    return extension.*.first_event;
+    return .{
+        .event_base = extension.*.first_event,
+        .client_disconnect_mode = reply.*.major_version >= 6,
+    };
 }
 
 fn checkXres(self: *Self) bool {

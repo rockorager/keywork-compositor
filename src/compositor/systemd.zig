@@ -122,6 +122,22 @@ pub fn publishDisplay(self: *const Self, display_name: []const u8) !void {
     try self.updateActivationEnvironment(&.{display});
 }
 
+pub fn unpublishDisplay(self: *const Self) !void {
+    if (!self.session_enabled) return;
+
+    if (!try self.run(&.{ "systemctl", "--user", "unset-environment", "DISPLAY" })) {
+        return error.SystemdEnvironmentUpdateFailed;
+    }
+    const updated = self.run(&.{ "dbus-update-activation-environment", "DISPLAY=" }) catch |err| {
+        log.warn("could not clear DISPLAY from the D-Bus activation environment: {t}", .{err});
+        return;
+    };
+    if (!updated) {
+        // dbus-broker services still receive the systemd manager environment.
+        log.warn("dbus-update-activation-environment exited unsuccessfully", .{});
+    }
+}
+
 pub fn shutdown(self: *const Self) !void {
     if (!self.session_enabled) return;
 

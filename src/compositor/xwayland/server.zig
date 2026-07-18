@@ -38,6 +38,7 @@ keyboard_grab: *XwaylandKeyboardGrab,
 listener: Listener,
 client: ?*wl.Client,
 client_destroy_listener: wl.Listener(*wl.Client),
+x_sources: [2]?*wl.EventSource,
 notify_source: ?*wl.EventSource,
 notify_fd: std.posix.fd_t,
 notify_buffer: [32]u8,
@@ -63,6 +64,7 @@ pub const Listener = struct {
     /// Takes ownership of wm_fd, including on failure.
     ready: *const fn (*anyopaque, []const u8, std.posix.fd_t) bool,
     stopped: *const fn (*anyopaque) void,
+    unavailable: *const fn (*anyopaque) void,
 };
 
 pub fn init(
@@ -82,6 +84,7 @@ pub fn init(
         .listener = listener,
         .client = null,
         .client_destroy_listener = wl.Listener(*wl.Client).init(clientDestroyed),
+        .x_sources = .{ null, null },
         .notify_source = null,
         .notify_fd = invalid_fd,
         .notify_buffer = undefined,
@@ -126,6 +129,56 @@ pub fn start(
     self.environ_map = environ_map;
     try environ_map.put("DISPLAY", self.displayName());
 
+    try self.listenForClients();
+    log.info("Xwayland will start on demand at {s}", .{self.displayName()});
+}
+
+fn listenForClients(self: *Self) !void {
+    std.debug.assert(self.display_number != null);
+    std.debug.assert(self.client == null);
+    std.debug.assert(self.pid == null);
+    std.debug.assert(self.x_sources[0] == null and self.x_sources[1] == null);
+    errdefer self.stopListening();
+    for (self.x_fds, &self.x_sources) |fd, *source| {
+        source.* = try self.event_loop.addFd(
+            *Self,
+            fd,
+            .{ .readable = true },
+            startOnDemand,
+            self,
+        );
+    }
+}
+
+fn stopListening(self: *Self) void {
+    for (&self.x_sources) |*source| {
+        if (source.*) |event_source| event_source.remove();
+        source.* = null;
+    }
+}
+
+fn startOnDemand(_: std.posix.fd_t, mask: wl.EventMask, self: *Self) c_int {
+    if (!mask.readable) {
+        if (mask.hangup or mask.@"error") {
+            log.err("Xwayland display socket stopped listening", .{});
+            self.stop(false);
+        }
+        return 0;
+    }
+    self.stopListening();
+    self.launch() catch |err| {
+        log.err("failed to launch Xwayland: {t}", .{err});
+        self.stop(false);
+    };
+    return 0;
+}
+
+fn launch(self: *Self) !void {
+    std.debug.assert(self.display_number != null);
+    std.debug.assert(self.environ_map != null);
+    std.debug.assert(self.client == null);
+    std.debug.assert(self.pid == null);
+
     var wayland_fds = try socketPair();
     defer closeFd(&wayland_fds[1]);
     errdefer closeFd(&wayland_fds[0]);
@@ -157,6 +210,7 @@ pub fn start(
         self,
     );
 
+    const environ_map = self.environ_map.?;
     const executable = environ_map.get("KEYWORK_XWAYLAND") orelse "Xwayland";
     self.pid = try self.spawn(
         executable,
@@ -178,7 +232,19 @@ pub fn isReady(self: *const Self) bool {
 }
 
 pub fn terminate(self: *Self) void {
-    self.stop(true);
+    const was_running = self.client != null or self.pid != null;
+    if (!was_running) return;
+    if (self.client) |client| {
+        self.client_destroy_listener.link.remove();
+        self.client = null;
+        client.destroy();
+    }
+    self.finishProcess();
+    self.listener.stopped(self.listener.context);
+    self.listenForClients() catch |err| {
+        log.err("failed to resume on-demand Xwayland: {t}", .{err});
+        self.stop(false);
+    };
 }
 
 fn spawn(
@@ -281,6 +347,8 @@ fn spawn(
 
 fn stop(self: *Self, notify_listener: bool) void {
     const was_running = self.client != null or self.pid != null;
+    const was_available = self.display_number != null;
+    self.stopListening();
     if (self.client) |client| {
         self.client_destroy_listener.link.remove();
         self.client = null;
@@ -289,6 +357,7 @@ fn stop(self: *Self, notify_listener: bool) void {
     self.finishProcess();
     self.closeDisplay();
     self.restoreEnvironment();
+    if (was_available) self.listener.unavailable(self.listener.context);
     if (notify_listener and was_running)
         self.listener.stopped(self.listener.context);
 }
@@ -310,10 +379,16 @@ fn clientDestroyed(listener: *wl.Listener(*wl.Client), client: *wl.Client) void 
     std.debug.assert(self.client == client);
     listener.link.remove();
     self.client = null;
+    if (!self.ready) {
+        self.fail("Xwayland exited before becoming ready");
+        return;
+    }
     self.finishProcess();
-    self.closeDisplay();
-    self.restoreEnvironment();
     self.listener.stopped(self.listener.context);
+    self.listenForClients() catch |err| {
+        log.err("failed to resume on-demand Xwayland: {t}", .{err});
+        self.stop(false);
+    };
 }
 
 fn notifyReady(_: std.posix.fd_t, mask: wl.EventMask, self: *Self) c_int {
