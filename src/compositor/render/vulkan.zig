@@ -438,8 +438,8 @@ fn initGraphics(
     }, null);
     defer wrapper.destroyShaderModule(device, solid_shader, null);
     const image_shader = try wrapper.createShaderModule(device, &.{
-        .code_size = @sizeOf(@TypeOf(shaders.image_instanced)),
-        .p_code = &shaders.image_instanced,
+        .code_size = @sizeOf(@TypeOf(shaders.image_alpha_instanced)),
+        .p_code = &shaders.image_alpha_instanced,
     }, null);
     defer wrapper.destroyShaderModule(device, image_shader, null);
     const shadow_shader = try wrapper.createShaderModule(device, &.{
@@ -3412,6 +3412,7 @@ fn hashRenderCommand(hasher: *std.hash.Wyhash, command: render.Command) bool {
             hashOptionalRoundedClip(hasher, image.rounded_clip);
             hashOptionalRect(hasher, image.clip);
             hashScalar(hasher, @intFromBool(image.is_opaque));
+            hashScalar(hasher, image.alpha_multiplier);
             if (image.buffer.dmabuf) |dmabuf| {
                 hashScalar(hasher, @as(u8, 1));
                 hashScalar(hasher, dmabuf.format);
@@ -3675,7 +3676,7 @@ fn compileDrawRuns(
                         @floatFromInt(radius),
                         @floatFromInt(@intFromEnum(image.transform)),
                         @floatFromInt(@intFromBool(dmabuf != null and dmabuf.?.y_inverted)),
-                        0,
+                        @as(f32, @floatFromInt(image.alpha_multiplier)) / @as(f32, @floatFromInt(std.math.maxInt(u32))),
                     },
                 },
             );
@@ -3817,7 +3818,7 @@ fn compileDrawRuns(
                 .clip = undefined,
                 .color = .{ 1, 1, 1, 1 },
                 .rounded = blur_rect,
-                .parameters = .{ @floatFromInt(radius), 0, 0, 0 },
+                .parameters = .{ @floatFromInt(radius), 0, 0, 1 },
             };
             var composite_count: u32 = 0;
             if (!blur.cache_only) {
@@ -4021,7 +4022,7 @@ fn blurSampleRect(rect: render.Rect, radius: u32, level: u8, frame_size: render.
 }
 
 fn imageInstance(destination: render.Rect, source: render.Rect) Instance {
-    return .{ .destination = rectFloats(destination), .source = rectFloats(source), .clip = rectFloats(destination), .color = .{ 1, 1, 1, 1 }, .rounded = .{ 0, 0, 0, 0 }, .parameters = .{ 0, 0, 0, 0 } };
+    return .{ .destination = rectFloats(destination), .source = rectFloats(source), .clip = rectFloats(destination), .color = .{ 1, 1, 1, 1 }, .rounded = .{ 0, 0, 0, 0 }, .parameters = .{ 0, 0, 0, 1 } };
 }
 
 fn upsampleInstance(destination: render.Rect) Instance {
@@ -4032,7 +4033,7 @@ fn upsampleInstance(destination: render.Rect) Instance {
         .clip = destination_floats,
         .color = .{ 1, 1, 1, 1 },
         .rounded = .{ 0, 0, 0, 0 },
-        .parameters = .{ 0, 0, 0, 0 },
+        .parameters = .{ 0, 0, 0, 1 },
     };
 }
 
@@ -5269,6 +5270,35 @@ test "Vulkan renderer blends premultiplied alpha" {
     }, .{ .pixels = .{ .size = size, .stride_pixels = 1, .pixels = &pixel } });
 
     try std.testing.expectEqual(@as(u32, 0xff40803f), pixel[0]);
+}
+
+test "Vulkan renderer applies image alpha multiplier" {
+    var renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
+        error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+
+    const size: render.Size = .{ .width = 1, .height = 1 };
+    var source = [_]u32{0xffff0000};
+    var target = [_]u32{0};
+    const commands = [_]render.Command{
+        .{ .clear = render.Color.rgba(0, 0, 255, 255) },
+        .{ .image = .{
+            .x = 0,
+            .y = 0,
+            .size = size,
+            .buffer = .{ .size = size, .stride_pixels = 1, .pixels = &source },
+            .alpha_multiplier = 0x8000_0000,
+        } },
+    };
+    try renderer.renderFrame(.{ .size = size, .commands = &commands }, .{ .pixels = .{
+        .size = size,
+        .stride_pixels = 1,
+        .pixels = &target,
+    } });
+
+    try std.testing.expectEqual(@as(u32, 0xff80007f), target[0]);
 }
 
 test "Vulkan renderer uploads cached image content only for a new version" {

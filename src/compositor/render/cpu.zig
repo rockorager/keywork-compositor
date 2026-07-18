@@ -645,11 +645,15 @@ fn compositePixels(
     if (image.rounded_clip) |clip| clipped = clipped.intersection(clip.rect) orelse return;
     const source_x: i32 = clipped.x - image.x;
     const source_y: i32 = clipped.y - image.y;
-    const mask = if (image.rounded_clip) |clip|
-        try createRoundedMask(
+    const mask = if (image.rounded_clip) |clip| rounded: {
+        const rounded_mask = try createRoundedMask(
             .{ .width = clip.rect.width, .height = clip.rect.height },
             clip.radius,
-        )
+        );
+        scaleMask(rounded_mask, image.alpha_multiplier);
+        break :rounded rounded_mask;
+    } else if (image.alpha_multiplier != std.math.maxInt(u32))
+        try createAlphaMask(image.alpha_multiplier)
     else
         null;
     defer if (mask) |rounded_mask| {
@@ -669,6 +673,23 @@ fn compositePixels(
         @intCast(clipped.width),
         @intCast(clipped.height),
     );
+}
+
+fn createAlphaMask(factor: u32) Error!*pixman.pixman_image_t {
+    const alpha: u16 = @intCast((@as(u64, factor) * std.math.maxInt(u16) + std.math.maxInt(u32) / 2) / std.math.maxInt(u32));
+    const color: pixman.pixman_color_t = .{ .red = 0, .green = 0, .blue = 0, .alpha = alpha };
+    return pixman.pixman_image_create_solid_fill(&color) orelse error.OutOfMemory;
+}
+
+fn scaleMask(mask: *pixman.pixman_image_t, factor: u32) void {
+    if (factor == std.math.maxInt(u32)) return;
+    const data: [*]u8 = @ptrCast(pixman.pixman_image_get_data(mask));
+    const stride: usize = @intCast(pixman.pixman_image_get_stride(mask));
+    const width: usize = @intCast(pixman.pixman_image_get_width(mask));
+    const height: usize = @intCast(pixman.pixman_image_get_height(mask));
+    for (0..height) |y| for (data[y * stride ..][0..width]) |*value| {
+        value.* = @intCast((@as(u64, value.*) * factor + std.math.maxInt(u32) / 2) / std.math.maxInt(u32));
+    };
 }
 
 fn sourceTransform(
@@ -1085,6 +1106,40 @@ test "CPU renderer clips image corners with an antialiased mask" {
     const corner_alpha: u8 = @truncate(output.pixel(0, 0) >> 24);
     try std.testing.expect(corner_alpha > 0 and corner_alpha < 255);
     try std.testing.expectEqual(@as(u32, 0xffffffff), output.pixel(1, 1));
+}
+
+test "CPU renderer applies alpha multiplier to premultiplied and opaque pixels" {
+    const size: render_types.Size = .{ .width = 1, .height = 1 };
+    var output = try headless.init(std.testing.allocator, size);
+    defer output.deinit();
+    var renderer = Self.init(std.testing.allocator);
+    defer renderer.deinit();
+
+    var source = [_]u32{0xffff0000};
+    const image: render_types.Image = .{
+        .x = 0,
+        .y = 0,
+        .size = size,
+        .buffer = .{ .size = size, .stride_pixels = 1, .pixels = &source },
+        .alpha_multiplier = 0x8000_0000,
+    };
+    const commands = [_]render_types.Command{
+        .{ .clear = render_types.Color.rgba(0, 0, 255, 255) },
+        .{ .image = image },
+    };
+    try renderer.render(.{ .size = size, .commands = &commands }, output.target());
+    try std.testing.expectEqual(@as(u32, 0xff80007f), output.pixel(0, 0));
+
+    source[0] = 0x80400000;
+    output.target().pixels[0] = 0;
+    try renderer.render(.{ .size = size, .commands = &.{.{ .image = image }} }, output.target());
+    try std.testing.expectEqual(@as(u32, 0x40200000), output.pixel(0, 0));
+
+    var zero = image;
+    zero.alpha_multiplier = 0;
+    output.target().pixels[0] = 0xff123456;
+    try renderer.render(.{ .size = size, .commands = &.{.{ .image = zero }} }, output.target());
+    try std.testing.expectEqual(@as(u32, 0xff123456), output.pixel(0, 0));
 }
 
 test "CPU renderer positions rounded clips independently from images" {

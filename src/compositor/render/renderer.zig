@@ -204,6 +204,7 @@ pub const Renderer = struct {
             else => return null,
         };
         if (!image.is_opaque) return null;
+        if (image.alpha_multiplier != std.math.maxInt(u32)) return null;
         if (image.x != 0 or image.y != 0) return null;
         if (!std.meta.eql(image.size, active.target.size())) return null;
         if (image.source != null or image.transform != .normal or
@@ -312,6 +313,7 @@ fn translateCommand(
             .source = image.source,
             .transform = image.transform,
             .is_opaque = image.is_opaque,
+            .alpha_multiplier = image.alpha_multiplier,
             .rounded_clip = if (image.rounded_clip) |clip| .{
                 .rect = translateRect(clip.rect, origin),
                 .radius = clip.radius,
@@ -382,6 +384,7 @@ fn scaleCommand(command: render_types.Command, scale: render_types.Scale) render
                 .source = image.source,
                 .transform = image.transform,
                 .is_opaque = image.is_opaque,
+                .alpha_multiplier = image.alpha_multiplier,
                 .rounded_clip = if (image.rounded_clip) |clip| .{
                     .rect = scaleRect(clip.rect, scale),
                     .radius = scaleUnsigned(clip.radius, scale),
@@ -574,6 +577,16 @@ test "direct scanout candidate requires a final exact opaque DMA-BUF image" {
     transparent_commands[1].image.is_opaque = false;
     try renderer.beginFrame(target, .{}, .{}, null);
     try renderer.append(&transparent_commands);
+    try std.testing.expectEqual(
+        @as(?render_types.PixelBuffer, null),
+        renderer.directScanoutCandidate(),
+    );
+    renderer.cancelFrame();
+
+    var alpha_commands = direct_commands;
+    alpha_commands[1].image.alpha_multiplier = 0x8000_0000;
+    try renderer.beginFrame(target, .{}, .{}, null);
+    try renderer.append(&alpha_commands);
     try std.testing.expectEqual(
         @as(?render_types.PixelBuffer, null),
         renderer.directScanoutCandidate(),

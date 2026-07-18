@@ -27,6 +27,7 @@ role_handler: ?RoleHandler,
 viewport_handler: ?ViewportHandler,
 content_type_handler: ?ContentTypeHandler,
 color_representation_handler: ?ColorRepresentationHandler,
+alpha_modifier_handler: ?AlphaModifierHandler,
 tearing_control_handler: ?TearingControlHandler,
 fifo_handler: ?FifoHandler,
 commit_timer_handler: ?CommitTimerHandler,
@@ -53,6 +54,8 @@ pub const State = struct {
     current_content_type: ContentType,
     pending_color_representation: ColorRepresentationState,
     current_color_representation: ColorRepresentationState,
+    pending_alpha_multiplier: u32,
+    current_alpha_multiplier: u32,
     pending_presentation_hint: PresentationHint,
     current_presentation_hint: PresentationHint,
     pending_fifo_set: bool,
@@ -105,6 +108,8 @@ pub const State = struct {
             .current_content_type = .none,
             .pending_color_representation = .{},
             .current_color_representation = .{},
+            .pending_alpha_multiplier = std.math.maxInt(u32),
+            .current_alpha_multiplier = std.math.maxInt(u32),
             .pending_presentation_hint = .vsync,
             .current_presentation_hint = .vsync,
             .pending_fifo_set = false,
@@ -198,6 +203,7 @@ pub fn create(
         .viewport_handler = null,
         .content_type_handler = null,
         .color_representation_handler = null,
+        .alpha_modifier_handler = null,
         .tearing_control_handler = null,
         .fifo_handler = null,
         .commit_timer_handler = null,
@@ -347,6 +353,32 @@ pub fn pendingColorRepresentation(self: *Self) ColorRepresentationState {
 pub fn currentColorRepresentation(store: *Store, id: Id) ?ColorRepresentationState {
     const surface_state = store.get(id) orelse return null;
     return surface_state.current_color_representation;
+}
+
+pub const AlphaModifierHandler = struct {
+    context: *anyopaque,
+    surface_destroyed: *const fn (*anyopaque) void,
+};
+
+pub fn setAlphaModifierHandler(self: *Self, handler: AlphaModifierHandler) error{AlreadyExists}!void {
+    if (self.alpha_modifier_handler != null) return error.AlreadyExists;
+    self.alpha_modifier_handler = handler;
+}
+
+pub fn clearAlphaModifierHandler(self: *Self, context: *anyopaque) void {
+    const handler = self.alpha_modifier_handler orelse unreachable;
+    std.debug.assert(handler.context == context);
+    self.alpha_modifier_handler = null;
+    self.state().pending_alpha_multiplier = std.math.maxInt(u32);
+}
+
+pub fn setPendingAlphaMultiplier(self: *Self, factor: u32) void {
+    std.debug.assert(self.alpha_modifier_handler != null);
+    self.state().pending_alpha_multiplier = factor;
+}
+
+pub fn currentAlphaMultiplier(store: *Store, id: Id) ?u32 {
+    return (store.get(id) orelse return null).current_alpha_multiplier;
 }
 
 pub const PresentationHint = wp.TearingControlV1.PresentationHint;
@@ -549,6 +581,7 @@ const CachedCommit = struct {
     viewport: ViewportState,
     content_type: ContentType,
     color_representation: ColorRepresentationState,
+    alpha_multiplier: u32,
     presentation_hint: PresentationHint,
     blur_region: Region,
     blur_region_changed: bool,
@@ -1216,6 +1249,8 @@ fn applyPending(self: *Self, commit_info: CommitInfo) void {
     surface_state.current_viewport = surface_state.pending_viewport;
     surface_state.current_content_type = surface_state.pending_content_type;
     surface_state.current_color_representation = surface_state.pending_color_representation;
+    const alpha_changed = surface_state.current_alpha_multiplier != surface_state.pending_alpha_multiplier;
+    surface_state.current_alpha_multiplier = surface_state.pending_alpha_multiplier;
     surface_state.current_presentation_hint = surface_state.pending_presentation_hint;
     surface_state.current_offset_x = surface_state.pending_offset_x;
     surface_state.current_offset_y = surface_state.pending_offset_y;
@@ -1226,6 +1261,7 @@ fn applyPending(self: *Self, commit_info: CommitInfo) void {
         &surface_state.pending_buffer_damage,
         offset_changed,
     );
+    if (alpha_changed) surface_state.current_damage_precise = false;
     if (surface_state.pending_blur_region_changed) {
         surface_state.current_damage_precise = false;
     }
@@ -1311,6 +1347,7 @@ fn cachePending(self: *Self, role_ready: bool) bool {
         .viewport = surface_state.pending_viewport,
         .content_type = surface_state.pending_content_type,
         .color_representation = surface_state.pending_color_representation,
+        .alpha_multiplier = surface_state.pending_alpha_multiplier,
         .presentation_hint = surface_state.pending_presentation_hint,
         .blur_region = Region.init(),
         .blur_region_changed = surface_state.pending_blur_region_changed,
@@ -1434,6 +1471,8 @@ fn applyCached(self: *Self, cached: *CachedCommit) void {
     surface_state.current_viewport = cached.viewport;
     surface_state.current_content_type = cached.content_type;
     surface_state.current_color_representation = cached.color_representation;
+    const alpha_changed = surface_state.current_alpha_multiplier != cached.alpha_multiplier;
+    surface_state.current_alpha_multiplier = cached.alpha_multiplier;
     surface_state.current_presentation_hint = cached.presentation_hint;
     surface_state.current_offset_x = cached.offset_x;
     surface_state.current_offset_y = cached.offset_y;
@@ -1444,6 +1483,7 @@ fn applyCached(self: *Self, cached: *CachedCommit) void {
         &cached.buffer_damage,
         offset_changed,
     );
+    if (alpha_changed) surface_state.current_damage_precise = false;
     if (cached.blur_region_changed) surface_state.current_damage_precise = false;
     applyFifoSet(surface_state, cached.fifo_set);
     if (surface_state.presentation_output != null) surface_state.commit_after_submission = true;
@@ -1647,6 +1687,10 @@ fn handleDestroy(_: *wl.Surface, self: *Self) void {
     }
     if (self.color_representation_handler) |handler| {
         self.color_representation_handler = null;
+        handler.surface_destroyed(handler.context);
+    }
+    if (self.alpha_modifier_handler) |handler| {
+        self.alpha_modifier_handler = null;
         handler.surface_destroyed(handler.context);
     }
     if (self.tearing_control_handler) |handler| {
@@ -2819,6 +2863,7 @@ fn testCachedCommit(
         .transform = .normal,
         .viewport = .{},
         .content_type = .none,
+        .alpha_multiplier = std.math.maxInt(u32),
         .color_representation = .{},
         .presentation_hint = .vsync,
         .blur_region = Region.init(),
@@ -2873,6 +2918,7 @@ test "commit timing preserves synchronized and ordered application" {
         .viewport_handler = null,
         .content_type_handler = null,
         .color_representation_handler = null,
+        .alpha_modifier_handler = null,
         .tearing_control_handler = null,
         .fifo_handler = null,
         .commit_timer_handler = null,
@@ -2920,6 +2966,7 @@ test "commit timing moves a pending target to exactly one cached commit" {
         .viewport_handler = null,
         .content_type_handler = null,
         .color_representation_handler = null,
+        .alpha_modifier_handler = null,
         .tearing_control_handler = null,
         .fifo_handler = null,
         .commit_timer_handler = null,
@@ -2962,6 +3009,7 @@ test "synchronized application ignores FIFO waits while desynchronized applicati
         .viewport_handler = null,
         .content_type_handler = null,
         .color_representation_handler = null,
+        .alpha_modifier_handler = null,
         .tearing_control_handler = null,
         .fifo_handler = null,
         .commit_timer_handler = null,
@@ -2996,6 +3044,7 @@ test "synchronized application ignores FIFO waits while desynchronized applicati
         .viewport = .{},
         .content_type = .none,
         .color_representation = .{},
+        .alpha_multiplier = std.math.maxInt(u32),
         .presentation_hint = .vsync,
         .blur_region = Region.init(),
         .blur_region_changed = false,

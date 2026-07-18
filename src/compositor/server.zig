@@ -17,6 +17,7 @@ const SinglePixelBuffer = @import("wayland/single_pixel_buffer.zig");
 const ContentType = @import("wayland/content_type.zig");
 const ColorManagement = @import("wayland/color_management.zig");
 const ColorRepresentation = @import("wayland/color_representation.zig");
+const AlphaModifier = @import("wayland/alpha_modifier.zig");
 const BackgroundEffect = @import("wayland/background_effect.zig");
 const SecurityContext = @import("wayland/security_context.zig");
 const SessionLock = @import("wayland/session_lock.zig");
@@ -123,6 +124,7 @@ single_pixel_buffer: SinglePixelBuffer,
 content_type: ContentType,
 color_management: ColorManagement,
 color_representation: ColorRepresentation,
+alpha_modifier: AlphaModifier,
 background_effect: BackgroundEffect,
 security_context: SecurityContext,
 session_lock: SessionLock,
@@ -703,6 +705,7 @@ pub fn createWithVirtualOutput(
         .content_type = undefined,
         .color_management = undefined,
         .color_representation = undefined,
+        .alpha_modifier = undefined,
         .background_effect = undefined,
         .security_context = undefined,
         .session_lock = undefined,
@@ -831,6 +834,8 @@ pub fn createWithVirtualOutput(
     errdefer self.color_management.deinit();
     try self.color_representation.init(allocator, display);
     errdefer self.color_representation.deinit();
+    try self.alpha_modifier.init(allocator, display);
+    errdefer self.alpha_modifier.deinit();
     try self.seat.init(allocator, io, display, "default", self.compositor.surfaceStore());
     errdefer self.seat.deinit();
     try self.transient_seat.init(
@@ -1517,6 +1522,7 @@ pub fn destroy(self: *Self) void {
     while (render_outputs.next()) |entry| {
         std.debug.assert(self.removeRenderOutput(entry.id));
     }
+    self.alpha_modifier.deinit();
     self.color_representation.deinit();
     self.color_management.deinit();
     self.outputs.deinit();
@@ -6016,8 +6022,7 @@ fn expandBackdropBlurDamage(
         while (surface_iterator.next()) |surface_entry| {
             const region = Surface.currentBlurRegion(surfaces, surface_entry.id) orelse continue;
             const buffer = Surface.currentBuffer(surfaces, surface_entry.id) orelse continue;
-            if (buffer.force_opaque or
-                Surface.currentOpaqueCoversBuffer(surfaces, surface_entry.id)) continue;
+            if (surfaceFullyOpaque(surfaces, surface_entry.id, buffer)) continue;
             const root = self.subcompositor.rootSurface(surface_entry.id);
             if (!self.scene.surfaceMapped(root)) continue;
             const root_position = self.scene.surfacePosition(root) orelse continue;
@@ -6315,9 +6320,7 @@ fn hasBackgroundEffect(self: *Self) bool {
     while (iterator.next()) |entry| {
         if (Surface.currentBlurRegion(surfaces, entry.id) == null) continue;
         const buffer = Surface.currentBuffer(surfaces, entry.id) orelse continue;
-        if (!buffer.force_opaque and !Surface.currentOpaqueCoversBuffer(surfaces, entry.id)) {
-            return true;
-        }
+        if (!surfaceFullyOpaque(surfaces, entry.id, buffer)) return true;
     }
     return false;
 }
@@ -6790,6 +6793,10 @@ fn renderSurfaceTree(
                 clip,
             );
             const pixel_buffer = buffer.pixelBuffer();
+            const alpha_multiplier = Surface.currentAlphaMultiplier(
+                self.compositor.surfaceStore(),
+                surface_id,
+            ) orelse std.math.maxInt(u32);
             const image_command = [_]render.Command{
                 .{ .image = .{
                     .x = x,
@@ -6800,11 +6807,12 @@ fn renderSurfaceTree(
                     .transform = renderBufferTransform(buffer.transform),
                     .rounded_clip = rounded_clip,
                     .clip = clip,
-                    .is_opaque = buffer.force_opaque or
-                        Surface.currentOpaqueCoversBuffer(
-                            self.compositor.surfaceStore(),
-                            surface_id,
-                        ),
+                    .is_opaque = surfaceFullyOpaque(
+                        self.compositor.surfaceStore(),
+                        surface_id,
+                        buffer,
+                    ),
+                    .alpha_multiplier = alpha_multiplier,
                 } },
             };
             try self.renderCommands(frame, &image_command);
@@ -6833,7 +6841,7 @@ fn renderSurfaceBackgroundEffect(
     const blur = Scene.background_blur;
     const surfaces = self.compositor.surfaceStore();
     const buffer = Surface.currentBuffer(surfaces, surface_id) orelse return;
-    if (buffer.force_opaque or Surface.currentOpaqueCoversBuffer(surfaces, surface_id)) return;
+    if (surfaceFullyOpaque(surfaces, surface_id, buffer)) return;
     const region = Surface.currentBlurRegion(surfaces, surface_id) orelse return;
     var rectangles = region.rectangleIterator();
     while (rectangles.next()) |rectangle| {
@@ -6853,6 +6861,15 @@ fn renderSurfaceBackgroundEffect(
         } }};
         try self.renderCommands(frame, &command);
     }
+}
+
+fn surfaceFullyOpaque(
+    surfaces: *Surface.Store,
+    surface_id: Surface.Id,
+    buffer: *const Surface.BufferSnapshot,
+) bool {
+    return Surface.currentAlphaMultiplier(surfaces, surface_id) == std.math.maxInt(u32) and
+        (buffer.force_opaque or Surface.currentOpaqueCoversBuffer(surfaces, surface_id));
 }
 
 fn surfaceEffectRect(rectangle: Region.Rectangle, size: render.Size) ?render.Rect {

@@ -211,6 +211,7 @@ pub const Image = struct {
     rounded_clip: ?RoundedClip = null,
     clip: ?Rect = null,
     is_opaque: bool = false,
+    alpha_multiplier: u32 = std.math.maxInt(u32),
 };
 
 pub fn shadowBlurExtent(blur_radius: u32) u32 {
