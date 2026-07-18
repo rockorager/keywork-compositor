@@ -1,5 +1,10 @@
 [Unit]
 Description=Keywork graphical session
-BindsTo=keywork-compositor.service graphical-session.target
-After=keywork-compositor.service graphical-session.target
+BindsTo=graphical-session.target
+Wants=graphical-session-pre.target
+After=graphical-session-pre.target
+
 Wants=keywork-shell.service
+
+Wants=xdg-desktop-autostart.target
+Before=xdg-desktop-autostart.target

@@ -41,6 +41,7 @@ pub const Executor = struct {
     context: *anyopaque,
     execute: *const fn (*anyopaque, command.Command) void,
     reload: *const fn (*anyopaque) anyerror!void,
+    quit: *const fn (*anyopaque) void,
 };
 
 const Direction = control.Direction;
@@ -200,6 +201,7 @@ const Client = struct {
     input: std.ArrayList(u8) = .empty,
     output: std.ArrayList(u8) = .empty,
     output_offset: usize = 0,
+    quit_after_write: bool = false,
 
     fn create(owner: *Self, fd: std.posix.fd_t) !void {
         const self = try owner.allocator.create(Client);
@@ -258,7 +260,12 @@ const Client = struct {
                     self.owner.executor,
                     &self.input,
                     &self.output,
+                    &self.quit_after_write,
                 ) catch return false;
+                if (self.quit_after_write and self.output_offset == self.output.items.len) {
+                    self.owner.executor.quit(self.owner.executor.context);
+                    return false;
+                }
                 continue;
             }
             if (result == 0) return false;
@@ -287,6 +294,10 @@ const Client = struct {
         }
         self.output.clearRetainingCapacity();
         self.output_offset = 0;
+        if (self.quit_after_write) {
+            self.owner.executor.quit(self.owner.executor.context);
+            return false;
+        }
         return self.updateMask();
     }
 
@@ -306,9 +317,13 @@ fn processInput(
     executor: Executor,
     input: *std.ArrayList(u8),
     output: *std.ArrayList(u8),
+    quit_requested: *bool,
 ) !void {
     var frames: varlink.FrameIterator = .init(input.items);
-    while (try frames.next()) |message| try handleMessage(allocator, executor, message, output);
+    while (try frames.next()) |message| {
+        try handleMessage(allocator, executor, message, output, quit_requested);
+        if (quit_requested.*) break;
+    }
     const consumed = frames.consumed();
     if (consumed == 0) return;
     const remaining = input.items[consumed..];
@@ -321,6 +336,7 @@ fn handleMessage(
     executor: Executor,
     message: []const u8,
     output: *std.ArrayList(u8),
+    quit_requested: *bool,
 ) !void {
     const parsed = try std.json.parseFromSlice(varlink.Call, allocator, message, .{
         .ignore_unknown_fields = true,
@@ -445,6 +461,15 @@ fn handleMessage(
         if (!call.oneway) try writeSuccess(allocator, output);
         return;
     }
+    if (std.mem.eql(u8, call.method, control.quit_method)) {
+        if (!emptyParameters(call.parameters)) {
+            if (!call.oneway) try writeInvalidParameter(allocator, output, "parameters");
+            return;
+        }
+        if (!call.oneway) try writeSuccess(allocator, output);
+        quit_requested.* = true;
+        return;
+    }
 
     if (!call.oneway) try writeMessage(allocator, output, .{
         .@"error" = service_interface_name ++ ".MethodNotFound",
@@ -538,13 +563,14 @@ const Recorder = struct {
     commands: std.ArrayList(command.Command) = .empty,
     reload_count: usize = 0,
     reload_error: ?anyerror = null,
+    quit_count: usize = 0,
 
     fn deinit(self: *Recorder) void {
         self.commands.deinit(std.testing.allocator);
     }
 
     fn executor(self: *Recorder) Executor {
-        return .{ .context = self, .execute = execute, .reload = reload };
+        return .{ .context = self, .execute = execute, .reload = reload, .quit = quit };
     }
 
     fn execute(context: *anyopaque, value: command.Command) void {
@@ -556,6 +582,11 @@ const Recorder = struct {
         const self: *Recorder = @ptrCast(@alignCast(context));
         self.reload_count += 1;
         if (self.reload_error) |err| return err;
+    }
+
+    fn quit(context: *anyopaque) void {
+        const self: *Recorder = @ptrCast(@alignCast(context));
+        self.quit_count += 1;
     }
 };
 
@@ -574,13 +605,14 @@ test "fragmented and coalesced calls execute typed commands in order" {
         \\{"method":"dev.rockorager.keywork.compositor.SwitchWorkspace","parameters":{"workspace":3}}
     ;
     try input.appendSlice(std.testing.allocator, focus[0..20]);
-    try processInput(std.testing.allocator, recorder.executor(), &input, &output);
+    var quit_requested = false;
+    try processInput(std.testing.allocator, recorder.executor(), &input, &output, &quit_requested);
     try std.testing.expectEqual(@as(usize, 0), recorder.commands.items.len);
     try input.appendSlice(std.testing.allocator, focus[20..]);
     try input.append(std.testing.allocator, 0);
     try input.appendSlice(std.testing.allocator, workspace);
     try input.append(std.testing.allocator, 0);
-    try processInput(std.testing.allocator, recorder.executor(), &input, &output);
+    try processInput(std.testing.allocator, recorder.executor(), &input, &output, &quit_requested);
 
     try std.testing.expectEqual(@as(usize, 2), recorder.commands.items.len);
     try std.testing.expect(std.meta.eql(
@@ -602,12 +634,14 @@ test "oneway calls suppress replies and invalid workspaces return typed errors" 
     defer recorder.deinit();
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(std.testing.allocator);
+    var quit_requested = false;
 
     try handleMessage(
         std.testing.allocator,
         recorder.executor(),
         "{\"method\":\"dev.rockorager.keywork.compositor.SetLayout\",\"parameters\":{\"layout\":\"dwindle\"},\"oneway\":true}",
         &output,
+        &quit_requested,
     );
     try std.testing.expectEqual(@as(usize, 1), recorder.commands.items.len);
     try std.testing.expectEqual(@as(usize, 0), output.items.len);
@@ -617,6 +651,7 @@ test "oneway calls suppress replies and invalid workspaces return typed errors" 
         recorder.executor(),
         "{\"method\":\"dev.rockorager.keywork.compositor.SwitchWorkspace\",\"parameters\":{\"workspace\":0}}",
         &output,
+        &quit_requested,
     );
     try std.testing.expectEqual(@as(usize, 1), recorder.commands.items.len);
     try std.testing.expectEqualStrings(
@@ -630,17 +665,18 @@ test "configuration reload returns success or a typed failure" {
     defer recorder.deinit();
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(std.testing.allocator);
+    var quit_requested = false;
 
     const call =
         \\{"method":"dev.rockorager.keywork.compositor.ReloadConfiguration","parameters":{}}
     ;
-    try handleMessage(std.testing.allocator, recorder.executor(), call, &output);
+    try handleMessage(std.testing.allocator, recorder.executor(), call, &output, &quit_requested);
     try std.testing.expectEqual(@as(usize, 1), recorder.reload_count);
     try std.testing.expectEqualStrings("{\"parameters\":{}}\x00", output.items);
 
     output.clearRetainingCapacity();
     recorder.reload_error = error.InvalidConfiguration;
-    try handleMessage(std.testing.allocator, recorder.executor(), call, &output);
+    try handleMessage(std.testing.allocator, recorder.executor(), call, &output, &quit_requested);
     try std.testing.expectEqual(@as(usize, 2), recorder.reload_count);
     try std.testing.expectEqualStrings(
         "{\"error\":\"dev.rockorager.keywork.compositor.ConfigurationReloadFailed\",\"parameters\":{}}\x00",
@@ -653,12 +689,14 @@ test "standard service introspection returns the control interface" {
     defer recorder.deinit();
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(std.testing.allocator);
+    var quit_requested = false;
 
     try handleMessage(
         std.testing.allocator,
         recorder.executor(),
         "{\"method\":\"org.varlink.service.GetInterfaceDescription\",\"parameters\":{\"interface\":\"dev.rockorager.keywork.compositor\"}}",
         &output,
+        &quit_requested,
     );
     const parsed = try std.json.parseFromSlice(
         struct { parameters: struct { description: []const u8 } },
@@ -668,4 +706,23 @@ test "standard service introspection returns the control interface" {
     );
     defer parsed.deinit();
     try std.testing.expectEqualStrings(interface_description, parsed.value.parameters.description);
+}
+
+test "quit is deferred until the caller's reply can be written" {
+    var recorder: Recorder = .{};
+    defer recorder.deinit();
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(std.testing.allocator);
+    var quit_requested = false;
+
+    try handleMessage(
+        std.testing.allocator,
+        recorder.executor(),
+        "{\"method\":\"dev.rockorager.keywork.compositor.Quit\",\"parameters\":{}}",
+        &output,
+        &quit_requested,
+    );
+    try std.testing.expect(quit_requested);
+    try std.testing.expectEqual(@as(usize, 0), recorder.quit_count);
+    try std.testing.expectEqualStrings("{\"parameters\":{}}\x00", output.items);
 }

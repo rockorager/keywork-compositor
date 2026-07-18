@@ -1,6 +1,6 @@
 [Desktop Entry]
 Name=Keywork
 Comment=Keywork Wayland desktop
-Exec=keywork-session
+Exec=keywork-compositor
 Type=Application
 DesktopNames=keywork

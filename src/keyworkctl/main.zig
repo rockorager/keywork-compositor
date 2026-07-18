@@ -10,7 +10,7 @@ const usage =
     \\
     \\commands: focus DIRECTION | move-focused DIRECTION | set-layout LAYOUT
     \\          switch-workspace WORKSPACE | move-focused-to-workspace WORKSPACE
-    \\          reload
+    \\          reload | quit
     \\directions: next, previous, left, down, up, right
     \\layouts: master-stack, dwindle, scrolling
     \\
@@ -23,6 +23,7 @@ const Command = union(enum) {
     switch_workspace: i64,
     move_to_workspace: i64,
     reload,
+    quit,
 };
 
 pub fn main(init: std.process.Init) void {
@@ -67,6 +68,13 @@ fn run(init: std.process.Init) !void {
     };
     var client = try varlink.Client.connect(init.gpa, init.io, address);
     defer client.deinit();
+    switch (command) {
+        .quit => {
+            try client.notify(control.quit_method, Empty{});
+            return;
+        },
+        else => {},
+    }
     var reply = switch (command) {
         .focus => |direction| try client.call(control.focus_method, .{ .direction = direction }),
         .move_focused => |direction| try client.call(control.move_focused_method, .{ .direction = direction }),
@@ -74,6 +82,7 @@ fn run(init: std.process.Init) !void {
         .switch_workspace => |workspace| try client.call(control.switch_workspace_method, .{ .workspace = workspace }),
         .move_to_workspace => |workspace| try client.call(control.move_focused_to_workspace_method, .{ .workspace = workspace }),
         .reload => try client.call(control.reload_configuration_method, Empty{}),
+        .quit => unreachable,
     };
     defer reply.deinit();
     if (reply.value.@"error") |name| {
@@ -96,6 +105,7 @@ fn printUsage(io: std.Io, err: anyerror) anyerror {
 
 fn parse(arguments: []const []const u8) !Command {
     if (arguments.len == 1 and std.mem.eql(u8, arguments[0], "reload")) return .reload;
+    if (arguments.len == 1 and std.mem.eql(u8, arguments[0], "quit")) return .quit;
     if (arguments.len != 2) return error.InvalidArguments;
     const name = arguments[0];
     const value = arguments[1];
@@ -131,6 +141,7 @@ test "CLI parsing maps wire values and validates workspaces" {
     try std.testing.expectEqual(control.Layout.master_stack, (try parse(&.{ "set-layout", "master-stack" })).set_layout);
     try std.testing.expectEqual(@as(i64, 10), (try parse(&.{ "switch-workspace", "10" })).switch_workspace);
     try std.testing.expectEqual(Command.reload, try parse(&.{"reload"}));
+    try std.testing.expectEqual(Command.quit, try parse(&.{"quit"}));
     try std.testing.expectError(error.InvalidWorkspace, parse(&.{ "switch-workspace", "11" }));
     try std.testing.expectError(error.InvalidDirection, parse(&.{ "focus", "sideways" }));
     try std.testing.expectError(error.UnknownCommand, parse(&.{ "unknown", "value" }));

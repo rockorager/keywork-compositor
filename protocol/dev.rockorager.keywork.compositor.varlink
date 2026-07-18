@@ -25,6 +25,9 @@ method MoveFocusedToWorkspace (workspace: int) -> ()
 # Parse and atomically apply the selected configuration.
 method ReloadConfiguration () -> ()
 
+# Shut down the Keywork graphical session.
+method Quit () -> ()
+
 # The requested workspace number is outside Keywork's supported range.
 error InvalidWorkspace (workspace: int)
 

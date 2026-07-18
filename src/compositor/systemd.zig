@@ -13,22 +13,49 @@ const current_desktop = "XDG_CURRENT_DESKTOP=keywork";
 const session_desktop = "XDG_SESSION_DESKTOP=keywork";
 const session_type = "XDG_SESSION_TYPE=wayland";
 const max_assignments = 6;
+const environment_names = [_][]const u8{
+    "WAYLAND_DISPLAY",
+    "DISPLAY",
+    "KEYWORK_CONTROL",
+    "XDG_CURRENT_DESKTOP",
+    "XDG_SESSION_DESKTOP",
+    "XDG_SESSION_TYPE",
+    "XCURSOR_SIZE",
+};
 
 io: std.Io,
+environ_map: *const std.process.Environ.Map,
 notify_enabled: bool,
 session_enabled: bool,
 
-pub fn init(io: std.Io, environ_map: *const std.process.Environ.Map) Self {
+pub fn init(
+    io: std.Io,
+    environ_map: *const std.process.Environ.Map,
+    session_enabled: bool,
+) Self {
     const notify_enabled = environ_map.get("NOTIFY_SOCKET") != null;
     return .{
         .io = io,
+        .environ_map = environ_map,
         .notify_enabled = notify_enabled,
-        .session_enabled = notify_enabled and std.mem.eql(
-            u8,
-            environ_map.get("KEYWORK_SYSTEMD_SESSION") orelse "",
-            "1",
-        ),
+        .session_enabled = session_enabled,
     };
+}
+
+pub fn prepare(self: *const Self) !void {
+    if (!self.session_enabled or self.notify_enabled) return;
+
+    if (!try self.run(&.{
+        "systemctl",
+        "--user",
+        "stop",
+        "keywork-session.target",
+        "graphical-session.target",
+    })) return error.StaleSessionStopFailed;
+    if (!try self.run(&.{ "systemctl", "--user", "reset-failed" })) {
+        return error.SystemdResetFailed;
+    }
+    self.clearActivationEnvironment();
 }
 
 pub fn ready(
@@ -66,9 +93,21 @@ pub fn ready(
         });
     }
 
-    if (!self.notify_enabled) return;
-    const notified = c.sd_notify(0, "READY=1");
-    if (notified <= 0) return error.NotifyFailed;
+    // Notify an external manager before starting targets which may be ordered
+    // after its compositor unit. This avoids waiting on our own readiness.
+    if (self.notify_enabled) {
+        const notified = c.sd_notify(0, "READY=1");
+        if (notified <= 0) return error.NotifyFailed;
+    }
+    // Session services connect to Wayland, so they cannot become ready until
+    // the compositor enters its event loop.
+    if (self.session_enabled and !try self.run(&.{
+        "systemctl",
+        "--user",
+        "--no-block",
+        "start",
+        "keywork-session.target",
+    })) return error.SessionTargetStartFailed;
 }
 
 pub fn publishDisplay(self: *const Self, display_name: []const u8) !void {
@@ -83,6 +122,61 @@ pub fn publishDisplay(self: *const Self, display_name: []const u8) !void {
     try self.updateActivationEnvironment(&.{display});
 }
 
+pub fn shutdown(self: *const Self) !void {
+    if (!self.session_enabled) return;
+
+    self.clearActivationEnvironment();
+    const stopped = if (self.notify_enabled)
+        try self.run(&.{
+            "systemctl",
+            "--user",
+            "--no-block",
+            "stop",
+            "keywork-session.target",
+            "graphical-session.target",
+        })
+    else
+        try self.run(&.{
+            "systemctl",
+            "--user",
+            "stop",
+            "keywork-session.target",
+            "graphical-session.target",
+        });
+    if (!stopped) return error.SessionTargetStopFailed;
+}
+
+fn clearActivationEnvironment(self: *const Self) void {
+    var systemctl_argv: [3 + environment_names.len][]const u8 = undefined;
+    systemctl_argv[0] = "systemctl";
+    systemctl_argv[1] = "--user";
+    systemctl_argv[2] = "unset-environment";
+    @memcpy(systemctl_argv[3..], &environment_names);
+    const cleared = self.run(&systemctl_argv) catch |err| failed: {
+        log.warn("could not clear the systemd activation environment: {t}", .{err});
+        break :failed false;
+    };
+    if (!cleared) log.warn("systemd activation environment cleanup failed", .{});
+
+    const empty_assignments = [_][]const u8{
+        "WAYLAND_DISPLAY=",
+        "DISPLAY=",
+        "KEYWORK_CONTROL=",
+        "XDG_CURRENT_DESKTOP=",
+        "XDG_SESSION_DESKTOP=",
+        "XDG_SESSION_TYPE=",
+        "XCURSOR_SIZE=",
+    };
+    var dbus_argv: [1 + empty_assignments.len][]const u8 = undefined;
+    dbus_argv[0] = "dbus-update-activation-environment";
+    @memcpy(dbus_argv[1..], &empty_assignments);
+    const dbus_cleared = self.run(&dbus_argv) catch |err| failed: {
+        log.warn("could not clear the D-Bus activation environment: {t}", .{err});
+        break :failed false;
+    };
+    if (!dbus_cleared) log.warn("D-Bus activation environment cleanup failed", .{});
+}
+
 fn updateActivationEnvironment(self: *const Self, assignments: []const []const u8) !void {
     std.debug.assert(assignments.len > 0 and assignments.len <= max_assignments);
 
@@ -91,14 +185,14 @@ fn updateActivationEnvironment(self: *const Self, assignments: []const []const u
     systemctl_argv[1] = "--user";
     systemctl_argv[2] = "set-environment";
     @memcpy(systemctl_argv[3 .. 3 + assignments.len], assignments);
-    if (!try run(self.io, systemctl_argv[0 .. 3 + assignments.len])) {
+    if (!try self.run(systemctl_argv[0 .. 3 + assignments.len])) {
         return error.SystemdEnvironmentUpdateFailed;
     }
 
     var dbus_argv: [1 + max_assignments][]const u8 = undefined;
     dbus_argv[0] = "dbus-update-activation-environment";
     @memcpy(dbus_argv[1 .. 1 + assignments.len], assignments);
-    const updated = run(self.io, dbus_argv[0 .. 1 + assignments.len]) catch |err| {
+    const updated = self.run(dbus_argv[0 .. 1 + assignments.len]) catch |err| {
         log.warn("could not update the D-Bus activation environment: {t}", .{err});
         return;
     };
@@ -108,35 +202,40 @@ fn updateActivationEnvironment(self: *const Self, assignments: []const []const u
     }
 }
 
-fn run(io: std.Io, argv: []const []const u8) !bool {
-    var child = try std.process.spawn(io, .{
+fn run(self: *const Self, argv: []const []const u8) !bool {
+    var child = try std.process.spawn(self.io, .{
         .argv = argv,
+        .environ_map = self.environ_map,
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .inherit,
     });
-    const term = try child.wait(io);
+    const term = try child.wait(self.io);
     return switch (term) {
         .exited => |status| status == 0,
         else => false,
     };
 }
 
-test "session publication requires notification and explicit ownership" {
+test "native output enables session publication independently of notification" {
     var environ_map = std.process.Environ.Map.init(std.testing.allocator);
     defer environ_map.deinit();
 
-    var systemd: Self = .init(std.testing.io, &environ_map);
+    var systemd: Self = .init(std.testing.io, &environ_map, false);
     try std.testing.expect(!systemd.notify_enabled);
     try std.testing.expect(!systemd.session_enabled);
 
     try environ_map.put("NOTIFY_SOCKET", "/run/notify");
-    systemd = .init(std.testing.io, &environ_map);
+    systemd = .init(std.testing.io, &environ_map, false);
     try std.testing.expect(systemd.notify_enabled);
     try std.testing.expect(!systemd.session_enabled);
 
-    try environ_map.put("KEYWORK_SYSTEMD_SESSION", "1");
-    systemd = .init(std.testing.io, &environ_map);
+    systemd = .init(std.testing.io, &environ_map, true);
     try std.testing.expect(systemd.notify_enabled);
+    try std.testing.expect(systemd.session_enabled);
+
+    _ = environ_map.swapRemove("NOTIFY_SOCKET");
+    systemd = .init(std.testing.io, &environ_map, true);
+    try std.testing.expect(!systemd.notify_enabled);
     try std.testing.expect(systemd.session_enabled);
 }

@@ -70,6 +70,21 @@ pub const Client = struct {
             .ignore_unknown_fields = true,
         });
     }
+
+    pub fn notify(self: *Client, method: []const u8, parameters: anytype) !void {
+        var request: std.ArrayList(u8) = .empty;
+        defer request.deinit(self.allocator);
+        try encode(self.allocator, &request, .{
+            .method = method,
+            .parameters = parameters,
+            .oneway = true,
+        }, maximum_message_size);
+
+        var write_buffer: [4096]u8 = undefined;
+        var stream_writer = self.stream.writer(self.io, &write_buffer);
+        try stream_writer.interface.writeAll(request.items);
+        try stream_writer.interface.flush();
+    }
 };
 
 pub const FrameIterator = struct {
@@ -127,5 +142,19 @@ test "encoding appends JSON and NUL within caller bound" {
     try std.testing.expectError(
         error.OutputTooLarge,
         encode(std.testing.allocator, &output, .{ .ok = true }, output.items.len + 1),
+    );
+}
+
+test "oneway calls encode without requiring a reply" {
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(std.testing.allocator);
+    try encode(std.testing.allocator, &output, .{
+        .method = "example.Quit",
+        .parameters = struct {}{},
+        .oneway = true,
+    }, 1024);
+    try std.testing.expectEqualStrings(
+        "{\"method\":\"example.Quit\",\"parameters\":{},\"oneway\":true}\x00",
+        output.items,
     );
 }

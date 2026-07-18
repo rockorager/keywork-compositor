@@ -17,16 +17,38 @@ pub fn main(init: std.process.Init) !void {
     defer arguments.deinit();
     _ = arguments.next();
     const explicit_config = try parseArguments(&arguments);
-    var launcher: Launcher = .init(init.gpa, init.io, init.environ_map);
-    defer launcher.deinit();
-    const renderer_kind: Renderer.Kind = if (init.environ_map.get("KEYWORK_RENDERER")) |value|
-        std.meta.stringToEnum(Renderer.Kind, value) orelse return error.InvalidRenderer
-    else
-        .cpu;
     const output_kind: OutputBackend.Kind = if (init.environ_map.get("KEYWORK_OUTPUT")) |value|
         std.meta.stringToEnum(OutputBackend.Kind, value) orelse return error.InvalidOutputBackend
     else
-        .headless;
+        .drm;
+    const renderer_kind: Renderer.Kind = if (init.environ_map.get("KEYWORK_RENDERER")) |value|
+        std.meta.stringToEnum(Renderer.Kind, value) orelse return error.InvalidRenderer
+    else if (output_kind == .drm)
+        .vulkan
+    else
+        .cpu;
+    const native_session = output_kind == .drm;
+    if (native_session) {
+        _ = init.environ_map.swapRemove("WAYLAND_DISPLAY");
+        _ = init.environ_map.swapRemove("DISPLAY");
+        _ = init.environ_map.swapRemove("KEYWORK_CONTROL");
+        try init.environ_map.put("XDG_CURRENT_DESKTOP", "keywork");
+        try init.environ_map.put("XDG_SESSION_DESKTOP", "keywork");
+        try init.environ_map.put("XDG_SESSION_TYPE", "wayland");
+    }
+    const session_lock = if (native_session)
+        try acquireSessionLock(
+            init.gpa,
+            init.io,
+            init.environ_map.get("XDG_RUNTIME_DIR") orelse return error.MissingRuntimeDirectory,
+        )
+    else
+        null;
+    defer if (session_lock) |file| file.close(init.io);
+    var systemd: Systemd = .init(init.io, init.environ_map, native_session);
+    try systemd.prepare();
+    var launcher: Launcher = .init(init.gpa, init.io, init.environ_map);
+    defer launcher.deinit();
     var virtual_output: Server.VirtualOutputConfig = .{};
     if (output_kind == .headless) {
         if (init.environ_map.get("KEYWORK_HEADLESS_SIZE")) |value| {
@@ -96,7 +118,6 @@ pub fn main(init: std.process.Init) !void {
     );
     try init.environ_map.put("KEYWORK_CONTROL", control_address);
     server.setLauncher(&launcher);
-    var systemd: Systemd = .init(init.io, init.environ_map);
     server.setXwaylandReadyListener(.{
         .context = &systemd,
         .ready = xwaylandReady,
@@ -109,9 +130,17 @@ pub fn main(init: std.process.Init) !void {
     );
     try writer.interface.flush();
     server.startXwayland(init.environ_map);
-    try systemd.ready(socket_name, control_address, init.environ_map.get("XCURSOR_SIZE").?);
+    systemd.ready(socket_name, control_address, init.environ_map.get("XCURSOR_SIZE").?) catch |err| {
+        systemd.shutdown() catch |shutdown_err| {
+            log.warn("failed to roll back graphical session startup: {t}", .{shutdown_err});
+        };
+        return err;
+    };
 
     server.run();
+    systemd.shutdown() catch |err| {
+        log.warn("failed to shut down the graphical session targets: {t}", .{err});
+    };
 }
 
 fn parseArguments(arguments: anytype) !?[]const u8 {
@@ -127,6 +156,20 @@ fn xwaylandReady(context: *anyopaque, display_name: []const u8) void {
     systemd.publishDisplay(display_name) catch |err| {
         log.warn("failed to publish DISPLAY to the activation environment: {t}", .{err});
     };
+}
+
+fn acquireSessionLock(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    runtime_directory: []const u8,
+) !std.Io.File {
+    if (!std.fs.path.isAbsolute(runtime_directory)) return error.InvalidRuntimeDirectory;
+    const path = try std.fs.path.join(allocator, &.{ runtime_directory, "keywork-compositor.lock" });
+    defer allocator.free(path);
+    return std.Io.Dir.createFileAbsolute(io, path, .{
+        .truncate = false,
+        .lock = .exclusive,
+    });
 }
 
 fn parseHeadlessSize(value: []const u8) !render.Size {

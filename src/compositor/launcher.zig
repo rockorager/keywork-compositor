@@ -29,6 +29,10 @@ const StartTransientParameters = struct {
 
     const Context = struct {
         ID: []const u8,
+        PartOf: []const []const u8,
+        Requisite: []const []const u8,
+        After: []const []const u8,
+        CollectMode: enum { inactive_or_failed } = .inactive_or_failed,
         Service: Service,
     };
 
@@ -175,9 +179,13 @@ fn launchWithVarlink(self: *Self, argv: []const []const u8) !void {
         .path = resolved_executable orelse argv[0],
         .arguments = argv,
     }};
+    const session_target = [_][]const u8{"graphical-session.target"};
     var reply = try self.client.?.call(start_transient_method, StartTransientParameters{
         .context = .{
             .ID = unit_name,
+            .PartOf = &session_target,
+            .Requisite = &session_target,
+            .After = &session_target,
             .Service = .{ .ExecStart = &commands },
         },
     });
@@ -196,7 +204,16 @@ fn launchWithVarlink(self: *Self, argv: []const []const u8) !void {
 }
 
 fn launchWithSystemdRun(self: *Self, argv: []const []const u8) !void {
-    const prefix = [_][]const u8{ "systemd-run", "--user", "--collect", "--" };
+    const prefix = [_][]const u8{
+        "systemd-run",
+        "--user",
+        "--collect",
+        "--slice=app.slice",
+        "--property=PartOf=graphical-session.target",
+        "--property=Requisite=graphical-session.target",
+        "--property=After=graphical-session.target",
+        "--",
+    };
     const child_argv = try self.allocator.alloc([]const u8, prefix.len + argv.len);
     defer self.allocator.free(child_argv);
     @memcpy(child_argv[0..prefix.len], &prefix);
@@ -265,7 +282,8 @@ fn resolveExecutable(
 fn unsupportedError(name: []const u8) bool {
     return std.mem.eql(u8, name, "org.varlink.service.InterfaceNotFound") or
         std.mem.eql(u8, name, "org.varlink.service.MethodNotFound") or
-        std.mem.eql(u8, name, "org.varlink.service.MethodNotImplemented");
+        std.mem.eql(u8, name, "org.varlink.service.MethodNotImplemented") or
+        std.mem.eql(u8, name, "io.systemd.Unit.PropertyNotSupported");
 }
 
 pub fn validateArgv(argv: []const []const u8) !void {
@@ -290,6 +308,7 @@ test "launcher accepts absolute and search-path executables only" {
 
 test "only capability errors permit an unambiguous fallback" {
     try std.testing.expect(unsupportedError("org.varlink.service.MethodNotFound"));
+    try std.testing.expect(unsupportedError("io.systemd.Unit.PropertyNotSupported"));
     try std.testing.expect(!unsupportedError("io.systemd.Unit.UnitExists"));
     try std.testing.expect(!unsupportedError("org.varlink.service.InvalidParameter"));
 }

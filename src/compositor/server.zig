@@ -1585,6 +1585,7 @@ pub fn listenControl(self: *Self, runtime_directory: []const u8) ![]const u8 {
             .context = self,
             .execute = executeControlCommand,
             .reload = reloadControlConfiguration,
+            .quit = quitControlSession,
         },
         runtime_directory,
     );
@@ -1600,6 +1601,11 @@ fn executeControlCommand(context: *anyopaque, command: Command) void {
 fn reloadControlConfiguration(context: *anyopaque) !void {
     const self: *Self = @ptrCast(@alignCast(context));
     try self.reloadConfiguration();
+}
+
+fn quitControlSession(context: *anyopaque) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.terminate();
 }
 
 pub fn setLauncher(self: *Self, launcher: *Launcher) void {
