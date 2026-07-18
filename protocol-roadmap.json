@@ -1237,16 +1237,17 @@
       "interfaces": [
         {
           "name": "wp_drm_lease_device_v1",
-          "current_version": null,
+          "current_version": 1,
           "target_version": 1
         }
       ],
-      "status": "not_started",
+      "status": "done",
       "privileged": true,
       "blocked_by": [
         "security-context",
         "wlr-output-management"
-      ]
+      ],
+      "status_detail": "Version 1 advertises the active DRM node and dynamic connector offers only to unrestricted clients, validates multi-connector requests and stale offer generations, and transfers leases containing each connector, CRTC, and primary plane. Granting disables compositor use of enabled outputs without allowing the last render output to be leased; client destruction, session suspension, connector withdrawal, kernel lease loss, and shutdown finish tracked leases, while released connectors receive fresh offers. Output-management changes are rejected while a head is leased. Unit and build validation pass; physical lease creation, VT switching, and unplug behavior remain hardware-dependent."
     },
     {
       "id": "color-management",

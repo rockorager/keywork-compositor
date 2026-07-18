@@ -35,6 +35,7 @@ gbm_device: ?Gbm,
 atomic: bool,
 active_outputs: std.ArrayList(*DrmOutput),
 retired_outputs: std.ArrayList(*DrmOutput),
+leases: std.ArrayList(LeaseTracking),
 listener: ?Listener,
 initialized: bool,
 failed: bool,
@@ -44,7 +45,23 @@ pub const Listener = struct {
     added: *const fn (*anyopaque, *DrmOutput) void,
     removing: *const fn (*anyopaque, *DrmOutput) void,
     failed: *const fn (*anyopaque) void,
+    activated: *const fn (*anyopaque) void = ignoreEvent,
+    deactivating: *const fn (*anyopaque) void = ignoreEvent,
+    lease_revoked: *const fn (*anyopaque, u32) void = ignoreLeaseRevoked,
 };
+
+pub const Lease = struct {
+    fd: std.posix.fd_t,
+    lessee_id: u32,
+};
+
+const LeaseTracking = struct {
+    lessee_id: u32,
+    connector_ids: []u32,
+};
+
+fn ignoreEvent(_: *anyopaque) void {}
+fn ignoreLeaseRevoked(_: *anyopaque, _: u32) void {}
 
 pub fn init(self: *Self, allocator: std.mem.Allocator, io: std.Io, event_loop: *wl.EventLoop, session: *Session, device_path: ?[]const u8) !void {
     const path = if (device_path) |value| try allocator.dupeSentinel(u8, value, 0) else null;
@@ -65,6 +82,7 @@ pub fn init(self: *Self, allocator: std.mem.Allocator, io: std.Io, event_loop: *
         .atomic = false,
         .active_outputs = .empty,
         .retired_outputs = .empty,
+        .leases = .empty,
         .listener = null,
         .initialized = false,
         .failed = false,
@@ -90,7 +108,11 @@ pub fn deinit(self: *Self) void {
     self.initialized = false;
     self.session.removeListener(&self.session_listener);
     self.deinitHotplugMonitor();
+    // Normally the protocol owner revokes first. This fallback prevents a
+    // still-active lessor from retaining leases during partial initialization.
+    while (self.leases.items.len > 0) self.revokeLease(self.leases.items[0].lessee_id);
     self.deactivate();
+    self.leases.deinit(self.allocator);
     self.destroyList(&self.active_outputs);
     self.active_outputs.deinit(self.allocator);
     self.retired_outputs.deinit(self.allocator);
@@ -108,6 +130,79 @@ pub fn deviceId(self: *const Self) ?render.DrmDeviceId {
         .major = @intCast(c.major(number)),
         .minor = @intCast(c.minor(number)),
     };
+}
+
+pub fn openNonMasterFd(self: *Self) !std.posix.fd_t {
+    if (self.failed or self.device == null or !self.session.isActive()) return error.SessionInactive;
+    const fd = try std.posix.openatZ(std.posix.AT.FDCWD, self.device_path.?, .{
+        .ACCMODE = .RDWR,
+        .CLOEXEC = true,
+    }, 0);
+    errdefer _ = std.c.close(fd);
+    if (c.drmIsMaster(fd) == 1 and c.drmDropMaster(fd) != 0) return error.DropMasterFailed;
+    return fd;
+}
+
+pub fn createLease(self: *Self, outputs_to_lease: []const *DrmOutput) !Lease {
+    if (self.failed or self.device == null or !self.session.isActive()) return error.SessionInactive;
+    if (outputs_to_lease.len == 0) return error.EmptyLease;
+
+    var objects: std.ArrayList(u32) = .empty;
+    defer objects.deinit(self.allocator);
+    const connector_ids = try self.allocator.alloc(u32, outputs_to_lease.len);
+    errdefer self.allocator.free(connector_ids);
+    for (outputs_to_lease, 0..) |output, index| {
+        if (self.findOutput(output.connector_id) != output) return error.UnknownOutput;
+        if (self.outputLeased(output)) return error.OutputAlreadyLeased;
+        for (connector_ids[0..index]) |id| if (id == output.connector_id) return error.DuplicateOutput;
+        const plane_id = output.primary_plane_id orelse return error.OutputNotLeaseable;
+        connector_ids[index] = output.connector_id;
+        for ([_]u32{ output.connector_id, output.crtc_id, plane_id }) |object_id| {
+            if (object_id == 0) return error.OutputNotLeaseable;
+            if (!containsId(objects.items, object_id)) try objects.append(self.allocator, object_id);
+        }
+    }
+    try self.leases.ensureUnusedCapacity(self.allocator, 1);
+    var lessee_id: u32 = 0;
+    const lease_fd = c.drmModeCreateLease(
+        self.device.?.fd,
+        objects.items.ptr,
+        @intCast(objects.items.len),
+        @bitCast(std.c.O{ .CLOEXEC = true }),
+        &lessee_id,
+    );
+    if (lease_fd < 0) return error.CreateLeaseFailed;
+    self.leases.appendAssumeCapacity(.{ .lessee_id = lessee_id, .connector_ids = connector_ids });
+    return .{ .fd = lease_fd, .lessee_id = lessee_id };
+}
+
+pub fn revokeLease(self: *Self, lessee_id: u32) void {
+    for (self.leases.items, 0..) |lease, index| if (lease.lessee_id == lessee_id) {
+        // The session deactivation callback runs after Session has cleared its
+        // active flag, but before this device fd is closed.
+        if (self.device != null and c.drmModeRevokeLease(self.device.?.fd, lessee_id) != 0) {
+            if (self.session.isActive()) {
+                log.err("failed to revoke DRM lease {d}", .{lessee_id});
+            } else {
+                log.debug("DRM lease {d} outlived session master access", .{lessee_id});
+            }
+        }
+        self.allocator.free(lease.connector_ids);
+        _ = self.leases.orderedRemove(index);
+        return;
+    };
+}
+
+pub fn outputLeased(self: *const Self, output: *const DrmOutput) bool {
+    for (self.leases.items) |lease| for (lease.connector_ids) |connector_id| {
+        if (connector_id == output.connector_id) return true;
+    };
+    return false;
+}
+
+fn containsId(ids: []const u32, sought: u32) bool {
+    for (ids) |id| if (id == sought) return true;
+    return false;
 }
 
 pub fn setOutputEnabled(self: *Self, output: *DrmOutput, enabled: bool) !void {
@@ -212,6 +307,7 @@ fn activate(self: *Self) !void {
         break :blk null;
     };
     log.info("opened DRM device {s}", .{self.device_path.?});
+    if (self.initialized) try self.refreshLeases();
     const selections = try DrmOutput.selectOutputs(
         self.allocator,
         device.fd,
@@ -241,6 +337,7 @@ fn activate(self: *Self) !void {
     while (index > 0) {
         index -= 1;
         const output = self.active_outputs.items[index];
+        if (self.outputLeased(output)) continue;
         var found = false;
         for (selections) |selection| if (selection.connector_id == output.connector_id) {
             found = true;
@@ -249,9 +346,11 @@ fn activate(self: *Self) !void {
         if (!found) self.removeAt(index, device.fd);
     }
     self.event_source = try self.event_loop.addFd(*Self, device.fd, .{ .readable = true }, handleDrmEvent, self);
+    if (self.initialized) if (self.listener) |listener| listener.activated(listener.context);
 }
 
 fn deactivate(self: *Self) void {
+    if (self.device != null) if (self.listener) |listener| listener.deactivating(listener.context);
     for (self.active_outputs.items) |output| output.notifyDeactivated();
     if (self.event_source) |source| {
         source.remove();
@@ -279,13 +378,20 @@ fn removeAt(self: *Self, index: usize, fd: std.posix.fd_t) void {
 
 fn reconcile(self: *Self) !void {
     const device = self.device.?;
+    // A revoked lessee returns its connector to the lessor's resource list.
+    // Update tracking first so a simultaneous unplug is not hidden.
+    try self.refreshLeases();
     const selections = try DrmOutput.selectOutputs(
         self.allocator,
         device.fd,
         self.active_outputs.items,
     );
     defer DrmOutput.deinitSelections(self.allocator, selections);
-    var topology_changed = selections.len != self.active_outputs.items.len;
+    var unleased_output_count: usize = 0;
+    for (self.active_outputs.items) |output| if (!self.outputLeased(output)) {
+        unleased_output_count += 1;
+    };
+    var topology_changed = selections.len != unleased_output_count;
     for (selections) |selection| {
         const output = self.findOutput(selection.connector_id) orelse {
             topology_changed = true;
@@ -316,12 +422,30 @@ fn reconcile(self: *Self) !void {
     while (index > 0) {
         index -= 1;
         const output = self.active_outputs.items[index];
+        if (self.outputLeased(output)) continue;
         var found = false;
         for (selections) |selection| if (selection.connector_id == output.connector_id) {
             found = true;
             break;
         };
         if (!found) self.removeAt(index, device.fd);
+    }
+}
+
+fn refreshLeases(self: *Self) !void {
+    const device = self.device orelse return error.SessionInactive;
+    const kernel_lessees = c.drmModeListLessees(device.fd) orelse return error.ListLesseesFailed;
+    defer c.drmFree(kernel_lessees);
+    const ids_ptr: [*]const u32 = @ptrFromInt(@intFromPtr(kernel_lessees) + @sizeOf(c.drmModeLesseeListRes));
+    const ids = ids_ptr[0..kernel_lessees.*.count];
+    var index = self.leases.items.len;
+    while (index > 0) {
+        index -= 1;
+        const lease = self.leases.items[index];
+        if (containsId(ids, lease.lessee_id)) continue;
+        self.allocator.free(lease.connector_ids);
+        _ = self.leases.orderedRemove(index);
+        if (self.listener) |listener| listener.lease_revoked(listener.context, lease.lessee_id);
     }
 }
 

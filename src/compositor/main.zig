@@ -461,6 +461,7 @@ test {
     _ = @import("wayland/content_type.zig");
     _ = @import("wayland/background_effect.zig");
     _ = @import("wayland/security_context.zig");
+    _ = @import("wayland/drm_lease.zig");
     _ = @import("wayland/session_lock.zig");
     _ = @import("wayland/cursor_shape.zig");
     _ = @import("wayland/tablet.zig");
