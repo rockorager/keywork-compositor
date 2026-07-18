@@ -227,9 +227,10 @@ pub fn present(
     self: *Self,
     damage: *const Region,
     render_fence_fd: ?std.posix.fd_t,
+    allow_tearing: bool,
 ) !?presentation.Info {
     return switch (self.backend) {
-        .drm => |output| output.present(damage, render_fence_fd),
+        .drm => |output| output.present(damage, render_fence_fd, allow_tearing),
         .headless => blk: {
             std.debug.assert(render_fence_fd == null);
             break :blk presentation.Info.now(self.io);
@@ -245,9 +246,10 @@ pub fn present(
 pub fn tryDirectScanout(
     self: *Self,
     buffer: render.PixelBuffer,
+    allow_tearing: bool,
 ) DirectScanoutResult {
     return switch (self.backend) {
-        .drm => |output| output.tryDirectScanout(buffer),
+        .drm => |output| output.tryDirectScanout(buffer, allow_tearing),
         .headless, .nested => .{},
     };
 }

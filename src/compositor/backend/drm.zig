@@ -52,6 +52,7 @@ atomic_plane: ?AtomicPlaneProperties,
 scanout_modifiers: []u64,
 implicit_scanout: bool,
 sync_file_import_supported: bool,
+async_page_flip_supported: bool,
 connector_name: [32]u8,
 connector_name_length: usize,
 make_value: [*c]u8,
@@ -68,6 +69,7 @@ pending: ?usize,
 displayed: ?usize,
 direct_pending: ?DirectScanout,
 direct_displayed: ?DirectScanout,
+pending_page_flip: ?PageFlipMode,
 direct_framebuffers: std.AutoHashMapUnmanaged(u64, DirectFramebuffer),
 direct_frame_number: u64,
 direct_scanout_active: bool,
@@ -105,6 +107,11 @@ const DirectScanout = struct {
     fn release(self: DirectScanout) void {
         self.source.release(self.source.context);
     }
+};
+
+const PageFlipMode = enum {
+    vsync,
+    async,
 };
 
 const AtomicPlaneProperties = struct {
@@ -224,6 +231,7 @@ pub fn init(
         .scanout_modifiers = &.{},
         .implicit_scanout = true,
         .sync_file_import_supported = true,
+        .async_page_flip_supported = false,
         .connector_name = undefined,
         .connector_name_length = 0,
         .make_value = null,
@@ -240,6 +248,7 @@ pub fn init(
         .displayed = null,
         .direct_pending = null,
         .direct_displayed = null,
+        .pending_page_flip = null,
         .direct_framebuffers = .empty,
         .direct_frame_number = 0,
         .direct_scanout_active = false,
@@ -370,6 +379,7 @@ pub fn present(
     self: *Self,
     frame_damage: *const Region,
     render_fence_fd: ?std.posix.fd_t,
+    allow_tearing: bool,
 ) !?presentation.Info {
     const index = self.acquired orelse return error.NoAcquiredBuffer;
     const fd = self.device_access.fd(self.device_access.context) orelse return error.SessionInactive;
@@ -426,8 +436,15 @@ pub fn present(
         };
     }
 
-    if (!self.queuePageFlip(fd, buffer.framebuffer_id, self.size, null)) return error.PageFlipFailed;
+    const page_flip = self.queuePageFlip(
+        fd,
+        buffer.framebuffer_id,
+        self.size,
+        null,
+        allow_tearing,
+    ) orelse return error.PageFlipFailed;
     self.pending = index;
+    self.pending_page_flip = page_flip;
     self.acquired = null;
     return null;
 }
@@ -466,7 +483,11 @@ fn waitSyncFile(sync_file_fd: std.posix.fd_t) !void {
     }
 }
 
-pub fn tryDirectScanout(self: *Self, buffer: render.PixelBuffer) DirectScanoutResult {
+pub fn tryDirectScanout(
+    self: *Self,
+    buffer: render.PixelBuffer,
+    allow_tearing: bool,
+) DirectScanoutResult {
     const source = buffer.dmabuf orelse return .{};
     const source_cache = buffer.source_cache orelse return .{};
     if (!self.mode_set or self.acquired == null or self.pending != null or
@@ -483,14 +504,21 @@ pub fn tryDirectScanout(self: *Self, buffer: render.PixelBuffer) DirectScanoutRe
     const framebuffer = self.directFramebuffer(fd, buffer) catch return .{};
 
     source.retain(source.context);
-    if (!self.queuePageFlip(fd, framebuffer.framebuffer_id, buffer.size, source)) {
+    const page_flip = self.queuePageFlip(
+        fd,
+        framebuffer.framebuffer_id,
+        buffer.size,
+        source,
+        allow_tearing,
+    ) orelse {
         source.release(source.context);
         return .{};
-    }
+    };
     self.direct_pending = .{
         .source = source,
         .cache_id = source_cache.id,
     };
+    self.pending_page_flip = page_flip;
     self.acquired = null;
     self.resetBufferDamage(self.size);
     return .{ .accepted = true };
@@ -534,6 +562,7 @@ pub fn activate(self: *Self, fd: std.posix.fd_t, selection: Selection, device_pa
     if (self.device_access.atomic(self.device_access.context) and self.atomic_plane == null) {
         log.warn("primary plane lacks required atomic properties; using legacy frame commits", .{});
     }
+    self.async_page_flip_supported = supportsAsyncPageFlips(fd, self.atomic_plane != null);
     self.retired = false;
     const connector_type = c.drmModeGetConnectorTypeName(selection.connector_type);
     const type_name = if (connector_type == null) "Unknown" else std.mem.span(connector_type);
@@ -660,9 +689,11 @@ pub fn disconnect(self: *Self, fd: std.posix.fd_t) void {
 fn release(self: *Self, fd: std.posix.fd_t) void {
     self.mode_set = false;
     self.atomic_plane = null;
+    self.async_page_flip_supported = false;
     self.acquired = null;
     self.pending = null;
     self.displayed = null;
+    self.pending_page_flip = null;
     self.releaseDirectScanouts();
     self.destroyDirectFramebuffers(fd);
     self.destroyPair(fd, &self.buffers, self.shadow_pixels);
@@ -775,6 +806,7 @@ pub fn notifyDeactivated(self: *Self) void {
 pub fn retire(self: *Self) void {
     self.retired = true;
     self.pending = null;
+    self.pending_page_flip = null;
 }
 
 pub fn dispatchEvent(_: *Self, fd: std.posix.fd_t) !void {
@@ -795,6 +827,11 @@ fn handlePageFlip(
         self.device_access.fail(self.device_access.context, error.UnexpectedPageFlip);
         return;
     }
+    const page_flip = self.pending_page_flip orelse {
+        self.device_access.fail(self.device_access.context, error.UnexpectedPageFlip);
+        return;
+    };
+    self.pending_page_flip = null;
     const zero_copy = self.direct_pending != null;
     if (self.direct_pending) |direct| {
         if (self.direct_displayed) |displayed| displayed.release();
@@ -818,7 +855,7 @@ fn handlePageFlip(
         .refresh_nanoseconds = self.refresh_nanoseconds,
         .sequence = sequence,
         .flags = .{
-            .vsync = true,
+            .vsync = page_flip == .vsync,
             .hardware_clock = true,
             .hardware_completion = true,
             .zero_copy = zero_copy,
@@ -1316,18 +1353,33 @@ fn queuePageFlip(
     framebuffer_id: u32,
     source_size: render.Size,
     source: ?render.DmabufSource,
-) bool {
-    const properties = self.atomic_plane orelse return c.drmModePageFlip(
-        fd,
-        self.crtc_id,
-        framebuffer_id,
-        c.DRM_MODE_PAGE_FLIP_EVENT,
-        self,
-    ) == 0;
-    const request = c.drmModeAtomicAlloc() orelse return false;
+    allow_tearing: bool,
+) ?PageFlipMode {
+    const preferred_mode: PageFlipMode = if (allow_tearing and self.async_page_flip_supported)
+        .async
+    else
+        .vsync;
+    const properties = self.atomic_plane orelse {
+        if (c.drmModePageFlip(
+            fd,
+            self.crtc_id,
+            framebuffer_id,
+            pageFlipFlags(preferred_mode),
+            self,
+        ) == 0) return preferred_mode;
+        if (preferred_mode == .async and c.drmModePageFlip(
+            fd,
+            self.crtc_id,
+            framebuffer_id,
+            pageFlipFlags(.vsync),
+            self,
+        ) == 0) return .vsync;
+        return null;
+    };
+    const request = c.drmModeAtomicAlloc() orelse return null;
     defer c.drmModeAtomicFree(request);
 
-    const plane_id = self.primary_plane_id orelse return false;
+    const plane_id = self.primary_plane_id orelse return null;
     if (!addAtomicProperty(request, plane_id, properties.fb_id, framebuffer_id) or
         !addAtomicProperty(request, plane_id, properties.crtc_id, self.crtc_id) or
         !addAtomicProperty(request, plane_id, properties.src_x, 0) or
@@ -1339,7 +1391,7 @@ fn queuePageFlip(
         !addAtomicProperty(request, plane_id, properties.crtc_w, self.size.width) or
         !addAtomicProperty(request, plane_id, properties.crtc_h, self.size.height))
     {
-        return false;
+        return null;
     }
 
     const fence_fd = if (properties.in_fence_fd != 0 and source != null)
@@ -1351,15 +1403,36 @@ fn queuePageFlip(
     }
     if (fence_fd) |value| {
         if (!addAtomicProperty(request, plane_id, properties.in_fence_fd, @bitCast(@as(i64, value)))) {
-            return false;
+            return null;
         }
     }
-    return c.drmModeAtomicCommit(
+    if (c.drmModeAtomicCommit(
         fd,
         request,
-        c.DRM_MODE_ATOMIC_NONBLOCK | c.DRM_MODE_PAGE_FLIP_EVENT,
+        @as(c_uint, @intCast(c.DRM_MODE_ATOMIC_NONBLOCK)) | pageFlipFlags(preferred_mode),
         self,
-    ) == 0;
+    ) == 0) return preferred_mode;
+    if (preferred_mode == .async and c.drmModeAtomicCommit(
+        fd,
+        request,
+        @as(c_uint, @intCast(c.DRM_MODE_ATOMIC_NONBLOCK)) | pageFlipFlags(.vsync),
+        self,
+    ) == 0) return .vsync;
+    return null;
+}
+
+fn supportsAsyncPageFlips(fd: std.posix.fd_t, atomic: bool) bool {
+    var capability: u64 = 0;
+    const capability_name = if (atomic)
+        c.DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP
+    else
+        c.DRM_CAP_ASYNC_PAGE_FLIP;
+    return c.drmGetCap(fd, @intCast(capability_name), &capability) == 0 and capability != 0;
+}
+
+fn pageFlipFlags(mode: PageFlipMode) c_uint {
+    return @as(c_uint, @intCast(c.DRM_MODE_PAGE_FLIP_EVENT)) |
+        if (mode == .async) @as(c_uint, @intCast(c.DRM_MODE_PAGE_FLIP_ASYNC)) else 0;
 }
 
 fn clearInheritedCursor(self: *Self, fd: std.posix.fd_t) void {
@@ -1920,6 +1993,17 @@ test "DRM discovery only accepts primary nodes" {
     try std.testing.expect(isPrimaryNode("/dev/dri/card12"));
     try std.testing.expect(!isPrimaryNode("/dev/dri/renderD128"));
     try std.testing.expect(!isPrimaryNode("/sys/class/drm/card0-DP-1"));
+}
+
+test "asynchronous page flips retain completion events" {
+    try std.testing.expectEqual(
+        @as(u32, c.DRM_MODE_PAGE_FLIP_EVENT),
+        pageFlipFlags(.vsync),
+    );
+    try std.testing.expectEqual(
+        @as(u32, c.DRM_MODE_PAGE_FLIP_EVENT | c.DRM_MODE_PAGE_FLIP_ASYNC),
+        pageFlipFlags(.async),
+    );
 }
 
 test "CRTC selection preserves preferred and never selects claimed" {

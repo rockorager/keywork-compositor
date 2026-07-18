@@ -26,6 +26,7 @@ has_pending_attachment: bool,
 role_handler: ?RoleHandler,
 viewport_handler: ?ViewportHandler,
 content_type_handler: ?ContentTypeHandler,
+tearing_control_handler: ?TearingControlHandler,
 background_effect_handler: ?BackgroundEffectHandler,
 explicit_sync_handler: ?ExplicitSyncHandler,
 commit_listeners: std.ArrayList(*CommitListener),
@@ -47,6 +48,8 @@ pub const State = struct {
     current_viewport: ViewportState,
     pending_content_type: ContentType,
     current_content_type: ContentType,
+    pending_presentation_hint: PresentationHint,
+    current_presentation_hint: PresentationHint,
     pending_blur_region: Region,
     pending_blur_region_changed: bool,
     current_blur_region: Region,
@@ -89,6 +92,8 @@ pub const State = struct {
             .current_viewport = .{},
             .pending_content_type = .none,
             .current_content_type = .none,
+            .pending_presentation_hint = .vsync,
+            .current_presentation_hint = .vsync,
             .pending_blur_region = Region.init(),
             .pending_blur_region_changed = false,
             .current_blur_region = Region.init(),
@@ -173,6 +178,7 @@ pub fn create(
         .role_handler = null,
         .viewport_handler = null,
         .content_type_handler = null,
+        .tearing_control_handler = null,
         .background_effect_handler = null,
         .explicit_sync_handler = null,
         .commit_listeners = .empty,
@@ -282,6 +288,38 @@ pub fn currentContentType(store: *Store, id: Id) ?ContentType {
     return surface_state.current_content_type;
 }
 
+pub const PresentationHint = wp.TearingControlV1.PresentationHint;
+
+pub const TearingControlHandler = struct {
+    context: *anyopaque,
+    surface_destroyed: *const fn (*anyopaque) void,
+};
+
+pub fn setTearingControlHandler(
+    self: *Self,
+    handler: TearingControlHandler,
+) error{AlreadyExists}!void {
+    if (self.tearing_control_handler != null) return error.AlreadyExists;
+    self.tearing_control_handler = handler;
+}
+
+pub fn clearTearingControlHandler(self: *Self, context: *anyopaque) void {
+    const handler = self.tearing_control_handler orelse unreachable;
+    std.debug.assert(handler.context == context);
+    self.tearing_control_handler = null;
+    self.state().pending_presentation_hint = .vsync;
+}
+
+pub fn setPendingPresentationHint(self: *Self, hint: PresentationHint) void {
+    std.debug.assert(self.tearing_control_handler != null);
+    self.state().pending_presentation_hint = hint;
+}
+
+pub fn currentPresentationHint(store: *Store, id: Id) ?PresentationHint {
+    const surface_state = store.get(id) orelse return null;
+    return surface_state.current_presentation_hint;
+}
+
 pub const BackgroundEffectHandler = struct {
     context: *anyopaque,
     surface_destroyed: *const fn (*anyopaque) void,
@@ -387,6 +425,7 @@ const CachedCommit = struct {
     transform: wl.Output.Transform,
     viewport: ViewportState,
     content_type: ContentType,
+    presentation_hint: PresentationHint,
     blur_region: Region,
     blur_region_changed: bool,
     surface_damage: Region,
@@ -957,6 +996,7 @@ fn applyPending(self: *Self, commit_info: CommitInfo) void {
     surface_state.current_transform = surface_state.pending_transform;
     surface_state.current_viewport = surface_state.pending_viewport;
     surface_state.current_content_type = surface_state.pending_content_type;
+    surface_state.current_presentation_hint = surface_state.pending_presentation_hint;
     surface_state.current_offset_x = surface_state.pending_offset_x;
     surface_state.current_offset_y = surface_state.pending_offset_y;
     updateCurrentDamage(
@@ -1040,6 +1080,7 @@ fn cachePending(self: *Self, role_ready: bool) bool {
         .transform = surface_state.pending_transform,
         .viewport = surface_state.pending_viewport,
         .content_type = surface_state.pending_content_type,
+        .presentation_hint = surface_state.pending_presentation_hint,
         .blur_region = Region.init(),
         .blur_region_changed = surface_state.pending_blur_region_changed,
         .surface_damage = Region.init(),
@@ -1157,6 +1198,7 @@ fn applyCached(self: *Self, cached: *CachedCommit) void {
     surface_state.current_transform = cached.transform;
     surface_state.current_viewport = cached.viewport;
     surface_state.current_content_type = cached.content_type;
+    surface_state.current_presentation_hint = cached.presentation_hint;
     surface_state.current_offset_x = cached.offset_x;
     surface_state.current_offset_y = cached.offset_y;
     updateCurrentDamage(
@@ -1364,6 +1406,10 @@ fn handleDestroy(_: *wl.Surface, self: *Self) void {
     }
     if (self.content_type_handler) |handler| {
         self.content_type_handler = null;
+        handler.surface_destroyed(handler.context);
+    }
+    if (self.tearing_control_handler) |handler| {
+        self.tearing_control_handler = null;
         handler.surface_destroyed(handler.context);
     }
     if (self.background_effect_handler) |handler| {

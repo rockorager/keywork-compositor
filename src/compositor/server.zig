@@ -47,6 +47,7 @@ const FractionalScale = @import("wayland/fractional_scale.zig");
 const Fixes = @import("wayland/fixes.zig");
 const LinuxDmabuf = @import("wayland/linux_dmabuf.zig");
 const LinuxDrmSyncobj = @import("wayland/linux_drm_syncobj.zig");
+const TearingControl = @import("wayland/tearing_control.zig");
 const XdgActivation = @import("wayland/xdg_activation.zig");
 const Output = @import("wayland/output.zig");
 const OutputLayout = @import("wayland/output_layout.zig");
@@ -163,6 +164,7 @@ fractional_scale: FractionalScale,
 fixes: Fixes,
 linux_dmabuf: LinuxDmabuf,
 linux_drm_syncobj: LinuxDrmSyncobj,
+tearing_control: TearingControl,
 xdg_activation: XdgActivation,
 viewporter: Viewporter,
 window_manager: WindowManager,
@@ -726,6 +728,7 @@ pub fn createWithVirtualOutput(
         .fixes = undefined,
         .linux_dmabuf = undefined,
         .linux_drm_syncobj = undefined,
+        .tearing_control = undefined,
         .xdg_activation = undefined,
         .viewporter = undefined,
         .window_manager = undefined,
@@ -932,6 +935,8 @@ pub fn createWithVirtualOutput(
         self.renderer.dmabufDeviceId(),
     );
     errdefer self.linux_drm_syncobj.deinit();
+    try self.tearing_control.init(allocator, display);
+    errdefer self.tearing_control.deinit();
     try self.subcompositor.init(allocator, display, self.compositor.surfaceStore());
     errdefer self.subcompositor.deinit();
     self.scene.init(allocator);
@@ -1323,6 +1328,7 @@ pub fn destroy(self: *Self) void {
     self.gtk_shell.deinit();
     self.scene.deinit();
     self.subcompositor.deinit();
+    self.tearing_control.deinit();
     self.linux_drm_syncobj.deinit();
     self.linux_dmabuf.deinit();
     self.fixes.deinit();
@@ -5608,11 +5614,21 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
     }
 
     const top_fullscreen = try self.renderDesktopContents(&frame, true);
+    const allow_tearing = if (top_fullscreen) |window_id|
+        if (self.scene.windowSurface(window_id)) |surface_id|
+            Surface.currentPresentationHint(
+                self.compositor.surfaceStore(),
+                surface_id,
+            ) == .async
+        else
+            false
+    else
+        false;
     var presented: ?presentation.Info = null;
     var direct_scanout = false;
     if (self.renderer.directScanoutCandidate()) |candidate| {
         increment(&render_output.frame_statistics.direct_scanout_candidates);
-        const result = render_output.backend.tryDirectScanout(candidate);
+        const result = render_output.backend.tryDirectScanout(candidate, allow_tearing);
         if (result.accepted) {
             self.renderer.cancelFrame();
             renderer_frame_active = false;
@@ -5629,7 +5645,11 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
         defer if (render_fence_fd) |fd| {
             _ = std.c.close(fd);
         };
-        presented = render_output.backend.present(&frame_damage, render_fence_fd) catch
+        presented = render_output.backend.present(
+            &frame_damage,
+            render_fence_fd,
+            allow_tearing,
+        ) catch
             return error.InvalidTarget;
         render_output.commitFrame(.composited);
     }
@@ -5776,6 +5796,7 @@ fn presentSessionLockFrame(
     const presented = frame.render_output.backend.present(
         frame.presentation_damage.?,
         render_fence_fd,
+        false,
     ) catch
         return error.InvalidTarget;
     frame.render_output.commitFrame(.composited);

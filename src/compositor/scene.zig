@@ -851,6 +851,11 @@ pub fn windowPosition(self: *Self, id: Id) ?Position {
     return window.position;
 }
 
+pub fn windowSurface(self: *Self, id: Id) ?Surface.Id {
+    const window = self.windows.get(id) orelse return null;
+    return window.surface_id;
+}
+
 pub fn layerSurface(self: *Self, id: LayerSurfaceId) ?*LayerSurface {
     return self.layer_surfaces.get(id);
 }
