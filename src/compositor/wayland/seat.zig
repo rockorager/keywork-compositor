@@ -527,6 +527,10 @@ pub fn hasPressedPointerButton(self: *const Self, button: u32) bool {
     return false;
 }
 
+pub fn hasPressedPointerButtons(self: *const Self) bool {
+    return self.pressed_pointer_buttons.items.len != 0;
+}
+
 pub fn hasPressedPointerButtonForSurface(
     self: *const Self,
     button: u32,

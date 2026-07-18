@@ -44,9 +44,15 @@ outer_gap: u32 = 16,
 window_effects: Scene.Effects = Scene.default_effects,
 focused_window_effects: Scene.Effects = Scene.default_effects,
 focused_window_border: ?Scene.Borders = null,
+tiling_drag: ?TilingDrag = null,
 
 const WindowStore = slot_map.SlotMap(Window, enum { builtin_window });
 pub const WindowId = WindowStore.Id;
+
+const TilingDrag = struct {
+    source: WindowId,
+    target: ?WindowId = null,
+};
 
 const KnownXwaylandWindow = struct {
     scene_id: Scene.Id,
@@ -554,29 +560,112 @@ pub fn pointerButton(self: *Self, root: ?Surface.Id, state: wl.Pointer.ButtonSta
 
 fn focusPointerRoot(self: *Self, root: ?Surface.Id) void {
     if (self.layer_focus == .exclusive) return;
-    const surface_id = root orelse return;
-    var candidate: ?WindowId = null;
+    const id = self.windowForSurface(root orelse return) orelse return;
+    if (self.focusWindow(id)) self.relayout();
+}
+
+fn windowForSurface(self: *Self, surface_id: Surface.Id) ?WindowId {
     var it = self.windows.iterator();
-    while (it.next()) |entry| if (std.meta.eql(entry.value.surface_id, surface_id)) {
-        candidate = entry.id;
-        break;
-    };
-    const id = candidate orelse (if (self.xdg_shell.surfaceRootWindow(surface_id)) |xdg_id| self.findXdg(xdg_id) else null) orelse return;
-    const window = self.windows.get(id) orelse return;
+    while (it.next()) |entry| {
+        if (std.meta.eql(entry.value.surface_id, surface_id)) return entry.id;
+    }
+    const xdg_id = self.xdg_shell.surfaceRootWindow(surface_id) orelse return null;
+    return self.findXdg(xdg_id);
+}
+
+fn focusWindow(self: *Self, id: WindowId) bool {
+    const window = self.windows.get(id) orelse return false;
     const workspace = &self.workspaces.items[window.workspace];
-    if (!workspace.active) return;
+    if (!workspace.active) return false;
     const target = neutral(id);
     const output_changed = !std.meta.eql(self.default_output, workspace.output);
     const focus_changed = workspace.workspace.focused == null or
         !workspace.workspace.focused.?.eql(target);
     _ = self.layer_shell.relinquishNonExclusiveFocus();
-    if (!output_changed and !focus_changed) return;
+    if (!output_changed and !focus_changed) return false;
     self.default_output = workspace.output;
     if (focus_changed) {
         const changed = workspace.workspace.focus(target);
         std.debug.assert(changed);
     }
+    return true;
+}
+
+/// Starts a compositor-owned Super+pointer tiling drag. The server owns the
+/// physical button grab; this object owns only policy and drop state.
+pub fn beginTilingDrag(self: *Self, root: ?Surface.Id) bool {
+    if (self.tiling_drag != null or self.layer_focus == .exclusive) return false;
+    const id = self.windowForSurface(root orelse return false) orelse return false;
+    const window = self.windows.get(id) orelse return false;
+    if (!self.isDraggableTiledWindow(window)) return false;
+    const workspace = &self.workspaces.items[window.workspace];
+    if (!workspace.active) return false;
+    self.tiling_drag = .{ .source = id };
+    if (self.focusWindow(id)) self.relayout();
+    return true;
+}
+
+pub fn tilingDragActive(self: *const Self) bool {
+    return self.tiling_drag != null;
+}
+
+/// Updates the drop target and returns whether the visible preview changed.
+pub fn updateTilingDrag(self: *Self, x: f64, y: f64) bool {
+    const drag = if (self.tiling_drag) |*value| value else return false;
+    const previous = drag.target;
+    drag.target = null;
+    const source = self.windows.get(drag.source) orelse return previous != null;
+    if (!self.isDraggableTiledWindow(source)) return previous != null;
+    const workspace = &self.workspaces.items[source.workspace];
+    if (!workspace.active) return previous != null;
+    for (workspace.workspace.members.items) |member| {
+        const id = internal(member);
+        if (std.meta.eql(id, drag.source)) continue;
+        const window = self.windows.get(id) orelse continue;
+        if (!self.isDraggableTiledWindow(window)) continue;
+        const plan = window.placement orelse continue;
+        if (!pointInLayoutPlan(x, y, plan)) continue;
+        drag.target = id;
+        break;
+    }
+    return !std.meta.eql(previous, drag.target);
+}
+
+pub fn tilingDragPreview(self: *Self) ?types.Rect {
+    const drag = self.tiling_drag orelse return null;
+    const target = self.windows.get(drag.target orelse return null) orelse return null;
+    if (!self.isDraggableTiledWindow(target)) return null;
+    return visibleLayoutRect(target.placement orelse return null);
+}
+
+/// Ends the pointer grab by swapping the source and target in layout order.
+pub fn endTilingDrag(self: *Self, commit: bool) bool {
+    const drag = self.tiling_drag orelse return false;
+    self.tiling_drag = null;
+    if (!commit) return true;
+    const target_id = drag.target orelse return true;
+    const source = self.windows.get(drag.source) orelse return true;
+    const target = self.windows.get(target_id) orelse return true;
+    if (source.workspace != target.workspace or
+        !self.isDraggableTiledWindow(source) or
+        !self.isDraggableTiledWindow(target)) return true;
+    const workspace_entry = &self.workspaces.items[source.workspace];
+    if (!workspace_entry.active) return true;
+    const changed = workspace_entry.workspace.swapWindows(
+        neutral(drag.source),
+        neutral(target_id),
+    );
+    std.debug.assert(changed);
+    _ = workspace_entry.workspace.focus(neutral(drag.source));
+    self.default_output = workspace_entry.output;
     self.relayout();
+    return true;
+}
+
+fn isDraggableTiledWindow(self: *Self, window: *const Window) bool {
+    return window.mapped and !window.minimized and window.fullscreen_output == null and
+        !self.isFloating(window) and self.transientParent(window) == null and
+        window.placement != null and window.placement.?.visible;
 }
 
 fn currentDimensions(self: *Self, window: *const Window) XdgShell.Dimensions {
@@ -1147,6 +1236,35 @@ fn centeredRect(parent: types.Rect, size: types.Size) types.Rect {
     };
 }
 
+fn pointInLayoutPlan(x: f64, y: f64, plan: types.LayoutPlan) bool {
+    const rect = visibleLayoutRect(plan) orelse return false;
+    return x >= @as(f64, @floatFromInt(rect.x)) and
+        y >= @as(f64, @floatFromInt(rect.y)) and
+        x < @as(f64, @floatFromInt(@as(i64, rect.x) + rect.size.width)) and
+        y < @as(f64, @floatFromInt(@as(i64, rect.y) + rect.size.height));
+}
+
+fn visibleLayoutRect(plan: types.LayoutPlan) ?types.Rect {
+    if (!plan.visible) return null;
+    const clip = plan.clip orelse return plan.rect;
+    const left = @max(@as(i64, plan.rect.x), clip.x);
+    const top = @max(@as(i64, plan.rect.y), clip.y);
+    const right = @min(
+        @as(i64, plan.rect.x) + plan.rect.size.width,
+        @as(i64, clip.x) + clip.size.width,
+    );
+    const bottom = @min(
+        @as(i64, plan.rect.y) + plan.rect.size.height,
+        @as(i64, clip.y) + clip.size.height,
+    );
+    if (left >= right or top >= bottom) return null;
+    return .{
+        .x = @intCast(left),
+        .y = @intCast(top),
+        .size = types.Size.init(@intCast(right - left), @intCast(bottom - top)),
+    };
+}
+
 fn centeredCoordinate(parent_start: i32, parent_length: u32, child_length: u32) i32 {
     const doubled = 2 * @as(i64, parent_start) + parent_length - child_length;
     return @intCast(std.math.clamp(
@@ -1537,6 +1655,27 @@ test "manually floated windows are capped to two thirds of the usable area" {
             .{ .width = 640, .height = 480 },
         ),
     );
+}
+
+test "tiling drag hit testing honors visibility and layout clipping" {
+    const plan: types.LayoutPlan = .{
+        .id = types.id(1),
+        .rect = .{ .x = 10, .y = 20, .size = types.Size.init(100, 80) },
+        .visible = true,
+        .clip = .{ .x = 30, .y = 10, .size = types.Size.init(40, 50) },
+    };
+    try std.testing.expectEqual(
+        types.Rect{ .x = 30, .y = 20, .size = types.Size.init(40, 40) },
+        visibleLayoutRect(plan).?,
+    );
+    try std.testing.expect(pointInLayoutPlan(30, 20, plan));
+    try std.testing.expect(pointInLayoutPlan(69.99, 59.99, plan));
+    try std.testing.expect(!pointInLayoutPlan(29.99, 20, plan));
+    try std.testing.expect(!pointInLayoutPlan(70, 20, plan));
+
+    var hidden = plan;
+    hidden.visible = false;
+    try std.testing.expect(visibleLayoutRect(hidden) == null);
 }
 
 test "directional navigation prefers aligned neighbors then distance" {

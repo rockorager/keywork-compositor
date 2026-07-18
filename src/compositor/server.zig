@@ -71,6 +71,7 @@ const WindowManager = @import("window_manager.zig");
 
 const wl = wayland.server.wl;
 const log = std.log.scoped(.server);
+const linux_button_left = 0x110;
 
 allocator: std.mem.Allocator,
 io: std.Io,
@@ -2610,6 +2611,9 @@ fn sessionLockStateChanged(context: *anyopaque, locked: bool) void {
     const self: *Self = @ptrCast(@alignCast(context));
     self.refreshIdleInhibition();
     if (locked) self.xwayland_keyboard_grab.cancelAll();
+    if (self.window_manager_initialized and self.window_manager.endTilingDrag(false)) {
+        requestRepaint(self);
+    }
     self.pointer_constraints.deactivateAll();
     self.data_device.cancel();
     self.tablet.cancelFocus();
@@ -3389,6 +3393,11 @@ fn pointerEnter(context: *anyopaque, x: f64, y: f64) void {
         self.seat.pointerEnter(point.x, point.y, route.focus);
         return;
     }
+    if (self.window_manager.tilingDragActive()) {
+        self.seat.pointerEnter(point.x, point.y, null);
+        if (self.window_manager.updateTilingDrag(point.x, point.y)) requestRepaint(self);
+        return;
+    }
     if (self.data_device.isDragging()) {
         self.pointer_constraints.deactivateAll();
         self.seat.pointerEnter(
@@ -3406,6 +3415,7 @@ fn pointerEnter(context: *anyopaque, x: f64, y: f64) void {
 
 fn pointerLeave(context: *anyopaque) void {
     const self = serverForOutput(context);
+    if (self.window_manager.endTilingDrag(false)) requestRepaint(self);
     self.pointer_constraints.deactivateAll();
     self.data_device.pointerLeft();
     if (self.xwm_initialized) self.xwm.dragLeft();
@@ -3428,6 +3438,12 @@ fn pointerMotionForSeat(output: *RenderOutput, seat: *Seat, time: u32, x: f64, y
             target.y,
             self.pointerFocus(target.x, target.y),
         );
+        return;
+    }
+    if (seat == &self.seat and self.window_manager.tilingDragActive()) {
+        self.pointer_constraints.deactivateAll();
+        seat.pointerMotion(time, target.x, target.y, null);
+        if (self.window_manager.updateTilingDrag(target.x, target.y)) requestRepaint(self);
         return;
     }
     if (seat == &self.seat and self.data_device.isDragging()) {
@@ -3522,10 +3538,45 @@ fn pointerButtonForSeat(
         }
         return;
     }
+    if (seat == &self.seat and self.window_manager.tilingDragActive()) {
+        if (button == linux_button_left and state == .released) {
+            const position = seat.pointerPosition();
+            if (position) |point| {
+                _ = self.window_manager.updateTilingDrag(point.x, point.y);
+            }
+            _ = self.window_manager.endTilingDrag(true);
+            if (position) |point| {
+                const route = self.pointerRoute(point.x, point.y);
+                seat.pointerEnter(point.x, point.y, route.focus);
+                self.pointer_constraints.syncFocus();
+            }
+            requestRepaint(self);
+        } else {
+            _ = seat.pointerButton(time, button, state) catch {
+                log.err("failed to store pointer button state", .{});
+                self.terminate();
+            };
+        }
+        return;
+    }
     const root = if (seat.pointerPosition()) |position|
         self.pointerRoute(position.x, position.y).root
     else
         null;
+    if (seat == &self.seat and button == linux_button_left and state == .pressed and
+        seat.effectiveModifiers() & Config.super != 0 and
+        !seat.hasPressedPointerButtons() and
+        !self.keyboard_shortcuts_inhibit.inhibitsSeatNamed(InputManager.default_seat_name) and
+        !self.xdg_shell.hasPopupGrab() and self.window_manager.beginTilingDrag(root))
+    {
+        self.pointer_constraints.deactivateAll();
+        seat.suppressPointerFocus(true);
+        if (seat.pointerPosition()) |position| {
+            _ = self.window_manager.updateTilingDrag(position.x, position.y);
+        }
+        requestRepaint(self);
+        return;
+    }
     self.window_manager.pointerButton(root, state);
     if (state == .pressed) {
         const focused = if (seat.pointerFocusedSurface()) |surface_id|
@@ -3549,6 +3600,7 @@ fn pointerButtonForSeat(
 
 fn dragStarted(context: *anyopaque) void {
     const self: *Self = @ptrCast(@alignCast(context));
+    if (self.window_manager.endTilingDrag(false)) requestRepaint(self);
     self.pointer_constraints.deactivateAll();
     if (self.xwm_initialized) self.xwm.dragStarted();
     const position = self.seat.pointerPosition() orelse return;
@@ -5607,7 +5659,10 @@ fn renderDesktopContents(
             );
         },
     };
-    if (top_fullscreen == null) try self.renderLayerSurfaces(frame, .top);
+    if (top_fullscreen == null) {
+        try self.renderTilingDragPreview(frame);
+        try self.renderLayerSurfaces(frame, .top);
+    }
     try self.renderLayerSurfaces(frame, .overlay);
     try self.renderLayerPopups(frame);
 
@@ -5864,6 +5919,31 @@ fn renderLayerSurfaces(
             null,
         );
     }
+}
+
+fn renderTilingDragPreview(
+    self: *Self,
+    frame: *const OutputFrame,
+) renderer_types.Renderer.Error!void {
+    const preview = self.window_manager.tilingDragPreview() orelse return;
+    const command = [_]render.Command{tilingDragPreviewCommand(.{
+        .x = preview.x,
+        .y = preview.y,
+        .width = preview.size.width,
+        .height = preview.size.height,
+    })};
+    try self.renderCommands(frame, &command);
+}
+
+fn tilingDragPreviewCommand(rect: render.Rect) render.Command {
+    std.debug.assert(rect.width > 0 and rect.height > 0);
+    return .{ .shadow = .{
+        .rect = rect,
+        .corner_radius = 12,
+        .blur_radius = 20,
+        .spread = 0,
+        .color = render.Color.rgba(0x28, 0x70, 0xbd, 0x70),
+    } };
 }
 
 fn submitLayerSurfaces(self: *Self, output: *Output, layer: Scene.Layer) void {
