@@ -1258,16 +1258,17 @@
       "interfaces": [
         {
           "name": "wp_color_manager_v1",
-          "current_version": null,
+          "current_version": 3,
           "target_version": 3
         }
       ],
-      "status": "not_started",
+      "status": "done",
       "privileged": false,
       "blocked_by": [
         "linux-dmabuf",
         "presentation-time"
-      ]
+      ],
+      "status_detail": "Version 3 exposes one immutable SDR sRGB/BT.709 gamma-2.2 description for outputs and preferred surfaces, with perceptual intent only. Optional ICC/parametric creators and Windows/HDR color spaces are unsupported and are not advertised."
     },
     {
       "id": "color-representation",

@@ -15,6 +15,7 @@ const XdgForeign = @import("wayland/xdg_foreign.zig");
 const LayerShell = @import("wayland/layer_shell.zig");
 const SinglePixelBuffer = @import("wayland/single_pixel_buffer.zig");
 const ContentType = @import("wayland/content_type.zig");
+const ColorManagement = @import("wayland/color_management.zig");
 const BackgroundEffect = @import("wayland/background_effect.zig");
 const SecurityContext = @import("wayland/security_context.zig");
 const SessionLock = @import("wayland/session_lock.zig");
@@ -119,6 +120,7 @@ drm_lease: DrmLease,
 drm_lease_initialized: bool,
 single_pixel_buffer: SinglePixelBuffer,
 content_type: ContentType,
+color_management: ColorManagement,
 background_effect: BackgroundEffect,
 security_context: SecurityContext,
 session_lock: SessionLock,
@@ -697,6 +699,7 @@ pub fn createWithVirtualOutput(
         .drm_lease_initialized = false,
         .single_pixel_buffer = undefined,
         .content_type = undefined,
+        .color_management = undefined,
         .background_effect = undefined,
         .security_context = undefined,
         .session_lock = undefined,
@@ -821,6 +824,8 @@ pub fn createWithVirtualOutput(
     errdefer self.security_context.deinit();
     self.outputs.init(allocator, display, self.compositor.surfaceStore());
     errdefer self.outputs.deinit();
+    try self.color_management.init(allocator, display, &self.outputs);
+    errdefer self.color_management.deinit();
     try self.seat.init(allocator, io, display, "default", self.compositor.surfaceStore());
     errdefer self.seat.deinit();
     try self.transient_seat.init(
@@ -1507,6 +1512,7 @@ pub fn destroy(self: *Self) void {
     while (render_outputs.next()) |entry| {
         std.debug.assert(self.removeRenderOutput(entry.id));
     }
+    self.color_management.deinit();
     self.outputs.deinit();
     self.render_outputs.deinit(allocator);
     self.routed_touches.deinit(allocator);
@@ -1787,6 +1793,7 @@ fn removeRenderOutput(self: *Self, id: RenderOutputId) bool {
     Surface.discardPresentation(self.compositor.surfaceStore(), protocol_output);
     Surface.clearFifoBarriersForOutput(self.compositor.surfaceStore(), protocol_output);
     if (self.xdg_output_initialized) self.xdg_output.removeOutput(protocol_output);
+    self.color_management.removeOutput(protocol_output);
     std.debug.assert(self.outputs.remove(render_output.protocol_id));
     if (self.session_lock_initialized) {
         self.session_lock.outputRemoved(render_output.protocol_id);
