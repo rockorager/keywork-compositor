@@ -80,7 +80,7 @@ pub fn scanoutFormats(self: *const Self) []const render.DmabufFormatModifier {
 
 pub fn compositedScanoutFormat(self: *const Self) ?render.DmabufFormat {
     return switch (self.backend) {
-        .drm => .xrgb8888,
+        .drm => |output| output.compositedScanoutFormat(),
         .headless => null,
         .nested => .argb8888,
     };

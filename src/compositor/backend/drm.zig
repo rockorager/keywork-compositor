@@ -303,6 +303,14 @@ pub fn scanoutFormats(self: *const Self) []const render.DmabufFormatModifier {
     return self.scanout_formats;
 }
 
+pub fn compositedScanoutFormat(self: *const Self) render.DmabufFormat {
+    const format = if (self.buffers[0].gbm) |buffer|
+        buffer.format
+    else
+        c.DRM_FORMAT_XRGB8888;
+    return render.DmabufFormat.fromFourcc(format) orelse unreachable;
+}
+
 pub fn detach(self: *Self) void {
     std.debug.assert(self.listener != null);
     self.listener = null;
@@ -1637,10 +1645,15 @@ fn directFramebuffer(
 
 fn legacyFramebufferLayoutMatches(self: *const Self, buffer: render.PixelBuffer) bool {
     const source = buffer.dmabuf orelse return false;
-    if (source.format != c.DRM_FORMAT_XRGB8888) return false;
+    const compositor_format = if (self.buffers[0].gbm) |gbm_buffer|
+        gbm_buffer.format
+    else
+        c.DRM_FORMAT_XRGB8888;
+    if (source.format != compositor_format) return false;
     if (self.direct_displayed) |displayed| {
         const current = self.direct_framebuffers.get(displayed.cache_id) orelse return false;
-        return std.meta.eql(current.size, buffer.size) and
+        return current.format == source.format and
+            std.meta.eql(current.size, buffer.size) and
             current.modifier == source.modifier and
             current.stride == source.stride and
             current.offset == source.offset;
@@ -1933,28 +1946,43 @@ fn allocateGpuPair(self: *Self, fd: std.posix.fd_t, size: render.Size) !BufferPa
     const gbm = self.device_access.gbm(self.device_access.context) orelse return error.NoGbmDevice;
     var compatible_modifiers: std.ArrayList(u64) = .empty;
     defer compatible_modifiers.deinit(self.allocator);
-    for (self.scanout_formats) |pair| {
-        if (pair.format != c.DRM_FORMAT_XRGB8888) continue;
-        const modifier = pair.modifier;
-        if (render.DmabufFormatModifier.contains(
-            renderer.target_formats,
-            pair.format,
-            modifier,
-        ) and renderer.supports_target(renderer.context, size, pair.format, modifier)) {
-            try compatible_modifiers.append(self.allocator, modifier);
-        }
-    }
     var last_error: anyerror = error.NoSupportedModifier;
-    if (compatible_modifiers.items.len > 0) {
+    for ([_]u32{ c.DRM_FORMAT_XRGB2101010, c.DRM_FORMAT_XRGB8888 }) |format| {
+        compatible_modifiers.clearRetainingCapacity();
+        for (self.scanout_formats) |pair| {
+            if (pair.format != format) continue;
+            const modifier = pair.modifier;
+            if (render.DmabufFormatModifier.contains(
+                renderer.target_formats,
+                pair.format,
+                modifier,
+            ) and renderer.supports_target(renderer.context, size, pair.format, modifier)) {
+                try compatible_modifiers.append(self.allocator, modifier);
+            }
+        }
+        if (compatible_modifiers.items.len == 0) continue;
         var pair: BufferPair = .{};
-        createGpuPair(fd, gbm, renderer, size, compatible_modifiers.items, &pair) catch |err| {
+        createGpuPair(
+            fd,
+            gbm,
+            renderer,
+            size,
+            format,
+            compatible_modifiers.items,
+            &pair,
+        ) catch |err| {
             last_error = err;
             self.destroyPair(fd, &pair.buffers, pair.shadow_pixels);
         };
         if (pair.buffers[0].render_target_id != null) {
             log.info(
-                "allocated GPU scanout buffers at {d}x{d}, modifier 0x{x}",
-                .{ size.width, size.height, pair.buffers[0].gbm.?.modifier },
+                "allocated {s} GPU scanout buffers at {d}x{d}, modifier 0x{x}",
+                .{
+                    @tagName(render.DmabufFormat.fromFourcc(format).?),
+                    size.width,
+                    size.height,
+                    pair.buffers[0].gbm.?.modifier,
+                },
             );
             return pair;
         }
@@ -1962,7 +1990,15 @@ fn allocateGpuPair(self: *Self, fd: std.posix.fd_t, size: render.Size) !BufferPa
     if (!self.implicit_scanout) return last_error;
 
     var pair: BufferPair = .{};
-    createGpuPair(fd, gbm, renderer, size, null, &pair) catch |err| {
+    createGpuPair(
+        fd,
+        gbm,
+        renderer,
+        size,
+        c.DRM_FORMAT_XRGB8888,
+        null,
+        &pair,
+    ) catch |err| {
         self.destroyPair(fd, &pair.buffers, pair.shadow_pixels);
         return err;
     };
@@ -1978,18 +2014,20 @@ fn createGpuPair(
     gbm: *Gbm,
     renderer: render.DmabufRenderer,
     size: render.Size,
+    format: u32,
     modifiers: ?[]const u64,
     pair: *BufferPair,
 ) !void {
     for (&pair.buffers) |*buffer| {
         buffer.gbm = if (modifiers) |explicit|
-            try gbm.createBuffer(size, c.DRM_FORMAT_XRGB8888, explicit)
+            try gbm.createBuffer(size, format, explicit)
         else
-            try gbm.createImplicitBuffer(size, c.DRM_FORMAT_XRGB8888);
+            try gbm.createImplicitBuffer(size, format);
         const bo = &buffer.gbm.?;
+        if (bo.format != format) return error.UnexpectedBufferFormat;
         if (!render.DmabufFormatModifier.contains(
             renderer.target_formats,
-            c.DRM_FORMAT_XRGB8888,
+            format,
             bo.modifier,
         )) {
             return error.UnsupportedRendererModifier;
@@ -1998,10 +2036,10 @@ fn createGpuPair(
         var pitches = [_]u32{ bo.stride, 0, 0, 0 };
         var offsets = [_]u32{ bo.offset, 0, 0, 0 };
         const result = if (modifiers == null)
-            c.drmModeAddFB2(fd, size.width, size.height, c.DRM_FORMAT_XRGB8888, &handles, &pitches, &offsets, &buffer.framebuffer_id, 0)
+            c.drmModeAddFB2(fd, size.width, size.height, format, &handles, &pitches, &offsets, &buffer.framebuffer_id, 0)
         else blk: {
             var framebuffer_modifiers = [_]u64{ bo.modifier, 0, 0, 0 };
-            break :blk c.drmModeAddFB2WithModifiers(fd, size.width, size.height, c.DRM_FORMAT_XRGB8888, &handles, &pitches, &offsets, &framebuffer_modifiers, &buffer.framebuffer_id, c.DRM_MODE_FB_MODIFIERS);
+            break :blk c.drmModeAddFB2WithModifiers(fd, size.width, size.height, format, &handles, &pitches, &offsets, &framebuffer_modifiers, &buffer.framebuffer_id, c.DRM_MODE_FB_MODIFIERS);
         };
         if (result != 0) return error.AddFramebufferFailed;
         const id = render.allocateRenderTargetId();
@@ -2009,7 +2047,7 @@ fn createGpuPair(
             .id = id,
             .size = size,
             .fd = bo.fd,
-            .format = c.DRM_FORMAT_XRGB8888,
+            .format = format,
             .modifier = bo.modifier,
             .stride = bo.stride,
             .offset = bo.offset,

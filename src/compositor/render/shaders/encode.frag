@@ -4,6 +4,7 @@ layout(push_constant) uniform Push {
     vec2 target_size;
     vec2 texture_size;
     float swap_rb;
+    float quantization_levels;
     layout(offset=32) vec4 color_matrix_0;
     vec4 color_matrix_1;
     vec4 color_matrix_2;
@@ -76,7 +77,7 @@ float dither(ivec2 coordinate) {
         15.0,  7.0, 13.0,  5.0
     );
     int index=(coordinate.y&3)*4+(coordinate.x&3);
-    return (matrix[index]/16.0-0.46875)/255.0;
+    return (matrix[index]/16.0-0.46875)/pc.quantization_levels;
 }
 
 void main() {

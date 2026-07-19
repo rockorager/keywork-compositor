@@ -14,6 +14,7 @@ device: *c.gbm_device,
 pub const Buffer = struct {
     bo: *c.gbm_bo,
     fd: std.posix.fd_t,
+    format: u32,
     handle: u32,
     stride: u32,
     offset: u32,
@@ -74,6 +75,7 @@ fn exportBuffer(bo: *c.gbm_bo) !Buffer {
     return .{
         .bo = bo,
         .fd = fd,
+        .format = c.gbm_bo_get_format(bo),
         .handle = c.gbm_bo_get_handle_for_plane(bo, 0).u32,
         .stride = c.gbm_bo_get_stride_for_plane(bo, 0),
         .offset = c.gbm_bo_get_offset(bo, 0),

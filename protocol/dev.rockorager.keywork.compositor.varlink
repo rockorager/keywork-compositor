@@ -42,7 +42,7 @@ type DirectScanoutRejections (
 type FramePath (none, composited, direct_scanout)
 
 # A renderer working or output scanout buffer format.
-type BufferFormat (none, argb8888, xrgb8888, abgr8888, xbgr8888, rgba16f_linear)
+type BufferFormat (none, argb8888, xrgb8888, abgr8888, xbgr8888, xrgb2101010, rgba16f_linear)
 
 # The output-space transform applied during presentation.
 type OutputTransform (normal)

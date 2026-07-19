@@ -38,6 +38,7 @@ swap_red_blue: bool,
 render_pass: vk.RenderPass,
 scratch_render_pass: vk.RenderPass,
 output_render_pass: vk.RenderPass,
+output_10bit: ?OutputGraphics,
 descriptor_set_layout: vk.DescriptorSetLayout,
 descriptor_pool: vk.DescriptorPool,
 pipeline_layout: vk.PipelineLayout,
@@ -67,6 +68,8 @@ pending_wait_semaphores: std.ArrayList(vk.Semaphore) = .empty,
 pending_textures: std.ArrayList(Texture) = .empty,
 dmabuf_modifiers: []u64,
 dmabuf_sampled_modifiers: []u64,
+dmabuf_10bit_modifiers: []u64,
+dmabuf_10bit_sampled_modifiers: []u64,
 dmabuf_target_formats: []render.DmabufFormatModifier,
 dmabuf_source_modifiers: []u64,
 dmabuf_rgba_source_modifiers: []u64,
@@ -110,6 +113,7 @@ const Output = struct {
     view: vk.ImageView,
     descriptor_set: vk.DescriptorSet,
     framebuffer: vk.Framebuffer,
+    format: vk.Format,
     size: render.Size,
     color_description: render.ColorDescription = .{},
     kind: OutputKind = .pixels,
@@ -203,7 +207,8 @@ const FramePush = extern struct {
     target_size: [2]f32,
     texture_size: [2]f32,
     swap_red_blue: f32,
-    padding: [3]f32 = @splat(0),
+    quantization_levels: f32 = 255,
+    padding: [2]f32 = @splat(0),
     color_matrix_0: [4]f32 = .{ 1, 0, 0, 0 },
     color_matrix_1: [4]f32 = .{ 0, 1, 0, 0 },
     color_matrix_2: [4]f32 = .{ 0, 0, 1, 0 },
@@ -332,6 +337,7 @@ const Graphics = struct {
     render_pass: vk.RenderPass,
     scratch_render_pass: vk.RenderPass,
     output_render_pass: vk.RenderPass,
+    output_10bit: ?OutputGraphics,
     descriptor_set_layout: vk.DescriptorSetLayout,
     descriptor_pool: vk.DescriptorPool,
     pipeline_layout: vk.PipelineLayout,
@@ -345,6 +351,11 @@ const Graphics = struct {
     blur_composite_pipeline: vk.Pipeline,
     encode_pipeline: vk.Pipeline,
     sampler: vk.Sampler,
+};
+
+const OutputGraphics = struct {
+    render_pass: vk.RenderPass,
+    encode_pipeline: vk.Pipeline,
 };
 
 const working_format: vk.Format = .r16g16b16a16_sfloat;
@@ -375,6 +386,7 @@ fn initGraphics(
     wrapper: vk.DeviceWrapper,
     device: vk.Device,
     format: vk.Format,
+    enable_10bit_output: bool,
 ) !Graphics {
     const binding: vk.DescriptorSetLayoutBinding = .{
         .binding = 0,
@@ -582,10 +594,36 @@ fn initGraphics(
         false,
     );
     errdefer wrapper.destroyPipeline(device, encode_pipeline, null);
+    const output_10bit: ?OutputGraphics = if (enable_10bit_output) output: {
+        var ten_bit_attachment = output_attachment;
+        ten_bit_attachment.format = .a2r10g10b10_unorm_pack32;
+        const ten_bit_render_pass = try wrapper.createRenderPass(device, &.{
+            .attachment_count = 1,
+            .p_attachments = @ptrCast(&ten_bit_attachment),
+            .subpass_count = 1,
+            .p_subpasses = @ptrCast(&subpass),
+        }, null);
+        errdefer wrapper.destroyRenderPass(device, ten_bit_render_pass, null);
+        const ten_bit_pipeline = try createPipeline(
+            wrapper,
+            device,
+            ten_bit_render_pass,
+            pipeline_layout,
+            vertex_shader,
+            encode_shader,
+            false,
+        );
+        break :output .{
+            .render_pass = ten_bit_render_pass,
+            .encode_pipeline = ten_bit_pipeline,
+        };
+    } else null;
+    errdefer if (output_10bit) |output| destroyOutputGraphics(wrapper, device, output);
     return .{
         .render_pass = render_pass,
         .scratch_render_pass = scratch_render_pass,
         .output_render_pass = output_render_pass,
+        .output_10bit = output_10bit,
         .descriptor_set_layout = descriptor_set_layout,
         .descriptor_pool = descriptor_pool,
         .pipeline_layout = pipeline_layout,
@@ -722,6 +760,7 @@ fn createPipeline(
 }
 
 fn destroyGraphics(wrapper: vk.DeviceWrapper, device: vk.Device, graphics: Graphics) void {
+    if (graphics.output_10bit) |output| destroyOutputGraphics(wrapper, device, output);
     wrapper.destroyPipeline(device, graphics.encode_pipeline, null);
     wrapper.destroyPipeline(device, graphics.blur_composite_pipeline, null);
     wrapper.destroyPipeline(device, graphics.blur_vertical_pipeline, null);
@@ -738,6 +777,15 @@ fn destroyGraphics(wrapper: vk.DeviceWrapper, device: vk.Device, graphics: Graph
     wrapper.destroyPipelineLayout(device, graphics.pipeline_layout, null);
     wrapper.destroyDescriptorPool(device, graphics.descriptor_pool, null);
     wrapper.destroyDescriptorSetLayout(device, graphics.descriptor_set_layout, null);
+}
+
+fn destroyOutputGraphics(
+    wrapper: vk.DeviceWrapper,
+    device: vk.Device,
+    graphics: OutputGraphics,
+) void {
+    wrapper.destroyPipeline(device, graphics.encode_pipeline, null);
+    wrapper.destroyRenderPass(device, graphics.render_pass, null);
 }
 
 const instance_extensions = [_][*:0]const u8{
@@ -774,6 +822,15 @@ fn dmabufSourceVkFormat(fourcc: u32) ?vk.Format {
     return switch (render.DmabufFormat.fromFourcc(fourcc) orelse return null) {
         .argb8888, .xrgb8888 => .b8g8r8a8_unorm,
         .abgr8888, .xbgr8888 => .r8g8b8a8_unorm,
+        .xrgb2101010 => null,
+    };
+}
+
+fn dmabufTargetVkFormat(fourcc: u32) ?vk.Format {
+    return switch (render.DmabufFormat.fromFourcc(fourcc) orelse return null) {
+        .xrgb8888 => .b8g8r8a8_unorm,
+        .xrgb2101010 => .a2r10g10b10_unorm_pack32,
+        .argb8888, .abgr8888, .xbgr8888 => null,
     };
 }
 
@@ -830,7 +887,84 @@ test "DMA-BUF source FourCC selects the matching Vulkan format" {
         vk.Format.r8g8b8a8_unorm,
         dmabufSourceVkFormat(@intFromEnum(render.DmabufFormat.xbgr8888)).?,
     );
+    try std.testing.expect(
+        dmabufSourceVkFormat(@intFromEnum(render.DmabufFormat.xrgb2101010)) == null,
+    );
     try std.testing.expect(dmabufSourceVkFormat(0) == null);
+}
+
+test "DMA-BUF target FourCC selects the matching Vulkan format" {
+    try std.testing.expectEqual(
+        vk.Format.b8g8r8a8_unorm,
+        dmabufTargetVkFormat(@intFromEnum(render.DmabufFormat.xrgb8888)).?,
+    );
+    try std.testing.expectEqual(
+        vk.Format.a2r10g10b10_unorm_pack32,
+        dmabufTargetVkFormat(@intFromEnum(render.DmabufFormat.xrgb2101010)).?,
+    );
+    try std.testing.expect(dmabufTargetVkFormat(0) == null);
+}
+
+const DmabufTargetModifiers = struct {
+    supported: []u64,
+    sampleable: []u64,
+};
+
+fn queryDmabufTargetModifiers(
+    allocator: std.mem.Allocator,
+    instance_wrapper: vk.InstanceWrapper,
+    physical_device: vk.PhysicalDevice,
+    format: vk.Format,
+) error{OutOfMemory}!DmabufTargetModifiers {
+    var modifier_list: vk.DrmFormatModifierPropertiesListEXT = .{};
+    var format_properties: vk.FormatProperties2 = .{ .format_properties = undefined };
+    format_properties.p_next = &modifier_list;
+    instance_wrapper.getPhysicalDeviceFormatProperties2KHR(
+        physical_device,
+        format,
+        &format_properties,
+    );
+    const properties = allocator.alloc(
+        vk.DrmFormatModifierPropertiesEXT,
+        modifier_list.drm_format_modifier_count,
+    ) catch return error.OutOfMemory;
+    defer allocator.free(properties);
+    modifier_list.p_drm_format_modifier_properties = properties.ptr;
+    instance_wrapper.getPhysicalDeviceFormatProperties2KHR(
+        physical_device,
+        format,
+        &format_properties,
+    );
+
+    var supported: std.ArrayList(u64) = .empty;
+    defer supported.deinit(allocator);
+    var fallback: std.ArrayList(u64) = .empty;
+    defer fallback.deinit(allocator);
+    var sampleable: std.ArrayList(u64) = .empty;
+    defer sampleable.deinit(allocator);
+    for (properties) |property| {
+        const features = property.drm_format_modifier_tiling_features;
+        if (property.drm_format_modifier_plane_count != 1 or
+            !features.color_attachment_bit or !features.color_attachment_blend_bit or
+            !features.transfer_dst_bit or (!features.transfer_src_bit and
+            (!features.sampled_image_bit or !features.sampled_image_filter_linear_bit)))
+        {
+            continue;
+        }
+        if (features.sampled_image_bit and features.sampled_image_filter_linear_bit) {
+            try supported.append(allocator, property.drm_format_modifier);
+            try sampleable.append(allocator, property.drm_format_modifier);
+        } else {
+            try fallback.append(allocator, property.drm_format_modifier);
+        }
+    }
+    try supported.appendSlice(allocator, fallback.items);
+    const supported_owned = try supported.toOwnedSlice(allocator);
+    errdefer allocator.free(supported_owned);
+    return .{
+        .supported = supported_owned,
+        .sampleable = try sampleable.toOwnedSlice(allocator),
+    };
 }
 
 fn queryDmabufSourceModifiers(
@@ -1093,6 +1227,8 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
     }
     var dmabuf_modifiers: []u64 = &.{};
     var dmabuf_sampled_modifiers: []u64 = &.{};
+    var dmabuf_10bit_modifiers: []u64 = &.{};
+    var dmabuf_10bit_sampled_modifiers: []u64 = &.{};
     var dmabuf_target_formats: []render.DmabufFormatModifier = &.{};
     var dmabuf_source_modifiers: []u64 = &.{};
     var dmabuf_rgba_source_modifiers: []u64 = &.{};
@@ -1161,12 +1297,28 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
         dmabuf_sampled_modifiers = sampled_modifiers.toOwnedSlice(allocator) catch
             return error.OutOfMemory;
         errdefer if (dmabuf_sampled_modifiers.len != 0) allocator.free(dmabuf_sampled_modifiers);
+        const ten_bit = try queryDmabufTargetModifiers(
+            allocator,
+            instance_wrapper,
+            physical_device,
+            .a2r10g10b10_unorm_pack32,
+        );
+        dmabuf_10bit_modifiers = ten_bit.supported;
+        errdefer if (dmabuf_10bit_modifiers.len != 0) allocator.free(dmabuf_10bit_modifiers);
+        dmabuf_10bit_sampled_modifiers = ten_bit.sampleable;
+        errdefer if (dmabuf_10bit_sampled_modifiers.len != 0) {
+            allocator.free(dmabuf_10bit_sampled_modifiers);
+        };
         dmabuf_target_formats = try allocator.alloc(
             render.DmabufFormatModifier,
-            dmabuf_modifiers.len,
+            dmabuf_10bit_modifiers.len + dmabuf_modifiers.len,
         );
         errdefer allocator.free(dmabuf_target_formats);
-        for (dmabuf_modifiers, dmabuf_target_formats) |modifier, *target| target.* = .{
+        for (dmabuf_10bit_modifiers, dmabuf_target_formats[0..dmabuf_10bit_modifiers.len]) |modifier, *target| target.* = .{
+            .format = @intFromEnum(render.DmabufFormat.xrgb2101010),
+            .modifier = modifier,
+        };
+        for (dmabuf_modifiers, dmabuf_target_formats[dmabuf_10bit_modifiers.len..]) |modifier, *target| target.* = .{
             .format = @intFromEnum(render.DmabufFormat.xrgb8888),
             .modifier = modifier,
         };
@@ -1200,13 +1352,22 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
     }
     errdefer if (dmabuf_modifiers.len != 0) allocator.free(dmabuf_modifiers);
     errdefer if (dmabuf_sampled_modifiers.len != 0) allocator.free(dmabuf_sampled_modifiers);
+    errdefer if (dmabuf_10bit_modifiers.len != 0) allocator.free(dmabuf_10bit_modifiers);
+    errdefer if (dmabuf_10bit_sampled_modifiers.len != 0) {
+        allocator.free(dmabuf_10bit_sampled_modifiers);
+    };
     errdefer if (dmabuf_target_formats.len != 0) allocator.free(dmabuf_target_formats);
     errdefer if (dmabuf_source_modifiers.len != 0) allocator.free(dmabuf_source_modifiers);
     errdefer if (dmabuf_rgba_source_modifiers.len != 0) {
         allocator.free(dmabuf_rgba_source_modifiers);
     };
     errdefer if (dmabuf_source_formats.len != 0) allocator.free(dmabuf_source_formats);
-    const graphics = initGraphics(device_wrapper, device, format) catch |err| {
+    const graphics = initGraphics(
+        device_wrapper,
+        device,
+        format,
+        dmabuf_10bit_modifiers.len != 0,
+    ) catch |err| {
         log.err("failed to initialize Vulkan graphics pipelines: {t}", .{err});
         return error.VulkanUnavailable;
     };
@@ -1238,6 +1399,7 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
         .render_pass = graphics.render_pass,
         .scratch_render_pass = graphics.scratch_render_pass,
         .output_render_pass = graphics.output_render_pass,
+        .output_10bit = graphics.output_10bit,
         .descriptor_set_layout = graphics.descriptor_set_layout,
         .descriptor_pool = graphics.descriptor_pool,
         .pipeline_layout = graphics.pipeline_layout,
@@ -1261,6 +1423,11 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
         .instance_capacity = 0,
         .dmabuf_modifiers = if (dmabuf_capable) dmabuf_modifiers else &.{},
         .dmabuf_sampled_modifiers = if (dmabuf_capable) dmabuf_sampled_modifiers else &.{},
+        .dmabuf_10bit_modifiers = if (dmabuf_capable) dmabuf_10bit_modifiers else &.{},
+        .dmabuf_10bit_sampled_modifiers = if (dmabuf_capable)
+            dmabuf_10bit_sampled_modifiers
+        else
+            &.{},
         .dmabuf_target_formats = if (dmabuf_capable) dmabuf_target_formats else &.{},
         .dmabuf_source_modifiers = if (dmabuf_capable) dmabuf_source_modifiers else &.{},
         .dmabuf_rgba_source_modifiers = if (dmabuf_capable)
@@ -1284,6 +1451,10 @@ pub fn deinit(self: *Self) void {
     self.destroyCachedResources();
     if (self.dmabuf_modifiers.len != 0) self.allocator.free(self.dmabuf_modifiers);
     if (self.dmabuf_sampled_modifiers.len != 0) self.allocator.free(self.dmabuf_sampled_modifiers);
+    if (self.dmabuf_10bit_modifiers.len != 0) self.allocator.free(self.dmabuf_10bit_modifiers);
+    if (self.dmabuf_10bit_sampled_modifiers.len != 0) {
+        self.allocator.free(self.dmabuf_10bit_sampled_modifiers);
+    }
     if (self.dmabuf_target_formats.len != 0) self.allocator.free(self.dmabuf_target_formats);
     if (self.dmabuf_source_modifiers.len != 0) self.allocator.free(self.dmabuf_source_modifiers);
     if (self.dmabuf_rgba_source_modifiers.len != 0) {
@@ -1302,6 +1473,7 @@ pub fn deinit(self: *Self) void {
         .render_pass = self.render_pass,
         .scratch_render_pass = self.scratch_render_pass,
         .output_render_pass = self.output_render_pass,
+        .output_10bit = self.output_10bit,
         .descriptor_set_layout = self.descriptor_set_layout,
         .descriptor_pool = self.descriptor_pool,
         .pipeline_layout = self.pipeline_layout,
@@ -1339,6 +1511,15 @@ pub fn dmabufAccess(self: *Self) ?render.DmabufRenderer {
         .import_target = importTargetCallback,
         .release_target = releaseTargetCallback,
     };
+}
+
+fn outputGraphics(self: *const Self, format: vk.Format) OutputGraphics {
+    if (format == self.format) return .{
+        .render_pass = self.output_render_pass,
+        .encode_pipeline = self.encode_pipeline,
+    };
+    if (format == .a2r10g10b10_unorm_pack32) return self.output_10bit orelse unreachable;
+    unreachable;
 }
 
 pub fn dmabufDeviceId(self: *const Self) ?render.DrmDeviceId {
@@ -1444,15 +1625,16 @@ fn releaseTargetCallback(context: *anyopaque, id: u64) void {
 }
 
 fn importTarget(self: *Self, descriptor: render.DmabufDescriptor) Error!void {
+    const target_format = dmabufTargetVkFormat(descriptor.format) orelse
+        return error.InvalidTarget;
     if (descriptor.id == 0 or
-        descriptor.format != @intFromEnum(render.DmabufFormat.xrgb8888) or
         descriptor.size.width == 0 or descriptor.size.height == 0 or
         descriptor.stride < descriptor.size.width * @sizeOf(u32) or
         self.outputs.contains(.{ .dmabuf = descriptor.id }) or
         !self.supportsDmabufTarget(descriptor.size, descriptor.format, descriptor.modifier))
         return error.InvalidTarget;
 
-    const sampleable = self.dmabufTargetSampleable(descriptor.modifier);
+    const sampleable = self.dmabufTargetSampleable(descriptor.format, descriptor.modifier);
     const image_usage = dmabufTargetUsage(sampleable);
 
     const duplicate_fd = std.c.dup(descriptor.fd);
@@ -1480,7 +1662,7 @@ fn importTarget(self: *Self, descriptor: render.DmabufDescriptor) Error!void {
     const image = self.device_wrapper.createImage(self.device, &.{
         .p_next = &external_info,
         .image_type = .@"2d",
-        .format = .b8g8r8a8_unorm,
+        .format = target_format,
         .extent = extent(descriptor.size),
         .mip_levels = 1,
         .array_layers = 1,
@@ -1521,7 +1703,7 @@ fn importTarget(self: *Self, descriptor: render.DmabufDescriptor) Error!void {
     const view = self.device_wrapper.createImageView(self.device, &.{
         .image = image,
         .view_type = .@"2d",
-        .format = .b8g8r8a8_unorm,
+        .format = target_format,
         .components = .{ .r = .identity, .g = .identity, .b = .identity, .a = .identity },
         .subresource_range = colorSubresourceRange(),
     }, null) catch return error.VulkanFailure;
@@ -1529,7 +1711,7 @@ fn importTarget(self: *Self, descriptor: render.DmabufDescriptor) Error!void {
     const descriptor_set = if (sampleable) try self.createImageDescriptor(view) else vk.DescriptorSet.null_handle;
     errdefer if (descriptor_set != .null_handle) self.destroyImageDescriptor(descriptor_set);
     const framebuffer = self.device_wrapper.createFramebuffer(self.device, &.{
-        .render_pass = self.output_render_pass,
+        .render_pass = self.outputGraphics(target_format).render_pass,
         .attachment_count = 1,
         .p_attachments = @ptrCast(&view),
         .width = descriptor.size.width,
@@ -1551,6 +1733,7 @@ fn importTarget(self: *Self, descriptor: render.DmabufDescriptor) Error!void {
         .view = view,
         .descriptor_set = descriptor_set,
         .framebuffer = framebuffer,
+        .format = target_format,
         .size = descriptor.size,
         .kind = .dmabuf,
         .last_used = self.frame_number,
@@ -1570,9 +1753,10 @@ fn allocateCommandBuffer(self: *Self) Error!vk.CommandBuffer {
 }
 
 fn supportsDmabufTarget(self: *Self, size: render.Size, format: u32, modifier: u64) bool {
-    if (format != @intFromEnum(render.DmabufFormat.xrgb8888) or
-        size.width == 0 or size.height == 0 or
-        std.mem.indexOfScalar(u64, self.dmabuf_modifiers, modifier) == null)
+    const target_format = dmabufTargetVkFormat(format) orelse return false;
+    if (size.width == 0 or size.height == 0 or
+        !render.DmabufFormatModifier.contains(self.dmabuf_target_formats, format, modifier) or
+        (target_format == .a2r10g10b10_unorm_pack32 and self.output_10bit == null))
         return false;
 
     const modifier_info: vk.PhysicalDeviceImageDrmFormatModifierInfoEXT = .{
@@ -1583,10 +1767,10 @@ fn supportsDmabufTarget(self: *Self, size: render.Size, format: u32, modifier: u
         .p_next = &modifier_info,
         .handle_type = .{ .dma_buf_bit_ext = true },
     };
-    const sampleable = self.dmabufTargetSampleable(modifier);
+    const sampleable = self.dmabufTargetSampleable(format, modifier);
     const format_info: vk.PhysicalDeviceImageFormatInfo2 = .{
         .p_next = &external_info,
-        .format = .b8g8r8a8_unorm,
+        .format = target_format,
         .type = .@"2d",
         .tiling = .drm_format_modifier_ext,
         .usage = dmabufTargetUsage(sampleable),
@@ -1608,8 +1792,13 @@ fn supportsDmabufTarget(self: *Self, size: render.Size, format: u32, modifier: u
         size.width <= maximum.width and size.height <= maximum.height;
 }
 
-fn dmabufTargetSampleable(self: *const Self, modifier: u64) bool {
-    return std.mem.indexOfScalar(u64, self.dmabuf_sampled_modifiers, modifier) != null;
+fn dmabufTargetSampleable(self: *const Self, format: u32, modifier: u64) bool {
+    const modifiers = switch (render.DmabufFormat.fromFourcc(format) orelse return false) {
+        .xrgb8888 => self.dmabuf_sampled_modifiers,
+        .xrgb2101010 => self.dmabuf_10bit_sampled_modifiers,
+        .argb8888, .abgr8888, .xbgr8888 => return false,
+    };
+    return std.mem.indexOfScalar(u64, modifiers, modifier) != null;
 }
 
 fn dmabufTargetUsage(sampleable: bool) vk.ImageUsageFlags {
@@ -2305,19 +2494,24 @@ fn renderFrameWithCompletion(
             }
         }
         const output_pass_info: vk.RenderPassBeginInfo = .{
-            .render_pass = self.output_render_pass,
+            .render_pass = self.outputGraphics(output.format).render_pass,
             .framebuffer = output.framebuffer,
             .render_area = rect2D(frame_render_area),
         };
         self.device_wrapper.cmdBeginRenderPass(command_buffer, &output_pass_info, .@"inline");
         self.setViewportAndScissor(command_buffer, frame.size);
         self.device_wrapper.cmdSetScissor(command_buffer, 0, &.{rect2D(frame_render_area)});
-        self.device_wrapper.cmdBindPipeline(command_buffer, .graphics, self.encode_pipeline);
+        self.device_wrapper.cmdBindPipeline(
+            command_buffer,
+            .graphics,
+            self.outputGraphics(output.format).encode_pipeline,
+        );
         self.device_wrapper.cmdBindDescriptorSets(command_buffer, .graphics, self.pipeline_layout, 0, &.{output.linear.descriptor_set}, null);
         const output_push: FramePush = .{
             .target_size = sizeFloats(frame.size),
             .texture_size = sizeFloats(frame.size),
-            .swap_red_blue = @floatFromInt(@intFromBool(self.swap_red_blue)),
+            .swap_red_blue = @floatFromInt(@intFromBool(output.format == .r8g8b8a8_unorm)),
+            .quantization_levels = if (output.format == .a2r10g10b10_unorm_pack32) 1023 else 255,
             .color_matrix_0 = .{ 1, 0, 0, 0 },
             .color_matrix_1 = .{ 0, 1, 0, 0 },
             .color_matrix_2 = .{ 0, 0, 1, 0 },
@@ -2825,6 +3019,7 @@ fn createOutput(self: *Self, size: render.Size) Error!Output {
         .view = allocation.view,
         .descriptor_set = descriptor_set,
         .framebuffer = framebuffer,
+        .format = self.format,
         .size = size,
         .last_used = self.frame_number,
         .linear = linear,
@@ -5060,6 +5255,7 @@ fn transitionRenderToExternal(
         .view = .null_handle,
         .descriptor_set = .null_handle,
         .framebuffer = .null_handle,
+        .format = .undefined,
         .size = .{ .width = 0, .height = 0 },
         .last_used = 0,
         .linear = undefined,
@@ -5089,6 +5285,7 @@ fn transitionExternalSourceToSample(
         .view = .null_handle,
         .descriptor_set = .null_handle,
         .framebuffer = .null_handle,
+        .format = .undefined,
         .size = .{ .width = 0, .height = 0 },
         .last_used = 0,
         .linear = undefined,
@@ -5118,6 +5315,7 @@ fn transitionSampleToExternal(
         .view = .null_handle,
         .descriptor_set = .null_handle,
         .framebuffer = .null_handle,
+        .format = .undefined,
         .size = .{ .width = 0, .height = 0 },
         .last_used = 0,
         .linear = undefined,

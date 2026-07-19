@@ -229,6 +229,7 @@ fn bufferFormatName(format: control.BufferFormat) []const u8 {
         .xrgb8888 => "XRGB8888",
         .abgr8888 => "ABGR8888",
         .xbgr8888 => "XBGR8888",
+        .xrgb2101010 => "XRGB2101010",
         .rgba16f_linear => "RGBA16F linear",
     };
 }

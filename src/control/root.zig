@@ -35,7 +35,15 @@ pub const DirectScanoutRejections = struct {
 };
 
 pub const FramePath = enum { none, composited, direct_scanout };
-pub const BufferFormat = enum { none, argb8888, xrgb8888, abgr8888, xbgr8888, rgba16f_linear };
+pub const BufferFormat = enum {
+    none,
+    argb8888,
+    xrgb8888,
+    abgr8888,
+    xbgr8888,
+    xrgb2101010,
+    rgba16f_linear,
+};
 pub const OutputTransform = enum { normal };
 
 pub const FrameDiagnostics = struct {

@@ -366,6 +366,7 @@ pub const DmabufFormat = enum(u32) {
     xrgb8888 = 0x34325258,
     abgr8888 = 0x34324241,
     xbgr8888 = 0x34324258,
+    xrgb2101010 = 0x30335258,
 
     pub fn fromFourcc(fourcc: u32) ?DmabufFormat {
         return switch (fourcc) {
@@ -373,6 +374,7 @@ pub const DmabufFormat = enum(u32) {
             @intFromEnum(DmabufFormat.xrgb8888) => .xrgb8888,
             @intFromEnum(DmabufFormat.abgr8888) => .abgr8888,
             @intFromEnum(DmabufFormat.xbgr8888) => .xbgr8888,
+            @intFromEnum(DmabufFormat.xrgb2101010) => .xrgb2101010,
             else => null,
         };
     }
@@ -385,7 +387,7 @@ pub const DmabufFormat = enum(u32) {
         return switch (self) {
             .argb8888 => .xrgb8888,
             .abgr8888 => .xbgr8888,
-            .xrgb8888, .xbgr8888 => self,
+            .xrgb8888, .xbgr8888, .xrgb2101010 => self,
         };
     }
 
@@ -394,14 +396,30 @@ pub const DmabufFormat = enum(u32) {
     }
 
     pub fn toArgb8888(self: DmabufFormat, pixel: u32) u32 {
+        if (self == .xrgb2101010) return 0xff00_0000 |
+            tenToEight((pixel >> 20) & 0x3ff) << 16 |
+            tenToEight((pixel >> 10) & 0x3ff) << 8 |
+            tenToEight(pixel & 0x3ff);
         var converted = if (self.redBlueSwapped()) swapRedBlue(pixel) else pixel;
         if (!self.hasAlpha()) converted |= 0xff00_0000;
         return converted;
     }
 
     pub fn fromArgb8888(self: DmabufFormat, pixel: u32) u32 {
+        if (self == .xrgb2101010) return 0xc000_0000 |
+            eightToTen((pixel >> 16) & 0xff) << 20 |
+            eightToTen((pixel >> 8) & 0xff) << 10 |
+            eightToTen(pixel & 0xff);
         const converted = if (self.hasAlpha()) pixel else pixel | 0xff00_0000;
         return if (self.redBlueSwapped()) swapRedBlue(converted) else converted;
+    }
+
+    fn tenToEight(value: u32) u32 {
+        return (value * 255 + 511) / 1023;
+    }
+
+    fn eightToTen(value: u32) u32 {
+        return (value * 1023 + 127) / 255;
     }
 
     fn swapRedBlue(pixel: u32) u32 {
@@ -601,6 +619,14 @@ test "DMA-BUF formats normalize red-blue order and opacity" {
     try std.testing.expectEqual(
         @as(u32, 0x80112233),
         DmabufFormat.abgr8888.fromArgb8888(0x80332211),
+    );
+    try std.testing.expectEqual(
+        @as(u32, 0xff804020),
+        DmabufFormat.xrgb2101010.toArgb8888(0xe024_0480),
+    );
+    try std.testing.expectEqual(
+        @as(u32, 0xe024_0480),
+        DmabufFormat.xrgb2101010.fromArgb8888(0xff804020),
     );
 }
 
