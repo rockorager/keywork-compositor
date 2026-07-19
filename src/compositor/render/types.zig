@@ -195,6 +195,13 @@ pub const TransferFunction = union(enum) {
     st2084_pq,
     hlg,
     power: u32,
+
+    pub fn isHdr(self: TransferFunction) bool {
+        return switch (self) {
+            .st2084_pq, .hlg => true,
+            .bt1886, .gamma22, .srgb, .power => false,
+        };
+    }
 };
 
 pub const srgb_chromaticities: Chromaticities = .{
@@ -628,6 +635,16 @@ test "DMA-BUF formats normalize red-blue order and opacity" {
         @as(u32, 0xe024_0480),
         DmabufFormat.xrgb2101010.fromArgb8888(0xff804020),
     );
+}
+
+test "HDR transfer functions are identified explicitly" {
+    const pq: TransferFunction = .st2084_pq;
+    const hlg: TransferFunction = .hlg;
+    const srgb: TransferFunction = .srgb;
+    try std.testing.expect(pq.isHdr());
+    try std.testing.expect(hlg.isHdr());
+    try std.testing.expect(!srgb.isHdr());
+    try std.testing.expect(!(TransferFunction{ .power = 22000 }).isHdr());
 }
 
 test "fractional scale rounds physical dimensions halfway up" {

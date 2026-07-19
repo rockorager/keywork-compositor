@@ -272,6 +272,28 @@ pub const Renderer = struct {
         return .{ .candidate = image.buffer };
     }
 
+    pub fn preferredOutputTransfer(self: *const Renderer) ?render_types.TransferFunction {
+        std.debug.assert(self.active_frame != null);
+        var hlg = false;
+        for (self.commands.items) |command| switch (command) {
+            .image => |image| switch (image.buffer.color_description.transfer_function) {
+                .st2084_pq => return .st2084_pq,
+                .hlg => hlg = true,
+                .bt1886, .gamma22, .srgb, .power => {},
+            },
+            else => {},
+        };
+        return if (hlg) .hlg else null;
+    }
+
+    pub fn setOutputColorDescription(
+        self: *Renderer,
+        description: render_types.ColorDescription,
+    ) void {
+        const active = if (self.active_frame) |*frame| frame else unreachable;
+        active.color_description = description;
+    }
+
     pub fn cancelFrame(self: *Renderer) void {
         std.debug.assert(self.active_frame != null);
         self.active_frame = null;
@@ -554,6 +576,47 @@ test "cancelled renderer frame does not leak commands" {
     );
 
     try std.testing.expectEqual(@as(u32, 0xff0000ff), output.pixel(0, 0));
+}
+
+test "renderer prefers PQ then HLG output for visible HDR images" {
+    const size: render_types.Size = .{ .width = 1, .height = 1 };
+    var output = try headless.init(std.testing.allocator, size);
+    defer output.deinit();
+    var renderer = try Renderer.init(std.testing.allocator, .cpu);
+    defer renderer.deinit();
+    var pixel: u32 = 0;
+    var image: render_types.Command = .{ .image = .{
+        .x = 0,
+        .y = 0,
+        .size = size,
+        .buffer = .{
+            .size = size,
+            .stride_pixels = size.width,
+            .pixels = @as(*[1]u32, &pixel),
+        },
+    } };
+
+    try renderer.beginFrame(.{ .pixels = output.target() }, .{}, .{}, null, .{});
+    try renderer.append(&.{image});
+    try std.testing.expect(renderer.preferredOutputTransfer() == null);
+    renderer.cancelFrame();
+
+    image.image.buffer.color_description.transfer_function = .hlg;
+    try renderer.beginFrame(.{ .pixels = output.target() }, .{}, .{}, null, .{});
+    try renderer.append(&.{image});
+    const hlg: render_types.TransferFunction = .hlg;
+    try std.testing.expectEqual(
+        hlg,
+        renderer.preferredOutputTransfer().?,
+    );
+    image.image.buffer.color_description.transfer_function = .st2084_pq;
+    try renderer.append(&.{image});
+    const pq: render_types.TransferFunction = .st2084_pq;
+    try std.testing.expectEqual(
+        pq,
+        renderer.preferredOutputTransfer().?,
+    );
+    renderer.cancelFrame();
 }
 
 test "direct scanout candidate requires a final exact opaque DMA-BUF image" {

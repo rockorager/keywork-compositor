@@ -107,6 +107,16 @@ pub fn colorDescription(self: *const Self) render.ColorDescription {
     };
 }
 
+pub fn hdrOutputDescription(
+    self: *const Self,
+    transfer: render.TransferFunction,
+) ?render.ColorDescription {
+    return switch (self.backend) {
+        .drm => |output| output.hdrOutputDescription(transfer),
+        .headless, .nested => null,
+    };
+}
+
 pub fn make(self: *const Self, fallback: []const u8) []const u8 {
     return switch (self.backend) {
         .drm => |output| output.make() orelse fallback,
