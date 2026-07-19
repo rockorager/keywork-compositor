@@ -518,12 +518,12 @@ const Params = struct {
                 return;
             }
         }
-        if (descriptor.modifier != linear_modifier) {
+        const format_info = render.DmabufFormat.fromFourcc(descriptor.format).?;
+        if (descriptor.modifier != linear_modifier or !format_info.isPackedRgb()) {
             const validator = self.manager.source_validator orelse {
                 self.importFailed(immediate_id);
                 return;
             };
-            const format_info = render.DmabufFormat.fromFourcc(descriptor.format).?;
             validator.validate(validator.context, .{
                 .size = descriptor.size,
                 .format = descriptor.format,
@@ -629,6 +629,9 @@ fn validateDescriptor(
 ) DescriptorError!Descriptor {
     if (width <= 0 or height <= 0) return error.InvalidDimensions;
     const format_info = render.DmabufFormat.fromFourcc(format) orelse return error.InvalidFormat;
+    if (!format_info.isPackedRgb() and (@rem(width, 2) != 0 or @rem(height, 2) != 0)) {
+        return error.InvalidDimensions;
+    }
     const plane_count = format_info.planeCount();
     for (planes[0..plane_count]) |plane| if (plane == null) return error.Incomplete;
     for (planes[plane_count..]) |plane| if (plane != null) return error.Incomplete;
@@ -1164,14 +1167,14 @@ test "DMA-BUF descriptor retains every plane required by video formats" {
     planes[0] = .{ .fd = luma_fd, .offset = 3, .stride = 5, .modifier = 42 };
     try std.testing.expectError(
         error.Incomplete,
-        validateDescriptor(planes, 5, 3, nv12, no_flags, false, &supported),
+        validateDescriptor(planes, 6, 4, nv12, no_flags, false, &supported),
     );
 
     planes[1] = .{ .fd = chroma_fd, .offset = 7, .stride = 6, .modifier = 42 };
     const descriptor = try validateDescriptor(
         planes,
-        5,
-        3,
+        6,
+        4,
         nv12,
         no_flags,
         false,
@@ -1186,12 +1189,21 @@ test "DMA-BUF descriptor retains every plane required by video formats" {
     planes[1].?.modifier = 43;
     try std.testing.expectError(
         error.InvalidFormat,
-        validateDescriptor(planes, 5, 3, nv12, no_flags, false, &supported),
+        validateDescriptor(planes, 6, 4, nv12, no_flags, false, &supported),
     );
     planes[1].?.modifier = 42;
     planes[2] = planes[1];
     try std.testing.expectError(
         error.Incomplete,
-        validateDescriptor(planes, 5, 3, nv12, no_flags, false, &supported),
+        validateDescriptor(planes, 6, 4, nv12, no_flags, false, &supported),
+    );
+    planes[2] = null;
+    try std.testing.expectError(
+        error.InvalidDimensions,
+        validateDescriptor(planes, 5, 4, nv12, no_flags, false, &supported),
+    );
+    try std.testing.expectError(
+        error.InvalidDimensions,
+        validateDescriptor(planes, 6, 3, nv12, no_flags, false, &supported),
     );
 }
