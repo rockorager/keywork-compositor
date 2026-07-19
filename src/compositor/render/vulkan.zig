@@ -7717,6 +7717,11 @@ fn syncTestDmaBuf(fd: std.posix.fd_t, flags: u64) bool {
     }
 }
 
+const TestVideoPattern = enum {
+    uniform_red,
+    isolated_chroma,
+};
+
 fn fillTestVideoBuffer(
     mapping: []u8,
     format: render.DmabufFormat,
@@ -7724,6 +7729,7 @@ fn fillTestVideoBuffer(
     luma_stride: u32,
     chroma_offset: u32,
     chroma_stride: u32,
+    pattern: TestVideoPattern,
 ) void {
     switch (format) {
         .nv12 => {
@@ -7733,12 +7739,18 @@ fn fillTestVideoBuffer(
             for (0..size.height / 2) |y| {
                 const row = mapping[@as(usize, chroma_offset) + y * chroma_stride ..];
                 for (0..size.width / 2) |x| {
-                    row[x * 2] = 102;
-                    row[x * 2 + 1] = 240;
+                    row[x * 2] = if (pattern == .uniform_red) 102 else 128;
+                    row[x * 2 + 1] = if (pattern == .uniform_red) 240 else 128;
                 }
+            }
+            if (pattern == .isolated_chroma) {
+                const row = mapping[@as(usize, chroma_offset) + 16 * chroma_stride ..];
+                row[16 * 2] = 102;
+                row[16 * 2 + 1] = 240;
             }
         },
         .p010 => {
+            std.debug.assert(pattern == .uniform_red);
             const y_code: u16 = 252 << 6;
             const cb_code: u16 = 408 << 6;
             const cr_code: u16 = 960 << 6;
@@ -7763,6 +7775,7 @@ fn fillTestVideoBuffer(
 fn expectVideoImport(
     format: render.DmabufFormat,
     chroma_location: render.ChromaLocation,
+    pattern: TestVideoPattern,
 ) !void {
     const fd = std.c.open("/dev/dri/renderD128", std.c.O{
         .ACCMODE = .RDWR,
@@ -7828,6 +7841,7 @@ fn expectVideoImport(
         luma_stride,
         chroma_offset,
         chroma_stride,
+        pattern,
     );
     if (!syncTestDmaBuf(
         storage.fd,
@@ -7915,19 +7929,42 @@ fn expectVideoImport(
         expected_manual,
         renderer.textures.get(cache_id).?.manual_ycbcr != null,
     );
-    try expectArgbNear(0xffff0000, target_pixels[32 * 64 + 32], 2);
+    switch (pattern) {
+        .uniform_red => try expectArgbNear(0xffff0000, target_pixels[32 * 64 + 32], 2),
+        .isolated_chroma => switch (chroma_location) {
+            .type_4 => {
+                try expectArgbNear(0xffff0000, target_pixels[33 * 64 + 32], 2);
+                try expectArgbNear(
+                    target_pixels[33 * 64 + 31],
+                    target_pixels[32 * 64 + 32],
+                    2,
+                );
+            },
+            .type_5 => try expectArgbNear(
+                target_pixels[33 * 64 + 32],
+                target_pixels[33 * 64 + 33],
+                2,
+            ),
+            .type_0, .type_1, .type_2, .type_3 => unreachable,
+        },
+    }
 }
 
 test "Vulkan converts known NV12 pixels with an immutable sampler" {
-    try expectVideoImport(.nv12, .type_0);
+    try expectVideoImport(.nv12, .type_0, .uniform_red);
 }
 
 test "Vulkan manually reconstructs known NV12 pixels" {
-    try expectVideoImport(.nv12, .type_4);
+    try expectVideoImport(.nv12, .type_4, .uniform_red);
 }
 
 test "Vulkan manually reconstructs known P010 pixels" {
-    try expectVideoImport(.p010, .type_5);
+    try expectVideoImport(.p010, .type_5, .uniform_red);
+}
+
+test "Vulkan reconstructs bottom-sited NV12 chroma" {
+    try expectVideoImport(.nv12, .type_4, .isolated_chroma);
+    try expectVideoImport(.nv12, .type_5, .isolated_chroma);
 }
 
 test "Vulkan renderer blends premultiplied alpha in linear light" {
