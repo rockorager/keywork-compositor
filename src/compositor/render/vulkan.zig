@@ -4828,14 +4828,46 @@ fn sourceColorTransform(
         .st2084_pq => .{ 5, @floatFromInt(description.max_luminance), @floatFromInt(description.reference_luminance), @floatFromInt(target_peak) },
         .hlg => .{ 6, @floatFromInt(description.max_luminance), @floatFromInt(description.reference_luminance), @floatFromInt(target_peak) },
     };
+    const output_rgb = rgbToXyz(output_description.primaries) orelse
+        rgbToXyz(render.srgb_chromaticities).?;
+    const compress_gamut = gamutCompressionNeeded(matrix);
     return .{
-        .color_matrix_0 = .{ @floatCast(matrix[0][0]), @floatCast(matrix[0][1]), @floatCast(matrix[0][2]), 0 },
-        .color_matrix_1 = .{ @floatCast(matrix[1][0]), @floatCast(matrix[1][1]), @floatCast(matrix[1][2]), 0 },
-        .color_matrix_2 = .{ @floatCast(matrix[2][0]), @floatCast(matrix[2][1]), @floatCast(matrix[2][2]), 0 },
+        .color_matrix_0 = .{ @floatCast(matrix[0][0]), @floatCast(matrix[0][1]), @floatCast(matrix[0][2]), @floatCast(if (compress_gamut) output_rgb[1][0] else -output_rgb[1][0]) },
+        .color_matrix_1 = .{ @floatCast(matrix[1][0]), @floatCast(matrix[1][1]), @floatCast(matrix[1][2]), @floatCast(output_rgb[1][1]) },
+        .color_matrix_2 = .{ @floatCast(matrix[2][0]), @floatCast(matrix[2][1]), @floatCast(matrix[2][2]), @floatCast(output_rgb[1][2]) },
         .transfer = transfer,
         .output_transfer = outputColorTransfer(output_description),
         .transfer_aux = colorTransferAux(description),
     };
+}
+
+fn gamutCompressionNeeded(matrix: Matrix3) bool {
+    const tolerance = 0.001;
+    for (matrix) |row| {
+        for (row) |value| {
+            if (value < -tolerance or value > 1 + tolerance) return true;
+        }
+    }
+    return false;
+}
+
+test "gamut compression policy distinguishes wider and equivalent primaries" {
+    try std.testing.expect(!gamutCompressionNeeded(identityMatrix3()));
+    try std.testing.expect(gamutCompressionNeeded(colorConversionMatrix(
+        render.display_p3_chromaticities,
+        render.srgb_chromaticities,
+    ).?));
+    try std.testing.expect(!gamutCompressionNeeded(colorConversionMatrix(
+        render.srgb_chromaticities,
+        render.display_p3_chromaticities,
+    ).?));
+
+    var nearly_srgb = render.srgb_chromaticities;
+    nearly_srgb.red_x += 1;
+    try std.testing.expect(!gamutCompressionNeeded(colorConversionMatrix(
+        nearly_srgb,
+        render.srgb_chromaticities,
+    ).?));
 }
 
 fn outputColorTransfer(description: render.ColorDescription) [4]f32 {
@@ -6143,6 +6175,99 @@ test "Vulkan HDR tone mapping preserves highlight gradation" {
     try expectArgbNear(0xff000000 | @as(u32, upper) * 0x010101, target_pixels[1], 1);
     try std.testing.expect(lower + 3 < upper);
     try std.testing.expect(upper < 250);
+}
+
+test "Vulkan renderer compresses wide gamut colors without channel clipping" {
+    var renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
+        error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+
+    const size: render.Size = .{ .width = 1, .height = 1 };
+    var source_pixels = [_]u32{0xffff0000};
+    var target_pixels = [_]u32{0};
+    try renderer.renderFrame(.{
+        .size = size,
+        .commands = &.{.{ .image = .{
+            .x = 0,
+            .y = 0,
+            .size = size,
+            .buffer = .{
+                .size = size,
+                .stride_pixels = 1,
+                .pixels = &source_pixels,
+                .color_description = .{
+                    .primaries = render.display_p3_chromaticities,
+                    .named_primaries = .display_p3,
+                },
+            },
+        } }},
+    }, .{ .pixels = .{
+        .size = size,
+        .stride_pixels = 1,
+        .pixels = &target_pixels,
+    } });
+
+    const red: u8 = @truncate(target_pixels[0] >> 16);
+    const green: u8 = @truncate(target_pixels[0] >> 8);
+    const blue: u8 = @truncate(target_pixels[0]);
+    try std.testing.expect(red >= 245);
+    try std.testing.expect(green >= 25 and green <= 70);
+    try std.testing.expect(blue >= 35 and blue <= 80);
+}
+
+test "Vulkan renderer preserves HDR hue above the output peak" {
+    var renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
+        error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+
+    const size: render.Size = .{ .width = 1, .height = 1 };
+    // A BT.2020 red near 4000 nits exceeds this P3 output's 1000-nit peak.
+    var source_pixels = [_]u32{0xffe60000};
+    var target_pixels = [_]u32{0};
+    try renderer.renderFrame(.{
+        .size = size,
+        .commands = &.{.{ .image = .{
+            .x = 0,
+            .y = 0,
+            .size = size,
+            .buffer = .{
+                .size = size,
+                .stride_pixels = 1,
+                .pixels = &source_pixels,
+                .color_description = .{
+                    .primaries = render.bt2020_chromaticities,
+                    .named_primaries = .bt2020,
+                    .transfer_function = .st2084_pq,
+                    .min_luminance = 50,
+                    .max_luminance = 10000,
+                    .reference_luminance = 203,
+                },
+            },
+        } }},
+        .output_color_description = .{
+            .primaries = render.display_p3_chromaticities,
+            .named_primaries = .display_p3,
+            .transfer_function = .st2084_pq,
+            .min_luminance = 50,
+            .max_luminance = 1000,
+            .reference_luminance = 203,
+        },
+    }, .{ .pixels = .{
+        .size = size,
+        .stride_pixels = 1,
+        .pixels = &target_pixels,
+    } });
+
+    const red: u8 = @truncate(target_pixels[0] >> 16);
+    const green: u8 = @truncate(target_pixels[0] >> 8);
+    const blue: u8 = @truncate(target_pixels[0]);
+    try std.testing.expect(red > 220);
+    try std.testing.expect(@as(u16, red) > @as(u16, green) + 40);
+    try std.testing.expect(@as(u16, red) > @as(u16, blue) + 40);
 }
 
 test "Vulkan renderer preserves image orientation and source rectangles" {

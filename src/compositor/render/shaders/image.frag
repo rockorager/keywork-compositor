@@ -74,6 +74,32 @@ vec3 toneMapHdr(vec3 nits) {
     return mapped_peak>output_peak ? mapped*(output_peak/mapped_peak) : mapped;
 }
 
+vec3 compressGamut(vec3 color) {
+    if (pc.color_matrix_0.w<=0.0) return color;
+    if (int(pc.transfer.x+0.5)>=5 && int(pc.output_transfer.x+0.5)>=5) return color;
+    vec3 luminance_weights=vec3(
+        pc.color_matrix_0.w,
+        pc.color_matrix_1.w,
+        pc.color_matrix_2.w
+    );
+    float output_peak=max(pc.output_transfer.w/pc.output_transfer.z,1.0);
+    float luminance=clamp(dot(luminance_weights,color),0.0,output_peak);
+    vec3 chroma=color-vec3(luminance);
+    float boundary=1000000.0;
+    if (chroma.r>0.000001) boundary=min(boundary,(output_peak-luminance)/chroma.r);
+    else if (chroma.r< -0.000001) boundary=min(boundary,-luminance/chroma.r);
+    if (chroma.g>0.000001) boundary=min(boundary,(output_peak-luminance)/chroma.g);
+    else if (chroma.g< -0.000001) boundary=min(boundary,-luminance/chroma.g);
+    if (chroma.b>0.000001) boundary=min(boundary,(output_peak-luminance)/chroma.b);
+    else if (chroma.b< -0.000001) boundary=min(boundary,-luminance/chroma.b);
+    float saturation=1.0/max(boundary,0.000001);
+    const float threshold=0.8;
+    if (saturation<=threshold) return color;
+    float compressed=threshold+(1.0-threshold)*
+        (1.0-exp(-(saturation-threshold)/(1.0-threshold)));
+    return vec3(luminance)+chroma*(compressed/saturation);
+}
+
 vec3 decodeColor(vec3 electrical) {
     vec3 optical=vec3(
         decodeComponent(electrical.r),
@@ -94,11 +120,11 @@ vec3 decodeColor(vec3 electrical) {
     }
     else if (transfer==3) optical/=pc.transfer.z;
     else optical=((pc.transfer.w-pc.transfer_aux.x)*optical+pc.transfer_aux.x)/pc.transfer.z;
-    return vec3(
+    return compressGamut(vec3(
         dot(pc.color_matrix_0.xyz,optical),
         dot(pc.color_matrix_1.xyz,optical),
         dot(pc.color_matrix_2.xyz,optical)
-    );
+    ));
 }
 
 void main() {
