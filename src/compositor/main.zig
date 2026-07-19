@@ -393,6 +393,7 @@ test "cursor size defaults when missing or empty" {
 
 test {
     _ = @import("render/types.zig");
+    _ = @import("render/icc.zig");
     _ = @import("render/renderer.zig");
     _ = @import("render/cpu.zig");
     _ = @import("render/vulkan.zig");

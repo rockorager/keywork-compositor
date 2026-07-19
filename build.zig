@@ -175,6 +175,7 @@ pub fn build(b: *std.Build) void {
     addVulkanShader(b, compositor, "vulkan-blur-horizontal", "src/compositor/render/shaders/blur_horizontal.frag");
     addVulkanShader(b, compositor, "vulkan-blur-vertical", "src/compositor/render/shaders/blur_vertical.frag");
     addVulkanShader(b, compositor, "vulkan-encode", "src/compositor/render/shaders/encode.frag");
+    compositor.linkSystemLibrary("lcms2", .{});
     compositor.linkSystemLibrary("libdisplay-info", .{});
     compositor.linkSystemLibrary("libdrm", .{});
     compositor.linkSystemLibrary("gbm", .{});
