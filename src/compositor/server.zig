@@ -2835,7 +2835,7 @@ fn surfaceChanged(context: *anyopaque, surface_id: Surface.Id) void {
     const damage = Surface.currentDamage(surfaces, surface_id) orelse
         return requestRepaint(self);
     const layer_shadow = if (std.meta.eql(surface_id, root) and
-        self.layer_shell.castsShadow(root)) self.layer_shell_effects.shadow else null;
+        self.layer_shell.usesEffects(root)) self.layer_shell_effects.shadow else null;
     if (damage.isEmpty()) {
         var bounds: ?render.Rect = null;
         self.addSurfaceTreeBounds(root, root_position.x, root_position.y, &bounds) catch
@@ -4635,6 +4635,9 @@ fn hitTestLayer(self: *Self, layer: Scene.Layer, x: f64, y: f64) ?Seat.PointerFo
     while (surfaces.next()) |entry| {
         const layer_surface = entry.layer_surface;
         if (!layer_surface.mapped) continue;
+        if (self.layerSurfaceEffectsRect(layer_surface)) |rect| {
+            if (!pointInRoundedRect(x, y, rect, self.layer_shell_effects.corner_radius)) continue;
+        }
         if (self.hitTestSurface(
             layer_surface.surface_id,
             layer_surface.position,
@@ -5995,6 +5998,18 @@ fn layerSurfaceRect(
     };
 }
 
+fn layerSurfaceEffectsRect(
+    self: *Self,
+    layer_surface: *const Scene.LayerSurface,
+) ?render.Rect {
+    if (!self.layer_shell.usesEffects(layer_surface.surface_id)) return null;
+    const buffer = Surface.currentBuffer(
+        self.compositor.surfaceStore(),
+        layer_surface.surface_id,
+    ) orelse return null;
+    return layerSurfaceRect(layer_surface, buffer.logical_size);
+}
+
 fn addBackdropBlurDamage(
     damage: *Region,
     blur: BackdropBlurArea,
@@ -6565,31 +6580,31 @@ fn renderLayerSurfaces(
     while (surfaces.next()) |entry| {
         const layer_surface = entry.layer_surface;
         if (!layer_surface.mapped) continue;
-        if (self.layer_shell.castsShadow(layer_surface.surface_id)) {
+        const effects_rect = self.layerSurfaceEffectsRect(layer_surface);
+        if (effects_rect) |rect| {
             if (self.layer_shell_effects.shadow) |shadow| {
-                const buffer = Surface.currentBuffer(
-                    self.compositor.surfaceStore(),
-                    layer_surface.surface_id,
+                try self.renderShadow(
+                    frame,
+                    rect,
+                    self.layer_shell_effects.corner_radius,
+                    shadow,
+                    null,
                 );
-                if (buffer) |root_buffer| {
-                    if (layerSurfaceRect(layer_surface, root_buffer.logical_size)) |rect| {
-                        try self.renderShadow(
-                            frame,
-                            rect,
-                            self.layer_shell_effects.corner_radius,
-                            shadow,
-                            null,
-                        );
-                    }
-                }
             }
         }
+        const rounded_clip: ?render.RoundedClip = if (effects_rect) |rect|
+            if (self.layer_shell_effects.corner_radius == 0)
+                null
+            else
+                .{ .rect = rect, .radius = self.layer_shell_effects.corner_radius }
+        else
+            null;
         try self.renderSurfaceTree(
             frame,
             layer_surface.surface_id,
             layer_surface.position.x,
             layer_surface.position.y,
-            null,
+            rounded_clip,
             null,
         );
     }
