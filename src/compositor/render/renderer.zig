@@ -276,6 +276,65 @@ pub const Renderer = struct {
         return .{ .candidate = image.buffer };
     }
 
+    pub fn overlayScanoutCandidate(self: *Renderer) render_types.OverlayScanoutCandidate {
+        const active = self.active_frame orelse return .{ .rejected = .no_topmost_surface };
+        const last_command = self.commands.getLastOrNull() orelse
+            return .{ .rejected = .no_topmost_surface };
+        const image = switch (last_command) {
+            .image => |image| image,
+            else => return .{ .rejected = .no_topmost_surface },
+        };
+        if (!image.is_opaque or image.alpha_multiplier != std.math.maxInt(u32)) {
+            return .{ .rejected = .non_opaque_surface };
+        }
+        if (image.rounded_clip != null or image.clip != null) {
+            return .{ .rejected = .clipped_surface };
+        }
+        if (image.source != null or image.transform != .normal) {
+            return .{ .rejected = .transformed_surface };
+        }
+        if (!std.meta.eql(image.size, image.buffer.size)) {
+            return .{ .rejected = .scaled_surface };
+        }
+        const right = @as(i64, image.x) + image.size.width;
+        const bottom = @as(i64, image.y) + image.size.height;
+        if (image.x < 0 or image.y < 0 or right > active.target.size().width or
+            bottom > active.target.size().height or image.size.width == 0 or image.size.height == 0)
+        {
+            return .{ .rejected = .outside_output };
+        }
+        const dmabuf = image.buffer.dmabuf orelse return .{ .rejected = .non_dmabuf };
+        const format = render_types.DmabufFormat.fromFourcc(dmabuf.format) orelse
+            return .{ .rejected = .non_rgb_surface };
+        const rgb_representation: render_types.ColorRepresentation = .{};
+        if (!format.isPackedRgb() or
+            !std.meta.eql(image.buffer.color_representation, rgb_representation))
+        {
+            return .{ .rejected = .non_rgb_surface };
+        }
+        if (dmabuf.y_inverted) return .{ .rejected = .y_inverted };
+        if (image.buffer.source_cache == null) {
+            return .{ .rejected = .missing_buffer_identity };
+        }
+        if (!std.meta.eql(image.buffer.color_description, active.color_description) or
+            active.output_calibration != null)
+        {
+            return .{ .rejected = .color_conversion };
+        }
+
+        var buffer = image.buffer;
+        buffer.dmabuf.?.force_opaque = true;
+        return .{ .candidate = .{
+            .buffer = buffer,
+            .destination = .{
+                .x = image.x,
+                .y = image.y,
+                .width = image.size.width,
+                .height = image.size.height,
+            },
+        } };
+    }
+
     pub fn preferredOutputTransfer(self: *const Renderer) ?render_types.TransferFunction {
         std.debug.assert(self.active_frame != null);
         var hlg = false;
@@ -669,7 +728,7 @@ test "direct scanout candidate requires a final exact opaque DMA-BUF image" {
             },
             .plane_count = 1,
             .y_inverted = false,
-            .force_opaque = true,
+            .force_opaque = false,
             .retain = NoopSource.retain,
             .release = NoopSource.release,
             .begin_cpu_read = NoopSource.begin,
@@ -699,6 +758,12 @@ test "direct scanout candidate requires a final exact opaque DMA-BUF image" {
     try renderer.beginFrame(target, .{}, .{}, null, .{});
     try renderer.append(&direct_commands);
     try expectDirectScanoutCandidate(renderer.directScanoutCandidate());
+    const overlay = try expectOverlayScanoutCandidate(renderer.overlayScanoutCandidate());
+    try std.testing.expectEqual(
+        render_types.Rect{ .x = 0, .y = 0, .width = 2, .height = 2 },
+        overlay.destination,
+    );
+    try std.testing.expect(overlay.buffer.dmabuf.?.force_opaque);
     renderer.cancelFrame();
 
     const p3: render_types.ColorDescription = .{
@@ -708,6 +773,7 @@ test "direct scanout candidate requires a final exact opaque DMA-BUF image" {
     try renderer.beginFrame(target, .{}, .{}, null, p3);
     try renderer.append(&direct_commands);
     try expectDirectScanoutRejection(.color_conversion, renderer.directScanoutCandidate());
+    try expectOverlayScanoutRejection(.color_conversion, renderer.overlayScanoutCandidate());
     renderer.cancelFrame();
 
     var matching_color_commands = direct_commands;
@@ -744,6 +810,7 @@ test "direct scanout candidate requires a final exact opaque DMA-BUF image" {
     try renderer.beginFrame(target, .{}, .{}, null, .{});
     try renderer.append(&scaled_commands);
     try expectDirectScanoutCandidate(renderer.directScanoutCandidate());
+    try expectOverlayScanoutRejection(.scaled_surface, renderer.overlayScanoutCandidate());
     renderer.cancelFrame();
 
     var transparent_commands = direct_commands;
@@ -751,6 +818,7 @@ test "direct scanout candidate requires a final exact opaque DMA-BUF image" {
     try renderer.beginFrame(target, .{}, .{}, null, .{});
     try renderer.append(&transparent_commands);
     try expectDirectScanoutRejection(.non_opaque_surface, renderer.directScanoutCandidate());
+    try expectOverlayScanoutRejection(.non_opaque_surface, renderer.overlayScanoutCandidate());
     renderer.cancelFrame();
 
     var alpha_commands = direct_commands;
@@ -765,6 +833,7 @@ test "direct scanout candidate requires a final exact opaque DMA-BUF image" {
     try renderer.beginFrame(target, .{}, .{}, null, .{});
     try renderer.append(&transformed_commands);
     try expectDirectScanoutRejection(.surface_transform, renderer.directScanoutCandidate());
+    try expectOverlayScanoutRejection(.transformed_surface, renderer.overlayScanoutCandidate());
     renderer.cancelFrame();
 
     var non_dmabuf_commands = direct_commands;
@@ -772,6 +841,7 @@ test "direct scanout candidate requires a final exact opaque DMA-BUF image" {
     try renderer.beginFrame(target, .{}, .{}, null, .{});
     try renderer.append(&non_dmabuf_commands);
     try expectDirectScanoutRejection(.non_dmabuf, renderer.directScanoutCandidate());
+    try expectOverlayScanoutRejection(.non_dmabuf, renderer.overlayScanoutCandidate());
     renderer.cancelFrame();
 
     var inverted_commands = direct_commands;
@@ -795,6 +865,7 @@ test "direct scanout candidate requires a final exact opaque DMA-BUF image" {
         .color = render_types.Color.rgba(255, 255, 255, 255),
     } }});
     try expectDirectScanoutRejection(.no_fullscreen_surface, renderer.directScanoutCandidate());
+    try expectOverlayScanoutRejection(.no_topmost_surface, renderer.overlayScanoutCandidate());
     renderer.cancelFrame();
 }
 
@@ -811,6 +882,28 @@ fn expectDirectScanoutCandidate(candidate: render_types.DirectScanoutCandidate) 
 fn expectDirectScanoutRejection(
     expected: render_types.DirectScanoutRejection,
     candidate: render_types.DirectScanoutCandidate,
+) !void {
+    switch (candidate) {
+        .candidate => return error.TestUnexpectedResult,
+        .rejected => |reason| try std.testing.expectEqual(expected, reason),
+    }
+}
+
+fn expectOverlayScanoutCandidate(
+    candidate: render_types.OverlayScanoutCandidate,
+) !render_types.OverlayScanout {
+    return switch (candidate) {
+        .candidate => |overlay| overlay,
+        .rejected => |reason| {
+            std.debug.print("unexpected overlay scanout rejection: {t}\n", .{reason});
+            return error.TestUnexpectedResult;
+        },
+    };
+}
+
+fn expectOverlayScanoutRejection(
+    expected: render_types.OverlayScanoutRejection,
+    candidate: render_types.OverlayScanoutCandidate,
 ) !void {
     switch (candidate) {
         .candidate => return error.TestUnexpectedResult,

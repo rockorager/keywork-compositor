@@ -605,6 +605,40 @@ pub const DirectScanoutCandidate = union(enum) {
     rejected: DirectScanoutRejection,
 };
 
+pub const OverlayScanoutRejection = enum(u8) {
+    no_topmost_surface,
+    non_opaque_surface,
+    clipped_surface,
+    transformed_surface,
+    scaled_surface,
+    outside_output,
+    non_dmabuf,
+    non_rgb_surface,
+    y_inverted,
+    missing_buffer_identity,
+    color_conversion,
+    unsupported_backend,
+    output_unavailable,
+    output_busy,
+    device_inactive,
+    no_overlay_plane,
+    unsupported_format_or_modifier,
+    unsupported_layout,
+    framebuffer_import_failed,
+    atomic_test_failed,
+    page_flip_failed,
+};
+
+pub const OverlayScanout = struct {
+    buffer: PixelBuffer,
+    destination: Rect,
+};
+
+pub const OverlayScanoutCandidate = union(enum) {
+    candidate: OverlayScanout,
+    rejected: OverlayScanoutRejection,
+};
+
 pub const DmabufPlane = struct {
     fd: std.posix.fd_t = -1,
     stride: u32 = 0,
