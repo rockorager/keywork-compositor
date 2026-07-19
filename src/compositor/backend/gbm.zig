@@ -11,6 +11,13 @@ const c = @cImport({
 
 device: *c.gbm_device,
 
+pub const Plane = struct {
+    fd: std.posix.fd_t = -1,
+    handle: u32 = 0,
+    stride: u32 = 0,
+    offset: u32 = 0,
+};
+
 pub const Buffer = struct {
     bo: *c.gbm_bo,
     fd: std.posix.fd_t,
@@ -19,9 +26,15 @@ pub const Buffer = struct {
     stride: u32,
     offset: u32,
     modifier: u64,
+    planes: [render.max_dmabuf_planes]Plane,
+    plane_count: u8,
+
+    pub fn planeSlice(self: *const Buffer) []const Plane {
+        return self.planes[0..self.plane_count];
+    }
 
     pub fn deinit(self: *Buffer) void {
-        _ = std.c.close(self.fd);
+        for (self.planeSlice()) |plane| _ = std.c.close(plane.fd);
         c.gbm_bo_destroy(self.bo);
         self.* = undefined;
     }
@@ -69,16 +82,35 @@ pub fn createImplicitBuffer(self: *Self, size: render.Size, format: u32) !Buffer
 
 fn exportBuffer(bo: *c.gbm_bo) !Buffer {
     errdefer c.gbm_bo_destroy(bo);
-    if (c.gbm_bo_get_plane_count(bo) != 1) return error.UnsupportedPlaneCount;
-    const fd = c.gbm_bo_get_fd_for_plane(bo, 0);
-    if (fd < 0) return error.ExportBufferFailed;
+    const plane_count = c.gbm_bo_get_plane_count(bo);
+    if (plane_count <= 0 or plane_count > render.max_dmabuf_planes) {
+        return error.UnsupportedPlaneCount;
+    }
+    var planes: [render.max_dmabuf_planes]Plane = @splat(.{});
+    var exported_count: usize = 0;
+    errdefer {
+        for (planes[0..exported_count]) |plane| _ = std.c.close(plane.fd);
+    }
+    for (planes[0..@intCast(plane_count)], 0..) |*plane, index| {
+        const fd = c.gbm_bo_get_fd_for_plane(bo, @intCast(index));
+        if (fd < 0) return error.ExportBufferFailed;
+        plane.* = .{
+            .fd = fd,
+            .handle = c.gbm_bo_get_handle_for_plane(bo, @intCast(index)).u32,
+            .stride = c.gbm_bo_get_stride_for_plane(bo, @intCast(index)),
+            .offset = c.gbm_bo_get_offset(bo, @intCast(index)),
+        };
+        exported_count += 1;
+    }
     return .{
         .bo = bo,
-        .fd = fd,
+        .fd = planes[0].fd,
         .format = c.gbm_bo_get_format(bo),
-        .handle = c.gbm_bo_get_handle_for_plane(bo, 0).u32,
-        .stride = c.gbm_bo_get_stride_for_plane(bo, 0),
-        .offset = c.gbm_bo_get_offset(bo, 0),
+        .handle = planes[0].handle,
+        .stride = planes[0].stride,
+        .offset = planes[0].offset,
         .modifier = c.gbm_bo_get_modifier(bo),
+        .planes = planes,
+        .plane_count = @intCast(plane_count),
     };
 }
