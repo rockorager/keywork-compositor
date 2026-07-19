@@ -1984,6 +1984,14 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
             .format = @intFromEnum(source_format),
             .modifier = modifier,
         });
+        for (dmabuf_nv12_source_modifiers) |modifier| try pairs.append(allocator, .{
+            .format = @intFromEnum(render.DmabufFormat.nv12),
+            .modifier = modifier,
+        });
+        for (dmabuf_p010_source_modifiers) |modifier| try pairs.append(allocator, .{
+            .format = @intFromEnum(render.DmabufFormat.p010),
+            .modifier = modifier,
+        });
         dmabuf_source_formats = try pairs.toOwnedSlice(allocator);
     }
     errdefer if (dmabuf_modifiers.len != 0) allocator.free(dmabuf_modifiers);
@@ -7795,6 +7803,11 @@ fn expectVideoImport(
         .argb8888, .xrgb8888, .abgr8888, .xbgr8888, .xrgb2101010 => unreachable,
     };
     if (std.mem.indexOfScalar(u64, modifiers, 0) == null) return error.SkipZigTest;
+    try std.testing.expect(render.DmabufFormatModifier.contains(
+        renderer.dmabuf_source_formats,
+        @intFromEnum(format),
+        0,
+    ));
 
     const Gbm = @import("../backend/gbm.zig");
     var gbm = Gbm.init(fd) catch return error.SkipZigTest;
