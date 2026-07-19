@@ -82,6 +82,7 @@ dmabuf_device_id: ?render.DrmDeviceId,
 outputs: std.AutoHashMapUnmanaged(TargetKey, Output) = .empty,
 textures: std.AutoHashMapUnmanaged(u64, Texture) = .empty,
 calibrations: std.AutoHashMapUnmanaged(u64, CalibrationTexture) = .empty,
+video_graphics: std.AutoHashMapUnmanaged(VideoGraphicsKey, VideoGraphics) = .empty,
 frame_number: u64,
 resource_epoch: u64,
 fallback: CpuRenderer,
@@ -183,6 +184,9 @@ const Texture = struct {
     memory: vk.DeviceMemory,
     view: vk.ImageView,
     descriptor_set: vk.DescriptorSet,
+    pipeline: vk.Pipeline = .null_handle,
+    pipeline_layout: vk.PipelineLayout = .null_handle,
+    video_representation: ?render.ColorRepresentation = null,
     size: render.Size,
     version: u64 = 0,
     initialized: bool = false,
@@ -288,6 +292,8 @@ const BaseBackdropCache = struct {
 
 const DrawRun = struct {
     pipeline: PipelineKind,
+    pipeline_handle: vk.Pipeline = .null_handle,
+    pipeline_layout: vk.PipelineLayout = .null_handle,
     descriptor_set: ?vk.DescriptorSet,
     texture_size: render.Size,
     first_instance: u32,
@@ -890,12 +896,48 @@ fn dmabufTargetVkFormat(fourcc: u32) ?vk.Format {
     };
 }
 
+fn dmabufSourceExtentValid(format: render.DmabufFormat, size: render.Size) bool {
+    if (size.width == 0 or size.height == 0) return false;
+    return format.isPackedRgb() or (size.width % 2 == 0 and size.height % 2 == 0);
+}
+
+test "Vulkan source extents respect chroma subsampling" {
+    try std.testing.expect(dmabufSourceExtentValid(.nv12, .{ .width = 1920, .height = 1080 }));
+    try std.testing.expect(!dmabufSourceExtentValid(.nv12, .{ .width = 1919, .height = 1080 }));
+    try std.testing.expect(!dmabufSourceExtentValid(.p010, .{ .width = 1920, .height = 1079 }));
+    try std.testing.expect(dmabufSourceExtentValid(.argb8888, .{ .width = 1919, .height = 1079 }));
+}
+
 const YcbcrConversion = struct {
     model: vk.SamplerYcbcrModelConversion,
     range: vk.SamplerYcbcrRange,
     x_chroma_offset: vk.ChromaLocation,
     y_chroma_offset: vk.ChromaLocation,
 };
+
+const VideoGraphicsKey = struct {
+    format: vk.Format,
+    model: vk.SamplerYcbcrModelConversion,
+    range: vk.SamplerYcbcrRange,
+    x_chroma_offset: vk.ChromaLocation,
+    y_chroma_offset: vk.ChromaLocation,
+};
+
+const VideoGraphics = struct {
+    conversion: vk.SamplerYcbcrConversion,
+    sampler: vk.Sampler,
+    descriptor_set_layout: vk.DescriptorSetLayout,
+    pipeline_layout: vk.PipelineLayout,
+    pipeline: vk.Pipeline,
+};
+
+fn defaultVideoRepresentation() render.ColorRepresentation {
+    return .{
+        .coefficients = .bt709,
+        .range = .limited,
+        .chroma_location = .type_0,
+    };
+}
 
 fn ycbcrConversion(representation: render.ColorRepresentation) ?YcbcrConversion {
     const model: vk.SamplerYcbcrModelConversion = switch (representation.coefficients) {
@@ -923,6 +965,139 @@ fn ycbcrConversion(representation: render.ColorRepresentation) ?YcbcrConversion 
         .x_chroma_offset = offsets[0],
         .y_chroma_offset = offsets[1],
     };
+}
+
+fn videoGraphicsKey(format: vk.Format, conversion: YcbcrConversion) VideoGraphicsKey {
+    return .{
+        .format = format,
+        .model = conversion.model,
+        .range = conversion.range,
+        .x_chroma_offset = conversion.x_chroma_offset,
+        .y_chroma_offset = conversion.y_chroma_offset,
+    };
+}
+
+fn getVideoGraphics(self: *Self, key: VideoGraphicsKey) Error!VideoGraphics {
+    if (self.video_graphics.get(key)) |graphics| return graphics;
+    const graphics = try self.createVideoGraphics(key);
+    self.video_graphics.put(self.allocator, key, graphics) catch {
+        self.destroyVideoGraphics(graphics);
+        return error.OutOfMemory;
+    };
+    return graphics;
+}
+
+fn createVideoGraphics(self: *Self, key: VideoGraphicsKey) Error!VideoGraphics {
+    const conversion = self.device_wrapper.createSamplerYcbcrConversionKHR(self.device, &.{
+        .format = key.format,
+        .ycbcr_model = key.model,
+        .ycbcr_range = key.range,
+        .components = .{
+            .r = .identity,
+            .g = .identity,
+            .b = .identity,
+            .a = .identity,
+        },
+        .x_chroma_offset = key.x_chroma_offset,
+        .y_chroma_offset = key.y_chroma_offset,
+        .chroma_filter = .linear,
+        .force_explicit_reconstruction = .false,
+    }, null) catch return error.VulkanFailure;
+    errdefer self.device_wrapper.destroySamplerYcbcrConversionKHR(
+        self.device,
+        conversion,
+        null,
+    );
+    const conversion_info: vk.SamplerYcbcrConversionInfo = .{ .conversion = conversion };
+    const sampler = self.device_wrapper.createSampler(self.device, &.{
+        .p_next = &conversion_info,
+        .mag_filter = .linear,
+        .min_filter = .linear,
+        .mipmap_mode = .nearest,
+        .address_mode_u = .clamp_to_edge,
+        .address_mode_v = .clamp_to_edge,
+        .address_mode_w = .clamp_to_edge,
+        .mip_lod_bias = 0,
+        .anisotropy_enable = .false,
+        .max_anisotropy = 1,
+        .compare_enable = .false,
+        .compare_op = .always,
+        .min_lod = 0,
+        .max_lod = 0,
+        .border_color = .float_transparent_black,
+        .unnormalized_coordinates = .false,
+    }, null) catch return error.VulkanFailure;
+    errdefer self.device_wrapper.destroySampler(self.device, sampler, null);
+    const binding: vk.DescriptorSetLayoutBinding = .{
+        .binding = 0,
+        .descriptor_type = .combined_image_sampler,
+        .descriptor_count = 1,
+        .stage_flags = .{ .fragment_bit = true },
+        .p_immutable_samplers = @ptrCast(&sampler),
+    };
+    const descriptor_set_layout = self.device_wrapper.createDescriptorSetLayout(self.device, &.{
+        .binding_count = 1,
+        .p_bindings = @ptrCast(&binding),
+    }, null) catch return error.VulkanFailure;
+    errdefer self.device_wrapper.destroyDescriptorSetLayout(
+        self.device,
+        descriptor_set_layout,
+        null,
+    );
+    const push_range: vk.PushConstantRange = .{
+        .stage_flags = .{ .vertex_bit = true, .fragment_bit = true },
+        .offset = 0,
+        .size = @sizeOf(FramePush),
+    };
+    const pipeline_layout = self.device_wrapper.createPipelineLayout(self.device, &.{
+        .set_layout_count = 1,
+        .p_set_layouts = @ptrCast(&descriptor_set_layout),
+        .push_constant_range_count = 1,
+        .p_push_constant_ranges = @ptrCast(&push_range),
+    }, null) catch return error.VulkanFailure;
+    errdefer self.device_wrapper.destroyPipelineLayout(self.device, pipeline_layout, null);
+    const vertex_shader = self.device_wrapper.createShaderModule(self.device, &.{
+        .code_size = @sizeOf(@TypeOf(shaders.quad_instanced)),
+        .p_code = &shaders.quad_instanced,
+    }, null) catch return error.VulkanFailure;
+    defer self.device_wrapper.destroyShaderModule(self.device, vertex_shader, null);
+    const image_shader = self.device_wrapper.createShaderModule(self.device, &.{
+        .code_size = @sizeOf(@TypeOf(shaders.image_alpha_instanced)),
+        .p_code = &shaders.image_alpha_instanced,
+    }, null) catch return error.VulkanFailure;
+    defer self.device_wrapper.destroyShaderModule(self.device, image_shader, null);
+    const pipeline = createPipeline(
+        self.device_wrapper,
+        self.device,
+        self.render_pass,
+        pipeline_layout,
+        vertex_shader,
+        image_shader,
+        true,
+    ) catch return error.VulkanFailure;
+    return .{
+        .conversion = conversion,
+        .sampler = sampler,
+        .descriptor_set_layout = descriptor_set_layout,
+        .pipeline_layout = pipeline_layout,
+        .pipeline = pipeline,
+    };
+}
+
+fn destroyVideoGraphics(self: *Self, graphics: VideoGraphics) void {
+    self.device_wrapper.destroyPipeline(self.device, graphics.pipeline, null);
+    self.device_wrapper.destroyPipelineLayout(self.device, graphics.pipeline_layout, null);
+    self.device_wrapper.destroyDescriptorSetLayout(
+        self.device,
+        graphics.descriptor_set_layout,
+        null,
+    );
+    self.device_wrapper.destroySampler(self.device, graphics.sampler, null);
+    self.device_wrapper.destroySamplerYcbcrConversionKHR(
+        self.device,
+        graphics.conversion,
+        null,
+    );
 }
 
 test "color representation maps to Vulkan YCbCr conversion" {
@@ -972,6 +1147,26 @@ test "unsupported YCbCr conversion metadata is rejected" {
             .chroma_location = location,
         }) == null);
     }
+}
+
+test "Vulkan caches immutable YCbCr sampler pipelines" {
+    var renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
+        error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+    if (renderer.dmabuf_nv12_source_modifiers.len == 0) return error.SkipZigTest;
+
+    const parameters = ycbcrConversion(defaultVideoRepresentation()).?;
+    const key = videoGraphicsKey(.g8_b8r8_2plane_420_unorm, parameters);
+    const first = try renderer.getVideoGraphics(key);
+    const second = try renderer.getVideoGraphics(key);
+    try std.testing.expectEqual(first.conversion, second.conversion);
+    try std.testing.expectEqual(first.sampler, second.sampler);
+    try std.testing.expectEqual(first.descriptor_set_layout, second.descriptor_set_layout);
+    try std.testing.expectEqual(first.pipeline_layout, second.pipeline_layout);
+    try std.testing.expectEqual(first.pipeline, second.pipeline);
+    try std.testing.expectEqual(@as(usize, 1), renderer.video_graphics.count());
 }
 
 fn dmabufPlanesShareAllocation(planes: []const render.DmabufPlane) bool {
@@ -1849,6 +2044,8 @@ fn validateSourceCallback(
 ) anyerror!void {
     const self: *Self = @ptrCast(@alignCast(context));
     std.debug.assert(descriptor.modifier != 0);
+    const source_format = render.DmabufFormat.fromFourcc(descriptor.format) orelse
+        return error.InvalidTarget;
     const Noop = struct {
         fn retain(_: *anyopaque) void {}
         fn release(_: *anyopaque) void {}
@@ -1860,20 +2057,24 @@ fn validateSourceCallback(
         }
     };
     var source_context: u8 = 0;
-    const texture = try self.createImportedTexture(descriptor.size, .{
-        .context = &source_context,
-        .format = descriptor.format,
-        .modifier = descriptor.modifier,
-        .planes = descriptor.planes,
-        .plane_count = descriptor.plane_count,
-        .y_inverted = false,
-        .force_opaque = descriptor.force_opaque,
-        .retain = Noop.retain,
-        .release = Noop.release,
-        .begin_cpu_read = Noop.sync,
-        .end_cpu_read = Noop.sync,
-        .export_read_fence = Noop.exportFence,
-    });
+    const texture = try self.createImportedTexture(
+        descriptor.size,
+        .{
+            .context = &source_context,
+            .format = descriptor.format,
+            .modifier = descriptor.modifier,
+            .planes = descriptor.planes,
+            .plane_count = descriptor.plane_count,
+            .y_inverted = false,
+            .force_opaque = descriptor.force_opaque,
+            .retain = Noop.retain,
+            .release = Noop.release,
+            .begin_cpu_read = Noop.sync,
+            .end_cpu_read = Noop.sync,
+            .export_read_fence = Noop.exportFence,
+        },
+        if (source_format.isPackedRgb()) .{} else defaultVideoRepresentation(),
+    );
     self.destroyTexture(texture);
 }
 
@@ -2113,11 +2314,15 @@ fn dmabufTargetUsage(sampleable: bool) vk.ImageUsageFlags {
 }
 
 fn supportsDmabufSource(self: *Self, size: render.Size, source: render.DmabufSource) bool {
-    if (size.width == 0 or size.height == 0 or source.plane_count != 1) return false;
+    const source_format_info = render.DmabufFormat.fromFourcc(source.format) orelse return false;
+    if (!dmabufSourceExtentValid(source_format_info, size) or
+        source.plane_count != source_format_info.planeCount()) return false;
     const source_format = dmabufSourceVkFormat(source.format) orelse return false;
     const modifiers = switch (source_format) {
         .b8g8r8a8_unorm => self.dmabuf_source_modifiers,
         .r8g8b8a8_unorm => self.dmabuf_rgba_source_modifiers,
+        .g8_b8r8_2plane_420_unorm => self.dmabuf_nv12_source_modifiers,
+        .g10x6_b10x6r10x6_2plane_420_unorm_3pack16 => self.dmabuf_p010_source_modifiers,
         else => unreachable,
     };
     if (std.mem.indexOfScalar(u64, modifiers, source.modifier) == null) return false;
@@ -2708,7 +2913,8 @@ fn renderFrameWithCompletion(
                 &.{0},
             );
         }
-        var bound_pipeline: ?PipelineKind = null;
+        var bound_pipeline = vk.Pipeline.null_handle;
+        var bound_pipeline_layout = vk.PipelineLayout.null_handle;
         var bound_descriptor: ?vk.DescriptorSet = null;
         for (self.draw_runs.items, 0..) |run, run_index| {
             if (self.blurOpAt(run_index)) |blur_op| {
@@ -2785,17 +2991,30 @@ fn renderFrameWithCompletion(
                     self.transitionImage(command_buffer, output.linear.image, .shader_read_only_optimal, .color_attachment_optimal, .{ .shader_read_bit = true }, .{ .color_attachment_read_bit = true, .color_attachment_write_bit = true }, .{ .fragment_shader_bit = true }, .{ .color_attachment_output_bit = true });
                     self.device_wrapper.cmdBeginRenderPass(command_buffer, &render_pass_info, .@"inline");
                     self.setViewportAndScissor(command_buffer, frame.size);
-                    bound_pipeline = null;
+                    bound_pipeline = .null_handle;
+                    bound_pipeline_layout = .null_handle;
                     bound_descriptor = null;
                 }
             }
-            if (bound_pipeline != run.pipeline) {
+            const run_pipeline = if (run.pipeline_handle != .null_handle)
+                run.pipeline_handle
+            else
+                self.pipelineForKind(run.pipeline);
+            const run_pipeline_layout = if (run.pipeline_layout != .null_handle)
+                run.pipeline_layout
+            else
+                self.pipeline_layout;
+            if (bound_pipeline != run_pipeline) {
                 self.device_wrapper.cmdBindPipeline(
                     command_buffer,
                     .graphics,
-                    self.pipelineForKind(run.pipeline),
+                    run_pipeline,
                 );
-                bound_pipeline = run.pipeline;
+                bound_pipeline = run_pipeline;
+            }
+            if (bound_pipeline_layout != run_pipeline_layout) {
+                bound_pipeline_layout = run_pipeline_layout;
+                bound_descriptor = null;
             }
             const run_descriptor = if (run.pipeline == .blur_composite) blk: {
                 const blur_op = self.blurOpAt(run_index).?;
@@ -2806,7 +3025,7 @@ fn renderFrameWithCompletion(
                     self.device_wrapper.cmdBindDescriptorSets(
                         command_buffer,
                         .graphics,
-                        self.pipeline_layout,
+                        run_pipeline_layout,
                         0,
                         &.{descriptor_set},
                         null,
@@ -2832,7 +3051,7 @@ fn renderFrameWithCompletion(
             };
             self.device_wrapper.cmdPushConstants(
                 command_buffer,
-                self.pipeline_layout,
+                run_pipeline_layout,
                 .{ .vertex_bit = true, .fragment_bit = true },
                 0,
                 @sizeOf(FramePush),
@@ -3929,9 +4148,31 @@ fn prepareImportedTexture(
     previously_prepared: []const PreparedImage,
 ) Error!PreparedImage {
     const source = buffer.source_cache orelse return error.InvalidTarget;
+    const format = render.DmabufFormat.fromFourcc(buffer.dmabuf.?.format) orelse
+        return error.InvalidTarget;
+    const video_representation: ?render.ColorRepresentation = if (format.isPackedRgb())
+        null
+    else
+        buffer.color_representation;
     for (previously_prepared) |prepared| {
         if (prepared.cache_id == source.id) {
             if (!prepared.texture.imported) return error.InvalidTarget;
+            if (!std.meta.eql(prepared.texture.video_representation, video_representation)) {
+                const texture = try self.createImportedTexture(
+                    buffer.size,
+                    buffer.dmabuf.?,
+                    buffer.color_representation,
+                );
+                return .{
+                    .texture = texture,
+                    .buffer = buffer,
+                    .upload_offset = null,
+                    .upload_damage = null,
+                    .cache_id = null,
+                    .desired_version = source.version,
+                    .newly_imported = true,
+                };
+            }
             return .{
                 .texture = prepared.texture,
                 .buffer = buffer,
@@ -3943,7 +4184,10 @@ fn prepareImportedTexture(
         }
     }
     if (self.textures.get(source.id)) |existing| {
-        if (!existing.imported or !std.meta.eql(existing.size, buffer.size)) {
+        if (!existing.imported or
+            !std.meta.eql(existing.size, buffer.size) or
+            !std.meta.eql(existing.video_representation, video_representation))
+        {
             const removed = self.textures.fetchRemove(source.id).?;
             self.destroyTexture(removed.value);
         }
@@ -3961,7 +4205,11 @@ fn prepareImportedTexture(
     }
 
     self.makeTextureRoom() catch return error.VulkanFailure;
-    const texture = try self.createImportedTexture(buffer.size, buffer.dmabuf.?);
+    const texture = try self.createImportedTexture(
+        buffer.size,
+        buffer.dmabuf.?,
+        buffer.color_representation,
+    );
     errdefer self.destroyTexture(texture);
     self.textures.put(self.allocator, source.id, texture) catch return error.OutOfMemory;
     return .{
@@ -4185,27 +4433,43 @@ fn createImportedTexture(
     self: *Self,
     size: render.Size,
     source: render.DmabufSource,
+    representation: render.ColorRepresentation,
 ) Error!Texture {
     if (!self.supportsDmabufSource(size, source)) return error.InvalidTarget;
+    const format_info = render.DmabufFormat.fromFourcc(source.format) orelse
+        return error.InvalidTarget;
     const source_format = dmabufSourceVkFormat(source.format) orelse return error.InvalidTarget;
-    const source_plane = source.planes[0];
-    const duplicate_fd = std.c.dup(source_plane.fd);
+    const conversion_parameters = if (format_info.isPackedRgb())
+        null
+    else
+        ycbcrConversion(representation) orelse return error.InvalidTarget;
+    if (!format_info.isPackedRgb() and !dmabufPlanesShareAllocation(source.planeSlice())) {
+        return error.InvalidTarget;
+    }
+    const video_graphics: ?VideoGraphics = if (conversion_parameters) |parameters|
+        try self.getVideoGraphics(videoGraphicsKey(source_format, parameters))
+    else
+        null;
+    const duplicate_fd = std.c.dup(source.planes[0].fd);
     if (duplicate_fd < 0) return error.VulkanFailure;
     var fd_owned = true;
     defer if (fd_owned) {
         _ = std.c.close(duplicate_fd);
     };
-    const plane: vk.SubresourceLayout = .{
-        .offset = source_plane.offset,
-        .size = 0,
-        .row_pitch = source_plane.stride,
-        .array_pitch = 0,
-        .depth_pitch = 0,
-    };
+    var plane_layouts: [render.max_dmabuf_planes]vk.SubresourceLayout = undefined;
+    for (source.planeSlice(), plane_layouts[0..source.plane_count]) |source_plane, *plane| {
+        plane.* = .{
+            .offset = source_plane.offset,
+            .size = 0,
+            .row_pitch = source_plane.stride,
+            .array_pitch = 0,
+            .depth_pitch = 0,
+        };
+    }
     const modifier_info: vk.ImageDrmFormatModifierExplicitCreateInfoEXT = .{
         .drm_format_modifier = source.modifier,
-        .drm_format_modifier_plane_count = 1,
-        .p_plane_layouts = @ptrCast(&plane),
+        .drm_format_modifier_plane_count = source.plane_count,
+        .p_plane_layouts = &plane_layouts,
     };
     const external_info: vk.ExternalMemoryImageCreateInfo = .{
         .p_next = &modifier_info,
@@ -4251,7 +4515,14 @@ fn createImportedTexture(
     errdefer self.device_wrapper.freeMemory(self.device, memory, null);
     self.device_wrapper.bindImageMemory(self.device, image, memory, 0) catch
         return error.VulkanFailure;
+    const conversion_info: vk.SamplerYcbcrConversionInfo = .{
+        .conversion = if (video_graphics) |graphics|
+            graphics.conversion
+        else
+            .null_handle,
+    };
     const view = self.device_wrapper.createImageView(self.device, &.{
+        .p_next = if (video_graphics != null) &conversion_info else null,
         .image = image,
         .view_type = .@"2d",
         .format = source_format,
@@ -4259,16 +4530,20 @@ fn createImportedTexture(
             .r = .identity,
             .g = .identity,
             .b = .identity,
-            .a = if (source.force_opaque) .one else .identity,
+            .a = if (video_graphics == null and source.force_opaque) .one else .identity,
         },
         .subresource_range = colorSubresourceRange(),
     }, null) catch return error.VulkanFailure;
     errdefer self.device_wrapper.destroyImageView(self.device, view, null);
+    const descriptor_set_layout = if (video_graphics) |graphics|
+        graphics.descriptor_set_layout
+    else
+        self.descriptor_set_layout;
     var descriptor_set: vk.DescriptorSet = undefined;
     self.device_wrapper.allocateDescriptorSets(self.device, &.{
         .descriptor_pool = self.descriptor_pool,
         .descriptor_set_count = 1,
-        .p_set_layouts = @ptrCast(&self.descriptor_set_layout),
+        .p_set_layouts = @ptrCast(&descriptor_set_layout),
     }, @ptrCast(&descriptor_set)) catch return error.VulkanFailure;
     errdefer self.device_wrapper.freeDescriptorSets(
         self.device,
@@ -4276,7 +4551,7 @@ fn createImportedTexture(
         &.{descriptor_set},
     ) catch {};
     const image_info: vk.DescriptorImageInfo = .{
-        .sampler = self.sampler,
+        .sampler = if (video_graphics) |graphics| graphics.sampler else self.sampler,
         .image_view = view,
         .image_layout = .shader_read_only_optimal,
     };
@@ -4295,6 +4570,12 @@ fn createImportedTexture(
         .memory = memory,
         .view = view,
         .descriptor_set = descriptor_set,
+        .pipeline = if (video_graphics) |graphics| graphics.pipeline else .null_handle,
+        .pipeline_layout = if (video_graphics) |graphics|
+            graphics.pipeline_layout
+        else
+            .null_handle,
+        .video_representation = if (conversion_parameters != null) representation else null,
         .size = size,
         .initialized = true,
         .imported = true,
@@ -4311,11 +4592,9 @@ fn destroyTexture(self: *Self, texture: Texture) void {
         self.descriptor_pool,
         &.{texture.descriptor_set},
     ) catch {};
-    self.destroyImageAllocation(.{
-        .image = texture.image,
-        .memory = texture.memory,
-        .view = texture.view,
-    });
+    self.device_wrapper.destroyImageView(self.device, texture.view, null);
+    self.device_wrapper.destroyImage(self.device, texture.image, null);
+    self.device_wrapper.freeMemory(self.device, texture.memory, null);
 }
 
 fn makeTextureRoom(self: *Self) !void {
@@ -4388,6 +4667,9 @@ fn destroyCachedResources(self: *Self) void {
         self.destroyCalibrationTexture(calibration.*);
     }
     self.calibrations.deinit(self.allocator);
+    var video_iterator = self.video_graphics.valueIterator();
+    while (video_iterator.next()) |graphics| self.destroyVideoGraphics(graphics.*);
+    self.video_graphics.deinit(self.allocator);
 }
 
 fn invalidatePreparedTextures(self: *Self, prepared_images: []const PreparedImage) void {
@@ -4863,7 +5145,7 @@ fn compileDrawRuns(
                 .width = frame.size.width,
                 .height = frame.size.height,
             };
-            try self.emitDamaged(frame, rect, .replace, null, .{ .width = 1, .height = 1 }, .{}, .{
+            try self.emitDamaged(frame, rect, .replace, .null_handle, .null_handle, null, .{ .width = 1, .height = 1 }, .{}, .{
                 .destination = rectFloats(rect),
                 .source = .{ 0, 0, 1, 1 },
                 .clip = undefined,
@@ -4875,7 +5157,7 @@ fn compileDrawRuns(
         .solid_rect => |solid| {
             var clipped = solid.rect.clipTo(frame.size) orelse continue;
             if (solid.clip) |clip| clipped = clipped.intersection(clip) orelse continue;
-            try self.emitDamaged(frame, clipped, .blend, null, .{ .width = 1, .height = 1 }, .{}, .{
+            try self.emitDamaged(frame, clipped, .blend, .null_handle, .null_handle, null, .{ .width = 1, .height = 1 }, .{}, .{
                 .destination = rectFloats(clipped),
                 .source = .{ 0, 0, 1, 1 },
                 .clip = undefined,
@@ -4915,6 +5197,8 @@ fn compileDrawRuns(
                 frame,
                 clipped,
                 .image,
+                prepared.texture.pipeline,
+                prepared.texture.pipeline_layout,
                 prepared.texture.descriptor_set,
                 image.buffer.size,
                 sourceColorTransform(
@@ -4976,7 +5260,7 @@ fn compileDrawRuns(
                 cutout.radius,
                 @min(cutout.rect.width, cutout.rect.height) / 2,
             );
-            try self.emitDamaged(frame, clipped, .shadow, null, .{ .width = 1, .height = 1 }, .{}, .{
+            try self.emitDamaged(frame, clipped, .shadow, .null_handle, .null_handle, null, .{ .width = 1, .height = 1 }, .{}, .{
                 .destination = rectFloats(cutout.rect),
                 .source = .{ 0, 0, 1, 1 },
                 .clip = undefined,
@@ -5142,6 +5426,8 @@ fn emitDamaged(
     frame: render.Frame,
     visible_rect: render.Rect,
     pipeline_kind: PipelineKind,
+    pipeline_handle: vk.Pipeline,
+    pipeline_layout: vk.PipelineLayout,
     descriptor_set: ?vk.DescriptorSet,
     texture_size: render.Size,
     color_transform: ColorTransform,
@@ -5151,10 +5437,28 @@ fn emitDamaged(
         for (damage) |damaged| {
             const clipped_damage = damaged.clipTo(frame.size) orelse continue;
             const clipped = visible_rect.intersection(clipped_damage) orelse continue;
-            try self.emitInstance(pipeline_kind, descriptor_set, texture_size, color_transform, instance, clipped);
+            try self.emitInstance(
+                pipeline_kind,
+                pipeline_handle,
+                pipeline_layout,
+                descriptor_set,
+                texture_size,
+                color_transform,
+                instance,
+                clipped,
+            );
         }
     } else {
-        try self.emitInstance(pipeline_kind, descriptor_set, texture_size, color_transform, instance, visible_rect);
+        try self.emitInstance(
+            pipeline_kind,
+            pipeline_handle,
+            pipeline_layout,
+            descriptor_set,
+            texture_size,
+            color_transform,
+            instance,
+            visible_rect,
+        );
     }
 }
 
@@ -5192,6 +5496,8 @@ test "Vulkan blur bounds only cover damaged visible pixels" {
 fn emitInstance(
     self: *Self,
     pipeline_kind: PipelineKind,
+    pipeline_handle: vk.Pipeline,
+    pipeline_layout: vk.PipelineLayout,
     descriptor_set: ?vk.DescriptorSet,
     texture_size: render.Size,
     color_transform: ColorTransform,
@@ -5206,7 +5512,10 @@ fn emitInstance(
 
     if (self.draw_runs.items.len > 0) {
         const last = &self.draw_runs.items[self.draw_runs.items.len - 1];
-        if (last.pipeline == pipeline_kind and last.descriptor_set == descriptor_set and
+        if (last.pipeline == pipeline_kind and
+            last.pipeline_handle == pipeline_handle and
+            last.pipeline_layout == pipeline_layout and
+            last.descriptor_set == descriptor_set and
             std.meta.eql(last.texture_size, texture_size) and
             std.meta.eql(last.color_transform, color_transform))
         {
@@ -5217,6 +5526,8 @@ fn emitInstance(
     }
     try self.draw_runs.append(self.allocator, .{
         .pipeline = pipeline_kind,
+        .pipeline_handle = pipeline_handle,
+        .pipeline_layout = pipeline_layout,
         .descriptor_set = descriptor_set,
         .texture_size = texture_size,
         .first_instance = instance_index,
