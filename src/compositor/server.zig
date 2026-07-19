@@ -303,6 +303,7 @@ const RenderOutput = struct {
 const frame_latency_capacity = 1024;
 const frame_budget_tolerance_nanoseconds = std.time.ns_per_ms;
 const direct_scanout_rejection_count = std.meta.fields(render.DirectScanoutRejection).len;
+const overlay_scanout_rejection_count = std.meta.fields(render.OverlayScanoutRejection).len;
 
 const FramePath = enum { composited, direct_scanout };
 
@@ -344,6 +345,9 @@ const FrameStatistics = struct {
     direct_scanout_candidates: u64 = 0,
     direct_scanout_frames: u64 = 0,
     direct_scanout_rejections: [direct_scanout_rejection_count]u64 = @splat(0),
+    overlay_scanout_candidates: u64 = 0,
+    overlay_scanout_frames: u64 = 0,
+    overlay_scanout_rejections: [overlay_scanout_rejection_count]u64 = @splat(0),
     cpu_uploads: u64 = 0,
     dmabuf_imports: u64 = 0,
     frames_over_budget: u64 = 0,
@@ -414,6 +418,13 @@ const FrameStatistics = struct {
         reason: render.DirectScanoutRejection,
     ) void {
         increment(&self.direct_scanout_rejections[@intFromEnum(reason)]);
+    }
+
+    fn rejectOverlayScanout(
+        self: *FrameStatistics,
+        reason: render.OverlayScanoutRejection,
+    ) void {
+        increment(&self.overlay_scanout_rejections[@intFromEnum(reason)]);
     }
 
     fn addFrameCompletion(
@@ -6595,6 +6606,14 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
         .rejected => |reason| render_output.frame_statistics.rejectDirectScanout(reason),
     }
     if (!direct_scanout) {
+        var overlay_candidate: ?render.OverlayScanout = null;
+        switch (self.renderer.overlayScanoutCandidate()) {
+            .candidate => |candidate| {
+                increment(&render_output.frame_statistics.overlay_scanout_candidates);
+                overlay_candidate = candidate;
+            },
+            .rejected => |reason| render_output.frame_statistics.rejectOverlayScanout(reason),
+        }
         renderer_frame_active = false;
         const completion = try self.renderer.finishFrameScanout(
             outputStatisticsTag(render_output.protocol_id),
@@ -6605,7 +6624,28 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
         defer if (render_fence_fd) |fd| {
             _ = std.c.close(fd);
         };
-        presented = render_output.backend.present(
+        presented = if (overlay_candidate) |candidate| overlay_presented: {
+            const result = render_output.backend.presentOverlay(
+                &frame_damage,
+                render_fence_fd,
+                allow_tearing,
+                candidate,
+            ) catch |err| switch (err) {
+                error.OutputColorFallback => {
+                    render_output.discardFrame();
+                    output.cancelFrame();
+                    try self.refreshRenderOutputColorDescription(render_output);
+                    self.damageFullOutput(render_output);
+                    return;
+                },
+                else => return error.InvalidTarget,
+            };
+            switch (result.scanout) {
+                .accepted => increment(&render_output.frame_statistics.overlay_scanout_frames),
+                .rejected => |reason| render_output.frame_statistics.rejectOverlayScanout(reason),
+            }
+            break :overlay_presented result.presentation_info;
+        } else render_output.backend.present(
             &frame_damage,
             render_fence_fd,
             allow_tearing,

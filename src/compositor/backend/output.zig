@@ -30,6 +30,7 @@ pub const Kind = enum {
 
 pub const Listener = NestedOutput.Listener;
 pub const DirectScanoutResult = DrmOutput.DirectScanoutResult;
+pub const OverlayPresentation = DrmOutput.OverlayPresentation;
 
 pub fn init(
     self: *Self,
@@ -288,6 +289,27 @@ pub fn present(
             std.debug.assert(render_fence_fd == null);
             try output.present();
             break :blk null;
+        },
+    };
+}
+
+pub fn presentOverlay(
+    self: *Self,
+    damage: *const Region,
+    render_fence_fd: ?std.posix.fd_t,
+    allow_tearing: bool,
+    overlay: render.OverlayScanout,
+) !OverlayPresentation {
+    return switch (self.backend) {
+        .drm => |output| output.presentOverlay(
+            damage,
+            render_fence_fd,
+            allow_tearing,
+            overlay,
+        ),
+        .headless, .nested => .{
+            .presentation_info = try self.present(damage, render_fence_fd, allow_tearing),
+            .scanout = .{ .rejected = .unsupported_backend },
         },
     };
 }
