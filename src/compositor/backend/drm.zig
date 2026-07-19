@@ -1581,39 +1581,7 @@ fn primaryPlane(
                 break;
             }
         }
-        var formats: std.ArrayList(render.DmabufFormatModifier) = .empty;
-        defer formats.deinit(allocator);
-        if (formats_blob_id) |blob_id| if (c.drmModeGetPropertyBlob(fd, blob_id)) |blob| {
-            defer c.drmModeFreePropertyBlob(blob);
-            var iterator = std.mem.zeroes(c.drmModeFormatModifierIterator);
-            while (c.drmModeFormatModifierBlobIterNext(blob, &iterator)) {
-                if (render.DmabufFormat.fromFourcc(iterator.fmt) == null or
-                    render.DmabufFormatModifier.contains(formats.items, iterator.fmt, iterator.mod)) continue;
-                try formats.append(allocator, .{ .format = iterator.fmt, .modifier = iterator.mod });
-            }
-        };
-        if (formats_blob_id == null) {
-            for (plane.*.formats[0..format_count]) |format| if (render.DmabufFormat.fromFourcc(format) != null and
-                !render.DmabufFormatModifier.contains(formats.items, format, drm_format_mod_linear))
-                try formats.append(allocator, .{ .format = format, .modifier = drm_format_mod_linear });
-        }
-        for ([_]render.DmabufFormat{ .argb8888, .abgr8888 }) |alpha| {
-            const opaque_format = alpha.opaqueFormat();
-            const initial_len = formats.items.len;
-            var format_index: usize = 0;
-            while (format_index < initial_len) : (format_index += 1) {
-                const pair = formats.items[format_index];
-                if (pair.format == @intFromEnum(opaque_format) and
-                    !render.DmabufFormatModifier.contains(formats.items, @intFromEnum(alpha), pair.modifier))
-                {
-                    try formats.append(allocator, .{
-                        .format = @intFromEnum(alpha),
-                        .modifier = pair.modifier,
-                    });
-                }
-            }
-        }
-        const owned_formats = try formats.toOwnedSlice(allocator);
+        const owned_formats = try planeFormats(fd, plane, formats_blob_id, allocator);
         allocator.free(selected.formats);
         selected = .{
             .id = plane_id,
@@ -1624,6 +1592,48 @@ fn primaryPlane(
         if (score == 3) break;
     }
     return selected;
+}
+
+fn planeFormats(
+    fd: std.posix.fd_t,
+    plane: *c.drmModePlane,
+    formats_blob_id: ?u32,
+    allocator: std.mem.Allocator,
+) ![]render.DmabufFormatModifier {
+    var formats: std.ArrayList(render.DmabufFormatModifier) = .empty;
+    defer formats.deinit(allocator);
+    if (formats_blob_id) |blob_id| if (c.drmModeGetPropertyBlob(fd, blob_id)) |blob| {
+        defer c.drmModeFreePropertyBlob(blob);
+        var iterator = std.mem.zeroes(c.drmModeFormatModifierIterator);
+        while (c.drmModeFormatModifierBlobIterNext(blob, &iterator)) {
+            if (render.DmabufFormat.fromFourcc(iterator.fmt) == null or
+                render.DmabufFormatModifier.contains(formats.items, iterator.fmt, iterator.mod)) continue;
+            try formats.append(allocator, .{ .format = iterator.fmt, .modifier = iterator.mod });
+        }
+    };
+    if (formats_blob_id == null) {
+        const format_count: usize = @intCast(plane.*.count_formats);
+        for (plane.*.formats[0..format_count]) |format| if (render.DmabufFormat.fromFourcc(format) != null and
+            !render.DmabufFormatModifier.contains(formats.items, format, drm_format_mod_linear))
+            try formats.append(allocator, .{ .format = format, .modifier = drm_format_mod_linear });
+    }
+    for ([_]render.DmabufFormat{ .argb8888, .abgr8888 }) |alpha| {
+        const opaque_format = alpha.opaqueFormat();
+        const initial_len = formats.items.len;
+        var format_index: usize = 0;
+        while (format_index < initial_len) : (format_index += 1) {
+            const pair = formats.items[format_index];
+            if (pair.format == @intFromEnum(opaque_format) and
+                !render.DmabufFormatModifier.contains(formats.items, @intFromEnum(alpha), pair.modifier))
+            {
+                try formats.append(allocator, .{
+                    .format = @intFromEnum(alpha),
+                    .modifier = pair.modifier,
+                });
+            }
+        }
+    }
+    return formats.toOwnedSlice(allocator);
 }
 
 fn scanoutFramebufferFormat(
