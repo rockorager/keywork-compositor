@@ -164,9 +164,7 @@ vec4 sampleSource(vec2 coordinate) {
 }
 #endif
 
-void main() {
-    vec2 q=(pixel-dest.xy)/dest.zw;
-    vec2 transformed=source.xy+q*source.zw;
+vec2 mapToTexture(vec2 transformed) {
     vec2 coordinate;
     switch (int(parameters.y)) {
         case 1: coordinate=vec2(transformed.y,pc.texture_size.y-transformed.x); break;
@@ -179,12 +177,57 @@ void main() {
         default: coordinate=transformed; break;
     }
     if (parameters.z>0.5) coordinate.y=pc.texture_size.y-coordinate.y;
+    return coordinate;
+}
+
+#ifdef KEYWORK_CATMULL_ROM
+vec4 sampleCatmullRom(vec2 coordinate,vec2 lower,vec2 upper) {
+    vec2 center=floor(coordinate-0.5)+0.5;
+    vec2 fraction=coordinate-center;
+    vec2 w0=fraction*(-0.5+fraction*(1.0-0.5*fraction));
+    vec2 w1=1.0+fraction*fraction*(1.5*fraction-2.5);
+    vec2 w2=fraction*(0.5+fraction*(2.0-1.5*fraction));
+    vec2 w3=fraction*fraction*(0.5*fraction-0.5);
+    vec2 w12=w1+w2;
+    vec2 p0=clamp(center-1.0,lower,upper);
+    vec2 p12=clamp(center+w2/w12,lower,upper);
+    vec2 p3=clamp(center+2.0,lower,upper);
+    vec2 inverse_size=1.0/pc.texture_size;
+    p0*=inverse_size;
+    p12*=inverse_size;
+    p3*=inverse_size;
+    vec4 color=
+        texture(tex,vec2(p0.x,p0.y))*(w0.x*w0.y)+
+        texture(tex,vec2(p12.x,p0.y))*(w12.x*w0.y)+
+        texture(tex,vec2(p3.x,p0.y))*(w3.x*w0.y)+
+        texture(tex,vec2(p0.x,p12.y))*(w0.x*w12.y)+
+        texture(tex,vec2(p12.x,p12.y))*(w12.x*w12.y)+
+        texture(tex,vec2(p3.x,p12.y))*(w3.x*w12.y)+
+        texture(tex,vec2(p0.x,p3.y))*(w0.x*w3.y)+
+        texture(tex,vec2(p12.x,p3.y))*(w12.x*w3.y)+
+        texture(tex,vec2(p3.x,p3.y))*(w3.x*w3.y);
+    color=clamp(color,vec4(0.0),vec4(1.0));
+    color.rgb=min(color.rgb,vec3(color.a));
+    return color;
+}
+#endif
+
+void main() {
+    vec2 q=(pixel-dest.xy)/dest.zw;
+    vec2 transformed=source.xy+q*source.zw;
+    vec2 coordinate=mapToTexture(transformed);
 #ifdef KEYWORK_MANUAL_YCBCR
     vec4 color=sampleSource(coordinate);
 #else
 #ifdef KEYWORK_NEAREST
     ivec2 texel=clamp(ivec2(floor(coordinate)),ivec2(0),textureSize(tex,0)-ivec2(1));
     vec4 color=texelFetch(tex,texel,0);
+#elif defined(KEYWORK_CATMULL_ROM)
+    vec2 first=mapToTexture(source.xy);
+    vec2 last=mapToTexture(source.xy+source.zw);
+    vec2 lower=min(first,last)+0.5;
+    vec2 upper=max(max(first,last)-0.5,lower);
+    vec4 color=sampleCatmullRom(coordinate,lower,upper);
 #else
     vec2 uv=coordinate/pc.texture_size;
     vec4 color=texture(tex,uv);

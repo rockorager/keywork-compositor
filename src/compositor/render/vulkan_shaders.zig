@@ -6,6 +6,7 @@ pub const quad_instanced = spirvWords(@embedFile("vulkan-quad"));
 pub const solid_instanced = spirvWords(@embedFile("vulkan-solid"));
 pub const image_alpha_instanced = spirvWords(@embedFile("vulkan-image"));
 pub const image_nearest_instanced = spirvWords(@embedFile("vulkan-image-nearest"));
+pub const image_catmull_rom_instanced = spirvWords(@embedFile("vulkan-image-catmull-rom"));
 pub const video_manual_instanced = spirvWords(@embedFile("vulkan-video-manual"));
 pub const shadow_instanced = spirvWords(@embedFile("vulkan-shadow"));
 pub const blur_horizontal_paired = spirvWords(@embedFile("vulkan-blur-horizontal"));
@@ -14,7 +15,7 @@ pub const output_encode = spirvWords(@embedFile("vulkan-encode"));
 pub const output_encode_calibrated = spirvWords(@embedFile("vulkan-encode-calibrated"));
 
 fn spirvWords(comptime bytes: []const u8) [bytes.len / @sizeOf(u32)]u32 {
-    @setEvalBranchQuota(10_000);
+    @setEvalBranchQuota(50_000);
     comptime std.debug.assert(bytes.len >= @sizeOf(u32));
     comptime std.debug.assert(bytes.len % @sizeOf(u32) == 0);
 

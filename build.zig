@@ -181,6 +181,13 @@ pub fn build(b: *std.Build) void {
     addVulkanShaderVariant(
         b,
         compositor,
+        "vulkan-image-catmull-rom",
+        "src/compositor/render/shaders/image.frag",
+        "KEYWORK_CATMULL_ROM",
+    );
+    addVulkanShaderVariant(
+        b,
+        compositor,
         "vulkan-video-manual",
         "src/compositor/render/shaders/image.frag",
         "KEYWORK_MANUAL_YCBCR",
