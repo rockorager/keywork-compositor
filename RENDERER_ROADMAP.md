@@ -125,7 +125,7 @@ Current commands:
   bandwidth-proxy, import, copy, and frame-budget statistics. Add `--reset` to
   start a repeatable measurement window.
 
-- Build reference image tests for transfer functions, primaries, blending,
+- [x] Build reference image tests for transfer functions, primaries, blending,
   tone mapping, gamut mapping, scaling, and YCbCr conversion.
 - Add reproducible scenes for direct scanout, mixed windows, damage, blur,
   video, SDR, and HDR.

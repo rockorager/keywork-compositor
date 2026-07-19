@@ -7265,6 +7265,62 @@ test "Vulkan renderer composites image commands" {
     try expectArgbNear(source_pixels[0], target_pixels[0], 1);
 }
 
+test "renderer conformance: Vulkan transfer functions preserve encoded round trips" {
+    var renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
+        error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+
+    const size: render.Size = .{ .width = 4, .height = 1 };
+    var source_pixels = [_]u32{ 0xff0a0a0a, 0xff404040, 0xff808080, 0xffe0e0e0 };
+    var target_pixels = [_]u32{0} ** source_pixels.len;
+    var commands = [_]render.Command{.{ .image = .{
+        .x = 0,
+        .y = 0,
+        .size = size,
+        .buffer = .{
+            .size = size,
+            .stride_pixels = size.width,
+            .pixels = &source_pixels,
+        },
+        .is_opaque = true,
+    } }};
+    const descriptions = [_]render.ColorDescription{
+        .{ .transfer_function = .gamma22 },
+        .{ .transfer_function = .srgb },
+        .{ .transfer_function = .bt1886 },
+        .{ .transfer_function = .{ .power = 18000 } },
+        .{
+            .transfer_function = .st2084_pq,
+            .max_luminance = 1000,
+            .max_cll = 1000,
+        },
+        .{
+            .transfer_function = .hlg,
+            .max_luminance = 1000,
+            .max_cll = 1000,
+        },
+    };
+    const target: render.PixelBuffer = .{
+        .size = size,
+        .stride_pixels = size.width,
+        .pixels = &target_pixels,
+    };
+    for (descriptions) |description| {
+        @memset(&target_pixels, 0);
+        commands[0].image.buffer.color_description = description;
+        try renderer.renderFrame(.{
+            .size = size,
+            .commands = &commands,
+            .output_color_description = description,
+        }, .{ .pixels = target });
+        for (source_pixels, target_pixels) |expected, actual| {
+            try expectArgbNear(expected, actual, 2);
+        }
+    }
+}
+
 test "renderer conformance: Vulkan reconstruction preserves constant fields and source crop edges" {
     var renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
         error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
