@@ -169,14 +169,17 @@ fn writeStatistics(writer: *std.Io.Writer, outputs: []const control.OutputStatis
             },
         );
         try writer.print(
-            "  paths: composited {d}, direct scanout {d}/{d} candidates\n",
+            "  paths: composited {d}, direct scanout {d}/{d} candidates, overlay scanout {d}/{d} candidates\n",
             .{
                 output.composited_frames,
                 output.direct_scanout_frames,
                 output.direct_scanout_candidates,
+                output.overlay_scanout_frames,
+                output.overlay_scanout_candidates,
             },
         );
         try writeDirectScanoutRejections(writer, output.direct_scanout_rejections);
+        try writeOverlayScanoutRejections(writer, output.overlay_scanout_rejections);
         try writer.print("  buffer operations: CPU uploads {d}, DMA-BUF imports {d}\n", .{
             output.cpu_uploads,
             output.dmabuf_imports,
@@ -219,6 +222,7 @@ fn framePathName(path: control.FramePath) []const u8 {
         .none => "none",
         .composited => "composited",
         .direct_scanout => "direct scanout",
+        .overlay_scanout => "overlay scanout",
     };
 }
 
@@ -281,9 +285,70 @@ fn writeDirectScanoutRejection(
     label: []const u8,
     count: i64,
 ) !void {
+    return writeScanoutRejection(
+        writer,
+        wrote_rejection,
+        "direct scanout",
+        label,
+        count,
+    );
+}
+
+fn writeOverlayScanoutRejections(
+    writer: *std.Io.Writer,
+    rejections: control.OverlayScanoutRejections,
+) !void {
+    var wrote_rejection = false;
+    try writeOverlayScanoutRejection(writer, &wrote_rejection, "no topmost surface", rejections.no_topmost_surface);
+    try writeOverlayScanoutRejection(writer, &wrote_rejection, "non-opaque surface", rejections.non_opaque_surface);
+    try writeOverlayScanoutRejection(writer, &wrote_rejection, "clipped surface", rejections.clipped_surface);
+    try writeOverlayScanoutRejection(writer, &wrote_rejection, "transformed surface", rejections.transformed_surface);
+    try writeOverlayScanoutRejection(writer, &wrote_rejection, "scaled surface", rejections.scaled_surface);
+    try writeOverlayScanoutRejection(writer, &wrote_rejection, "outside output", rejections.outside_output);
+    try writeOverlayScanoutRejection(writer, &wrote_rejection, "non-DMA-BUF", rejections.non_dmabuf);
+    try writeOverlayScanoutRejection(writer, &wrote_rejection, "non-RGB surface", rejections.non_rgb_surface);
+    try writeOverlayScanoutRejection(writer, &wrote_rejection, "Y-inverted buffer", rejections.y_inverted);
+    try writeOverlayScanoutRejection(writer, &wrote_rejection, "missing buffer identity", rejections.missing_buffer_identity);
+    try writeOverlayScanoutRejection(writer, &wrote_rejection, "color conversion", rejections.color_conversion);
+    try writeOverlayScanoutRejection(writer, &wrote_rejection, "unsupported backend", rejections.unsupported_backend);
+    try writeOverlayScanoutRejection(writer, &wrote_rejection, "output unavailable", rejections.output_unavailable);
+    try writeOverlayScanoutRejection(writer, &wrote_rejection, "output busy", rejections.output_busy);
+    try writeOverlayScanoutRejection(writer, &wrote_rejection, "device inactive", rejections.device_inactive);
+    try writeOverlayScanoutRejection(writer, &wrote_rejection, "no overlay plane", rejections.no_overlay_plane);
+    try writeOverlayScanoutRejection(writer, &wrote_rejection, "unsupported format/modifier", rejections.unsupported_format_or_modifier);
+    try writeOverlayScanoutRejection(writer, &wrote_rejection, "unsupported layout", rejections.unsupported_layout);
+    try writeOverlayScanoutRejection(writer, &wrote_rejection, "synchronization failed", rejections.synchronization_failed);
+    try writeOverlayScanoutRejection(writer, &wrote_rejection, "framebuffer import failed", rejections.framebuffer_import_failed);
+    try writeOverlayScanoutRejection(writer, &wrote_rejection, "atomic test failed", rejections.atomic_test_failed);
+    try writeOverlayScanoutRejection(writer, &wrote_rejection, "page flip failed", rejections.page_flip_failed);
+    if (!wrote_rejection) try writer.writeAll("  overlay scanout rejections: none\n");
+}
+
+fn writeOverlayScanoutRejection(
+    writer: *std.Io.Writer,
+    wrote_rejection: *bool,
+    label: []const u8,
+    count: i64,
+) !void {
+    return writeScanoutRejection(
+        writer,
+        wrote_rejection,
+        "overlay scanout",
+        label,
+        count,
+    );
+}
+
+fn writeScanoutRejection(
+    writer: *std.Io.Writer,
+    wrote_rejection: *bool,
+    heading: []const u8,
+    label: []const u8,
+    count: i64,
+) !void {
     if (count == 0) return;
     if (!wrote_rejection.*) {
-        try writer.writeAll("  direct scanout rejections:\n");
+        try writer.print("  {s} rejections:\n", .{heading});
         wrote_rejection.* = true;
     }
     try writer.print("    {s}: {d}\n", .{ label, count });
@@ -435,11 +500,12 @@ test "performance statistics decode and render human-readable output" {
         \\  last frame: composited, working RGBA16F linear, scanout XRGB8888, transform normal
         \\  damage: 2 rectangles, 800000 pixels
         \\  frames: requested 10, started 9, presented 8, discarded 1
-        \\  paths: composited 7, direct scanout 1/3 candidates
+        \\  paths: composited 7, direct scanout 1/3 candidates, overlay scanout 0/0 candidates
         \\  direct scanout rejections:
         \\    no fullscreen surface: 4
         \\    color conversion: 1
         \\    page flip failed: 2
+        \\  overlay scanout rejections: none
         \\  buffer operations: CPU uploads 4, DMA-BUF imports 6
         \\  acquire retries: 2, frames over budget: 2
         \\  GPU total: p50 2100us, p95 4400us, p99 6100us, max 7200us (7 samples)
@@ -449,6 +515,23 @@ test "performance statistics decode and render human-readable output" {
         \\  request -> render: p50 1000us, p95 1200us, p99 1400us, max 1600us (8 samples)
         \\  render -> commit: p50 1100us, p95 2800us, p99 5600us, max 7000us (8 samples)
         \\  commit -> presentation: p50 6800us, p95 8000us, p99 14900us, max 18000us (8 samples)
+        \\
+    , writer.written());
+}
+
+test "overlay scanout rejections render nonzero reasons" {
+    var writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer writer.deinit();
+
+    try writeOverlayScanoutRejections(&writer.writer, .{
+        .no_topmost_surface = 2,
+        .atomic_test_failed = 1,
+    });
+
+    try std.testing.expectEqualStrings(
+        \\  overlay scanout rejections:
+        \\    no topmost surface: 2
+        \\    atomic test failed: 1
         \\
     , writer.written());
 }

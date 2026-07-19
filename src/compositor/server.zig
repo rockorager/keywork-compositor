@@ -266,6 +266,7 @@ const RenderOutput = struct {
         switch (path) {
             .composited => increment(&self.frame_statistics.composited_frames),
             .direct_scanout => increment(&self.frame_statistics.direct_scanout_frames),
+            .overlay_scanout => increment(&self.frame_statistics.overlay_scanout_frames),
         }
     }
 
@@ -305,7 +306,7 @@ const frame_budget_tolerance_nanoseconds = std.time.ns_per_ms;
 const direct_scanout_rejection_count = std.meta.fields(render.DirectScanoutRejection).len;
 const overlay_scanout_rejection_count = std.meta.fields(render.OverlayScanoutRejection).len;
 
-const FramePath = enum { composited, direct_scanout };
+const FramePath = enum { composited, direct_scanout, overlay_scanout };
 
 const PendingFrame = struct {
     request_nanoseconds: i96,
@@ -499,6 +500,32 @@ const FrameStatistics = struct {
                 .framebuffer_import_failed = self.directScanoutRejection(.framebuffer_import_failed),
                 .page_flip_failed = self.directScanoutRejection(.page_flip_failed),
             },
+            .overlay_scanout_candidates = wireInteger(self.overlay_scanout_candidates),
+            .overlay_scanout_frames = wireInteger(self.overlay_scanout_frames),
+            .overlay_scanout_rejections = .{
+                .no_topmost_surface = self.overlayScanoutRejection(.no_topmost_surface),
+                .non_opaque_surface = self.overlayScanoutRejection(.non_opaque_surface),
+                .clipped_surface = self.overlayScanoutRejection(.clipped_surface),
+                .transformed_surface = self.overlayScanoutRejection(.transformed_surface),
+                .scaled_surface = self.overlayScanoutRejection(.scaled_surface),
+                .outside_output = self.overlayScanoutRejection(.outside_output),
+                .non_dmabuf = self.overlayScanoutRejection(.non_dmabuf),
+                .non_rgb_surface = self.overlayScanoutRejection(.non_rgb_surface),
+                .y_inverted = self.overlayScanoutRejection(.y_inverted),
+                .missing_buffer_identity = self.overlayScanoutRejection(.missing_buffer_identity),
+                .color_conversion = self.overlayScanoutRejection(.color_conversion),
+                .unsupported_backend = self.overlayScanoutRejection(.unsupported_backend),
+                .output_unavailable = self.overlayScanoutRejection(.output_unavailable),
+                .output_busy = self.overlayScanoutRejection(.output_busy),
+                .device_inactive = self.overlayScanoutRejection(.device_inactive),
+                .no_overlay_plane = self.overlayScanoutRejection(.no_overlay_plane),
+                .unsupported_format_or_modifier = self.overlayScanoutRejection(.unsupported_format_or_modifier),
+                .unsupported_layout = self.overlayScanoutRejection(.unsupported_layout),
+                .synchronization_failed = self.overlayScanoutRejection(.synchronization_failed),
+                .framebuffer_import_failed = self.overlayScanoutRejection(.framebuffer_import_failed),
+                .atomic_test_failed = self.overlayScanoutRejection(.atomic_test_failed),
+                .page_flip_failed = self.overlayScanoutRejection(.page_flip_failed),
+            },
             .cpu_uploads = wireInteger(self.cpu_uploads),
             .dmabuf_imports = wireInteger(self.dmabuf_imports),
             .frames_over_budget = wireInteger(self.frames_over_budget),
@@ -517,6 +544,13 @@ const FrameStatistics = struct {
         reason: render.DirectScanoutRejection,
     ) i64 {
         return wireInteger(self.direct_scanout_rejections[@intFromEnum(reason)]);
+    }
+
+    fn overlayScanoutRejection(
+        self: *const FrameStatistics,
+        reason: render.OverlayScanoutRejection,
+    ) i64 {
+        return wireInteger(self.overlay_scanout_rejections[@intFromEnum(reason)]);
     }
 
     fn latencySummary(
@@ -619,6 +653,7 @@ fn controlFramePath(path: ?FramePath) ControlProtocol.FramePath {
     return if (path) |value| switch (value) {
         .composited => .composited,
         .direct_scanout => .direct_scanout,
+        .overlay_scanout => .overlay_scanout,
     } else .none;
 }
 
@@ -685,6 +720,12 @@ test "frame statistics summarize rolling latency and classify over-budget frames
     try std.testing.expectEqual(@as(i64, 2), statistics.directScanoutRejection(.color_conversion));
     try std.testing.expectEqual(@as(i64, 1), statistics.directScanoutRejection(.page_flip_failed));
 
+    statistics.rejectOverlayScanout(.no_overlay_plane);
+    statistics.rejectOverlayScanout(.atomic_test_failed);
+    statistics.rejectOverlayScanout(.atomic_test_failed);
+    try std.testing.expectEqual(@as(i64, 1), statistics.overlayScanoutRejection(.no_overlay_plane));
+    try std.testing.expectEqual(@as(i64, 2), statistics.overlayScanoutRejection(.atomic_test_failed));
+
     statistics.addFrameCompletion(.{ .cpu_uploads = 3, .dmabuf_imports = 2 });
     statistics.addFrameCompletion(.{ .cpu_uploads = 1, .dmabuf_imports = 4 });
     try std.testing.expectEqual(@as(u64, 4), statistics.cpu_uploads);
@@ -738,6 +779,17 @@ test "frame statistics summarize rolling latency and classify over-budget frames
     try std.testing.expectEqual(ControlProtocol.BufferFormat.xrgb8888, snapshot.last_frame.scanout_format);
     try std.testing.expectEqual(@as(i64, 3), snapshot.last_frame.damage_rectangles);
     try std.testing.expectEqual(@as(i64, 225), snapshot.last_frame.damaged_pixels);
+    try std.testing.expectEqual(@as(i64, 1), snapshot.overlay_scanout_rejections.no_overlay_plane);
+    try std.testing.expectEqual(@as(i64, 2), snapshot.overlay_scanout_rejections.atomic_test_failed);
+
+    statistics.recordFrame(.overlay_scanout, .xrgb8888, &damage);
+    const overlay_snapshot = statistics.snapshot(
+        "HEADLESS-1",
+        .{ .width = 100, .height = 100 },
+        60_000,
+        .rgba16f_linear,
+    );
+    try std.testing.expectEqual(ControlProtocol.FramePath.overlay_scanout, overlay_snapshot.last_frame.path);
 
     statistics.recordPresentation(.{
         .request_nanoseconds = 0,
@@ -752,6 +804,7 @@ test "frame statistics summarize rolling latency and classify over-budget frames
     try std.testing.expectEqual(@as(usize, 0), statistics.gpu_execution_count);
     try std.testing.expectEqual(@as(u64, 0), statistics.frames_presented);
     try std.testing.expectEqual(@as(i64, 0), statistics.directScanoutRejection(.color_conversion));
+    try std.testing.expectEqual(@as(i64, 0), statistics.overlayScanoutRejection(.atomic_test_failed));
     try std.testing.expectEqual(@as(u64, 0), statistics.cpu_uploads);
     try std.testing.expectEqual(@as(u64, 0), statistics.dmabuf_imports);
 
@@ -6675,7 +6728,6 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
                 },
                 else => return error.InvalidTarget,
             };
-            increment(&render_output.frame_statistics.overlay_scanout_frames);
             preservePromotedDamage(
                 &render_output.damage,
                 destination,
@@ -6697,7 +6749,7 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
             else => return error.InvalidTarget,
         };
         render_output.commitFrame(
-            .composited,
+            if (overlay_destination != null) .overlay_scanout else .composited,
             &frame_damage,
             render_output.backend.compositedScanoutFormat(),
         );

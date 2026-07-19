@@ -38,8 +38,34 @@ type DirectScanoutRejections (
     page_flip_failed: int
 )
 
+# Reasons composited images could not be promoted to an overlay plane.
+type OverlayScanoutRejections (
+    no_topmost_surface: int,
+    non_opaque_surface: int,
+    clipped_surface: int,
+    transformed_surface: int,
+    scaled_surface: int,
+    outside_output: int,
+    non_dmabuf: int,
+    non_rgb_surface: int,
+    y_inverted: int,
+    missing_buffer_identity: int,
+    color_conversion: int,
+    unsupported_backend: int,
+    output_unavailable: int,
+    output_busy: int,
+    device_inactive: int,
+    no_overlay_plane: int,
+    unsupported_format_or_modifier: int,
+    unsupported_layout: int,
+    synchronization_failed: int,
+    framebuffer_import_failed: int,
+    atomic_test_failed: int,
+    page_flip_failed: int
+)
+
 # The path used for the most recently committed frame.
-type FramePath (none, composited, direct_scanout)
+type FramePath (none, composited, direct_scanout, overlay_scanout)
 
 # A renderer working or output scanout buffer format.
 type BufferFormat (none, argb8888, xrgb8888, abgr8888, xbgr8888, xrgb2101010, rgba16f_linear)
@@ -73,6 +99,9 @@ type OutputStatistics (
     direct_scanout_candidates: int,
     direct_scanout_frames: int,
     direct_scanout_rejections: DirectScanoutRejections,
+    overlay_scanout_candidates: int,
+    overlay_scanout_frames: int,
+    overlay_scanout_rejections: OverlayScanoutRejections,
     cpu_uploads: int,
     dmabuf_imports: int,
     frames_over_budget: int,

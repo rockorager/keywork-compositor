@@ -34,7 +34,32 @@ pub const DirectScanoutRejections = struct {
     page_flip_failed: i64,
 };
 
-pub const FramePath = enum { none, composited, direct_scanout };
+pub const OverlayScanoutRejections = struct {
+    no_topmost_surface: i64 = 0,
+    non_opaque_surface: i64 = 0,
+    clipped_surface: i64 = 0,
+    transformed_surface: i64 = 0,
+    scaled_surface: i64 = 0,
+    outside_output: i64 = 0,
+    non_dmabuf: i64 = 0,
+    non_rgb_surface: i64 = 0,
+    y_inverted: i64 = 0,
+    missing_buffer_identity: i64 = 0,
+    color_conversion: i64 = 0,
+    unsupported_backend: i64 = 0,
+    output_unavailable: i64 = 0,
+    output_busy: i64 = 0,
+    device_inactive: i64 = 0,
+    no_overlay_plane: i64 = 0,
+    unsupported_format_or_modifier: i64 = 0,
+    unsupported_layout: i64 = 0,
+    synchronization_failed: i64 = 0,
+    framebuffer_import_failed: i64 = 0,
+    atomic_test_failed: i64 = 0,
+    page_flip_failed: i64 = 0,
+};
+
+pub const FramePath = enum { none, composited, direct_scanout, overlay_scanout };
 pub const BufferFormat = enum {
     none,
     argb8888,
@@ -70,6 +95,9 @@ pub const OutputStatistics = struct {
     direct_scanout_candidates: i64,
     direct_scanout_frames: i64,
     direct_scanout_rejections: DirectScanoutRejections,
+    overlay_scanout_candidates: i64 = 0,
+    overlay_scanout_frames: i64 = 0,
+    overlay_scanout_rejections: OverlayScanoutRejections = .{},
     cpu_uploads: i64,
     dmabuf_imports: i64,
     frames_over_budget: i64,

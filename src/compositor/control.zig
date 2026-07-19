@@ -695,6 +695,32 @@ const Recorder = struct {
                 .framebuffer_import_failed = 0,
                 .page_flip_failed = 0,
             },
+            .overlay_scanout_candidates = 3,
+            .overlay_scanout_frames = 2,
+            .overlay_scanout_rejections = .{
+                .no_topmost_surface = 1,
+                .non_opaque_surface = 0,
+                .clipped_surface = 0,
+                .transformed_surface = 0,
+                .scaled_surface = 0,
+                .outside_output = 0,
+                .non_dmabuf = 0,
+                .non_rgb_surface = 0,
+                .y_inverted = 0,
+                .missing_buffer_identity = 0,
+                .color_conversion = 0,
+                .unsupported_backend = 0,
+                .output_unavailable = 0,
+                .output_busy = 0,
+                .device_inactive = 0,
+                .no_overlay_plane = 0,
+                .unsupported_format_or_modifier = 0,
+                .unsupported_layout = 0,
+                .synchronization_failed = 0,
+                .framebuffer_import_failed = 0,
+                .atomic_test_failed = 0,
+                .page_flip_failed = 0,
+            },
             .cpu_uploads = 4,
             .dmabuf_imports = 6,
             .frames_over_budget = 1,
@@ -890,6 +916,9 @@ test "performance statistics return typed output snapshots and forward reset" {
     try std.testing.expectEqual(@as(i64, 4), statistics.frames_presented);
     try std.testing.expectEqual(control.FramePath.composited, statistics.last_frame.path);
     try std.testing.expectEqual(@as(i64, 20_000), statistics.last_frame.damaged_pixels);
+    try std.testing.expectEqual(@as(i64, 3), statistics.overlay_scanout_candidates);
+    try std.testing.expectEqual(@as(i64, 2), statistics.overlay_scanout_frames);
+    try std.testing.expectEqual(@as(i64, 1), statistics.overlay_scanout_rejections.no_topmost_surface);
     try std.testing.expectEqual(@as(i64, 300), statistics.request_to_presentation.p99_microseconds);
 }
 
