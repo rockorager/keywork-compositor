@@ -12,7 +12,7 @@ const usage =
     \\          close TARGET
     \\          toggle-fullscreen TARGET | toggle-floating TARGET
     \\          switch-workspace WORKSPACE | move-focused-to-workspace WORKSPACE
-    \\          stats [--reset] | reload | quit
+    \\          stats [--json] [--reset] | reload | quit
     \\directions: next, previous, left, down, up, right
     \\targets: focused
     \\layouts: master-stack, dwindle, scrolling
@@ -28,13 +28,18 @@ const Command = union(enum) {
     set_layout: control.Layout,
     switch_workspace: i64,
     move_to_workspace: i64,
-    stats: bool,
+    stats: StatisticsOptions,
     reload,
     quit,
 };
 
+const StatisticsOptions = struct {
+    reset: bool = false,
+    json: bool = false,
+};
+
 const StatisticsParameters = struct {
-    outputs: []control.OutputStatistics,
+    outputs: []const control.OutputStatistics,
 };
 
 pub fn main(init: std.process.Init) void {
@@ -91,7 +96,7 @@ fn run(init: std.process.Init) !void {
         .set_layout => |layout| try client.call(control.set_layout_method, .{ .layout = layout }),
         .switch_workspace => |workspace| try client.call(control.switch_workspace_method, .{ .workspace = workspace }),
         .move_to_workspace => |workspace| try client.call(control.move_focused_to_workspace_method, .{ .workspace = workspace }),
-        .stats => |reset| try client.call(control.get_performance_statistics_method, .{ .reset = reset }),
+        .stats => |options| try client.call(control.get_performance_statistics_method, .{ .reset = options.reset }),
         .reload => try client.call(control.reload_configuration_method, Empty{}),
         .quit => unreachable,
     };
@@ -109,7 +114,12 @@ fn run(init: std.process.Init) !void {
     }
     if (reply.value.continues) return error.UnexpectedContinuation;
     switch (command) {
-        .stats => try printStatistics(init.io, init.gpa, reply.value.parameters),
+        .stats => |options| try printStatistics(
+            init.io,
+            init.gpa,
+            reply.value.parameters,
+            options.json,
+        ),
         else => {},
     }
 }
@@ -118,13 +128,18 @@ fn printStatistics(
     io: std.Io,
     allocator: std.mem.Allocator,
     parameters: ?std.json.Value,
+    json: bool,
 ) !void {
     const parsed = try parseStatisticsParameters(allocator, parameters);
     defer parsed.deinit();
     var buffer: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writer(io, &buffer);
     defer stdout.interface.flush() catch {};
-    try writeStatistics(&stdout.interface, parsed.value.outputs);
+    if (json) {
+        try writeStatisticsJson(&stdout.interface, parsed.value.outputs);
+    } else {
+        try writeStatistics(&stdout.interface, parsed.value.outputs);
+    }
 }
 
 fn parseStatisticsParameters(
@@ -196,6 +211,11 @@ fn writeStatistics(writer: *std.Io.Writer, outputs: []const control.OutputStatis
         try writeLatency(writer, "render -> commit", output.render_to_commit);
         try writeLatency(writer, "commit -> presentation", output.commit_to_presentation);
     }
+}
+
+fn writeStatisticsJson(writer: *std.Io.Writer, outputs: []const control.OutputStatistics) !void {
+    try std.json.Stringify.value(StatisticsParameters{ .outputs = outputs }, .{}, writer);
+    try writer.writeByte('\n');
 }
 
 fn writeFrameDiagnostics(
@@ -386,9 +406,19 @@ fn printUsage(io: std.Io, err: anyerror) anyerror {
 }
 
 fn parse(arguments: []const []const u8) !Command {
-    if (arguments.len == 1 and std.mem.eql(u8, arguments[0], "stats")) return .{ .stats = false };
-    if (arguments.len == 2 and std.mem.eql(u8, arguments[0], "stats") and
-        std.mem.eql(u8, arguments[1], "--reset")) return .{ .stats = true };
+    if (arguments.len > 0 and std.mem.eql(u8, arguments[0], "stats")) {
+        var options: StatisticsOptions = .{};
+        for (arguments[1..]) |argument| {
+            if (std.mem.eql(u8, argument, "--reset") and !options.reset) {
+                options.reset = true;
+            } else if (std.mem.eql(u8, argument, "--json") and !options.json) {
+                options.json = true;
+            } else {
+                return error.InvalidArguments;
+            }
+        }
+        return .{ .stats = options };
+    }
     if (arguments.len == 1 and std.mem.eql(u8, arguments[0], "reload")) return .reload;
     if (arguments.len == 1 and std.mem.eql(u8, arguments[0], "quit")) return .quit;
     if (arguments.len != 2) return error.InvalidArguments;
@@ -435,8 +465,13 @@ test "CLI parsing maps wire values and validates workspaces" {
     try std.testing.expectEqual(control.WindowTarget.focused, (try parse(&.{ "toggle-floating", "focused" })).toggle_floating);
     try std.testing.expectEqual(control.Layout.master_stack, (try parse(&.{ "set-layout", "master-stack" })).set_layout);
     try std.testing.expectEqual(@as(i64, 10), (try parse(&.{ "switch-workspace", "10" })).switch_workspace);
-    try std.testing.expect(!(try parse(&.{"stats"})).stats);
-    try std.testing.expect((try parse(&.{ "stats", "--reset" })).stats);
+    try std.testing.expect(!(try parse(&.{"stats"})).stats.reset);
+    try std.testing.expect((try parse(&.{ "stats", "--reset" })).stats.reset);
+    try std.testing.expect((try parse(&.{ "stats", "--json" })).stats.json);
+    const json_reset = (try parse(&.{ "stats", "--json", "--reset" })).stats;
+    try std.testing.expect(json_reset.json);
+    try std.testing.expect(json_reset.reset);
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "stats", "--json", "--json" }));
     try std.testing.expectEqual(Command.reload, try parse(&.{"reload"}));
     try std.testing.expectEqual(Command.quit, try parse(&.{"quit"}));
     try std.testing.expectError(error.InvalidWorkspace, parse(&.{ "switch-workspace", "11" }));
@@ -534,4 +569,12 @@ test "overlay scanout rejections render nonzero reasons" {
         \\    atomic test failed: 1
         \\
     , writer.written());
+}
+
+test "performance statistics render machine-readable JSON" {
+    var writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer writer.deinit();
+
+    try writeStatisticsJson(&writer.writer, &.{});
+    try std.testing.expectEqualStrings("{\"outputs\":[]}\n", writer.written());
 }
