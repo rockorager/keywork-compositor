@@ -7760,7 +7760,7 @@ fn fillTestVideoBuffer(
     }
 }
 
-fn expectManualVideoImport(
+fn expectVideoImport(
     format: render.DmabufFormat,
     chroma_location: render.ChromaLocation,
 ) !void {
@@ -7907,16 +7907,27 @@ fn expectManualVideoImport(
 
     try std.testing.expectEqual(@as(u32, 0), completion.cpu_uploads);
     try std.testing.expectEqual(@as(u32, 1), completion.dmabuf_imports);
-    try std.testing.expect(renderer.textures.get(cache_id).?.manual_ycbcr != null);
+    const expected_manual = switch (chroma_location) {
+        .type_0, .type_1, .type_2, .type_3 => false,
+        .type_4, .type_5 => true,
+    };
+    try std.testing.expectEqual(
+        expected_manual,
+        renderer.textures.get(cache_id).?.manual_ycbcr != null,
+    );
     try expectArgbNear(0xffff0000, target_pixels[32 * 64 + 32], 2);
 }
 
+test "Vulkan converts known NV12 pixels with an immutable sampler" {
+    try expectVideoImport(.nv12, .type_0);
+}
+
 test "Vulkan manually reconstructs known NV12 pixels" {
-    try expectManualVideoImport(.nv12, .type_4);
+    try expectVideoImport(.nv12, .type_4);
 }
 
 test "Vulkan manually reconstructs known P010 pixels" {
-    try expectManualVideoImport(.p010, .type_5);
+    try expectVideoImport(.p010, .type_5);
 }
 
 test "Vulkan renderer blends premultiplied alpha in linear light" {
