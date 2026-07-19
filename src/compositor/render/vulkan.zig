@@ -409,6 +409,7 @@ fn initGraphics(
     device: vk.Device,
     format: vk.Format,
     enable_10bit_output: bool,
+    ycbcr_descriptor_count: u32,
 ) !Graphics {
     const binding: vk.DescriptorSetLayoutBinding = .{
         .binding = 0,
@@ -424,7 +425,8 @@ fn initGraphics(
 
     const pool_size: vk.DescriptorPoolSize = .{
         .type = .combined_image_sampler,
-        .descriptor_count = descriptor_set_capacity,
+        .descriptor_count = descriptorPoolCount(ycbcr_descriptor_count) orelse
+            return error.OutOfDeviceMemory,
     };
     const descriptor_pool = try wrapper.createDescriptorPool(device, &.{
         .flags = .{ .free_descriptor_set_bit = true },
@@ -892,7 +894,7 @@ fn dmabufSourceModifierImportable(
     physical_device: vk.PhysicalDevice,
     format: vk.Format,
     modifier: u64,
-) bool {
+) ?u32 {
     const modifier_info: vk.PhysicalDeviceImageDrmFormatModifierInfoEXT = .{
         .drm_format_modifier = modifier,
         .sharing_mode = .exclusive,
@@ -911,6 +913,10 @@ fn dmabufSourceModifierImportable(
     var external_properties: vk.ExternalImageFormatProperties = .{
         .external_memory_properties = undefined,
     };
+    var ycbcr_properties: vk.SamplerYcbcrConversionImageFormatProperties = .{
+        .combined_image_sampler_descriptor_count = 0,
+    };
+    external_properties.p_next = &ycbcr_properties;
     var format_properties: vk.ImageFormatProperties2 = .{
         .p_next = &external_properties,
         .image_format_properties = undefined,
@@ -919,8 +925,11 @@ fn dmabufSourceModifierImportable(
         physical_device,
         &format_info,
         &format_properties,
-    ) catch return false;
-    return external_properties.external_memory_properties.external_memory_features.importable_bit;
+    ) catch return null;
+    if (!external_properties.external_memory_properties.external_memory_features.importable_bit) {
+        return null;
+    }
+    return @max(ycbcr_properties.combined_image_sampler_descriptor_count, 1);
 }
 
 test "DMA-BUF source FourCC selects the matching Vulkan format" {
@@ -970,6 +979,31 @@ const DmabufTargetModifiers = struct {
     supported: []u64,
     sampleable: []u64,
 };
+
+const DmabufSourceModifiers = struct {
+    modifiers: []u64,
+    max_descriptor_count: u32,
+};
+
+fn descriptorPoolCount(ycbcr_descriptor_count: u32) ?u32 {
+    return std.math.mul(
+        u32,
+        descriptor_set_capacity,
+        @max(ycbcr_descriptor_count, 1),
+    ) catch null;
+}
+
+test "descriptor pool accounts for multi-descriptor YCbCr samplers" {
+    try std.testing.expectEqual(
+        @as(u32, descriptor_set_capacity),
+        descriptorPoolCount(0).?,
+    );
+    try std.testing.expectEqual(
+        @as(u32, descriptor_set_capacity * 3),
+        descriptorPoolCount(3).?,
+    );
+    try std.testing.expect(descriptorPoolCount(std.math.maxInt(u32)) == null);
+}
 
 fn queryDmabufTargetModifiers(
     allocator: std.mem.Allocator,
@@ -1035,7 +1069,7 @@ fn queryDmabufSourceModifiers(
     format: vk.Format,
     plane_count: u32,
     require_ycbcr: bool,
-) error{OutOfMemory}![]u64 {
+) error{OutOfMemory}!DmabufSourceModifiers {
     var modifier_list: vk.DrmFormatModifierPropertiesListEXT = .{};
     var format_properties: vk.FormatProperties2 = .{ .format_properties = undefined };
     format_properties.p_next = &modifier_list;
@@ -1058,6 +1092,7 @@ fn queryDmabufSourceModifiers(
 
     var modifiers: std.ArrayList(u64) = .empty;
     defer modifiers.deinit(allocator);
+    var max_descriptor_count: u32 = 1;
     for (properties) |property| {
         const features = property.drm_format_modifier_tiling_features;
         if (property.drm_format_modifier_plane_count == plane_count and
@@ -1065,19 +1100,23 @@ fn queryDmabufSourceModifiers(
             (!require_ycbcr or
                 (features.cosited_chroma_samples_bit and
                     features.midpoint_chroma_samples_bit and
-                    features.sampled_image_ycbcr_conversion_linear_filter_bit)) and
-            dmabufSourceModifierImportable(
+                    features.sampled_image_ycbcr_conversion_linear_filter_bit)))
+        {
+            const descriptor_count = dmabufSourceModifierImportable(
                 instance_wrapper,
                 physical_device,
                 format,
                 property.drm_format_modifier,
-            ))
-        {
+            ) orelse continue;
             modifiers.append(allocator, property.drm_format_modifier) catch
                 return error.OutOfMemory;
+            max_descriptor_count = @max(max_descriptor_count, descriptor_count);
         }
     }
-    return modifiers.toOwnedSlice(allocator) catch return error.OutOfMemory;
+    return .{
+        .modifiers = modifiers.toOwnedSlice(allocator) catch return error.OutOfMemory,
+        .max_descriptor_count = max_descriptor_count,
+    };
 }
 
 pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) InitError!Self {
@@ -1313,6 +1352,7 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
     var dmabuf_nv12_source_modifiers: []u64 = &.{};
     var dmabuf_p010_source_modifiers: []u64 = &.{};
     var dmabuf_source_formats: []render.DmabufFormatModifier = &.{};
+    var ycbcr_descriptor_count: u32 = 1;
     if (dmabuf_capable) {
         var modifier_list: vk.DrmFormatModifierPropertiesListEXT = .{};
         var format_properties: vk.FormatProperties2 = .{ .format_properties = undefined };
@@ -1365,7 +1405,7 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
                     physical_device,
                     .b8g8r8a8_unorm,
                     property.drm_format_modifier,
-                ))
+                ) != null)
             {
                 source_modifiers.append(allocator, property.drm_format_modifier) catch
                     return error.OutOfMemory;
@@ -1405,7 +1445,7 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
         dmabuf_source_modifiers = source_modifiers.toOwnedSlice(allocator) catch
             return error.OutOfMemory;
         errdefer if (dmabuf_source_modifiers.len != 0) allocator.free(dmabuf_source_modifiers);
-        dmabuf_rgba_source_modifiers = try queryDmabufSourceModifiers(
+        const rgba_source = try queryDmabufSourceModifiers(
             allocator,
             instance_wrapper,
             physical_device,
@@ -1413,11 +1453,12 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
             1,
             false,
         );
+        dmabuf_rgba_source_modifiers = rgba_source.modifiers;
         errdefer if (dmabuf_rgba_source_modifiers.len != 0) {
             allocator.free(dmabuf_rgba_source_modifiers);
         };
         if (ycbcr_capable) {
-            dmabuf_nv12_source_modifiers = try queryDmabufSourceModifiers(
+            const nv12_source = try queryDmabufSourceModifiers(
                 allocator,
                 instance_wrapper,
                 physical_device,
@@ -1425,16 +1466,26 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
                 2,
                 true,
             );
+            dmabuf_nv12_source_modifiers = nv12_source.modifiers;
+            ycbcr_descriptor_count = @max(
+                ycbcr_descriptor_count,
+                nv12_source.max_descriptor_count,
+            );
             errdefer if (dmabuf_nv12_source_modifiers.len != 0) {
                 allocator.free(dmabuf_nv12_source_modifiers);
             };
-            dmabuf_p010_source_modifiers = try queryDmabufSourceModifiers(
+            const p010_source = try queryDmabufSourceModifiers(
                 allocator,
                 instance_wrapper,
                 physical_device,
                 .g10x6_b10x6r10x6_2plane_420_unorm_3pack16,
                 2,
                 true,
+            );
+            dmabuf_p010_source_modifiers = p010_source.modifiers;
+            ycbcr_descriptor_count = @max(
+                ycbcr_descriptor_count,
+                p010_source.max_descriptor_count,
             );
             errdefer if (dmabuf_p010_source_modifiers.len != 0) {
                 allocator.free(dmabuf_p010_source_modifiers);
@@ -1479,6 +1530,7 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
         device,
         format,
         dmabuf_10bit_modifiers.len != 0,
+        ycbcr_descriptor_count,
     ) catch |err| {
         log.err("failed to initialize Vulkan graphics pipelines: {t}", .{err});
         return error.VulkanUnavailable;
