@@ -50,6 +50,7 @@ connector_id: u32,
 crtc_id: u32,
 primary_plane_id: ?u32,
 atomic_plane: ?AtomicPlaneProperties,
+overlay_plane: ?OverlayPlane,
 atomic_color: ?AtomicColorProperties,
 gamma_size: u32,
 gamma_lut: []u16,
@@ -161,6 +162,37 @@ const AtomicPlaneDisableProperties = struct {
     }
 };
 
+const PlaneZpos = struct {
+    property_id: u32,
+    current: u64,
+    maximum: u64,
+    immutable: bool,
+};
+
+const PlaneSelectionInfo = struct {
+    plane_type: ?u64 = null,
+    formats_blob_id: ?u32 = null,
+    zpos: ?PlaneZpos = null,
+};
+
+const OverlayPlane = struct {
+    id: u32,
+    formats: []render.DmabufFormatModifier,
+    atomic: AtomicPlaneProperties,
+    zpos_property: u32,
+    zpos: u64,
+
+    fn deinit(self: OverlayPlane, allocator: std.mem.Allocator) void {
+        allocator.free(self.formats);
+    }
+
+    fn clone(self: OverlayPlane, allocator: std.mem.Allocator) !OverlayPlane {
+        var result = self;
+        result.formats = try allocator.dupe(render.DmabufFormatModifier, self.formats);
+        return result;
+    }
+};
+
 const AtomicConnectorColorProperties = struct {
     colorspace: u32 = 0,
     default_colorspace: ?u64 = null,
@@ -239,6 +271,7 @@ pub const Selection = struct {
     connector_type_id: u32,
     crtc_id: u32,
     primary_plane_id: ?u32,
+    overlay_plane: ?OverlayPlane,
     scanout_formats: []render.DmabufFormatModifier,
     implicit_scanout: bool,
 };
@@ -247,6 +280,7 @@ const PrimaryPlane = struct {
     id: ?u32 = null,
     formats: []render.DmabufFormatModifier = &.{},
     implicit: bool = true,
+    zpos: ?u64 = null,
 };
 
 pub const Mode = struct {
@@ -308,6 +342,7 @@ pub fn init(
         .crtc_id = 0,
         .primary_plane_id = null,
         .atomic_plane = null,
+        .overlay_plane = null,
         .atomic_color = null,
         .gamma_size = 0,
         .gamma_lut = &.{},
@@ -369,6 +404,7 @@ pub fn deinit(self: *Self) void {
     self.allocator.free(self.gamma_lut);
     self.allocator.free(self.modes);
     self.allocator.free(self.scanout_formats);
+    if (self.overlay_plane) |plane| plane.deinit(self.allocator);
     for (&self.buffer_damage) |*damage| damage.deinit();
     self.* = undefined;
 }
@@ -757,9 +793,15 @@ pub fn activate(self: *Self, fd: std.posix.fd_t, selection: Selection, device_pa
     const selected_mode = selection.modes[selection.mode_index];
     const selected_size = selected_mode.size();
     const first_activation = self.size.width == 0;
+    const atomic = self.device_access.atomic(self.device_access.context);
+    const selected_overlay_id = if (atomic)
+        optionalOverlayPlaneId(selection.overlay_plane)
+    else
+        null;
     if (self.size.width != 0 and (!std.meta.eql(self.size, selected_size) or
         self.connector_id != selection.connector_id or
         self.primary_plane_id != selection.primary_plane_id or
+        optionalOverlayPlaneId(self.overlay_plane) != selected_overlay_id or
         !modeListsEqual(self.modes, selection.modes)))
     {
         return error.OutputChanged;
@@ -769,10 +811,20 @@ pub fn activate(self: *Self, fd: std.posix.fd_t, selection: Selection, device_pa
         self.allocator.free(modes);
         return err;
     };
+    const overlay_plane = if (atomic)
+        if (selection.overlay_plane) |plane| plane.clone(self.allocator) catch |err| {
+            self.allocator.free(scanout_formats);
+            self.allocator.free(modes);
+            return err;
+        } else null
+    else
+        null;
     self.allocator.free(self.modes);
     self.allocator.free(self.scanout_formats);
+    if (self.overlay_plane) |plane| plane.deinit(self.allocator);
     self.modes = modes;
     self.scanout_formats = scanout_formats;
+    self.overlay_plane = overlay_plane;
     self.implicit_scanout = selection.implicit_scanout;
     self.mode_index = selection.mode_index;
     self.mode = selected_mode.value;
@@ -782,7 +834,6 @@ pub fn activate(self: *Self, fd: std.posix.fd_t, selection: Selection, device_pa
     self.connector_id = selection.connector_id;
     self.crtc_id = selection.crtc_id;
     self.primary_plane_id = selection.primary_plane_id;
-    const atomic = self.device_access.atomic(self.device_access.context);
     self.atomic_plane = if (atomic)
         loadAtomicPlaneProperties(fd, self.primary_plane_id orelse 0)
     else
@@ -793,6 +844,12 @@ pub fn activate(self: *Self, fd: std.posix.fd_t, selection: Selection, device_pa
         null;
     if (atomic and self.atomic_plane == null) {
         log.warn("primary plane lacks required atomic properties; using legacy frame commits", .{});
+    }
+    if (self.overlay_plane) |plane| {
+        log.info(
+            "claimed overlay plane {d} for CRTC {d} at zpos {d} with {d} format/modifier pairs",
+            .{ plane.id, self.crtc_id, plane.zpos, plane.formats.len },
+        );
     }
     self.async_page_flip_supported = supportsAsyncPageFlips(fd, self.atomic_plane != null);
     self.retired = false;
@@ -1389,6 +1446,7 @@ pub fn selectOutputs(
         for (selections.items) |selection| {
             allocator.free(selection.modes);
             allocator.free(selection.scanout_formats);
+            if (selection.overlay_plane) |plane| plane.deinit(allocator);
         }
         selections.deinit(allocator);
     }
@@ -1397,6 +1455,10 @@ pub fn selectOutputs(
     defer claimed_primary_planes.deinit(allocator);
     var reserved_primary_planes: std.ArrayList(u32) = .empty;
     defer reserved_primary_planes.deinit(allocator);
+    var claimed_overlay_planes: std.ArrayList(u32) = .empty;
+    defer claimed_overlay_planes.deinit(allocator);
+    var reserved_overlay_planes: std.ArrayList(u32) = .empty;
+    defer reserved_overlay_planes.deinit(allocator);
 
     // Reserve working routes before assigning CRTCs to newly connected heads.
     // Otherwise connector enumeration order can steal an active output's CRTC.
@@ -1413,6 +1475,11 @@ pub fn selectOutputs(
             if (output.primary_plane_id) |plane_id| {
                 if (std.mem.indexOfScalar(u32, reserved_primary_planes.items, plane_id) == null) {
                     try reserved_primary_planes.append(allocator, plane_id);
+                }
+            }
+            if (output.overlay_plane) |plane| {
+                if (std.mem.indexOfScalar(u32, reserved_overlay_planes.items, plane.id) == null) {
+                    try reserved_overlay_planes.append(allocator, plane.id);
                 }
             }
         }
@@ -1468,10 +1535,31 @@ pub fn selectOutputs(
                 return err;
             };
         }
+        const overlay_plane = overlayPlane(
+            fd,
+            crtc_id,
+            crtc_index,
+            if (existing_output) |output| optionalOverlayPlaneId(output.overlay_plane) else null,
+            claimed_overlay_planes.items,
+            reserved_overlay_planes.items,
+            primary_plane.zpos,
+            allocator,
+        ) catch |err| {
+            allocator.free(primary_plane.formats);
+            return err;
+        };
+        if (overlay_plane) |plane| {
+            claimed_overlay_planes.append(allocator, plane.id) catch |err| {
+                allocator.free(primary_plane.formats);
+                plane.deinit(allocator);
+                return err;
+            };
+        }
         const mode_count: usize = @intCast(connector.*.count_modes);
         const connector_modes = connector.*.modes[0..mode_count];
         const modes = allocator.alloc(Mode, mode_count) catch |err| {
             allocator.free(primary_plane.formats);
+            if (overlay_plane) |plane| plane.deinit(allocator);
             return err;
         };
         for (connector_modes, modes) |mode, *stored| stored.* = .{
@@ -1494,11 +1582,13 @@ pub fn selectOutputs(
             .connector_type_id = connector.*.connector_type_id,
             .crtc_id = crtc_id,
             .primary_plane_id = primary_plane.id,
+            .overlay_plane = overlay_plane,
             .scanout_formats = primary_plane.formats,
             .implicit_scanout = primary_plane.implicit,
         }) catch |err| {
             allocator.free(modes);
             allocator.free(primary_plane.formats);
+            if (overlay_plane) |plane| plane.deinit(allocator);
             return err;
         };
     }
@@ -1509,6 +1599,7 @@ pub fn deinitSelections(allocator: std.mem.Allocator, selections: []Selection) v
     for (selections) |selection| {
         allocator.free(selection.modes);
         allocator.free(selection.scanout_formats);
+        if (selection.overlay_plane) |plane| plane.deinit(allocator);
     }
     allocator.free(selections);
 }
@@ -1536,32 +1627,8 @@ fn primaryPlane(
             (preferred_plane_id != plane_id and
                 std.mem.indexOfScalar(u32, reserved_planes, plane_id) != null)) continue;
 
-        const properties = c.drmModeObjectGetProperties(
-            fd,
-            plane_id,
-            c.DRM_MODE_OBJECT_PLANE,
-        ) orelse continue;
-        defer c.drmModeFreeObjectProperties(properties);
-        var plane_type: ?u64 = null;
-        var formats_blob_id: ?u32 = null;
-        const property_count: usize = @intCast(properties.*.count_props);
-        for (0..property_count) |property_index| {
-            const property = c.drmModeGetProperty(
-                fd,
-                properties.*.props[property_index],
-            ) orelse continue;
-            defer c.drmModeFreeProperty(property);
-            const property_name = std.mem.sliceTo(property.*.name[0..], 0);
-            const value = properties.*.prop_values[property_index];
-            if (std.mem.eql(u8, property_name, "type")) {
-                plane_type = value;
-            } else if (std.mem.eql(u8, property_name, "IN_FORMATS") and
-                value > 0 and value <= std.math.maxInt(u32))
-            {
-                formats_blob_id = @intCast(value);
-            }
-        }
-        if (plane_type != c.DRM_PLANE_TYPE_PRIMARY) continue;
+        const info = planeSelectionInfo(fd, plane_id) orelse continue;
+        if (info.plane_type != c.DRM_PLANE_TYPE_PRIMARY) continue;
         const score: u8 = if (preferred_plane_id == plane_id and
             (plane.*.crtc_id == 0 or plane.*.crtc_id == crtc_id))
             3
@@ -1581,15 +1648,159 @@ fn primaryPlane(
                 break;
             }
         }
-        const owned_formats = try planeFormats(fd, plane, formats_blob_id, allocator);
+        const owned_formats = try planeFormats(fd, plane, info.formats_blob_id, allocator);
         allocator.free(selected.formats);
         selected = .{
             .id = plane_id,
             .formats = owned_formats,
             .implicit = implicit,
+            .zpos = if (info.zpos) |zpos| zpos.current else null,
         };
         selected_score = score;
         if (score == 3) break;
+    }
+    return selected;
+}
+
+fn optionalOverlayPlaneId(plane: ?OverlayPlane) ?u32 {
+    return if (plane) |value| value.id else null;
+}
+
+fn planeSelectionInfo(fd: std.posix.fd_t, plane_id: u32) ?PlaneSelectionInfo {
+    const properties = c.drmModeObjectGetProperties(
+        fd,
+        plane_id,
+        c.DRM_MODE_OBJECT_PLANE,
+    ) orelse return null;
+    defer c.drmModeFreeObjectProperties(properties);
+
+    var result: PlaneSelectionInfo = .{};
+    const property_count: usize = @intCast(properties.*.count_props);
+    for (0..property_count) |property_index| {
+        const property_id = properties.*.props[property_index];
+        const property = c.drmModeGetProperty(fd, property_id) orelse continue;
+        defer c.drmModeFreeProperty(property);
+        const property_name = std.mem.sliceTo(property.*.name[0..], 0);
+        const value = properties.*.prop_values[property_index];
+        if (std.mem.eql(u8, property_name, "type")) {
+            result.plane_type = value;
+        } else if (std.mem.eql(u8, property_name, "IN_FORMATS") and
+            value > 0 and value <= std.math.maxInt(u32))
+        {
+            result.formats_blob_id = @intCast(value);
+        } else if (std.mem.eql(u8, property_name, "zpos")) {
+            const immutable = property.*.flags & c.DRM_MODE_PROP_IMMUTABLE != 0;
+            const maximum = if (!immutable and property.*.count_values >= 2)
+                @max(value, property.*.values[1])
+            else
+                value;
+            result.zpos = .{
+                .property_id = property_id,
+                .current = value,
+                .maximum = maximum,
+                .immutable = immutable,
+            };
+        }
+    }
+    return result;
+}
+
+const PlaneAssignmentRank = struct {
+    attachment: u8,
+    possible_crtc_count: u8,
+    plane_id: u32,
+
+    fn betterThan(self: PlaneAssignmentRank, other: PlaneAssignmentRank) bool {
+        if (self.attachment != other.attachment) return self.attachment > other.attachment;
+        if (self.possible_crtc_count != other.possible_crtc_count) {
+            return self.possible_crtc_count < other.possible_crtc_count;
+        }
+        return self.plane_id < other.plane_id;
+    }
+};
+
+fn planeAssignmentRank(
+    plane_id: u32,
+    plane_crtc_id: u32,
+    possible_crtcs: u32,
+    crtc_id: u32,
+    preferred_plane_id: ?u32,
+) PlaneAssignmentRank {
+    const attachment: u8 = if (preferred_plane_id == plane_id and
+        (plane_crtc_id == 0 or plane_crtc_id == crtc_id))
+        3
+    else if (plane_crtc_id == crtc_id)
+        2
+    else if (plane_crtc_id == 0)
+        1
+    else
+        0;
+    return .{
+        .attachment = attachment,
+        .possible_crtc_count = @intCast(@popCount(possible_crtcs)),
+        .plane_id = plane_id,
+    };
+}
+
+fn overlayZpos(zpos: PlaneZpos, primary_zpos: u64) ?u64 {
+    if (zpos.current > primary_zpos) return zpos.current;
+    if (zpos.immutable or zpos.maximum <= primary_zpos) return null;
+    return primary_zpos + 1;
+}
+
+fn overlayPlane(
+    fd: std.posix.fd_t,
+    crtc_id: u32,
+    crtc_index: usize,
+    preferred_plane_id: ?u32,
+    claimed_planes: []const u32,
+    reserved_planes: []const u32,
+    primary_zpos: ?u64,
+    allocator: std.mem.Allocator,
+) !?OverlayPlane {
+    const required_primary_zpos = primary_zpos orelse return null;
+    const resources = c.drmModeGetPlaneResources(fd) orelse return null;
+    defer c.drmModeFreePlaneResources(resources);
+    var selected: ?OverlayPlane = null;
+    errdefer if (selected) |plane| plane.deinit(allocator);
+    var selected_rank: ?PlaneAssignmentRank = null;
+    const plane_count: usize = @intCast(resources.*.count_planes);
+    for (resources.*.planes[0..plane_count]) |plane_id| {
+        const plane = c.drmModeGetPlane(fd, plane_id) orelse continue;
+        defer c.drmModeFreePlane(plane);
+        if (!crtcIndexPossible(plane.*.possible_crtcs, crtc_index) or
+            std.mem.indexOfScalar(u32, claimed_planes, plane_id) != null or
+            (preferred_plane_id != plane_id and
+                std.mem.indexOfScalar(u32, reserved_planes, plane_id) != null)) continue;
+
+        const rank = planeAssignmentRank(
+            plane_id,
+            plane.*.crtc_id,
+            plane.*.possible_crtcs,
+            crtc_id,
+            preferred_plane_id,
+        );
+        if (rank.attachment == 0 or
+            (selected_rank != null and !rank.betterThan(selected_rank.?))) continue;
+        const info = planeSelectionInfo(fd, plane_id) orelse continue;
+        if (info.plane_type != c.DRM_PLANE_TYPE_OVERLAY or info.formats_blob_id == null) continue;
+        const zpos = info.zpos orelse continue;
+        const selected_zpos = overlayZpos(zpos, required_primary_zpos) orelse continue;
+        const atomic = loadAtomicPlaneProperties(fd, plane_id) orelse continue;
+        const formats = try planeFormats(fd, plane, info.formats_blob_id, allocator);
+        if (formats.len == 0) {
+            allocator.free(formats);
+            continue;
+        }
+        if (selected) |old| old.deinit(allocator);
+        selected = .{
+            .id = plane_id,
+            .formats = formats,
+            .atomic = atomic,
+            .zpos_property = zpos.property_id,
+            .zpos = selected_zpos,
+        };
+        selected_rank = rank;
     }
     return selected;
 }
@@ -3134,4 +3345,37 @@ test "CRTC selection preserves preferred and never selects claimed" {
     try std.testing.expectEqual(@as(?usize, 1), selectCrtcIndex(&resources, 0b111, 20, 0));
     try std.testing.expectEqual(@as(?usize, 0), selectCrtcIndex(&resources, 0b111, 20, 0b010));
     try std.testing.expectEqual(@as(?usize, null), selectCrtcIndex(&resources, 0b011, null, 0b011));
+}
+
+test "overlay plane ranking preserves assignments and constrained planes" {
+    const preferred = planeAssignmentRank(7, 0, 0b111, 10, 7);
+    const attached = planeAssignmentRank(8, 10, 0b001, 10, 7);
+    const free = planeAssignmentRank(9, 0, 0b001, 10, 7);
+    const flexible = planeAssignmentRank(10, 0, 0b111, 10, 7);
+    const unavailable = planeAssignmentRank(11, 20, 0b001, 10, 7);
+    try std.testing.expect(preferred.betterThan(attached));
+    try std.testing.expect(attached.betterThan(free));
+    try std.testing.expect(free.betterThan(flexible));
+    try std.testing.expectEqual(@as(u8, 0), unavailable.attachment);
+}
+
+test "overlay plane zpos must remain above primary" {
+    try std.testing.expectEqual(@as(?u64, 2), overlayZpos(.{
+        .property_id = 1,
+        .current = 2,
+        .maximum = 2,
+        .immutable = true,
+    }, 0));
+    try std.testing.expectEqual(@as(?u64, 1), overlayZpos(.{
+        .property_id = 1,
+        .current = 0,
+        .maximum = 3,
+        .immutable = false,
+    }, 0));
+    try std.testing.expectEqual(@as(?u64, null), overlayZpos(.{
+        .property_id = 1,
+        .current = 0,
+        .maximum = 0,
+        .immutable = true,
+    }, 0));
 }
