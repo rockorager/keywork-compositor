@@ -3289,6 +3289,17 @@ fn damageFullOutput(self: *Self, output: *RenderOutput) void {
     self.scheduleRepaint(output);
 }
 
+fn preservePromotedDamage(damage: *Region, destination: render.Rect, output_size: render.Size) void {
+    // The primary omits this image, so it remains stale until a later frame
+    // repaints the rect beneath either a replacement overlay or normal composition.
+    damage.add(
+        destination.x,
+        destination.y,
+        @intCast(destination.width),
+        @intCast(destination.height),
+    ) catch damage.setRectangle(0, 0, output_size.width, output_size.height);
+}
+
 fn outputDamageRectangles(
     self: *Self,
     output: *RenderOutput,
@@ -6047,6 +6058,17 @@ test "damage scaling covers fractional sampling edges" {
     );
 }
 
+test "promoted overlay damage remains stale for the next frame" {
+    var damage = Region.init();
+    defer damage.deinit();
+    preservePromotedDamage(
+        &damage,
+        .{ .x = 10, .y = 20, .width = 30, .height = 40 },
+        .{ .width = 100, .height = 100 },
+    );
+    try std.testing.expect(damage.coversRectangle(10, 20, 30, 40));
+}
+
 fn captureOutput(
     self: *Self,
     output_id: OutputLayout.Id,
@@ -6606,30 +6628,36 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
         .rejected => |reason| render_output.frame_statistics.rejectDirectScanout(reason),
     }
     if (!direct_scanout) {
-        var overlay_candidate: ?render.OverlayScanout = null;
+        var overlay_destination: ?render.Rect = null;
         switch (self.renderer.overlayScanoutCandidate()) {
             .candidate => |candidate| {
                 increment(&render_output.frame_statistics.overlay_scanout_candidates);
-                overlay_candidate = candidate;
+                switch (render_output.backend.validateOverlayScanout(candidate)) {
+                    .accepted => overlay_destination = candidate.destination,
+                    .rejected => |reason| {
+                        render_output.frame_statistics.rejectOverlayScanout(reason);
+                    },
+                }
             },
             .rejected => |reason| render_output.frame_statistics.rejectOverlayScanout(reason),
         }
         renderer_frame_active = false;
-        const completion = try self.renderer.finishFrameScanout(
-            outputStatisticsTag(render_output.protocol_id),
-        );
+        const gpu_sample_tag = outputStatisticsTag(render_output.protocol_id);
+        const completion = if (overlay_destination != null)
+            try self.renderer.finishFrameScanoutWithoutTopmost(gpu_sample_tag)
+        else
+            try self.renderer.finishFrameScanout(gpu_sample_tag);
         render_output.frame_statistics.addFrameCompletion(completion);
         self.collectGpuTimings();
         const render_fence_fd = completion.sync_file_fd;
         defer if (render_fence_fd) |fd| {
             _ = std.c.close(fd);
         };
-        presented = if (overlay_candidate) |candidate| overlay_presented: {
-            const result = render_output.backend.presentOverlay(
+        presented = if (overlay_destination) |destination| overlay_presented: {
+            const result = render_output.backend.presentValidatedOverlay(
                 &frame_damage,
                 render_fence_fd,
                 allow_tearing,
-                candidate,
             ) catch |err| switch (err) {
                 error.OutputColorFallback => {
                     render_output.discardFrame();
@@ -6638,13 +6666,22 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
                     self.damageFullOutput(render_output);
                     return;
                 },
+                error.OverlayCommitFailed => {
+                    render_output.discardFrame();
+                    output.cancelFrame();
+                    render_output.frame_statistics.rejectOverlayScanout(.page_flip_failed);
+                    self.damageFullOutput(render_output);
+                    return;
+                },
                 else => return error.InvalidTarget,
             };
-            switch (result.scanout) {
-                .accepted => increment(&render_output.frame_statistics.overlay_scanout_frames),
-                .rejected => |reason| render_output.frame_statistics.rejectOverlayScanout(reason),
-            }
-            break :overlay_presented result.presentation_info;
+            increment(&render_output.frame_statistics.overlay_scanout_frames);
+            preservePromotedDamage(
+                &render_output.damage,
+                destination,
+                render_output.backend.modeSize(),
+            );
+            break :overlay_presented result;
         } else render_output.backend.present(
             &frame_damage,
             render_fence_fd,

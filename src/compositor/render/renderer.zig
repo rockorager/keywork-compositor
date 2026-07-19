@@ -203,12 +203,38 @@ pub const Renderer = struct {
         self: *Renderer,
         gpu_sample_tag: ?u64,
     ) Error!FrameCompletion {
+        return self.finishFrameScanoutCommands(gpu_sample_tag, false);
+    }
+
+    /// Finish a frame after its final image command was validated for an
+    /// output overlay plane. The caller must not present the resulting primary
+    /// buffer without that exact overlay state.
+    pub fn finishFrameScanoutWithoutTopmost(
+        self: *Renderer,
+        gpu_sample_tag: ?u64,
+    ) Error!FrameCompletion {
+        return self.finishFrameScanoutCommands(gpu_sample_tag, true);
+    }
+
+    fn finishFrameScanoutCommands(
+        self: *Renderer,
+        gpu_sample_tag: ?u64,
+        exclude_topmost: bool,
+    ) Error!FrameCompletion {
         const active = self.active_frame orelse unreachable;
         self.active_frame = null;
         defer self.commands.clearRetainingCapacity();
+        const commands = if (exclude_topmost) commands: {
+            const last_command = self.commands.getLastOrNull() orelse unreachable;
+            switch (last_command) {
+                .image => {},
+                else => unreachable,
+            }
+            break :commands self.commands.items[0 .. self.commands.items.len - 1];
+        } else self.commands.items;
         const frame: render_types.Frame = .{
             .size = active.target.size(),
-            .commands = self.commands.items,
+            .commands = commands,
             .damage = active.damage,
             .output_color_description = active.color_description,
             .output_calibration = active.output_calibration,
@@ -909,6 +935,38 @@ fn expectOverlayScanoutRejection(
         .candidate => return error.TestUnexpectedResult,
         .rejected => |reason| try std.testing.expectEqual(expected, reason),
     }
+}
+
+test "validated overlay image is omitted from primary composition" {
+    var target_pixels = [_]u32{0};
+    var source_pixels = [_]u32{0xffffffff};
+    const size: render_types.Size = .{ .width = 1, .height = 1 };
+    const target: render_types.Target = .{ .pixels = .{
+        .size = size,
+        .stride_pixels = 1,
+        .pixels = &target_pixels,
+    } };
+    const commands = [_]render_types.Command{
+        .{ .clear = render_types.Color.rgba(0, 0, 0, 255) },
+        .{ .image = .{
+            .x = 0,
+            .y = 0,
+            .size = size,
+            .buffer = .{
+                .size = size,
+                .stride_pixels = 1,
+                .pixels = &source_pixels,
+            },
+            .is_opaque = true,
+        } },
+    };
+
+    var renderer = try Renderer.init(std.testing.allocator, .cpu);
+    defer renderer.deinit();
+    try renderer.beginFrame(target, .{}, .{}, null, .{});
+    try renderer.append(&commands);
+    _ = try renderer.finishFrameScanoutWithoutTopmost(null);
+    try std.testing.expectEqual(@as(u32, 0xff000000), target_pixels[0]);
 }
 
 test "renderer scales logical commands into a physical target" {

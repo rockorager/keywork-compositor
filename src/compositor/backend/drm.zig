@@ -89,6 +89,7 @@ direct_pending: ?ClientScanout,
 direct_displayed: ?ClientScanout,
 overlay_pending: ?ClientScanout,
 overlay_displayed: ?ClientScanout,
+validated_overlay: ?PreparedOverlay,
 pending_page_flip: ?PageFlipMode,
 scanout_framebuffers: std.AutoHashMapUnmanaged(ScanoutFramebufferKey, ScanoutFramebuffer),
 scanout_frame_number: u64,
@@ -151,14 +152,20 @@ const PreparedOverlayResult = union(enum) {
     rejected: render.OverlayScanoutRejection,
 };
 
-const FramePresentation = struct {
-    presentation_info: ?presentation.Info,
-    overlay_scanout: ?OverlayScanoutResult,
+const AcquiredFrame = struct {
+    fd: std.posix.fd_t,
+    index: usize,
+    buffer: *Buffer,
 };
 
 const PageFlipMode = enum {
     vsync,
     async,
+};
+
+const PageFlipAction = enum {
+    test_only,
+    commit,
 };
 
 const AtomicPlaneProperties = struct {
@@ -299,11 +306,6 @@ pub const OverlayScanoutResult = union(enum) {
     rejected: render.OverlayScanoutRejection,
 };
 
-pub const OverlayPresentation = struct {
-    presentation_info: ?presentation.Info,
-    scanout: OverlayScanoutResult,
-};
-
 const max_scanout_framebuffers = 8;
 
 pub const Selection = struct {
@@ -425,6 +427,7 @@ pub fn init(
         .direct_displayed = null,
         .overlay_pending = null,
         .overlay_displayed = null,
+        .validated_overlay = null,
         .pending_page_flip = null,
         .scanout_framebuffers = .empty,
         .scanout_frame_number = 0,
@@ -443,6 +446,7 @@ pub fn deinit(self: *Self) void {
     std.debug.assert(self.shadow_pixels.len == 0);
     std.debug.assert(self.direct_pending == null and self.direct_displayed == null);
     std.debug.assert(self.overlay_pending == null and self.overlay_displayed == null);
+    std.debug.assert(self.validated_overlay == null);
     std.debug.assert(self.scanout_framebuffers.count() == 0);
     self.scanout_framebuffers.deinit(self.allocator);
     self.clearIdentity();
@@ -650,6 +654,7 @@ pub fn repairDamage(self: *Self, damage: *Region) !void {
 
 pub fn cancel(self: *Self) void {
     self.acquired = null;
+    self.discardValidatedOverlay();
 }
 
 pub fn present(
@@ -658,32 +663,113 @@ pub fn present(
     render_fence_fd: ?std.posix.fd_t,
     allow_tearing: bool,
 ) !?presentation.Info {
-    const result = try self.presentFrame(frame_damage, render_fence_fd, allow_tearing, null);
-    std.debug.assert(result.overlay_scanout == null);
-    return result.presentation_info;
-}
+    std.debug.assert(self.validated_overlay == null);
+    const frame = try self.prepareAcquiredFrame(frame_damage, render_fence_fd);
+    if (!self.mode_set) {
+        var connector_id = self.connector_id;
+        if (c.drmModeSetCrtc(
+            frame.fd,
+            self.crtc_id,
+            frame.buffer.framebuffer_id,
+            0,
+            0,
+            &connector_id,
+            1,
+            &self.mode,
+        ) != 0) return error.ModeSetFailed;
+        self.mode_set = true;
+        if (self.output_color_dirty and !self.commitOutputColorState(frame.fd)) {
+            self.rejectOutputColorState();
+            self.displayed = frame.index;
+            self.acquired = null;
+            self.setDirectScanoutActive(false);
+            self.color_fallback_pending = false;
+            return error.OutputColorFallback;
+        }
+        self.applyDesiredGamma(frame.fd) catch |err| {
+            log.warn("failed to restore gamma ramps on {s}: {t}", .{ self.name(), err });
+        };
+        self.displayed = frame.index;
+        self.acquired = null;
+        self.setDirectScanoutActive(false);
+        const clock: std.Io.Clock = if (self.presentation_clock_id ==
+            presentation.monotonic_clock_id) .awake else .real;
+        return .{
+            .timestamp = .fromNanoseconds(clock.now(self.io).nanoseconds),
+            .refresh_nanoseconds = self.refresh_nanoseconds,
+        };
+    }
 
-pub fn presentOverlay(
-    self: *Self,
-    frame_damage: *const Region,
-    render_fence_fd: ?std.posix.fd_t,
-    allow_tearing: bool,
-    overlay: render.OverlayScanout,
-) !OverlayPresentation {
-    const result = try self.presentFrame(frame_damage, render_fence_fd, allow_tearing, overlay);
-    return .{
-        .presentation_info = result.presentation_info,
-        .scanout = result.overlay_scanout.?,
+    const page_flip = self.queuePageFlip(
+        frame.fd,
+        frame.buffer.framebuffer_id,
+        self.size,
+        null,
+        null,
+        .commit,
+        allow_tearing,
+    ) catch unreachable orelse {
+        if (self.color_fallback_pending) {
+            self.acquired = null;
+            self.color_fallback_pending = false;
+            return error.OutputColorFallback;
+        }
+        return error.PageFlipFailed;
     };
+    self.pending = frame.index;
+    self.pending_page_flip = page_flip;
+    self.acquired = null;
+    return null;
 }
 
-fn presentFrame(
+/// Present the previously validated overlay with a primary frame that omits
+/// that image. Failure leaves the old display state intact and never commits
+/// the incomplete primary buffer by itself.
+pub fn presentValidatedOverlay(
     self: *Self,
     frame_damage: *const Region,
     render_fence_fd: ?std.posix.fd_t,
     allow_tearing: bool,
-    overlay: ?render.OverlayScanout,
-) !FramePresentation {
+) !?presentation.Info {
+    const validated = self.validated_overlay orelse return error.NoValidatedOverlay;
+    std.debug.assert(self.mode_set);
+    const frame = try self.prepareAcquiredFrame(frame_damage, render_fence_fd);
+    const page_flip = self.queuePageFlip(
+        frame.fd,
+        frame.buffer.framebuffer_id,
+        self.size,
+        null,
+        validated.atomic,
+        .commit,
+        allow_tearing,
+    ) catch {
+        self.discardFailedValidatedFrame();
+        if (self.color_fallback_pending) {
+            self.color_fallback_pending = false;
+            return error.OutputColorFallback;
+        }
+        return error.OverlayCommitFailed;
+    } orelse {
+        self.discardFailedValidatedFrame();
+        if (self.color_fallback_pending) {
+            self.color_fallback_pending = false;
+            return error.OutputColorFallback;
+        }
+        return error.OverlayCommitFailed;
+    };
+    self.overlay_pending = validated.scanout;
+    self.validated_overlay = null;
+    self.pending = frame.index;
+    self.pending_page_flip = page_flip;
+    self.acquired = null;
+    return null;
+}
+
+fn prepareAcquiredFrame(
+    self: *Self,
+    frame_damage: *const Region,
+    render_fence_fd: ?std.posix.fd_t,
+) !AcquiredFrame {
     const index = self.acquired orelse return error.NoAcquiredBuffer;
     const fd = self.device_access.fd(self.device_access.context) orelse return error.SessionInactive;
     if (!self.device_access.active(self.device_access.context)) return error.SessionInactive;
@@ -714,114 +800,10 @@ fn presentFrame(
         &self.buffer_damage[index],
     );
     self.buffer_damage[index].clear();
-
-    if (!self.mode_set) {
-        var connector_id = self.connector_id;
-        if (c.drmModeSetCrtc(
-            fd,
-            self.crtc_id,
-            buffer.framebuffer_id,
-            0,
-            0,
-            &connector_id,
-            1,
-            &self.mode,
-        ) != 0) return error.ModeSetFailed;
-        self.mode_set = true;
-        if (self.output_color_dirty and !self.commitOutputColorState(fd)) {
-            self.rejectOutputColorState();
-            self.displayed = index;
-            self.acquired = null;
-            self.setDirectScanoutActive(false);
-            self.color_fallback_pending = false;
-            return error.OutputColorFallback;
-        }
-        self.applyDesiredGamma(fd) catch |err| {
-            log.warn("failed to restore gamma ramps on {s}: {t}", .{ self.name(), err });
-        };
-        self.displayed = index;
-        self.acquired = null;
-        self.setDirectScanoutActive(false);
-        const clock: std.Io.Clock = if (self.presentation_clock_id ==
-            presentation.monotonic_clock_id) .awake else .real;
-        const presentation_info: presentation.Info = .{
-            .timestamp = .fromNanoseconds(clock.now(self.io).nanoseconds),
-            .refresh_nanoseconds = self.refresh_nanoseconds,
-        };
-        return .{
-            .presentation_info = presentation_info,
-            .overlay_scanout = if (overlay != null)
-                .{ .rejected = .output_unavailable }
-            else
-                null,
-        };
-    }
-
-    var overlay_result: ?OverlayScanoutResult = null;
-    const prepared_overlay = if (overlay) |candidate| prepared: {
-        switch (self.prepareOverlay(fd, candidate)) {
-            .prepared => |prepared| break :prepared prepared,
-            .rejected => |reason| {
-                overlay_result = .{ .rejected = reason };
-                break :prepared null;
-            },
-        }
-    } else null;
-    const page_flip = queued: {
-        if (prepared_overlay) |prepared| {
-            prepared.scanout.source.retain(prepared.scanout.source.context);
-            const overlay_page_flip = self.queuePageFlip(
-                fd,
-                buffer.framebuffer_id,
-                self.size,
-                null,
-                prepared.atomic,
-                allow_tearing,
-            ) catch |err| {
-                prepared.scanout.release();
-                overlay_result = .{ .rejected = switch (err) {
-                    error.AtomicTestFailed => .atomic_test_failed,
-                    error.OverlaySynchronizationFailed => .synchronization_failed,
-                } };
-                break :queued null;
-            };
-            if (overlay_page_flip) |queued_page_flip| {
-                self.overlay_pending = prepared.scanout;
-                overlay_result = .accepted;
-                break :queued queued_page_flip;
-            }
-            prepared.scanout.release();
-            overlay_result = .{ .rejected = .page_flip_failed };
-        }
-        break :queued null;
-    } orelse fallback: {
-        if (self.color_fallback_pending) {
-            self.acquired = null;
-            self.color_fallback_pending = false;
-            return error.OutputColorFallback;
-        }
-        break :fallback self.queuePageFlip(
-            fd,
-            buffer.framebuffer_id,
-            self.size,
-            null,
-            null,
-            allow_tearing,
-        ) catch unreachable orelse {
-            if (self.color_fallback_pending) {
-                self.acquired = null;
-                self.color_fallback_pending = false;
-                return error.OutputColorFallback;
-            }
-            return error.PageFlipFailed;
-        };
-    };
-    self.pending = index;
-    self.pending_page_flip = page_flip;
-    self.acquired = null;
     return .{
-        .presentation_info = null,
-        .overlay_scanout = overlay_result,
+        .fd = fd,
+        .index = index,
+        .buffer = buffer,
     };
 }
 
@@ -922,6 +904,50 @@ fn prepareOverlay(
     } };
 }
 
+/// Validate and retain an overlay candidate for the currently acquired frame.
+/// A successful candidate must be consumed by `presentValidatedOverlay` or
+/// released by `cancel` before another frame is acquired.
+pub fn validateOverlayScanout(
+    self: *Self,
+    candidate: render.OverlayScanout,
+) OverlayScanoutResult {
+    if (self.validated_overlay != null or self.acquired == null or
+        self.pending != null or self.direct_pending != null)
+    {
+        return .{ .rejected = .output_busy };
+    }
+    if (!self.mode_set) return .{ .rejected = .output_unavailable };
+    const fd = self.device_access.fd(self.device_access.context) orelse
+        return .{ .rejected = .device_inactive };
+    if (!self.device_access.active(self.device_access.context)) {
+        return .{ .rejected = .device_inactive };
+    }
+    const prepared = switch (self.prepareOverlay(fd, candidate)) {
+        .prepared => |prepared| prepared,
+        .rejected => |reason| return .{ .rejected = reason },
+    };
+    const index = self.acquired.?;
+    const tested = self.queuePageFlip(
+        fd,
+        self.buffers[index].framebuffer_id,
+        self.size,
+        null,
+        prepared.atomic,
+        .test_only,
+        false,
+    ) catch |err| {
+        const reason: render.OverlayScanoutRejection = switch (err) {
+            error.AtomicTestFailed => .atomic_test_failed,
+            error.OverlaySynchronizationFailed => .synchronization_failed,
+        };
+        return .{ .rejected = reason };
+    };
+    if (tested == null) return .{ .rejected = .atomic_test_failed };
+    prepared.scanout.source.retain(prepared.scanout.source.context);
+    self.validated_overlay = prepared;
+    return .accepted;
+}
+
 pub fn tryDirectScanout(
     self: *Self,
     buffer: render.PixelBuffer,
@@ -968,6 +994,7 @@ pub fn tryDirectScanout(
         buffer.size,
         source,
         null,
+        .commit,
         allow_tearing,
     ) catch unreachable orelse {
         source.release(source.context);
@@ -2440,6 +2467,7 @@ fn queuePageFlip(
     source_size: render.Size,
     source: ?render.DmabufSource,
     overlay: ?AtomicOverlay,
+    action: PageFlipAction,
     allow_tearing: bool,
 ) error{ AtomicTestFailed, OverlaySynchronizationFailed }!?PageFlipMode {
     const preferred_mode: PageFlipMode = if (!self.output_color_dirty and
@@ -2449,7 +2477,7 @@ fn queuePageFlip(
     else
         .vsync;
     const properties = self.atomic_plane orelse {
-        std.debug.assert(overlay == null);
+        std.debug.assert(overlay == null and action == .commit);
         if (c.drmModePageFlip(
             fd,
             self.crtc_id,
@@ -2501,7 +2529,8 @@ fn queuePageFlip(
                 overlay_fence_fd
             else
                 null;
-            if (overlay_fence_fd) |value_fence_fd| if (in_fence_fd == null and
+            if (overlay_fence_fd) |value_fence_fd| if (action == .commit and
+                in_fence_fd == null and
                 (!self.sync_file_import_supported or
                     !importSyncFile(value.source.planes[0].fd, value_fence_fd)))
             {
@@ -2533,16 +2562,16 @@ fn queuePageFlip(
             self.output_color_mode,
             self.color_description,
         ) catch {
-            if (color_dirty and self.output_color_mode != .sdr) {
+            if (action == .commit and color_dirty and self.output_color_mode != .sdr) {
                 self.rejectOutputColorState();
             }
             return null;
         };
         if (!color_added) {
             if (self.output_color_mode == .sdr) {
-                self.output_color_dirty = false;
+                if (action == .commit) self.output_color_dirty = false;
             } else {
-                if (color_dirty) self.rejectOutputColorState();
+                if (action == .commit and color_dirty) self.rejectOutputColorState();
                 return null;
             }
         }
@@ -2553,6 +2582,10 @@ fn queuePageFlip(
         @intCast(c.DRM_MODE_ATOMIC_NONBLOCK);
     if (overlay != null and !testAtomicRequest(fd, request, color_dirty)) {
         return error.AtomicTestFailed;
+    }
+    if (action == .test_only) {
+        std.debug.assert(overlay != null);
+        return .vsync;
     }
     if (c.drmModeAtomicCommit(
         fd,
@@ -3087,6 +3120,8 @@ fn makeScanoutFramebufferRoom(self: *Self, fd: std.posix.fd_t) !void {
                 std.meta.eql(self.overlay_pending.?.framebuffer_key, key)) or
             (self.overlay_displayed != null and
                 std.meta.eql(self.overlay_displayed.?.framebuffer_key, key)) or
+            (self.validated_overlay != null and
+                std.meta.eql(self.validated_overlay.?.scanout.framebuffer_key, key)) or
             entry.value_ptr.last_used >= oldest_frame) continue;
         oldest_key = key;
         oldest_frame = entry.value_ptr.last_used;
@@ -3107,7 +3142,18 @@ fn releaseClientScanouts(self: *Self) void {
     self.direct_displayed = null;
     self.overlay_pending = null;
     self.overlay_displayed = null;
+    self.discardValidatedOverlay();
     self.setDirectScanoutActive(false);
+}
+
+fn discardValidatedOverlay(self: *Self) void {
+    if (self.validated_overlay) |overlay| overlay.scanout.release();
+    self.validated_overlay = null;
+}
+
+fn discardFailedValidatedFrame(self: *Self) void {
+    self.discardValidatedOverlay();
+    self.acquired = null;
 }
 
 fn destroyScanoutFramebuffers(self: *Self, fd: std.posix.fd_t) void {

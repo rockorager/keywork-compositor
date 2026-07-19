@@ -30,7 +30,6 @@ pub const Kind = enum {
 
 pub const Listener = NestedOutput.Listener;
 pub const DirectScanoutResult = DrmOutput.DirectScanoutResult;
-pub const OverlayPresentation = DrmOutput.OverlayPresentation;
 
 pub fn init(
     self: *Self,
@@ -293,24 +292,31 @@ pub fn present(
     };
 }
 
-pub fn presentOverlay(
+/// Retain an accepted candidate until it is presented or the frame is canceled.
+pub fn validateOverlayScanout(
+    self: *Self,
+    overlay: render.OverlayScanout,
+) DrmOutput.OverlayScanoutResult {
+    return switch (self.backend) {
+        .drm => |output| output.validateOverlayScanout(overlay),
+        .headless, .nested => .{ .rejected = .unsupported_backend },
+    };
+}
+
+/// Present a primary buffer that omits the overlay retained by validation.
+pub fn presentValidatedOverlay(
     self: *Self,
     damage: *const Region,
     render_fence_fd: ?std.posix.fd_t,
     allow_tearing: bool,
-    overlay: render.OverlayScanout,
-) !OverlayPresentation {
+) !?presentation.Info {
     return switch (self.backend) {
-        .drm => |output| output.presentOverlay(
+        .drm => |output| output.presentValidatedOverlay(
             damage,
             render_fence_fd,
             allow_tearing,
-            overlay,
         ),
-        .headless, .nested => .{
-            .presentation_info = try self.present(damage, render_fence_fd, allow_tearing),
-            .scanout = .{ .rejected = .unsupported_backend },
-        },
+        .headless, .nested => error.NoValidatedOverlay,
     };
 }
 
