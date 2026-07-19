@@ -181,6 +181,7 @@ const AtomicPlaneProperties = struct {
     crtc_w: u32 = 0,
     crtc_h: u32 = 0,
     in_fence_fd: u32 = 0,
+    color: AtomicPlaneColorProperties = .{},
 
     fn complete(self: AtomicPlaneProperties) bool {
         return self.fb_id != 0 and self.crtc_id != 0 and
@@ -188,6 +189,46 @@ const AtomicPlaneProperties = struct {
             self.crtc_x != 0 and self.crtc_y != 0 and
             self.crtc_w != 0 and self.crtc_h != 0;
     }
+};
+
+const AtomicPlaneColorProperties = struct {
+    encoding: u32 = 0,
+    bt601: ?u64 = null,
+    bt709: ?u64 = null,
+    bt2020: ?u64 = null,
+    range: u32 = 0,
+    full_range: ?u64 = null,
+    limited_range: ?u64 = null,
+
+    fn state(
+        self: AtomicPlaneColorProperties,
+        representation: render.ColorRepresentation,
+    ) ?AtomicPlaneColorState {
+        if (self.encoding == 0 or self.range == 0) return null;
+        const encoding = switch (representation.coefficients) {
+            .identity => return null,
+            .bt601 => self.bt601,
+            .bt709 => self.bt709,
+            .bt2020 => self.bt2020,
+        } orelse return null;
+        const range = switch (representation.range) {
+            .full => self.full_range,
+            .limited => self.limited_range,
+        } orelse return null;
+        return .{
+            .encoding_property = self.encoding,
+            .encoding = encoding,
+            .range_property = self.range,
+            .range = range,
+        };
+    }
+};
+
+const AtomicPlaneColorState = struct {
+    encoding_property: u32,
+    encoding: u64,
+    range_property: u32,
+    range: u64,
 };
 
 const AtomicZpos = struct {
@@ -3077,6 +3118,16 @@ fn loadAtomicPlaneProperties(fd: std.posix.fd_t, plane_id: u32) ?AtomicPlaneProp
         const property = c.drmModeGetProperty(fd, property_id) orelse continue;
         defer c.drmModeFreeProperty(property);
         const property_name = std.mem.sliceTo(property.*.name[0..], 0);
+        if (std.mem.eql(u8, property_name, "COLOR_ENCODING")) {
+            result.color.encoding = property_id;
+            result.color.bt601 = propertyEnumValue(property, "ITU-R BT.601 YCbCr");
+            result.color.bt709 = propertyEnumValue(property, "ITU-R BT.709 YCbCr");
+            result.color.bt2020 = propertyEnumValue(property, "ITU-R BT.2020 YCbCr");
+        } else if (std.mem.eql(u8, property_name, "COLOR_RANGE")) {
+            result.color.range = property_id;
+            result.color.full_range = propertyEnumValue(property, "YCbCr full range");
+            result.color.limited_range = propertyEnumValue(property, "YCbCr limited range");
+        }
         inline for (.{
             .{ "FB_ID", "fb_id" },
             .{ "CRTC_ID", "crtc_id" },
@@ -3194,6 +3245,35 @@ fn propertyEnumValue(property: *const c.drmModePropertyRes, enum_name: []const u
         }
     }
     return null;
+}
+
+test "atomic plane color state maps supported YCbCr metadata" {
+    const properties: AtomicPlaneColorProperties = .{
+        .encoding = 10,
+        .bt601 = 20,
+        .bt709 = 21,
+        .range = 11,
+        .limited_range = 30,
+    };
+    try std.testing.expectEqual(
+        AtomicPlaneColorState{
+            .encoding_property = 10,
+            .encoding = 21,
+            .range_property = 11,
+            .range = 30,
+        },
+        properties.state(.{
+            .coefficients = .bt709,
+            .range = .limited,
+            .chroma_location = .type_1,
+        }).?,
+    );
+    try std.testing.expect(properties.state(.{
+        .coefficients = .bt2020,
+        .range = .limited,
+        .chroma_location = .type_1,
+    }) == null);
+    try std.testing.expect(properties.state(.{}) == null);
 }
 
 fn boundedU32(value: u64) u32 {
