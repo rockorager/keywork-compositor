@@ -549,8 +549,8 @@ pub const DrmDeviceId = struct {
 /// renderer. Import duplicates the descriptor's borrowed file descriptor.
 pub const DmabufRenderer = struct {
     context: *anyopaque,
-    modifiers: []const u64,
-    supports_target: *const fn (*anyopaque, Size, u64) bool,
+    target_formats: []const DmabufFormatModifier,
+    supports_target: *const fn (*anyopaque, Size, u32, u64) bool,
     import_target: *const fn (*anyopaque, DmabufDescriptor) anyerror!void,
     release_target: *const fn (*anyopaque, u64) void,
 };

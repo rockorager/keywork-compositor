@@ -1936,9 +1936,11 @@ fn allocateGpuPair(self: *Self, fd: std.posix.fd_t, size: render.Size) !BufferPa
     for (self.scanout_formats) |pair| {
         if (pair.format != c.DRM_FORMAT_XRGB8888) continue;
         const modifier = pair.modifier;
-        if (std.mem.indexOfScalar(u64, renderer.modifiers, modifier) != null and
-            renderer.supports_target(renderer.context, size, modifier))
-        {
+        if (render.DmabufFormatModifier.contains(
+            renderer.target_formats,
+            pair.format,
+            modifier,
+        ) and renderer.supports_target(renderer.context, size, pair.format, modifier)) {
             try compatible_modifiers.append(self.allocator, modifier);
         }
     }
@@ -1985,7 +1987,11 @@ fn createGpuPair(
         else
             try gbm.createImplicitBuffer(size, c.DRM_FORMAT_XRGB8888);
         const bo = &buffer.gbm.?;
-        if (std.mem.indexOfScalar(u64, renderer.modifiers, bo.modifier) == null) {
+        if (!render.DmabufFormatModifier.contains(
+            renderer.target_formats,
+            c.DRM_FORMAT_XRGB8888,
+            bo.modifier,
+        )) {
             return error.UnsupportedRendererModifier;
         }
         var handles = [_]u32{ bo.handle, 0, 0, 0 };
@@ -2235,17 +2241,21 @@ test "GBM Vulkan target accepts asynchronous render completion" {
         target_id: u64,
     };
     var selected: ?Selected = null;
-    for (access.modifiers) |modifier| {
-        var buffer = gbm.createBuffer(size, c.DRM_FORMAT_XRGB8888, &.{modifier}) catch continue;
+    for (access.target_formats) |target_format| {
+        var buffer = gbm.createBuffer(
+            size,
+            target_format.format,
+            &.{target_format.modifier},
+        ) catch continue;
         var handles = [_]u32{ buffer.handle, 0, 0, 0 };
         var pitches = [_]u32{ buffer.stride, 0, 0, 0 };
         var offsets = [_]u32{ buffer.offset, 0, 0, 0 };
         var framebuffer_id: u32 = 0;
         const add_result = if (buffer.modifier == drm_format_mod_linear)
-            c.drmModeAddFB2(fd, size.width, size.height, c.DRM_FORMAT_XRGB8888, &handles, &pitches, &offsets, &framebuffer_id, 0)
+            c.drmModeAddFB2(fd, size.width, size.height, target_format.format, &handles, &pitches, &offsets, &framebuffer_id, 0)
         else blk: {
             var modifiers = [_]u64{ buffer.modifier, 0, 0, 0 };
-            break :blk c.drmModeAddFB2WithModifiers(fd, size.width, size.height, c.DRM_FORMAT_XRGB8888, &handles, &pitches, &offsets, &modifiers, &framebuffer_id, c.DRM_MODE_FB_MODIFIERS);
+            break :blk c.drmModeAddFB2WithModifiers(fd, size.width, size.height, target_format.format, &handles, &pitches, &offsets, &modifiers, &framebuffer_id, c.DRM_MODE_FB_MODIFIERS);
         };
         if (add_result != 0) {
             buffer.deinit();
@@ -2256,7 +2266,7 @@ test "GBM Vulkan target accepts asynchronous render completion" {
             .id = target_id,
             .size = size,
             .fd = buffer.fd,
-            .format = c.DRM_FORMAT_XRGB8888,
+            .format = target_format.format,
             .modifier = buffer.modifier,
             .stride = buffer.stride,
             .offset = buffer.offset,

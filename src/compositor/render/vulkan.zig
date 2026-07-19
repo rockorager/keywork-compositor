@@ -67,6 +67,7 @@ pending_wait_semaphores: std.ArrayList(vk.Semaphore) = .empty,
 pending_textures: std.ArrayList(Texture) = .empty,
 dmabuf_modifiers: []u64,
 dmabuf_sampled_modifiers: []u64,
+dmabuf_target_formats: []render.DmabufFormatModifier,
 dmabuf_source_modifiers: []u64,
 dmabuf_rgba_source_modifiers: []u64,
 dmabuf_source_formats: []render.DmabufFormatModifier,
@@ -1092,6 +1093,7 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
     }
     var dmabuf_modifiers: []u64 = &.{};
     var dmabuf_sampled_modifiers: []u64 = &.{};
+    var dmabuf_target_formats: []render.DmabufFormatModifier = &.{};
     var dmabuf_source_modifiers: []u64 = &.{};
     var dmabuf_rgba_source_modifiers: []u64 = &.{};
     var dmabuf_source_formats: []render.DmabufFormatModifier = &.{};
@@ -1159,6 +1161,15 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
         dmabuf_sampled_modifiers = sampled_modifiers.toOwnedSlice(allocator) catch
             return error.OutOfMemory;
         errdefer if (dmabuf_sampled_modifiers.len != 0) allocator.free(dmabuf_sampled_modifiers);
+        dmabuf_target_formats = try allocator.alloc(
+            render.DmabufFormatModifier,
+            dmabuf_modifiers.len,
+        );
+        errdefer allocator.free(dmabuf_target_formats);
+        for (dmabuf_modifiers, dmabuf_target_formats) |modifier, *target| target.* = .{
+            .format = @intFromEnum(render.DmabufFormat.xrgb8888),
+            .modifier = modifier,
+        };
         dmabuf_source_modifiers = source_modifiers.toOwnedSlice(allocator) catch
             return error.OutOfMemory;
         errdefer if (dmabuf_source_modifiers.len != 0) allocator.free(dmabuf_source_modifiers);
@@ -1189,6 +1200,7 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
     }
     errdefer if (dmabuf_modifiers.len != 0) allocator.free(dmabuf_modifiers);
     errdefer if (dmabuf_sampled_modifiers.len != 0) allocator.free(dmabuf_sampled_modifiers);
+    errdefer if (dmabuf_target_formats.len != 0) allocator.free(dmabuf_target_formats);
     errdefer if (dmabuf_source_modifiers.len != 0) allocator.free(dmabuf_source_modifiers);
     errdefer if (dmabuf_rgba_source_modifiers.len != 0) {
         allocator.free(dmabuf_rgba_source_modifiers);
@@ -1249,6 +1261,7 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
         .instance_capacity = 0,
         .dmabuf_modifiers = if (dmabuf_capable) dmabuf_modifiers else &.{},
         .dmabuf_sampled_modifiers = if (dmabuf_capable) dmabuf_sampled_modifiers else &.{},
+        .dmabuf_target_formats = if (dmabuf_capable) dmabuf_target_formats else &.{},
         .dmabuf_source_modifiers = if (dmabuf_capable) dmabuf_source_modifiers else &.{},
         .dmabuf_rgba_source_modifiers = if (dmabuf_capable)
             dmabuf_rgba_source_modifiers
@@ -1271,6 +1284,7 @@ pub fn deinit(self: *Self) void {
     self.destroyCachedResources();
     if (self.dmabuf_modifiers.len != 0) self.allocator.free(self.dmabuf_modifiers);
     if (self.dmabuf_sampled_modifiers.len != 0) self.allocator.free(self.dmabuf_sampled_modifiers);
+    if (self.dmabuf_target_formats.len != 0) self.allocator.free(self.dmabuf_target_formats);
     if (self.dmabuf_source_modifiers.len != 0) self.allocator.free(self.dmabuf_source_modifiers);
     if (self.dmabuf_rgba_source_modifiers.len != 0) {
         self.allocator.free(self.dmabuf_rgba_source_modifiers);
@@ -1317,10 +1331,10 @@ pub fn deinit(self: *Self) void {
 }
 
 pub fn dmabufAccess(self: *Self) ?render.DmabufRenderer {
-    if (self.dmabuf_modifiers.len == 0) return null;
+    if (self.dmabuf_target_formats.len == 0) return null;
     return .{
         .context = self,
-        .modifiers = self.dmabuf_modifiers,
+        .target_formats = self.dmabuf_target_formats,
         .supports_target = supportsTargetCallback,
         .import_target = importTargetCallback,
         .release_target = releaseTargetCallback,
@@ -1409,9 +1423,14 @@ fn createOffscreenTarget(self: *Self, size: render.Size) Error!render.OffscreenT
     return .{ .id = id, .size = size };
 }
 
-fn supportsTargetCallback(context: *anyopaque, size: render.Size, modifier: u64) bool {
+fn supportsTargetCallback(
+    context: *anyopaque,
+    size: render.Size,
+    format: u32,
+    modifier: u64,
+) bool {
     const self: *Self = @ptrCast(@alignCast(context));
-    return self.supportsDmabufTarget(size, modifier);
+    return self.supportsDmabufTarget(size, format, modifier);
 }
 
 fn importTargetCallback(context: *anyopaque, descriptor: render.DmabufDescriptor) anyerror!void {
@@ -1425,11 +1444,12 @@ fn releaseTargetCallback(context: *anyopaque, id: u64) void {
 }
 
 fn importTarget(self: *Self, descriptor: render.DmabufDescriptor) Error!void {
-    if (descriptor.id == 0 or descriptor.format != 0x34325258 or
+    if (descriptor.id == 0 or
+        descriptor.format != @intFromEnum(render.DmabufFormat.xrgb8888) or
         descriptor.size.width == 0 or descriptor.size.height == 0 or
         descriptor.stride < descriptor.size.width * @sizeOf(u32) or
         self.outputs.contains(.{ .dmabuf = descriptor.id }) or
-        !self.supportsDmabufTarget(descriptor.size, descriptor.modifier))
+        !self.supportsDmabufTarget(descriptor.size, descriptor.format, descriptor.modifier))
         return error.InvalidTarget;
 
     const sampleable = self.dmabufTargetSampleable(descriptor.modifier);
@@ -1549,8 +1569,9 @@ fn allocateCommandBuffer(self: *Self) Error!vk.CommandBuffer {
     return command_buffer;
 }
 
-fn supportsDmabufTarget(self: *Self, size: render.Size, modifier: u64) bool {
-    if (size.width == 0 or size.height == 0 or
+fn supportsDmabufTarget(self: *Self, size: render.Size, format: u32, modifier: u64) bool {
+    if (format != @intFromEnum(render.DmabufFormat.xrgb8888) or
+        size.width == 0 or size.height == 0 or
         std.mem.indexOfScalar(u64, self.dmabuf_modifiers, modifier) == null)
         return false;
 
@@ -5925,13 +5946,17 @@ test "Vulkan renderer imports and renders directly to a GBM dmabuf" {
     const size: render.Size = .{ .width = 64, .height = 64 };
     var imported_buffer: ?Gbm.Buffer = null;
     const id = render.allocateRenderTargetId();
-    for (access.modifiers) |modifier| {
-        var buffer = gbm.createBuffer(size, 0x34325258, &.{modifier}) catch continue;
+    for (access.target_formats) |target_format| {
+        var buffer = gbm.createBuffer(
+            size,
+            target_format.format,
+            &.{target_format.modifier},
+        ) catch continue;
         renderer.importTarget(.{
             .id = id,
             .size = size,
             .fd = buffer.fd,
-            .format = 0x34325258,
+            .format = target_format.format,
             .modifier = buffer.modifier,
             .stride = buffer.stride,
             .offset = buffer.offset,
