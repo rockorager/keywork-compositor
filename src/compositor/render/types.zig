@@ -265,6 +265,33 @@ pub const ColorDescription = struct {
     }
 };
 
+pub const ColorCoefficients = enum(u8) {
+    identity,
+    bt601,
+    bt709,
+    bt2020,
+};
+
+pub const ColorRange = enum(u8) {
+    full,
+    limited,
+};
+
+pub const ChromaLocation = enum(u8) {
+    type_0,
+    type_1,
+    type_2,
+    type_3,
+    type_4,
+    type_5,
+};
+
+pub const ColorRepresentation = struct {
+    coefficients: ColorCoefficients = .identity,
+    range: ColorRange = .full,
+    chroma_location: ?ChromaLocation = null,
+};
+
 pub const SolidRect = struct {
     rect: Rect,
     color: Color,
@@ -520,6 +547,7 @@ pub const PixelBuffer = struct {
     pixels: []u32 = &.{},
     dmabuf: ?DmabufSource = null,
     color_description: ColorDescription = .{},
+    color_representation: ColorRepresentation = .{},
     /// Stable content identity for renderer texture caches. Anonymous buffers
     /// leave this null and must be uploaded whenever they are rendered.
     source_cache: ?SourceCache = null,

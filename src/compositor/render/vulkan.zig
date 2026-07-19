@@ -4360,6 +4360,9 @@ fn hashRenderCommand(hasher: *std.hash.Wyhash, command: render.Command) bool {
             hashSize(hasher, image.buffer.size);
             hashScalar(hasher, image.buffer.stride_pixels);
             hashColorDescription(hasher, image.buffer.color_description);
+            hashScalar(hasher, @intFromEnum(image.buffer.color_representation.coefficients));
+            hashScalar(hasher, @intFromEnum(image.buffer.color_representation.range));
+            hashOptionalScalar(hasher, image.buffer.color_representation.chroma_location);
             hashScalar(hasher, source_cache.id);
             hashScalar(hasher, source_cache.version);
             hashOptionalSourceRect(hasher, image.source);

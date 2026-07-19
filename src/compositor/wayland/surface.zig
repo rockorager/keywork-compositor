@@ -338,12 +338,49 @@ pub const ColorRepresentationState = struct {
     coefficients: ?wp.ColorRepresentationSurfaceV1.Coefficients = null,
     range: ?wp.ColorRepresentationSurfaceV1.Range = null,
     chroma_location: ?wp.ColorRepresentationSurfaceV1.ChromaLocation = null,
+
+    pub fn toRender(
+        self: ColorRepresentationState,
+        format: render_types.DmabufFormat,
+    ) render_types.ColorRepresentation {
+        if (format.isPackedRgb()) return .{};
+        const coefficients: render_types.ColorCoefficients = switch (self.coefficients orelse .bt709) {
+            .identity => .identity,
+            .bt601 => .bt601,
+            .bt709 => .bt709,
+            .bt2020 => .bt2020,
+            else => unreachable,
+        };
+        const range: render_types.ColorRange = switch (self.range orelse .limited) {
+            .full => .full,
+            .limited => .limited,
+            else => unreachable,
+        };
+        const chroma_location: render_types.ChromaLocation = switch (self.chroma_location orelse .type_0) {
+            .type_0 => .type_0,
+            .type_1 => .type_1,
+            .type_2 => .type_2,
+            .type_3 => .type_3,
+            .type_4 => .type_4,
+            .type_5 => .type_5,
+            else => unreachable,
+        };
+        return .{
+            .coefficients = coefficients,
+            .range = range,
+            .chroma_location = chroma_location,
+        };
+    }
 };
 
 pub const ColorRepresentationHandler = struct {
     context: *anyopaque,
     surface_destroyed: *const fn (*anyopaque) void,
-    validate_commit: *const fn (*anyopaque, ColorRepresentationState, bool) bool,
+    validate_commit: *const fn (
+        *anyopaque,
+        ColorRepresentationState,
+        ?render_types.DmabufFormat,
+    ) bool,
 };
 
 pub fn setColorRepresentationHandler(self: *Self, handler: ColorRepresentationHandler) error{AlreadyExists}!void {
@@ -1152,7 +1189,7 @@ fn commit(self: *Self) void {
         if (!handler.validate_commit(
             handler.context,
             surface_state.pending_color_representation,
-            commit_info.has_buffer,
+            effectiveBufferFormat(self),
         )) return;
     }
     const action = if (self.role_handler) |handler|
@@ -1212,6 +1249,24 @@ fn pendingCommitInfo(self: *Self) CommitInfo {
     };
 }
 
+fn effectiveBufferFormat(self: *Self) ?render_types.DmabufFormat {
+    if (self.has_pending_attachment) {
+        if (self.pending_attachment.dmabuf) |buffer| {
+            return render_types.DmabufFormat.fromFourcc(buffer.format()).?;
+        }
+        return if (self.pending_attachment.hasBuffer()) .argb8888 else null;
+    }
+    const cached_commits = self.state().cached_commits.items;
+    var index = cached_commits.len;
+    while (index > 0) {
+        index -= 1;
+        const cached = &cached_commits[index];
+        if (!cached.attachment_changed) continue;
+        return if (cached.buffer) |*buffer| buffer.bufferFormat() else null;
+    }
+    return if (self.state().current_buffer) |*buffer| buffer.bufferFormat() else null;
+}
+
 fn applyPending(self: *Self, commit_info: CommitInfo) void {
     const surface_state = self.state();
     var applied_info = commit_info;
@@ -1261,6 +1316,9 @@ fn applyPending(self: *Self, commit_info: CommitInfo) void {
             return;
         };
         current.color_description = surface_state.pending_color_description;
+        current.color_representation = surface_state.pending_color_representation.toRender(
+            current.bufferFormat(),
+        );
     }
 
     surface_state.current_scale = surface_state.pending_scale;
@@ -1270,6 +1328,10 @@ fn applyPending(self: *Self, commit_info: CommitInfo) void {
     const color_description_changed = !std.meta.eql(
         surface_state.current_color_description,
         surface_state.pending_color_description,
+    );
+    const color_representation_changed = !std.meta.eql(
+        surface_state.current_color_representation,
+        surface_state.pending_color_representation,
     );
     surface_state.current_color_description = surface_state.pending_color_description;
     surface_state.current_color_representation = surface_state.pending_color_representation;
@@ -1287,6 +1349,7 @@ fn applyPending(self: *Self, commit_info: CommitInfo) void {
     );
     if (alpha_changed) surface_state.current_damage_precise = false;
     if (color_description_changed) surface_state.current_damage_precise = false;
+    if (color_representation_changed) surface_state.current_damage_precise = false;
     if (surface_state.pending_blur_region_changed) {
         surface_state.current_damage_precise = false;
     }
@@ -1491,6 +1554,7 @@ fn applyCached(self: *Self, cached: *CachedCommit) void {
             cached.viewport,
         ) catch unreachable;
         current.color_description = cached.color_description;
+        current.color_representation = cached.color_representation.toRender(current.bufferFormat());
     }
 
     surface_state.current_scale = cached.scale;
@@ -1500,6 +1564,10 @@ fn applyCached(self: *Self, cached: *CachedCommit) void {
     const color_description_changed = !std.meta.eql(
         surface_state.current_color_description,
         cached.color_description,
+    );
+    const color_representation_changed = !std.meta.eql(
+        surface_state.current_color_representation,
+        cached.color_representation,
     );
     surface_state.current_color_description = cached.color_description;
     surface_state.current_color_representation = cached.color_representation;
@@ -1517,6 +1585,7 @@ fn applyCached(self: *Self, cached: *CachedCommit) void {
     );
     if (alpha_changed) surface_state.current_damage_precise = false;
     if (color_description_changed) surface_state.current_damage_precise = false;
+    if (color_representation_changed) surface_state.current_damage_precise = false;
     if (cached.blur_region_changed) surface_state.current_damage_precise = false;
     applyFifoSet(surface_state, cached.fifo_set);
     if (surface_state.presentation_output != null) surface_state.commit_after_submission = true;
@@ -1603,6 +1672,9 @@ fn snapshotPendingAttachment(
     else
         return null;
     snapshot.color_description = surface_state.pending_color_description;
+    snapshot.color_representation = surface_state.pending_color_representation.toRender(
+        snapshot.bufferFormat(),
+    );
     if (snapshot.retainsClientBuffer()) {
         const generation = surface_state.next_release_generation;
         surface_state.next_release_generation +%= 1;
@@ -2264,6 +2336,7 @@ pub const BufferSnapshot = struct {
     pixels: []u32,
     dmabuf: ?*DmabufUse = null,
     color_description: render_types.ColorDescription = .{},
+    color_representation: render_types.ColorRepresentation = .{},
     source_cache: render_types.SourceCache,
     source_damage: ?[]const render_types.Rect,
 
@@ -2456,6 +2529,13 @@ pub const BufferSnapshot = struct {
         return if (self.dmabuf) |dmabuf| dmabuf.isReady() else true;
     }
 
+    fn bufferFormat(self: *const BufferSnapshot) render_types.DmabufFormat {
+        return if (self.dmabuf) |dmabuf|
+            render_types.DmabufFormat.fromFourcc(dmabuf.buffer.format()).?
+        else
+            .argb8888;
+    }
+
     pub fn pixelBuffer(self: *BufferSnapshot) render_types.PixelBuffer {
         const dmabuf_source = if (self.dmabuf) |dmabuf| dmabuf.renderSource() else null;
         return .{
@@ -2470,6 +2550,7 @@ pub const BufferSnapshot = struct {
             .pixels = self.pixels,
             .dmabuf = dmabuf_source,
             .color_description = self.color_description,
+            .color_representation = self.color_representation,
             .source_cache = self.source_cache,
             .source_damage = self.source_damage,
         };

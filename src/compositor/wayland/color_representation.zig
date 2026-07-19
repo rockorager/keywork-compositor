@@ -1,9 +1,10 @@
-//! RGB-only color-representation-v1 metadata.
+//! Buffer color-model and quantization metadata.
 
 const Self = @This();
 
 const std = @import("std");
 const wayland = @import("wayland");
+const render = @import("../render/types.zig");
 const Surface = @import("surface.zig");
 
 const wl = wayland.server.wl;
@@ -32,6 +33,10 @@ fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
     resource.setHandler(*Self, managerRequest, null, self);
     resource.sendSupportedAlphaMode(.premultiplied_electrical);
     resource.sendSupportedCoefficientsAndRanges(.identity, .full);
+    inline for (.{ .bt601, .bt709, .bt2020 }) |coefficients| {
+        resource.sendSupportedCoefficientsAndRanges(coefficients, .full);
+        resource.sendSupportedCoefficientsAndRanges(coefficients, .limited);
+    }
     resource.sendDone();
 }
 
@@ -118,10 +123,17 @@ const Representation = struct {
         self.surface = null;
     }
 
-    fn validateCommit(context: *anyopaque, state: Surface.ColorRepresentationState, has_buffer: bool) bool {
+    fn validateCommit(
+        context: *anyopaque,
+        state: Surface.ColorRepresentationState,
+        format: ?render.DmabufFormat,
+    ) bool {
         const self: *Representation = @ptrCast(@alignCast(context));
-        if (!commitCompatible(state, has_buffer)) {
-            self.resource.postError(.pixel_format, "chroma location is incompatible with RGB contents");
+        if (!commitCompatible(state, format)) {
+            self.resource.postError(
+                .pixel_format,
+                "color representation is incompatible with the buffer format",
+            );
             return false;
         }
         return true;
@@ -133,7 +145,11 @@ fn supportedAlpha(alpha_mode: wp.ColorRepresentationSurfaceV1.AlphaMode) bool {
 }
 
 fn supportedCoefficients(coefficients: wp.ColorRepresentationSurfaceV1.Coefficients, range: wp.ColorRepresentationSurfaceV1.Range) bool {
-    return coefficients == .identity and range == .full;
+    return switch (coefficients) {
+        .identity => range == .full,
+        .bt601, .bt709, .bt2020 => range == .full or range == .limited,
+        else => false,
+    };
 }
 
 fn validChroma(chroma: wp.ColorRepresentationSurfaceV1.ChromaLocation) bool {
@@ -143,23 +159,67 @@ fn validChroma(chroma: wp.ColorRepresentationSurfaceV1.ChromaLocation) bool {
     };
 }
 
-fn commitCompatible(state: Surface.ColorRepresentationState, has_buffer: bool) bool {
-    return !has_buffer or state.chroma_location == null;
+fn commitCompatible(
+    state: Surface.ColorRepresentationState,
+    format: ?render.DmabufFormat,
+) bool {
+    const buffer_format = format orelse return true;
+    if ((state.coefficients == null) != (state.range == null)) return false;
+    if (buffer_format.isPackedRgb()) {
+        return state.chroma_location == null and
+            (state.coefficients == null or
+                (state.coefficients == .identity and state.range == .full));
+    }
+    return state.coefficients == null or
+        (state.coefficients != .identity and
+            supportedCoefficients(state.coefficients.?, state.range.?));
 }
 
-test "RGB capabilities and chroma validation" {
+test "RGB and YCbCr capabilities match buffer formats" {
     try std.testing.expect(supportedAlpha(.premultiplied_electrical));
     try std.testing.expect(!supportedAlpha(.premultiplied_optical));
     try std.testing.expect(!supportedAlpha(.straight));
     try std.testing.expect(supportedCoefficients(.identity, .full));
-    try std.testing.expect(!supportedCoefficients(.bt709, .full));
+    try std.testing.expect(supportedCoefficients(.bt709, .full));
+    try std.testing.expect(supportedCoefficients(.bt709, .limited));
+    try std.testing.expect(supportedCoefficients(.bt601, .limited));
+    try std.testing.expect(supportedCoefficients(.bt2020, .limited));
+    try std.testing.expect(!supportedCoefficients(.bt2020_cl, .limited));
     try std.testing.expect(!supportedCoefficients(.identity, .limited));
     inline for (.{ .type_0, .type_1, .type_2, .type_3, .type_4, .type_5 }) |chroma| {
         try std.testing.expect(validChroma(chroma));
     }
     var state: Surface.ColorRepresentationState = .{ .chroma_location = .type_3 };
-    try std.testing.expect(commitCompatible(state, false));
-    try std.testing.expect(!commitCompatible(state, true));
+    try std.testing.expect(commitCompatible(state, null));
+    try std.testing.expect(!commitCompatible(state, .argb8888));
+    try std.testing.expect(commitCompatible(state, .nv12));
     state.chroma_location = null;
-    try std.testing.expect(commitCompatible(state, true));
+    try std.testing.expect(commitCompatible(state, .argb8888));
+    state.coefficients = .bt709;
+    state.range = .limited;
+    try std.testing.expect(!commitCompatible(state, .argb8888));
+    try std.testing.expect(commitCompatible(state, .p010));
+    state.coefficients = .identity;
+    state.range = .full;
+    try std.testing.expect(commitCompatible(state, .argb8888));
+    try std.testing.expect(!commitCompatible(state, .nv12));
+
+    const default_video = (Surface.ColorRepresentationState{}).toRender(.nv12);
+    try std.testing.expectEqual(render.ColorCoefficients.bt709, default_video.coefficients);
+    try std.testing.expectEqual(render.ColorRange.limited, default_video.range);
+    try std.testing.expectEqual(render.ChromaLocation.type_0, default_video.chroma_location.?);
+
+    const explicit_video: Surface.ColorRepresentationState = .{
+        .coefficients = .bt2020,
+        .range = .full,
+        .chroma_location = .type_3,
+    };
+    try std.testing.expectEqual(
+        render.ColorRepresentation{
+            .coefficients = .bt2020,
+            .range = .full,
+            .chroma_location = .type_3,
+        },
+        explicit_video.toRender(.p010),
+    );
 }
