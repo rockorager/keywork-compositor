@@ -285,6 +285,16 @@ pub fn build(b: *std.Build) void {
     const keyworkctl_tests = b.addTest(.{ .root_module = keyworkctl_module });
     test_step.dependOn(&b.addRunArtifact(keyworkctl_tests).step);
 
+    const renderer_conformance_tests = b.addTest(.{
+        .root_module = compositor,
+        .filters = &.{"renderer conformance:"},
+    });
+    const renderer_conformance_step = b.step(
+        "renderer-conformance",
+        "Run renderer reference-vector conformance tests",
+    );
+    renderer_conformance_step.dependOn(&b.addRunArtifact(renderer_conformance_tests).step);
+
     const fmt_step = b.step("fmt", "Check code formatting");
     const fmt_check = b.addFmt(.{ .paths = &.{ "src", "build.zig", "build.zig.zon" }, .check = true });
     fmt_step.dependOn(&fmt_check.step);

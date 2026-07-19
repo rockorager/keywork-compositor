@@ -117,6 +117,14 @@ between paths does not produce a visible color or timing discontinuity.
 
 ## 8. Conformance and benchmark suite
 
+Current commands:
+
+- `zig build renderer-conformance --summary all` runs the deterministic renderer
+  reference-vector corpus independently from the broader unit suite.
+- `keyworkctl stats --json` captures machine-readable live path, latency,
+  bandwidth-proxy, import, copy, and frame-budget statistics. Add `--reset` to
+  start a repeatable measurement window.
+
 - Build reference image tests for transfer functions, primaries, blending,
   tone mapping, gamut mapping, scaling, and YCbCr conversion.
 - Add reproducible scenes for direct scanout, mixed windows, damage, blur,

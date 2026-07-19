@@ -838,7 +838,7 @@ test "fractional scale floors logical output dimensions" {
     );
 }
 
-test "image sampling preserves exact texel alignment" {
+test "renderer conformance: image sampling preserves exact texel alignment" {
     const buffer: PixelBuffer = .{
         .size = .{ .width = 3, .height = 2 },
         .stride_pixels = 3,
