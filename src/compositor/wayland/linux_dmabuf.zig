@@ -133,7 +133,7 @@ fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
         return;
     } else if (version >= zwp.LinuxDmabufV1.modifier_since_version) {
         for (self.supported_pairs) |pair| {
-            resource.sendModifier(pair.format, @intCast(pair.modifier >> 32), @intCast(pair.modifier));
+            resource.sendModifier(pair.format, @intCast(pair.modifier >> 32), @truncate(pair.modifier));
         }
     } else {
         for (self.supported_pairs, 0..) |pair, index| {
