@@ -158,6 +158,7 @@ fn writeStatistics(writer: *std.Io.Writer, outputs: []const control.OutputStatis
             try writer.print("{d}", .{fractional_refresh});
         }
         try writer.writeAll(" Hz)\n");
+        try writeFrameDiagnostics(writer, output.last_frame);
         try writer.print(
             "  frames: requested {d}, started {d}, presented {d}, discarded {d}\n",
             .{
@@ -192,6 +193,44 @@ fn writeStatistics(writer: *std.Io.Writer, outputs: []const control.OutputStatis
         try writeLatency(writer, "render -> commit", output.render_to_commit);
         try writeLatency(writer, "commit -> presentation", output.commit_to_presentation);
     }
+}
+
+fn writeFrameDiagnostics(
+    writer: *std.Io.Writer,
+    diagnostics: control.FrameDiagnostics,
+) !void {
+    try writer.print(
+        "  last frame: {s}, working {s}, scanout {s}, transform {s}\n",
+        .{
+            framePathName(diagnostics.path),
+            bufferFormatName(diagnostics.working_format),
+            bufferFormatName(diagnostics.scanout_format),
+            @tagName(diagnostics.output_transform),
+        },
+    );
+    try writer.print("  damage: {d} rectangles, {d} pixels\n", .{
+        diagnostics.damage_rectangles,
+        diagnostics.damaged_pixels,
+    });
+}
+
+fn framePathName(path: control.FramePath) []const u8 {
+    return switch (path) {
+        .none => "none",
+        .composited => "composited",
+        .direct_scanout => "direct scanout",
+    };
+}
+
+fn bufferFormatName(format: control.BufferFormat) []const u8 {
+    return switch (format) {
+        .none => "none",
+        .argb8888 => "ARGB8888",
+        .xrgb8888 => "XRGB8888",
+        .abgr8888 => "ABGR8888",
+        .xbgr8888 => "XBGR8888",
+        .rgba16f_linear => "RGBA16F linear",
+    };
 }
 
 fn writeLatency(
@@ -382,7 +421,7 @@ test "configuration reload errors expose their message" {
 
 test "performance statistics decode and render human-readable output" {
     var reply = try std.json.parseFromSlice(varlink.Reply, std.testing.allocator,
-        \\{"parameters":{"outputs":[{"name":"eDP-1","width":2880,"height":1800,"refresh_millihertz":120000,"frames_requested":10,"frames_started":9,"frames_presented":8,"frames_discarded":1,"acquire_retries":2,"composited_frames":7,"direct_scanout_candidates":3,"direct_scanout_frames":1,"direct_scanout_rejections":{"no_fullscreen_surface":4,"non_opaque_surface":0,"surface_transform":0,"non_dmabuf":0,"y_inverted":0,"missing_buffer_identity":0,"color_conversion":1,"unsupported_backend":0,"output_unavailable":0,"output_busy":0,"device_inactive":0,"unsupported_format_or_modifier":0,"unsupported_layout":0,"framebuffer_import_failed":0,"page_flip_failed":2},"cpu_uploads":4,"dmabuf_imports":6,"frames_over_budget":2,"gpu_execution":{"samples":7,"p50_microseconds":2100,"p95_microseconds":4400,"p99_microseconds":6100,"maximum_microseconds":7200},"gpu_composition":{"samples":7,"p50_microseconds":1500,"p95_microseconds":3300,"p99_microseconds":4700,"maximum_microseconds":5400},"gpu_output_encode":{"samples":7,"p50_microseconds":400,"p95_microseconds":700,"p99_microseconds":900,"maximum_microseconds":1100},"request_to_presentation":{"samples":8,"p50_microseconds":8200,"p95_microseconds":9100,"p99_microseconds":16700,"maximum_microseconds":25000},"request_to_render":{"samples":8,"p50_microseconds":1000,"p95_microseconds":1200,"p99_microseconds":1400,"maximum_microseconds":1600},"render_to_commit":{"samples":8,"p50_microseconds":1100,"p95_microseconds":2800,"p99_microseconds":5600,"maximum_microseconds":7000},"commit_to_presentation":{"samples":8,"p50_microseconds":6800,"p95_microseconds":8000,"p99_microseconds":14900,"maximum_microseconds":18000}}]}}
+        \\{"parameters":{"outputs":[{"name":"eDP-1","width":2880,"height":1800,"refresh_millihertz":120000,"last_frame":{"path":"composited","working_format":"rgba16f_linear","scanout_format":"xrgb8888","output_transform":"normal","damage_rectangles":2,"damaged_pixels":800000},"frames_requested":10,"frames_started":9,"frames_presented":8,"frames_discarded":1,"acquire_retries":2,"composited_frames":7,"direct_scanout_candidates":3,"direct_scanout_frames":1,"direct_scanout_rejections":{"no_fullscreen_surface":4,"non_opaque_surface":0,"surface_transform":0,"non_dmabuf":0,"y_inverted":0,"missing_buffer_identity":0,"color_conversion":1,"unsupported_backend":0,"output_unavailable":0,"output_busy":0,"device_inactive":0,"unsupported_format_or_modifier":0,"unsupported_layout":0,"framebuffer_import_failed":0,"page_flip_failed":2},"cpu_uploads":4,"dmabuf_imports":6,"frames_over_budget":2,"gpu_execution":{"samples":7,"p50_microseconds":2100,"p95_microseconds":4400,"p99_microseconds":6100,"maximum_microseconds":7200},"gpu_composition":{"samples":7,"p50_microseconds":1500,"p95_microseconds":3300,"p99_microseconds":4700,"maximum_microseconds":5400},"gpu_output_encode":{"samples":7,"p50_microseconds":400,"p95_microseconds":700,"p99_microseconds":900,"maximum_microseconds":1100},"request_to_presentation":{"samples":8,"p50_microseconds":8200,"p95_microseconds":9100,"p99_microseconds":16700,"maximum_microseconds":25000},"request_to_render":{"samples":8,"p50_microseconds":1000,"p95_microseconds":1200,"p99_microseconds":1400,"maximum_microseconds":1600},"render_to_commit":{"samples":8,"p50_microseconds":1100,"p95_microseconds":2800,"p99_microseconds":5600,"maximum_microseconds":7000},"commit_to_presentation":{"samples":8,"p50_microseconds":6800,"p95_microseconds":8000,"p99_microseconds":14900,"maximum_microseconds":18000}}]}}
     , .{});
     defer reply.deinit();
     const parsed = try parseStatisticsParameters(std.testing.allocator, reply.value.parameters);
@@ -392,6 +431,8 @@ test "performance statistics decode and render human-readable output" {
     try writeStatistics(&writer.writer, parsed.value.outputs);
     try std.testing.expectEqualStrings(
         \\eDP-1 2880x1800 (120.000 Hz)
+        \\  last frame: composited, working RGBA16F linear, scanout XRGB8888, transform normal
+        \\  damage: 2 rectangles, 800000 pixels
         \\  frames: requested 10, started 9, presented 8, discarded 1
         \\  paths: composited 7, direct scanout 1/3 candidates
         \\  direct scanout rejections:

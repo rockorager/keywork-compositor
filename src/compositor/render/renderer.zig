@@ -17,6 +17,11 @@ pub const Renderer = struct {
         vulkan,
     };
 
+    pub const WorkingFormat = enum {
+        argb8888,
+        rgba16f_linear,
+    };
+
     pub const Error = CpuRenderer.Error || VulkanRenderer.Error;
     pub const GpuTiming = VulkanRenderer.GpuTiming;
     pub const FrameCompletion = render_types.FrameCompletion;
@@ -74,6 +79,13 @@ pub const Renderer = struct {
         return switch (self.backend) {
             .cpu => false,
             .vulkan => true,
+        };
+    }
+
+    pub fn workingFormat(self: *const Renderer) WorkingFormat {
+        return switch (self.backend) {
+            .cpu => .argb8888,
+            .vulkan => .rgba16f_linear,
         };
     }
 

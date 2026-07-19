@@ -662,6 +662,14 @@ const Recorder = struct {
             .width = 1280,
             .height = 720,
             .refresh_millihertz = 60_000,
+            .last_frame = .{
+                .path = .composited,
+                .working_format = .rgba16f_linear,
+                .scanout_format = .none,
+                .output_transform = .normal,
+                .damage_rectangles = 2,
+                .damaged_pixels = 20_000,
+            },
             .frames_requested = 5,
             .frames_started = 5,
             .frames_presented = 4,
@@ -880,6 +888,8 @@ test "performance statistics return typed output snapshots and forward reset" {
     const statistics = parsed.value.parameters.outputs[0];
     try std.testing.expectEqualStrings("HEADLESS-1", statistics.name);
     try std.testing.expectEqual(@as(i64, 4), statistics.frames_presented);
+    try std.testing.expectEqual(control.FramePath.composited, statistics.last_frame.path);
+    try std.testing.expectEqual(@as(i64, 20_000), statistics.last_frame.damaged_pixels);
     try std.testing.expectEqual(@as(i64, 300), statistics.request_to_presentation.p99_microseconds);
 }
 

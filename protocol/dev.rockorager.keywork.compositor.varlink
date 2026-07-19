@@ -38,12 +38,32 @@ type DirectScanoutRejections (
     page_flip_failed: int
 )
 
+# The path used for the most recently committed frame.
+type FramePath (none, composited, direct_scanout)
+
+# A renderer working or output scanout buffer format.
+type BufferFormat (none, argb8888, xrgb8888, abgr8888, xbgr8888, rgba16f_linear)
+
+# The output-space transform applied during presentation.
+type OutputTransform (normal)
+
+# Diagnostic state for the most recently committed frame.
+type FrameDiagnostics (
+    path: FramePath,
+    working_format: BufferFormat,
+    scanout_format: BufferFormat,
+    output_transform: OutputTransform,
+    damage_rectangles: int,
+    damaged_pixels: int
+)
+
 # Per-output frame processing and presentation statistics.
 type OutputStatistics (
     name: string,
     width: int,
     height: int,
     refresh_millihertz: int,
+    last_frame: FrameDiagnostics,
     frames_requested: int,
     frames_started: int,
     frames_presented: int,

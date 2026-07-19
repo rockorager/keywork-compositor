@@ -41,7 +41,7 @@ mode.
 - [x] Count CPU uploads and imported DMA-BUFs.
 - [x] Report direct-scanout rejection reasons, including renderer eligibility
   and KMS presentation failures.
-- [ ] Record the working format, scanout format, output transform, damage, and
+- [x] Record the working format, scanout format, output transform, damage, and
   active render path for diagnostic captures.
 
 Acceptance: every presented frame is attributable to direct scanout or

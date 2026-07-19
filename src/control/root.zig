@@ -34,11 +34,25 @@ pub const DirectScanoutRejections = struct {
     page_flip_failed: i64,
 };
 
+pub const FramePath = enum { none, composited, direct_scanout };
+pub const BufferFormat = enum { none, argb8888, xrgb8888, abgr8888, xbgr8888, rgba16f_linear };
+pub const OutputTransform = enum { normal };
+
+pub const FrameDiagnostics = struct {
+    path: FramePath,
+    working_format: BufferFormat,
+    scanout_format: BufferFormat,
+    output_transform: OutputTransform,
+    damage_rectangles: i64,
+    damaged_pixels: i64,
+};
+
 pub const OutputStatistics = struct {
     name: []const u8,
     width: i64,
     height: i64,
     refresh_millihertz: i64,
+    last_frame: FrameDiagnostics,
     frames_requested: i64,
     frames_started: i64,
     frames_presented: i64,

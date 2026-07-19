@@ -250,10 +250,17 @@ const RenderOutput = struct {
         increment(&self.frame_statistics.frames_started);
     }
 
-    fn commitFrame(self: *RenderOutput, path: FramePath) void {
+    fn commitFrame(
+        self: *RenderOutput,
+        path: FramePath,
+        damage: *const Region,
+        scanout_format: ?render.DmabufFormat,
+    ) void {
         const pending = if (self.pending_frame) |*frame| frame else unreachable;
         std.debug.assert(pending.commit_nanoseconds == null);
+        std.debug.assert(path == .composited or scanout_format != null);
         pending.commit_nanoseconds = nowNanoseconds(self.server.io);
+        self.frame_statistics.recordFrame(path, scanout_format, damage);
         switch (path) {
             .composited => increment(&self.frame_statistics.composited_frames),
             .direct_scanout => increment(&self.frame_statistics.direct_scanout_frames),
@@ -344,6 +351,10 @@ const FrameStatistics = struct {
     gpu_execution_samples: [frame_latency_capacity]GpuExecution = undefined,
     gpu_execution_count: usize = 0,
     gpu_execution_next: usize = 0,
+    last_path: ?FramePath = null,
+    last_scanout_format: ?render.DmabufFormat = null,
+    last_damage_rectangles: u64 = 0,
+    last_damaged_pixels: u64 = 0,
 
     fn recordPresentation(
         self: *FrameStatistics,
@@ -411,17 +422,45 @@ const FrameStatistics = struct {
         self.dmabuf_imports +|= completion.dmabuf_imports;
     }
 
+    fn recordFrame(
+        self: *FrameStatistics,
+        path: FramePath,
+        scanout_format: ?render.DmabufFormat,
+        damage: *const Region,
+    ) void {
+        var rectangles: u64 = 0;
+        var pixels: u64 = 0;
+        var iterator = damage.rectangleIterator();
+        while (iterator.next()) |rectangle| {
+            rectangles +|= 1;
+            pixels +|= @as(u64, rectangle.width) * rectangle.height;
+        }
+        self.last_path = path;
+        self.last_scanout_format = scanout_format;
+        self.last_damage_rectangles = rectangles;
+        self.last_damaged_pixels = pixels;
+    }
+
     fn snapshot(
         self: *const FrameStatistics,
         name: []const u8,
         size: render.Size,
         refresh_millihertz: i32,
+        working_format: renderer_types.Renderer.WorkingFormat,
     ) ControlProtocol.OutputStatistics {
         return .{
             .name = name,
             .width = @intCast(size.width),
             .height = @intCast(size.height),
             .refresh_millihertz = refresh_millihertz,
+            .last_frame = .{
+                .path = controlFramePath(self.last_path),
+                .working_format = controlWorkingFormat(working_format),
+                .scanout_format = controlScanoutFormat(self.last_scanout_format),
+                .output_transform = .normal,
+                .damage_rectangles = wireInteger(self.last_damage_rectangles),
+                .damaged_pixels = wireInteger(self.last_damaged_pixels),
+            },
             .frames_requested = wireInteger(self.frames_requested),
             .frames_started = wireInteger(self.frames_started),
             .frames_presented = wireInteger(self.frames_presented),
@@ -563,6 +602,31 @@ fn wireInteger(value: u64) i64 {
     return @intCast(@min(value, @as(u64, std.math.maxInt(i64))));
 }
 
+fn controlFramePath(path: ?FramePath) ControlProtocol.FramePath {
+    return if (path) |value| switch (value) {
+        .composited => .composited,
+        .direct_scanout => .direct_scanout,
+    } else .none;
+}
+
+fn controlWorkingFormat(
+    format: renderer_types.Renderer.WorkingFormat,
+) ControlProtocol.BufferFormat {
+    return switch (format) {
+        .argb8888 => .argb8888,
+        .rgba16f_linear => .rgba16f_linear,
+    };
+}
+
+fn controlScanoutFormat(format: ?render.DmabufFormat) ControlProtocol.BufferFormat {
+    return if (format) |value| switch (value) {
+        .argb8888 => .argb8888,
+        .xrgb8888 => .xrgb8888,
+        .abgr8888 => .abgr8888,
+        .xbgr8888 => .xbgr8888,
+    } else .none;
+}
+
 fn increment(value: *u64) void {
     value.* +|= 1;
 }
@@ -642,6 +706,23 @@ test "frame statistics summarize rolling latency and classify over-budget frames
         @as(i64, 600),
         statistics.gpuExecutionSummary(.output_encode).p50_microseconds,
     );
+
+    var damage = Region.init();
+    defer damage.deinit();
+    try damage.add(0, 0, 10, 20);
+    try damage.add(20, 0, 5, 5);
+    statistics.recordFrame(.composited, .xrgb8888, &damage);
+    const snapshot = statistics.snapshot(
+        "HEADLESS-1",
+        .{ .width = 100, .height = 100 },
+        60_000,
+        .rgba16f_linear,
+    );
+    try std.testing.expectEqual(ControlProtocol.FramePath.composited, snapshot.last_frame.path);
+    try std.testing.expectEqual(ControlProtocol.BufferFormat.rgba16f_linear, snapshot.last_frame.working_format);
+    try std.testing.expectEqual(ControlProtocol.BufferFormat.xrgb8888, snapshot.last_frame.scanout_format);
+    try std.testing.expectEqual(@as(i64, 3), snapshot.last_frame.damage_rectangles);
+    try std.testing.expectEqual(@as(i64, 225), snapshot.last_frame.damaged_pixels);
 
     statistics.recordPresentation(.{
         .request_nanoseconds = 0,
@@ -2578,6 +2659,7 @@ fn controlPerformanceStatistics(
             protocol_output.name(),
             render_output.backend.modeSize(),
             render_output.backend.refreshMillihertz(),
+            self.renderer.workingFormat(),
         );
         if (reset) render_output.frame_statistics.reset();
     }
@@ -6407,7 +6489,10 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
                     self.renderer.cancelFrame();
                     renderer_frame_active = false;
                     direct_scanout = true;
-                    render_output.commitFrame(.direct_scanout);
+                    const scanout_format = render.DmabufFormat.fromFourcc(
+                        candidate.dmabuf.?.format,
+                    ) orelse unreachable;
+                    render_output.commitFrame(.direct_scanout, &frame_damage, scanout_format);
                 },
                 .rejected => |reason| render_output.frame_statistics.rejectDirectScanout(reason),
             }
@@ -6431,7 +6516,11 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
             allow_tearing,
         ) catch
             return error.InvalidTarget;
-        render_output.commitFrame(.composited);
+        render_output.commitFrame(
+            .composited,
+            &frame_damage,
+            render_output.backend.compositedScanoutFormat(),
+        );
     }
     output.endFrame();
     self.color_management.refreshPreferred();
@@ -6579,7 +6668,11 @@ fn presentSessionLockFrame(
         false,
     ) catch
         return error.InvalidTarget;
-    frame.render_output.commitFrame(.composited);
+    frame.render_output.commitFrame(
+        .composited,
+        frame.presentation_damage.?,
+        frame.render_output.backend.compositedScanoutFormat(),
+    );
     frame.render_output.lock_frame_pending = true;
     frame.output.endFrame();
     self.color_management.refreshPreferred();

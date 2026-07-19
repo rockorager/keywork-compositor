@@ -78,6 +78,14 @@ pub fn scanoutFormats(self: *const Self) []const render.DmabufFormatModifier {
     };
 }
 
+pub fn compositedScanoutFormat(self: *const Self) ?render.DmabufFormat {
+    return switch (self.backend) {
+        .drm => .xrgb8888,
+        .headless => null,
+        .nested => .argb8888,
+    };
+}
+
 pub fn name(self: *const Self, fallback: []const u8) []const u8 {
     return switch (self.backend) {
         .drm => |output| output.name(),
