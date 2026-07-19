@@ -4,6 +4,12 @@ layout(push_constant) uniform Push {
     vec2 target_size;
     vec2 texture_size;
     float swap_rb;
+    layout(offset=32) vec4 color_matrix_0;
+    vec4 color_matrix_1;
+    vec4 color_matrix_2;
+    vec4 transfer;
+    vec4 output_transfer;
+    vec4 transfer_aux;
 } pc;
 layout(location=0) in vec2 pixel;
 layout(location=1) flat in vec4 dest;
@@ -55,5 +61,5 @@ void main() {
     float coverage=parameters.y>0.0 ? roundedBoxShadow(rounded.xy,rounded.xy+rounded.zw,pixel,parameters.y*0.5,parameters.x) : roundedRectCoverage(pixel,rounded,parameters.x);
     vec4 shaded=color*coverage;
     shaded*=cutout;
-    out_color=pc.swap_rb>0.5 ? shaded.bgra : shaded;
+    out_color=shaded;
 }

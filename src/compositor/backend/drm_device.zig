@@ -47,6 +47,7 @@ pub const Listener = struct {
     failed: *const fn (*anyopaque) void,
     activated: *const fn (*anyopaque) void = ignoreEvent,
     deactivating: *const fn (*anyopaque) void = ignoreEvent,
+    changed: *const fn (*anyopaque, *DrmOutput) void = ignoreOutputEvent,
     lease_revoked: *const fn (*anyopaque, u32) void = ignoreLeaseRevoked,
 };
 
@@ -61,6 +62,7 @@ const LeaseTracking = struct {
 };
 
 fn ignoreEvent(_: *anyopaque) void {}
+fn ignoreOutputEvent(_: *anyopaque, _: *DrmOutput) void {}
 fn ignoreLeaseRevoked(_: *anyopaque, _: u32) void {}
 
 pub fn init(self: *Self, allocator: std.mem.Allocator, io: std.Io, event_loop: *wl.EventLoop, session: *Session, device_path: ?[]const u8) !void {
@@ -401,6 +403,12 @@ fn reconcile(self: *Self) !void {
             output.crtc_id != selection.crtc_id)
         {
             return error.OutputChanged;
+        }
+    }
+    for (selections) |selection| {
+        const output = self.findOutput(selection.connector_id) orelse continue;
+        if (output.refreshIdentity(device.fd)) {
+            if (self.listener) |listener| listener.changed(listener.context, output);
         }
     }
     if (!topology_changed) return;

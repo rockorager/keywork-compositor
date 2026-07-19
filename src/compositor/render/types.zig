@@ -158,6 +158,106 @@ pub const Color = struct {
     }
 };
 
+pub const Chromaticities = struct {
+    red_x: i32,
+    red_y: i32,
+    green_x: i32,
+    green_y: i32,
+    blue_x: i32,
+    blue_y: i32,
+    white_x: i32,
+    white_y: i32,
+
+    pub fn values(self: Chromaticities) [8]i32 {
+        return .{
+            self.red_x,
+            self.red_y,
+            self.green_x,
+            self.green_y,
+            self.blue_x,
+            self.blue_y,
+            self.white_x,
+            self.white_y,
+        };
+    }
+};
+
+pub const Primaries = enum {
+    srgb,
+    display_p3,
+    bt2020,
+};
+
+pub const TransferFunction = union(enum) {
+    bt1886,
+    gamma22,
+    srgb,
+    st2084_pq,
+    hlg,
+    power: u32,
+};
+
+pub const srgb_chromaticities: Chromaticities = .{
+    .red_x = 640000,
+    .red_y = 330000,
+    .green_x = 300000,
+    .green_y = 600000,
+    .blue_x = 150000,
+    .blue_y = 60000,
+    .white_x = 312700,
+    .white_y = 329000,
+};
+
+pub const display_p3_chromaticities: Chromaticities = .{
+    .red_x = 680000,
+    .red_y = 320000,
+    .green_x = 265000,
+    .green_y = 690000,
+    .blue_x = 150000,
+    .blue_y = 60000,
+    .white_x = 312700,
+    .white_y = 329000,
+};
+
+pub const bt2020_chromaticities: Chromaticities = .{
+    .red_x = 708000,
+    .red_y = 292000,
+    .green_x = 170000,
+    .green_y = 797000,
+    .blue_x = 131000,
+    .blue_y = 46000,
+    .white_x = 312700,
+    .white_y = 329000,
+};
+
+/// Immutable colorimetry copied into every retained image snapshot. Minimum
+/// luminances use the color-management-v1 fixed-point scale of 10000.
+pub const ColorDescription = struct {
+    primaries: Chromaticities = srgb_chromaticities,
+    named_primaries: ?Primaries = .srgb,
+    transfer_function: TransferFunction = .gamma22,
+    min_luminance: u32 = 2000,
+    max_luminance: u32 = 80,
+    reference_luminance: u32 = 80,
+    mastering_primaries: ?Chromaticities = null,
+    mastering_min_luminance: ?u32 = null,
+    mastering_max_luminance: ?u32 = null,
+    max_cll: ?u32 = null,
+    max_fall: ?u32 = null,
+
+    pub fn targetPrimaries(self: ColorDescription) Chromaticities {
+        return self.mastering_primaries orelse self.primaries;
+    }
+
+    pub fn targetMinLuminance(self: ColorDescription) u32 {
+        return self.mastering_min_luminance orelse self.min_luminance;
+    }
+
+    pub fn targetMaxLuminance(self: ColorDescription) u32 {
+        return self.mastering_max_luminance orelse self.max_luminance;
+    }
+};
+
 pub const SolidRect = struct {
     rect: Rect,
     color: Color,
@@ -258,6 +358,7 @@ pub const Frame = struct {
     scale: Scale = .{},
     /// Global logical coordinate rendered at the target's top-left corner.
     origin: Position = .{},
+    output_color_description: ColorDescription = .{},
 };
 
 pub const DmabufFormat = enum(u32) {
@@ -332,6 +433,7 @@ pub const PixelBuffer = struct {
     stride_pixels: u32,
     pixels: []u32 = &.{},
     dmabuf: ?DmabufSource = null,
+    color_description: ColorDescription = .{},
     /// Stable content identity for renderer texture caches. Anonymous buffers
     /// leave this null and must be uploaded whenever they are rendered.
     source_cache: ?SourceCache = null,

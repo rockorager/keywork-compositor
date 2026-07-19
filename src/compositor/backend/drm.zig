@@ -60,6 +60,7 @@ connector_name_length: usize,
 make_value: [*c]u8,
 model_value: [*c]u8,
 serial_value: [*c]u8,
+color_description: render.ColorDescription,
 description_value: [description_capacity]u8,
 description_length: usize,
 logical_x: i32,
@@ -241,6 +242,7 @@ pub fn init(
         .make_value = null,
         .model_value = null,
         .serial_value = null,
+        .color_description = .{},
         .description_value = undefined,
         .description_length = 0,
         .logical_x = 0,
@@ -327,6 +329,10 @@ pub fn serial(self: *const Self) ?[]const u8 {
 
 pub fn description(self: *const Self) []const u8 {
     return self.description_value[0..self.description_length];
+}
+
+pub fn colorDescription(self: *const Self) render.ColorDescription {
+    return self.color_description;
 }
 
 pub fn refreshMillihertz(self: *const Self) i32 {
@@ -584,7 +590,7 @@ pub fn activate(self: *Self, fd: std.posix.fd_t, selection: Selection, device_pa
         .{ type_name, selection.connector_type_id },
     );
     self.connector_name_length = name_value.len;
-    self.readIdentity(fd);
+    _ = self.refreshIdentity(fd);
     const make_value = self.make() orelse "Unknown";
     const model_value = self.model() orelse "display";
     const description_value = if (self.serial()) |serial_text|
@@ -671,8 +677,15 @@ fn readIdentity(self: *Self, fd: std.posix.fd_t) void {
         self.make_value = c.di_info_get_make(info);
         self.model_value = c.di_info_get_model(info);
         self.serial_value = c.di_info_get_serial(info);
+        self.color_description = colorDescriptionFromInfo(info);
         return;
     }
+}
+
+pub fn refreshIdentity(self: *Self, fd: std.posix.fd_t) bool {
+    const previous = self.color_description;
+    self.readIdentity(fd);
+    return !std.meta.eql(previous, self.color_description);
 }
 
 fn clearIdentity(self: *Self) void {
@@ -682,6 +695,81 @@ fn clearIdentity(self: *Self) void {
     self.make_value = null;
     self.model_value = null;
     self.serial_value = null;
+    self.color_description = .{};
+}
+
+fn colorDescriptionFromInfo(info: *const c.di_info) render.ColorDescription {
+    const primaries = c.di_info_get_default_color_primaries(info);
+    var values: ?[8]f32 = null;
+    if (primaries.*.has_primaries and primaries.*.has_default_white_point) {
+        const colors = primaries.*.primary;
+        values = .{
+            colors[0].x,
+            colors[0].y,
+            colors[1].x,
+            colors[1].y,
+            colors[2].x,
+            colors[2].y,
+            primaries.*.default_white.x,
+            primaries.*.default_white.y,
+        };
+    }
+    return colorDescriptionFromValues(values, c.di_info_get_default_gamma(info));
+}
+
+fn colorDescriptionFromValues(
+    primaries: ?[8]f32,
+    gamma: f32,
+) render.ColorDescription {
+    var result: render.ColorDescription = .{};
+    if (primaries) |values| {
+        var fixed: [8]i32 = undefined;
+        var valid = true;
+        for (values, &fixed) |value, *destination| {
+            if (!std.math.isFinite(value) or value < 0 or value > 1) {
+                valid = false;
+                break;
+            }
+            destination.* = @intFromFloat(@round(value * 1_000_000.0));
+        }
+        if (valid and fixed[1] > 0 and fixed[3] > 0 and fixed[5] > 0 and fixed[7] > 0) {
+            const chromaticities: render.Chromaticities = .{
+                .red_x = fixed[0],
+                .red_y = fixed[1],
+                .green_x = fixed[2],
+                .green_y = fixed[3],
+                .blue_x = fixed[4],
+                .blue_y = fixed[5],
+                .white_x = fixed[6],
+                .white_y = fixed[7],
+            };
+            if (approximatelySrgb(chromaticities)) {
+                result.primaries = render.srgb_chromaticities;
+                result.named_primaries = .srgb;
+            } else {
+                result.primaries = chromaticities;
+                result.named_primaries = null;
+            }
+        }
+    }
+    if (std.math.isFinite(gamma) and gamma >= 1 and gamma <= 10 and
+        @abs(gamma - 2.2) > 0.005)
+    {
+        result.transfer_function = .{
+            .power = @intFromFloat(@round(gamma * 10000.0)),
+        };
+    }
+    return result;
+}
+
+fn approximatelySrgb(chromaticities: render.Chromaticities) bool {
+    const tolerance = 1000;
+    const actual = chromaticities.values();
+    const expected = render.srgb_chromaticities.values();
+    for (actual, expected) |value, reference| {
+        if (@abs(value - reference) > tolerance) return false;
+    }
+    return true;
 }
 
 pub fn isPrimaryNode(path: []const u8) bool {
@@ -1252,6 +1340,51 @@ test "scanout framebuffer prefers an opaque format with the same memory layout" 
         scanoutFramebufferFormat(&formats, c.DRM_FORMAT_ABGR8888, 9).?,
     );
     try std.testing.expect(scanoutFramebufferFormat(&formats, c.DRM_FORMAT_XBGR8888, 9) == null);
+}
+
+test "EDID color values preserve valid primaries and gamma" {
+    const color_description = colorDescriptionFromValues(.{
+        0.680,
+        0.320,
+        0.265,
+        0.690,
+        0.150,
+        0.060,
+        0.3127,
+        0.3290,
+    }, 2.4);
+    try std.testing.expectEqual(@as(i32, 680000), color_description.primaries.red_x);
+    try std.testing.expectEqual(@as(i32, 329000), color_description.primaries.white_y);
+    try std.testing.expect(color_description.named_primaries == null);
+    try std.testing.expectEqual(render.TransferFunction{ .power = 24000 }, color_description.transfer_function);
+
+    const invalid = colorDescriptionFromValues(.{
+        0.680,
+        0,
+        0.265,
+        0.690,
+        0.150,
+        0.060,
+        0.3127,
+        0.3290,
+    }, std.math.nan(f32));
+    try std.testing.expectEqual(render.ColorDescription{}, invalid);
+    try std.testing.expectEqual(
+        render.TransferFunction.gamma22,
+        colorDescriptionFromValues(null, 2.2).transfer_function,
+    );
+
+    const quantized_srgb = colorDescriptionFromValues(.{
+        0.639648,
+        0.330078,
+        0.299805,
+        0.599609,
+        0.150391,
+        0.059570,
+        0.312500,
+        0.329102,
+    }, 2.2);
+    try std.testing.expectEqual(render.ColorDescription{}, quantized_srgb);
 }
 
 fn findOutput(outputs: []const *Self, connector_id: u32) ?*Self {

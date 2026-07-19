@@ -37,6 +37,7 @@ format: vk.Format,
 swap_red_blue: bool,
 render_pass: vk.RenderPass,
 scratch_render_pass: vk.RenderPass,
+output_render_pass: vk.RenderPass,
 descriptor_set_layout: vk.DescriptorSetLayout,
 descriptor_pool: vk.DescriptorPool,
 pipeline_layout: vk.PipelineLayout,
@@ -48,6 +49,7 @@ downsample_pipeline: vk.Pipeline,
 blur_horizontal_pipeline: vk.Pipeline,
 blur_vertical_pipeline: vk.Pipeline,
 blur_composite_pipeline: vk.Pipeline,
+encode_pipeline: vk.Pipeline,
 sampler: vk.Sampler,
 work_buffer: vk.Buffer,
 work_memory: vk.DeviceMemory,
@@ -103,6 +105,7 @@ const Output = struct {
     descriptor_set: vk.DescriptorSet,
     framebuffer: vk.Framebuffer,
     size: render.Size,
+    color_description: render.ColorDescription = .{},
     kind: OutputKind = .pixels,
     initialized: bool = false,
     last_used: u64,
@@ -111,6 +114,15 @@ const Output = struct {
     blur: ?BlurScratch = null,
     blur_initialized: u16 = 0,
     backdrop_cache: std.ArrayList(BackdropCache) = .empty,
+    linear: WorkingImage,
+};
+
+const WorkingImage = struct {
+    image: vk.Image,
+    memory: vk.DeviceMemory,
+    view: vk.ImageView,
+    descriptor_set: vk.DescriptorSet,
+    framebuffer: vk.Framebuffer,
 };
 
 const BlurImage = struct {
@@ -184,7 +196,22 @@ const FramePush = extern struct {
     target_size: [2]f32,
     texture_size: [2]f32,
     swap_red_blue: f32,
-    padding: f32 = 0,
+    padding: [3]f32 = @splat(0),
+    color_matrix_0: [4]f32 = .{ 1, 0, 0, 0 },
+    color_matrix_1: [4]f32 = .{ 0, 1, 0, 0 },
+    color_matrix_2: [4]f32 = .{ 0, 0, 1, 0 },
+    transfer: [4]f32 = .{ 0, 1, 1, 1 },
+    output_transfer: [4]f32 = .{ 1, 0, 80, 80 },
+    transfer_aux: [4]f32 = .{ 0.2, 0.2126, 0.7152, 0.0722 },
+};
+
+const ColorTransform = extern struct {
+    color_matrix_0: [4]f32 = .{ 1, 0, 0, 0 },
+    color_matrix_1: [4]f32 = .{ 0, 1, 0, 0 },
+    color_matrix_2: [4]f32 = .{ 0, 0, 1, 0 },
+    transfer: [4]f32 = .{ 0, 1, 1, 1 },
+    output_transfer: [4]f32 = .{ 1, 0, 80, 80 },
+    transfer_aux: [4]f32 = .{ 0.2, 0.2126, 0.7152, 0.0722 },
 };
 
 const PipelineKind = enum {
@@ -232,6 +259,7 @@ const DrawRun = struct {
     texture_size: render.Size,
     first_instance: u32,
     instance_count: u32,
+    color_transform: ColorTransform = .{},
 };
 
 const UploadRun = struct {
@@ -270,7 +298,7 @@ const RecordedFrame = struct {
 
 comptime {
     std.debug.assert(@sizeOf(Instance) == 96);
-    std.debug.assert(@sizeOf(FramePush) == 24);
+    std.debug.assert(@sizeOf(FramePush) == 128);
 }
 
 pub const InitError = error{
@@ -294,6 +322,7 @@ pub const GpuTiming = struct {
 const Graphics = struct {
     render_pass: vk.RenderPass,
     scratch_render_pass: vk.RenderPass,
+    output_render_pass: vk.RenderPass,
     descriptor_set_layout: vk.DescriptorSetLayout,
     descriptor_pool: vk.DescriptorPool,
     pipeline_layout: vk.PipelineLayout,
@@ -305,8 +334,11 @@ const Graphics = struct {
     blur_horizontal_pipeline: vk.Pipeline,
     blur_vertical_pipeline: vk.Pipeline,
     blur_composite_pipeline: vk.Pipeline,
+    encode_pipeline: vk.Pipeline,
     sampler: vk.Sampler,
 };
+
+const working_format: vk.Format = .r16g16b16a16_sfloat;
 
 fn chooseFormat(
     wrapper: vk.InstanceWrapper,
@@ -373,7 +405,7 @@ fn initGraphics(
     errdefer wrapper.destroyPipelineLayout(device, pipeline_layout, null);
 
     const attachment: vk.AttachmentDescription = .{
-        .format = format,
+        .format = working_format,
         .samples = .{ .@"1_bit" = true },
         .load_op = .load,
         .store_op = .store,
@@ -407,6 +439,15 @@ fn initGraphics(
         .p_subpasses = @ptrCast(&subpass),
     }, null);
     errdefer wrapper.destroyRenderPass(device, scratch_render_pass, null);
+    var output_attachment = attachment;
+    output_attachment.format = format;
+    const output_render_pass = try wrapper.createRenderPass(device, &.{
+        .attachment_count = 1,
+        .p_attachments = @ptrCast(&output_attachment),
+        .subpass_count = 1,
+        .p_subpasses = @ptrCast(&subpass),
+    }, null);
+    errdefer wrapper.destroyRenderPass(device, output_render_pass, null);
 
     const sampler = try wrapper.createSampler(device, &.{
         .mag_filter = .linear,
@@ -457,6 +498,11 @@ fn initGraphics(
         .p_code = &shaders.blur_vertical_paired,
     }, null);
     defer wrapper.destroyShaderModule(device, blur_vertical_shader, null);
+    const encode_shader = try wrapper.createShaderModule(device, &.{
+        .code_size = @sizeOf(@TypeOf(shaders.output_encode)),
+        .p_code = &shaders.output_encode,
+    }, null);
+    defer wrapper.destroyShaderModule(device, encode_shader, null);
     const replace_pipeline = createPipeline(
         wrapper,
         device,
@@ -517,9 +563,20 @@ fn initGraphics(
     errdefer wrapper.destroyPipeline(device, blur_vertical_pipeline, null);
     const blur_composite_pipeline = try createPipeline(wrapper, device, render_pass, pipeline_layout, vertex_shader, image_shader, true);
     errdefer wrapper.destroyPipeline(device, blur_composite_pipeline, null);
+    const encode_pipeline = try createPipeline(
+        wrapper,
+        device,
+        output_render_pass,
+        pipeline_layout,
+        vertex_shader,
+        encode_shader,
+        false,
+    );
+    errdefer wrapper.destroyPipeline(device, encode_pipeline, null);
     return .{
         .render_pass = render_pass,
         .scratch_render_pass = scratch_render_pass,
+        .output_render_pass = output_render_pass,
         .descriptor_set_layout = descriptor_set_layout,
         .descriptor_pool = descriptor_pool,
         .pipeline_layout = pipeline_layout,
@@ -531,6 +588,7 @@ fn initGraphics(
         .blur_horizontal_pipeline = blur_horizontal_pipeline,
         .blur_vertical_pipeline = blur_vertical_pipeline,
         .blur_composite_pipeline = blur_composite_pipeline,
+        .encode_pipeline = encode_pipeline,
         .sampler = sampler,
     };
 }
@@ -655,6 +713,7 @@ fn createPipeline(
 }
 
 fn destroyGraphics(wrapper: vk.DeviceWrapper, device: vk.Device, graphics: Graphics) void {
+    wrapper.destroyPipeline(device, graphics.encode_pipeline, null);
     wrapper.destroyPipeline(device, graphics.blur_composite_pipeline, null);
     wrapper.destroyPipeline(device, graphics.blur_vertical_pipeline, null);
     wrapper.destroyPipeline(device, graphics.blur_horizontal_pipeline, null);
@@ -664,6 +723,7 @@ fn destroyGraphics(wrapper: vk.DeviceWrapper, device: vk.Device, graphics: Graph
     wrapper.destroyPipeline(device, graphics.blend_pipeline, null);
     wrapper.destroyPipeline(device, graphics.replace_pipeline, null);
     wrapper.destroySampler(device, graphics.sampler, null);
+    wrapper.destroyRenderPass(device, graphics.output_render_pass, null);
     wrapper.destroyRenderPass(device, graphics.scratch_render_pass, null);
     wrapper.destroyRenderPass(device, graphics.render_pass, null);
     wrapper.destroyPipelineLayout(device, graphics.pipeline_layout, null);
@@ -1007,6 +1067,17 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
 
     const format = chooseFormat(instance_wrapper, physical_device) orelse
         return error.VulkanUnavailable;
+    const working_features = instance_wrapper.getPhysicalDeviceFormatProperties(
+        physical_device,
+        working_format,
+    ).optimal_tiling_features;
+    if (!working_features.color_attachment_bit or
+        !working_features.color_attachment_blend_bit or
+        !working_features.sampled_image_bit or
+        !working_features.sampled_image_filter_linear_bit)
+    {
+        return error.VulkanUnavailable;
+    }
     if (format != .b8g8r8a8_unorm) {
         dmabuf_capable = false;
         dmabuf_device_id = null;
@@ -1146,6 +1217,7 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
         .swap_red_blue = format == .r8g8b8a8_unorm,
         .render_pass = graphics.render_pass,
         .scratch_render_pass = graphics.scratch_render_pass,
+        .output_render_pass = graphics.output_render_pass,
         .descriptor_set_layout = graphics.descriptor_set_layout,
         .descriptor_pool = graphics.descriptor_pool,
         .pipeline_layout = graphics.pipeline_layout,
@@ -1157,6 +1229,7 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
         .blur_horizontal_pipeline = graphics.blur_horizontal_pipeline,
         .blur_vertical_pipeline = graphics.blur_vertical_pipeline,
         .blur_composite_pipeline = graphics.blur_composite_pipeline,
+        .encode_pipeline = graphics.encode_pipeline,
         .sampler = graphics.sampler,
         .work_buffer = .null_handle,
         .work_memory = .null_handle,
@@ -1206,6 +1279,7 @@ pub fn deinit(self: *Self) void {
     destroyGraphics(self.device_wrapper, self.device, .{
         .render_pass = self.render_pass,
         .scratch_render_pass = self.scratch_render_pass,
+        .output_render_pass = self.output_render_pass,
         .descriptor_set_layout = self.descriptor_set_layout,
         .descriptor_pool = self.descriptor_pool,
         .pipeline_layout = self.pipeline_layout,
@@ -1217,6 +1291,7 @@ pub fn deinit(self: *Self) void {
         .blur_horizontal_pipeline = self.blur_horizontal_pipeline,
         .blur_vertical_pipeline = self.blur_vertical_pipeline,
         .blur_composite_pipeline = self.blur_composite_pipeline,
+        .encode_pipeline = self.encode_pipeline,
         .sampler = self.sampler,
     });
     if (self.scanout_semaphore != .null_handle) {
@@ -1426,7 +1501,7 @@ fn importTarget(self: *Self, descriptor: render.DmabufDescriptor) Error!void {
     const descriptor_set = if (sampleable) try self.createImageDescriptor(view) else vk.DescriptorSet.null_handle;
     errdefer if (descriptor_set != .null_handle) self.destroyImageDescriptor(descriptor_set);
     const framebuffer = self.device_wrapper.createFramebuffer(self.device, &.{
-        .render_pass = self.render_pass,
+        .render_pass = self.output_render_pass,
         .attachment_count = 1,
         .p_attachments = @ptrCast(&view),
         .width = descriptor.size.width,
@@ -1434,6 +1509,8 @@ fn importTarget(self: *Self, descriptor: render.DmabufDescriptor) Error!void {
         .layers = 1,
     }, null) catch return error.VulkanFailure;
     errdefer self.device_wrapper.destroyFramebuffer(self.device, framebuffer, null);
+    const linear = try self.createWorkingTarget(descriptor.size);
+    errdefer self.destroyWorkingTarget(linear);
     const command_buffer = try self.allocateCommandBuffer();
     errdefer self.device_wrapper.freeCommandBuffers(
         self.device,
@@ -1450,6 +1527,7 @@ fn importTarget(self: *Self, descriptor: render.DmabufDescriptor) Error!void {
         .kind = .dmabuf,
         .last_used = self.frame_number,
         .command_buffer = command_buffer,
+        .linear = linear,
     }) catch return error.OutOfMemory;
 }
 
@@ -1762,15 +1840,45 @@ fn renderFrameWithCompletion(
     if (!std.meta.eql(output.size, frame.size)) return error.InvalidTarget;
     output.last_used = self.frame_number;
     var compiled_frame = frame;
-    try self.compileDrawRuns(compiled_frame, self.prepared_images.items);
+    if (output.initialized and
+        !std.meta.eql(output.color_description, frame.output_color_description))
+    {
+        // The retained image is expressed in the output's linear RGB space.
+        // Reusing any of it after the output description changes would mix
+        // incompatible primaries and reference luminances in one frame.
+        compiled_frame.damage = null;
+        output.recorded_frame.valid = false;
+        for (output.backdrop_cache.items) |*cache| {
+            cache.key = null;
+            cache.initialized = false;
+        }
+    }
+    output.color_description = frame.output_color_description;
+    // The retained linear image, rather than the scanout image, is the source
+    // of truth for partial redraws. Initialize all of it from the complete
+    // scene before accepting damage-limited updates.
+    if (!output.initialized and output.kind != .pixels) compiled_frame.damage = null;
+    try self.compileDrawRuns(
+        compiled_frame,
+        self.prepared_images.items,
+        frame.output_color_description,
+    );
     if (try self.prepareBackdropCaches(output, frame.commands) and frame.damage != null) {
         self.instances.clearRetainingCapacity();
         self.draw_runs.clearRetainingCapacity();
         self.blur_ops.clearRetainingCapacity();
         compiled_frame.damage = null;
-        try self.compileDrawRuns(compiled_frame, self.prepared_images.items);
+        try self.compileDrawRuns(
+            compiled_frame,
+            self.prepared_images.items,
+            frame.output_color_description,
+        );
         _ = try self.prepareBackdropCaches(output, frame.commands);
     }
+    if (self.instances.items.len >= std.math.maxInt(u32)) return error.InvalidTarget;
+    const encode_instance: u32 = @intCast(self.instances.items.len);
+    const full_output: render.Rect = .{ .x = 0, .y = 0, .width = frame.size.width, .height = frame.size.height };
+    try self.instances.append(self.allocator, imageInstance(full_output, full_output));
     const instance_bytes = std.mem.sliceAsBytes(self.instances.items);
     try self.ensureInstanceBuffer(instance_bytes.len);
     if (instance_bytes.len > 0) {
@@ -1805,7 +1913,6 @@ fn renderFrameWithCompletion(
     self.device_wrapper.resetFences(self.device, &.{self.fence}) catch
         return error.VulkanFailure;
     const reusable = output.kind != .pixels;
-    const full_output: render.Rect = .{ .x = 0, .y = 0, .width = frame.size.width, .height = frame.size.height };
     const frame_render_area = damageBounds(compiled_frame.damage, full_output) orelse full_output;
     const cache_hit = reusable and self.recordedFrameMatches(
         &output.recorded_frame,
@@ -1830,62 +1937,63 @@ fn renderFrameWithCompletion(
             );
         }
 
-        if (output.kind == .dmabuf) {
-            self.transitionExternalToRender(command_buffer, output.*);
-        } else if (!output.initialized) {
-            if (output.kind == .pixels) {
-                const pixels = switch (target) {
-                    .pixels => |value| value,
-                    else => unreachable,
-                };
-                self.transitionImage(
-                    command_buffer,
-                    output.image,
-                    .undefined,
-                    .transfer_dst_optimal,
-                    .{},
-                    .{ .transfer_write_bit = true },
-                    .{ .top_of_pipe_bit = true },
-                    .{ .transfer_bit = true },
-                );
-                const upload: vk.BufferImageCopy = .{
-                    .buffer_offset = 0,
-                    .buffer_row_length = pixels.stride_pixels,
-                    .buffer_image_height = pixels.size.height,
-                    .image_subresource = colorSubresourceLayers(),
-                    .image_offset = .{ .x = 0, .y = 0, .z = 0 },
-                    .image_extent = extent(pixels.size),
-                };
-                self.device_wrapper.cmdCopyBufferToImage(
-                    command_buffer,
-                    self.work_buffer,
-                    output.image,
-                    .transfer_dst_optimal,
-                    &.{upload},
-                );
-                self.transitionImage(
-                    command_buffer,
-                    output.image,
-                    .transfer_dst_optimal,
-                    .color_attachment_optimal,
-                    .{ .transfer_write_bit = true },
-                    .{ .color_attachment_read_bit = true, .color_attachment_write_bit = true },
-                    .{ .transfer_bit = true },
-                    .{ .color_attachment_output_bit = true },
-                );
-            } else {
-                std.debug.assert(output.kind == .offscreen);
-                self.transitionImage(
-                    command_buffer,
-                    output.image,
-                    .undefined,
-                    .color_attachment_optimal,
-                    .{},
-                    .{ .color_attachment_read_bit = true, .color_attachment_write_bit = true },
-                    .{ .top_of_pipe_bit = true },
-                    .{ .color_attachment_output_bit = true },
-                );
-            }
+        if (!output.initialized and output.kind == .pixels) {
+            const pixels = switch (target) {
+                .pixels => |value| value,
+                else => unreachable,
+            };
+            self.transitionImage(command_buffer, output.image, .undefined, .transfer_dst_optimal, .{}, .{ .transfer_write_bit = true }, .{ .top_of_pipe_bit = true }, .{ .transfer_bit = true });
+            const upload: vk.BufferImageCopy = .{
+                .buffer_offset = 0,
+                .buffer_row_length = pixels.stride_pixels,
+                .buffer_image_height = pixels.size.height,
+                .image_subresource = colorSubresourceLayers(),
+                .image_offset = .{ .x = 0, .y = 0, .z = 0 },
+                .image_extent = extent(pixels.size),
+            };
+            self.device_wrapper.cmdCopyBufferToImage(command_buffer, self.work_buffer, output.image, .transfer_dst_optimal, &.{upload});
+            self.transitionImage(command_buffer, output.image, .transfer_dst_optimal, .shader_read_only_optimal, .{ .transfer_write_bit = true }, .{ .shader_read_bit = true }, .{ .transfer_bit = true }, .{ .fragment_shader_bit = true });
+        }
+
+        self.transitionImage(
+            command_buffer,
+            output.linear.image,
+            if (output.initialized) .shader_read_only_optimal else .undefined,
+            .color_attachment_optimal,
+            if (output.initialized) .{ .shader_read_bit = true } else .{},
+            .{ .color_attachment_read_bit = true, .color_attachment_write_bit = true },
+            if (output.initialized)
+                .{ .fragment_shader_bit = true }
+            else
+                .{ .top_of_pipe_bit = true },
+            .{ .color_attachment_output_bit = true },
+        );
+
+        if (!output.initialized and output.kind == .pixels) {
+            const initialize_pass: vk.RenderPassBeginInfo = .{
+                .render_pass = self.render_pass,
+                .framebuffer = output.linear.framebuffer,
+                .render_area = rect2D(full_output),
+            };
+            self.device_wrapper.cmdBeginRenderPass(command_buffer, &initialize_pass, .@"inline");
+            self.setViewportAndScissor(command_buffer, frame.size);
+            self.device_wrapper.cmdBindVertexBuffers(command_buffer, 0, &.{self.instance_buffer}, &.{0});
+            self.device_wrapper.cmdBindPipeline(command_buffer, .graphics, self.downsample_pipeline);
+            self.device_wrapper.cmdBindDescriptorSets(command_buffer, .graphics, self.pipeline_layout, 0, &.{output.descriptor_set}, null);
+            const initialize_push: FramePush = .{
+                .target_size = sizeFloats(frame.size),
+                .texture_size = sizeFloats(frame.size),
+                .swap_red_blue = @floatFromInt(@intFromBool(self.swap_red_blue)),
+                .color_matrix_0 = .{ 1, 0, 0, 0 },
+                .color_matrix_1 = .{ 0, 1, 0, 0 },
+                .color_matrix_2 = .{ 0, 0, 1, 0 },
+                .transfer = .{ 1, 0, 80, 80 },
+                .output_transfer = .{ 1, 0, 80, 80 },
+                .transfer_aux = colorTransferAux(.{}),
+            };
+            self.device_wrapper.cmdPushConstants(command_buffer, self.pipeline_layout, .{ .vertex_bit = true, .fragment_bit = true }, 0, @sizeOf(FramePush), &initialize_push);
+            self.device_wrapper.cmdDraw(command_buffer, 4, 1, 0, encode_instance);
+            self.device_wrapper.cmdEndRenderPass(command_buffer);
         }
 
         for (self.prepared_images.items, 0..) |prepared, index| {
@@ -1944,7 +2052,7 @@ fn renderFrameWithCompletion(
 
         const render_pass_info: vk.RenderPassBeginInfo = .{
             .render_pass = self.render_pass,
-            .framebuffer = output.framebuffer,
+            .framebuffer = output.linear.framebuffer,
             .render_area = rect2D(frame_render_area),
         };
         self.device_wrapper.cmdBeginRenderPass(
@@ -1980,32 +2088,14 @@ fn renderFrameWithCompletion(
                 if (!blur_op.cache_hit) {
                     const scratch = output.blur.?;
                     self.device_wrapper.cmdEndRenderPass(command_buffer);
-                    const sample_output = output.descriptor_set != .null_handle;
-                    if (sample_output) {
-                        self.transitionImage(command_buffer, output.image, .color_attachment_optimal, .shader_read_only_optimal, .{ .color_attachment_write_bit = true }, .{ .shader_read_bit = true }, .{ .color_attachment_output_bit = true }, .{ .fragment_shader_bit = true });
-                    } else {
-                        self.transitionImage(command_buffer, output.image, .color_attachment_optimal, .transfer_src_optimal, .{ .color_attachment_write_bit = true }, .{ .transfer_read_bit = true }, .{ .color_attachment_output_bit = true }, .{ .transfer_bit = true });
-                        const level_zero = scratch.levels[0].?;
-                        const level_zero_bit: u16 = 1;
-                        self.transitionScratchForWrite(command_buffer, level_zero.a.image, blur_initialized & level_zero_bit != 0, .transfer_dst_optimal, .{ .transfer_write_bit = true }, .{ .transfer_bit = true });
-                        const offset: vk.Offset3D = .{ .x = blur_op.sample_rect.x, .y = blur_op.sample_rect.y, .z = 0 };
-                        self.device_wrapper.cmdCopyImage(command_buffer, output.image, .transfer_src_optimal, level_zero.a.image, .transfer_dst_optimal, &.{.{
-                            .src_subresource = colorSubresourceLayers(),
-                            .src_offset = offset,
-                            .dst_subresource = colorSubresourceLayers(),
-                            .dst_offset = offset,
-                            .extent = extent(.{ .width = blur_op.sample_rect.width, .height = blur_op.sample_rect.height }),
-                        }});
-                        self.transitionScratchToRead(command_buffer, level_zero.a.image, .transfer_dst_optimal, .{ .transfer_write_bit = true }, .{ .transfer_bit = true });
-                        blur_initialized |= level_zero_bit;
-                    }
+                    self.transitionImage(command_buffer, output.linear.image, .color_attachment_optimal, .shader_read_only_optimal, .{ .color_attachment_write_bit = true }, .{ .shader_read_bit = true }, .{ .color_attachment_output_bit = true }, .{ .fragment_shader_bit = true });
 
                     for (0..blur_op.level) |index| {
                         const destination_level = scratch.levels[index + 1].?;
                         const destination_bit: u16 = @as(u16, 1) << @intCast((index + 1) * 2);
                         self.transitionScratchForWrite(command_buffer, destination_level.a.image, blur_initialized & destination_bit != 0, .color_attachment_optimal, .{ .color_attachment_write_bit = true }, .{ .color_attachment_output_bit = true });
                         const source_descriptor = if (index == 0)
-                            if (sample_output) output.descriptor_set else scratch.levels[0].?.a.descriptor_set
+                            output.linear.descriptor_set
                         else
                             scratch.levels[index].?.a.descriptor_set;
                         const source_size = if (index == 0)
@@ -2019,7 +2109,7 @@ fn renderFrameWithCompletion(
 
                     const final_level = scratch.levels[blur_op.level].?;
                     const blur_source_descriptor = if (blur_op.level == 0)
-                        if (sample_output) output.descriptor_set else scratch.levels[0].?.a.descriptor_set
+                        output.linear.descriptor_set
                     else
                         final_level.a.descriptor_set;
                     const b_bit: u16 = @as(u16, 1) << @intCast(@as(usize, blur_op.level) * 2 + 1);
@@ -2064,11 +2154,7 @@ fn renderFrameWithCompletion(
                         self.transitionScratchToRead(command_buffer, destination_image, .color_attachment_optimal, .{ .color_attachment_write_bit = true }, .{ .color_attachment_output_bit = true });
                         if (destination_index != 1) blur_initialized |= destination_bit;
                     }
-                    if (sample_output) {
-                        self.transitionImage(command_buffer, output.image, .shader_read_only_optimal, .color_attachment_optimal, .{ .shader_read_bit = true }, .{ .color_attachment_read_bit = true, .color_attachment_write_bit = true }, .{ .fragment_shader_bit = true }, .{ .color_attachment_output_bit = true });
-                    } else {
-                        self.transitionImage(command_buffer, output.image, .transfer_src_optimal, .color_attachment_optimal, .{ .transfer_read_bit = true }, .{ .color_attachment_read_bit = true, .color_attachment_write_bit = true }, .{ .transfer_bit = true }, .{ .color_attachment_output_bit = true });
-                    }
+                    self.transitionImage(command_buffer, output.linear.image, .shader_read_only_optimal, .color_attachment_optimal, .{ .shader_read_bit = true }, .{ .color_attachment_read_bit = true, .color_attachment_write_bit = true }, .{ .fragment_shader_bit = true }, .{ .color_attachment_output_bit = true });
                     self.device_wrapper.cmdBeginRenderPass(command_buffer, &render_pass_info, .@"inline");
                     self.setViewportAndScissor(command_buffer, frame.size);
                     bound_pipeline = null;
@@ -2109,6 +2195,12 @@ fn renderFrameWithCompletion(
                     0
                 else
                     @floatFromInt(@intFromBool(self.swap_red_blue)),
+                .color_matrix_0 = run.color_transform.color_matrix_0,
+                .color_matrix_1 = run.color_transform.color_matrix_1,
+                .color_matrix_2 = run.color_transform.color_matrix_2,
+                .transfer = run.color_transform.transfer,
+                .output_transfer = run.color_transform.output_transfer,
+                .transfer_aux = run.color_transform.transfer_aux,
             };
             self.device_wrapper.cmdPushConstants(
                 command_buffer,
@@ -2126,6 +2218,41 @@ fn renderFrameWithCompletion(
                 run.first_instance,
             );
         }
+        self.device_wrapper.cmdEndRenderPass(command_buffer);
+
+        self.transitionImage(command_buffer, output.linear.image, .color_attachment_optimal, .shader_read_only_optimal, .{ .color_attachment_write_bit = true }, .{ .shader_read_bit = true }, .{ .color_attachment_output_bit = true }, .{ .fragment_shader_bit = true });
+        if (output.kind == .dmabuf) {
+            self.transitionExternalToRender(command_buffer, output.*);
+        } else if (!output.initialized) {
+            if (output.kind == .pixels) {
+                self.transitionImage(command_buffer, output.image, .shader_read_only_optimal, .color_attachment_optimal, .{ .shader_read_bit = true }, .{ .color_attachment_write_bit = true }, .{ .fragment_shader_bit = true }, .{ .color_attachment_output_bit = true });
+            } else {
+                self.transitionImage(command_buffer, output.image, .undefined, .color_attachment_optimal, .{}, .{ .color_attachment_write_bit = true }, .{ .top_of_pipe_bit = true }, .{ .color_attachment_output_bit = true });
+            }
+        }
+        const output_pass_info: vk.RenderPassBeginInfo = .{
+            .render_pass = self.output_render_pass,
+            .framebuffer = output.framebuffer,
+            .render_area = rect2D(frame_render_area),
+        };
+        self.device_wrapper.cmdBeginRenderPass(command_buffer, &output_pass_info, .@"inline");
+        self.setViewportAndScissor(command_buffer, frame.size);
+        self.device_wrapper.cmdSetScissor(command_buffer, 0, &.{rect2D(frame_render_area)});
+        self.device_wrapper.cmdBindPipeline(command_buffer, .graphics, self.encode_pipeline);
+        self.device_wrapper.cmdBindDescriptorSets(command_buffer, .graphics, self.pipeline_layout, 0, &.{output.linear.descriptor_set}, null);
+        const output_push: FramePush = .{
+            .target_size = sizeFloats(frame.size),
+            .texture_size = sizeFloats(frame.size),
+            .swap_red_blue = @floatFromInt(@intFromBool(self.swap_red_blue)),
+            .color_matrix_0 = .{ 1, 0, 0, 0 },
+            .color_matrix_1 = .{ 0, 1, 0, 0 },
+            .color_matrix_2 = .{ 0, 0, 1, 0 },
+            .transfer = .{ 1, 80, 80, 0 },
+            .output_transfer = outputColorTransfer(frame.output_color_description),
+            .transfer_aux = colorTransferAux(frame.output_color_description),
+        };
+        self.device_wrapper.cmdPushConstants(command_buffer, self.pipeline_layout, .{ .vertex_bit = true, .fragment_bit = true }, 0, @sizeOf(FramePush), &output_push);
+        self.device_wrapper.cmdDraw(command_buffer, 4, 1, 0, encode_instance);
         self.device_wrapper.cmdEndRenderPass(command_buffer);
 
         for (self.prepared_images.items, 0..) |prepared, index| {
@@ -2148,7 +2275,7 @@ fn renderFrameWithCompletion(
         );
         if (output.kind == .pixels) self.copyOutputDamage(
             command_buffer,
-            frame,
+            compiled_frame,
             target.pixels,
             output.image,
         );
@@ -2313,7 +2440,7 @@ fn renderFrameWithCompletion(
 
     try self.drainPending();
     frame_succeeded = true;
-    if (output.kind == .pixels) copyDamageToTarget(frame, target.pixels, self.work_mapped.?);
+    if (output.kind == .pixels) copyDamageToTarget(compiled_frame, target.pixels, self.work_mapped.?);
     return null;
 }
 
@@ -2589,13 +2716,16 @@ fn createOutput(self: *Self, size: render.Size) Error!Output {
     errdefer self.destroyImageDescriptor(descriptor_set);
     const attachments = [_]vk.ImageView{allocation.view};
     const framebuffer = self.device_wrapper.createFramebuffer(self.device, &.{
-        .render_pass = self.render_pass,
+        .render_pass = self.output_render_pass,
         .attachment_count = 1,
         .p_attachments = &attachments,
         .width = size.width,
         .height = size.height,
         .layers = 1,
     }, null) catch return error.VulkanFailure;
+    errdefer self.device_wrapper.destroyFramebuffer(self.device, framebuffer, null);
+    const linear = try self.createWorkingTarget(size);
+    errdefer self.destroyWorkingTarget(linear);
     return .{
         .image = allocation.image,
         .memory = allocation.memory,
@@ -2604,6 +2734,7 @@ fn createOutput(self: *Self, size: render.Size) Error!Output {
         .framebuffer = framebuffer,
         .size = size,
         .last_used = self.frame_number,
+        .linear = linear,
     };
 }
 
@@ -2649,6 +2780,7 @@ fn destroyOutput(self: *Self, value: Output) void {
     }
     self.device_wrapper.destroyFramebuffer(self.device, output.framebuffer, null);
     if (output.descriptor_set != .null_handle) self.destroyImageDescriptor(output.descriptor_set);
+    self.destroyWorkingTarget(output.linear);
     self.destroyImageAllocation(.{
         .image = output.image,
         .memory = output.memory,
@@ -2657,7 +2789,7 @@ fn destroyOutput(self: *Self, value: Output) void {
 }
 
 fn createBlurImage(self: *Self, size: render.Size, usage: vk.ImageUsageFlags) Error!BlurImage {
-    const allocation = try self.createImage(size, usage);
+    const allocation = try self.createWorkingImage(size, usage);
     errdefer self.destroyImageAllocation(allocation);
     const descriptor_set = try self.createImageDescriptor(allocation.view);
     return .{ .image = allocation.image, .memory = allocation.memory, .view = allocation.view, .descriptor_set = descriptor_set };
@@ -2692,7 +2824,7 @@ fn ensureBlurLevel(self: *Self, scratch: *BlurScratch, output_size: render.Size,
     std.debug.assert(index < blur_level_count);
     if (scratch.levels[index] != null) return;
     const level_size = blurLevelSize(output_size, @intCast(index));
-    const a = try self.createBlurImage(level_size, .{ .color_attachment_bit = true, .sampled_bit = true, .transfer_dst_bit = true });
+    const a = try self.createBlurImage(level_size, .{ .color_attachment_bit = true, .sampled_bit = true });
     errdefer self.destroyBlurImage(a);
     const b = try self.createBlurImage(level_size, .{ .color_attachment_bit = true, .sampled_bit = true });
     errdefer self.destroyBlurImage(b);
@@ -2733,7 +2865,7 @@ fn prepareBackdropCaches(
         if (blur_op.cache_hit) continue;
 
         if (output.blur == null) output.blur = .{};
-        if (output.descriptor_set == .null_handle or blur_op.level == 0) {
+        if (blur_op.level == 0) {
             try self.ensureBlurLevel(&output.blur.?, output.size, 0);
         }
         for (1..@as(usize, blur_op.level) + 1) |level| {
@@ -2843,9 +2975,26 @@ fn createImage(
     size: render.Size,
     usage: vk.ImageUsageFlags,
 ) Error!ImageAllocation {
+    return self.createImageForFormat(size, usage, self.format);
+}
+
+fn createWorkingImage(
+    self: *Self,
+    size: render.Size,
+    usage: vk.ImageUsageFlags,
+) Error!ImageAllocation {
+    return self.createImageForFormat(size, usage, working_format);
+}
+
+fn createImageForFormat(
+    self: *Self,
+    size: render.Size,
+    usage: vk.ImageUsageFlags,
+    format: vk.Format,
+) Error!ImageAllocation {
     const image = self.device_wrapper.createImage(self.device, &.{
         .image_type = .@"2d",
-        .format = self.format,
+        .format = format,
         .extent = extent(size),
         .mip_levels = 1,
         .array_layers = 1,
@@ -2872,11 +3021,46 @@ fn createImage(
     const view = self.device_wrapper.createImageView(self.device, &.{
         .image = image,
         .view_type = .@"2d",
-        .format = self.format,
+        .format = format,
         .components = .{ .r = .identity, .g = .identity, .b = .identity, .a = .identity },
         .subresource_range = colorSubresourceRange(),
     }, null) catch return error.VulkanFailure;
     return .{ .image = image, .memory = memory, .view = view };
+}
+
+fn createWorkingTarget(self: *Self, size: render.Size) Error!WorkingImage {
+    const allocation = try self.createWorkingImage(size, .{
+        .color_attachment_bit = true,
+        .sampled_bit = true,
+    });
+    errdefer self.destroyImageAllocation(allocation);
+    const descriptor_set = try self.createImageDescriptor(allocation.view);
+    errdefer self.destroyImageDescriptor(descriptor_set);
+    const framebuffer = self.device_wrapper.createFramebuffer(self.device, &.{
+        .render_pass = self.render_pass,
+        .attachment_count = 1,
+        .p_attachments = @ptrCast(&allocation.view),
+        .width = size.width,
+        .height = size.height,
+        .layers = 1,
+    }, null) catch return error.VulkanFailure;
+    return .{
+        .image = allocation.image,
+        .memory = allocation.memory,
+        .view = allocation.view,
+        .descriptor_set = descriptor_set,
+        .framebuffer = framebuffer,
+    };
+}
+
+fn destroyWorkingTarget(self: *Self, target: WorkingImage) void {
+    self.device_wrapper.destroyFramebuffer(self.device, target.framebuffer, null);
+    self.destroyImageDescriptor(target.descriptor_set);
+    self.destroyImageAllocation(.{
+        .image = target.image,
+        .memory = target.memory,
+        .view = target.view,
+    });
 }
 
 fn destroyImageAllocation(self: *Self, allocation: ImageAllocation) void {
@@ -3611,6 +3795,7 @@ fn hashRenderCommand(hasher: *std.hash.Wyhash, command: render.Command) bool {
             hashSize(hasher, image.size);
             hashSize(hasher, image.buffer.size);
             hashScalar(hasher, image.buffer.stride_pixels);
+            hashColorDescription(hasher, image.buffer.color_description);
             hashScalar(hasher, source_cache.id);
             hashScalar(hasher, source_cache.version);
             hashOptionalSourceRect(hasher, image.source);
@@ -3657,6 +3842,46 @@ fn hashColor(hasher: *std.hash.Wyhash, color: render.Color) void {
     hashScalar(hasher, color.green);
     hashScalar(hasher, color.blue);
     hashScalar(hasher, color.alpha);
+}
+
+fn hashColorDescription(hasher: *std.hash.Wyhash, description: render.ColorDescription) void {
+    hashChromaticities(hasher, description.primaries);
+    hashOptionalScalar(hasher, description.named_primaries);
+    switch (description.transfer_function) {
+        .bt1886 => hashScalar(hasher, @as(u8, 0)),
+        .gamma22 => hashScalar(hasher, @as(u8, 1)),
+        .srgb => hashScalar(hasher, @as(u8, 2)),
+        .st2084_pq => hashScalar(hasher, @as(u8, 3)),
+        .hlg => hashScalar(hasher, @as(u8, 4)),
+        .power => |exponent| {
+            hashScalar(hasher, @as(u8, 5));
+            hashScalar(hasher, exponent);
+        },
+    }
+    hashScalar(hasher, description.min_luminance);
+    hashScalar(hasher, description.max_luminance);
+    hashScalar(hasher, description.reference_luminance);
+    hashOptionalChromaticities(hasher, description.mastering_primaries);
+    hashOptionalScalar(hasher, description.mastering_min_luminance);
+    hashOptionalScalar(hasher, description.mastering_max_luminance);
+    hashOptionalScalar(hasher, description.max_cll);
+    hashOptionalScalar(hasher, description.max_fall);
+}
+
+fn hashChromaticities(hasher: *std.hash.Wyhash, chromaticities: render.Chromaticities) void {
+    for (chromaticities.values()) |value| hashScalar(hasher, value);
+}
+
+fn hashOptionalChromaticities(
+    hasher: *std.hash.Wyhash,
+    chromaticities: ?render.Chromaticities,
+) void {
+    if (chromaticities) |present| {
+        hashScalar(hasher, @as(u8, 1));
+        hashChromaticities(hasher, present);
+    } else {
+        hashScalar(hasher, @as(u8, 0));
+    }
 }
 
 fn hashOptionalScalar(hasher: *std.hash.Wyhash, value: anytype) void {
@@ -3802,6 +4027,7 @@ fn compileDrawRuns(
     self: *Self,
     frame: render.Frame,
     prepared_images: []const PreparedImage,
+    output_color_description: render.ColorDescription,
 ) Error!void {
     var prepared_index: usize = 0;
     var base_backdrop: ?BaseBackdropCache = null;
@@ -3813,11 +4039,11 @@ fn compileDrawRuns(
                 .width = frame.size.width,
                 .height = frame.size.height,
             };
-            try self.emitDamaged(frame, rect, .replace, null, .{ .width = 1, .height = 1 }, .{
+            try self.emitDamaged(frame, rect, .replace, null, .{ .width = 1, .height = 1 }, .{}, .{
                 .destination = rectFloats(rect),
                 .source = .{ 0, 0, 1, 1 },
                 .clip = undefined,
-                .color = colorFloats(color),
+                .color = colorFloats(color, output_color_description),
                 .rounded = .{ 0, 0, 0, 0 },
                 .parameters = .{ 0, 0, 0, 0 },
             });
@@ -3825,11 +4051,11 @@ fn compileDrawRuns(
         .solid_rect => |solid| {
             var clipped = solid.rect.clipTo(frame.size) orelse continue;
             if (solid.clip) |clip| clipped = clipped.intersection(clip) orelse continue;
-            try self.emitDamaged(frame, clipped, .blend, null, .{ .width = 1, .height = 1 }, .{
+            try self.emitDamaged(frame, clipped, .blend, null, .{ .width = 1, .height = 1 }, .{}, .{
                 .destination = rectFloats(clipped),
                 .source = .{ 0, 0, 1, 1 },
                 .clip = undefined,
-                .color = colorFloats(solid.color),
+                .color = colorFloats(solid.color, output_color_description),
                 .rounded = .{ 0, 0, 0, 0 },
                 .parameters = .{ 0, 0, 0, 0 },
             });
@@ -3867,6 +4093,10 @@ fn compileDrawRuns(
                 .image,
                 prepared.texture.descriptor_set,
                 image.buffer.size,
+                sourceColorTransform(
+                    image.buffer.color_description,
+                    output_color_description,
+                ),
                 .{
                     .destination = rectFloats(destination),
                     .source = .{
@@ -3922,11 +4152,11 @@ fn compileDrawRuns(
                 cutout.radius,
                 @min(cutout.rect.width, cutout.rect.height) / 2,
             );
-            try self.emitDamaged(frame, clipped, .shadow, null, .{ .width = 1, .height = 1 }, .{
+            try self.emitDamaged(frame, clipped, .shadow, null, .{ .width = 1, .height = 1 }, .{}, .{
                 .destination = rectFloats(cutout.rect),
                 .source = .{ 0, 0, 1, 1 },
                 .clip = undefined,
-                .color = colorFloats(shadow.color),
+                .color = colorFloats(shadow.color, output_color_description),
                 .rounded = .{
                     @floatFromInt(shape_x),
                     @floatFromInt(shape_y),
@@ -4090,16 +4320,17 @@ fn emitDamaged(
     pipeline_kind: PipelineKind,
     descriptor_set: ?vk.DescriptorSet,
     texture_size: render.Size,
+    color_transform: ColorTransform,
     instance: Instance,
 ) Error!void {
     if (frame.damage) |damage| {
         for (damage) |damaged| {
             const clipped_damage = damaged.clipTo(frame.size) orelse continue;
             const clipped = visible_rect.intersection(clipped_damage) orelse continue;
-            try self.emitInstance(pipeline_kind, descriptor_set, texture_size, instance, clipped);
+            try self.emitInstance(pipeline_kind, descriptor_set, texture_size, color_transform, instance, clipped);
         }
     } else {
-        try self.emitInstance(pipeline_kind, descriptor_set, texture_size, instance, visible_rect);
+        try self.emitInstance(pipeline_kind, descriptor_set, texture_size, color_transform, instance, visible_rect);
     }
 }
 
@@ -4139,6 +4370,7 @@ fn emitInstance(
     pipeline_kind: PipelineKind,
     descriptor_set: ?vk.DescriptorSet,
     texture_size: render.Size,
+    color_transform: ColorTransform,
     template: Instance,
     clip: render.Rect,
 ) Error!void {
@@ -4151,7 +4383,8 @@ fn emitInstance(
     if (self.draw_runs.items.len > 0) {
         const last = &self.draw_runs.items[self.draw_runs.items.len - 1];
         if (last.pipeline == pipeline_kind and last.descriptor_set == descriptor_set and
-            std.meta.eql(last.texture_size, texture_size))
+            std.meta.eql(last.texture_size, texture_size) and
+            std.meta.eql(last.color_transform, color_transform))
         {
             last.instance_count = std.math.add(u32, last.instance_count, 1) catch
                 return error.InvalidTarget;
@@ -4164,6 +4397,7 @@ fn emitInstance(
         .texture_size = texture_size,
         .first_instance = instance_index,
         .instance_count = 1,
+        .color_transform = color_transform,
     });
 }
 
@@ -4286,13 +4520,179 @@ fn transitionScratchToRead(self: *Self, command_buffer: vk.CommandBuffer, image:
     self.transitionImage(command_buffer, image, old_layout, .shader_read_only_optimal, source_access, .{ .shader_read_bit = true }, source_stage, .{ .fragment_shader_bit = true });
 }
 
-fn colorFloats(color: render.Color) [4]f32 {
-    const inverse: f32 = 1.0 / 255.0;
+const Matrix3 = [3][3]f64;
+
+fn sourceColorTransform(
+    description: render.ColorDescription,
+    output_description: render.ColorDescription,
+) ColorTransform {
+    const matrix = colorConversionMatrix(
+        description.primaries,
+        output_description.primaries,
+    ) orelse identityMatrix3();
+    const target_peak = description.max_cll orelse description.targetMaxLuminance();
+    const transfer: [4]f32 = switch (description.transfer_function) {
+        .gamma22 => .{ 1, 0, @floatFromInt(description.reference_luminance), @floatFromInt(description.max_luminance) },
+        .srgb => .{ 2, 0, @floatFromInt(description.reference_luminance), @floatFromInt(description.max_luminance) },
+        .bt1886 => .{ 3, @as(f32, @floatFromInt(description.min_luminance)) / 10000.0, @floatFromInt(description.reference_luminance), @floatFromInt(description.max_luminance) },
+        .power => |exponent| .{ 4, @as(f32, @floatFromInt(exponent)) / 10000.0, @floatFromInt(description.reference_luminance), @floatFromInt(description.max_luminance) },
+        .st2084_pq => .{ 5, @floatFromInt(description.max_luminance), @floatFromInt(description.reference_luminance), @floatFromInt(target_peak) },
+        .hlg => .{ 6, @floatFromInt(description.max_luminance), @floatFromInt(description.reference_luminance), @floatFromInt(target_peak) },
+    };
     return .{
-        @as(f32, @floatFromInt(color.red)) * inverse,
-        @as(f32, @floatFromInt(color.green)) * inverse,
-        @as(f32, @floatFromInt(color.blue)) * inverse,
-        @as(f32, @floatFromInt(color.alpha)) * inverse,
+        .color_matrix_0 = .{ @floatCast(matrix[0][0]), @floatCast(matrix[0][1]), @floatCast(matrix[0][2]), 0 },
+        .color_matrix_1 = .{ @floatCast(matrix[1][0]), @floatCast(matrix[1][1]), @floatCast(matrix[1][2]), 0 },
+        .color_matrix_2 = .{ @floatCast(matrix[2][0]), @floatCast(matrix[2][1]), @floatCast(matrix[2][2]), 0 },
+        .transfer = transfer,
+        .output_transfer = outputColorTransfer(output_description),
+        .transfer_aux = colorTransferAux(description),
+    };
+}
+
+fn outputColorTransfer(description: render.ColorDescription) [4]f32 {
+    return switch (description.transfer_function) {
+        .gamma22 => .{ 1, 0, @floatFromInt(description.reference_luminance), @floatFromInt(description.max_luminance) },
+        .srgb => .{ 2, 0, @floatFromInt(description.reference_luminance), @floatFromInt(description.max_luminance) },
+        .bt1886 => .{ 3, @as(f32, @floatFromInt(description.min_luminance)) / 10000.0, @floatFromInt(description.reference_luminance), @floatFromInt(description.max_luminance) },
+        .power => |exponent| .{ 4, @as(f32, @floatFromInt(exponent)) / 10000.0, @floatFromInt(description.reference_luminance), @floatFromInt(description.max_luminance) },
+        .st2084_pq => .{ 5, @floatFromInt(description.max_luminance), @floatFromInt(description.reference_luminance), @floatFromInt(description.max_luminance) },
+        .hlg => .{ 6, @floatFromInt(description.max_luminance), @floatFromInt(description.reference_luminance), @floatFromInt(description.max_luminance) },
+    };
+}
+
+fn colorTransferAux(description: render.ColorDescription) [4]f32 {
+    const matrix = rgbToXyz(description.primaries) orelse
+        rgbToXyz(render.srgb_chromaticities).?;
+    return .{
+        @as(f32, @floatFromInt(description.min_luminance)) / 10000.0,
+        @floatCast(matrix[1][0]),
+        @floatCast(matrix[1][1]),
+        @floatCast(matrix[1][2]),
+    };
+}
+
+fn colorConversionMatrix(source: render.Chromaticities, destination: render.Chromaticities) ?Matrix3 {
+    const source_rgb = rgbToXyz(source) orelse return null;
+    const destination_rgb = rgbToXyz(destination) orelse return null;
+    const destination_inverse = inverseMatrix3(destination_rgb) orelse return null;
+    const adaptation = chromaticAdaptation(source, destination) orelse return null;
+    return multiplyMatrix3(destination_inverse, multiplyMatrix3(adaptation, source_rgb));
+}
+
+fn rgbToXyz(chromaticities: render.Chromaticities) ?Matrix3 {
+    const values = chromaticities.values();
+    const red = xyToXyz(values[0], values[1]) orelse return null;
+    const green = xyToXyz(values[2], values[3]) orelse return null;
+    const blue = xyToXyz(values[4], values[5]) orelse return null;
+    const white = xyToXyz(values[6], values[7]) orelse return null;
+    const primaries: Matrix3 = .{
+        .{ red[0], green[0], blue[0] },
+        .{ red[1], green[1], blue[1] },
+        .{ red[2], green[2], blue[2] },
+    };
+    const inverse = inverseMatrix3(primaries) orelse return null;
+    const scale = multiplyMatrixVector(inverse, white);
+    return .{
+        .{ primaries[0][0] * scale[0], primaries[0][1] * scale[1], primaries[0][2] * scale[2] },
+        .{ primaries[1][0] * scale[0], primaries[1][1] * scale[1], primaries[1][2] * scale[2] },
+        .{ primaries[2][0] * scale[0], primaries[2][1] * scale[1], primaries[2][2] * scale[2] },
+    };
+}
+
+fn chromaticAdaptation(source: render.Chromaticities, destination: render.Chromaticities) ?Matrix3 {
+    const source_values = source.values();
+    const destination_values = destination.values();
+    const source_white = xyToXyz(source_values[6], source_values[7]) orelse return null;
+    const destination_white = xyToXyz(destination_values[6], destination_values[7]) orelse return null;
+    const bradford: Matrix3 = .{
+        .{ 0.8951, 0.2664, -0.1614 },
+        .{ -0.7502, 1.7135, 0.0367 },
+        .{ 0.0389, -0.0685, 1.0296 },
+    };
+    const bradford_inverse: Matrix3 = .{
+        .{ 0.9869929, -0.1470543, 0.1599627 },
+        .{ 0.4323053, 0.5183603, 0.0492912 },
+        .{ -0.0085287, 0.0400428, 0.9684867 },
+    };
+    const source_cone = multiplyMatrixVector(bradford, source_white);
+    const destination_cone = multiplyMatrixVector(bradford, destination_white);
+    if (@abs(source_cone[0]) < 1e-12 or @abs(source_cone[1]) < 1e-12 or @abs(source_cone[2]) < 1e-12) return null;
+    const scale: Matrix3 = .{
+        .{ destination_cone[0] / source_cone[0], 0, 0 },
+        .{ 0, destination_cone[1] / source_cone[1], 0 },
+        .{ 0, 0, destination_cone[2] / source_cone[2] },
+    };
+    return multiplyMatrix3(bradford_inverse, multiplyMatrix3(scale, bradford));
+}
+
+fn xyToXyz(x_fixed: i32, y_fixed: i32) ?[3]f64 {
+    const x = @as(f64, @floatFromInt(x_fixed)) / 1_000_000.0;
+    const y = @as(f64, @floatFromInt(y_fixed)) / 1_000_000.0;
+    if (!std.math.isFinite(x) or !std.math.isFinite(y) or y <= 0) return null;
+    return .{ x / y, 1, (1 - x - y) / y };
+}
+
+fn identityMatrix3() Matrix3 {
+    return .{ .{ 1, 0, 0 }, .{ 0, 1, 0 }, .{ 0, 0, 1 } };
+}
+
+fn multiplyMatrix3(a: Matrix3, b: Matrix3) Matrix3 {
+    var result: Matrix3 = @splat(@splat(0));
+    for (0..3) |row| for (0..3) |column| for (0..3) |index| {
+        result[row][column] += a[row][index] * b[index][column];
+    };
+    return result;
+}
+
+fn multiplyMatrixVector(matrix: Matrix3, vector: [3]f64) [3]f64 {
+    var result: [3]f64 = @splat(0);
+    for (0..3) |row| {
+        for (0..3) |column| result[row] += matrix[row][column] * vector[column];
+    }
+    return result;
+}
+
+fn inverseMatrix3(matrix: Matrix3) ?Matrix3 {
+    const determinant = matrix[0][0] * (matrix[1][1] * matrix[2][2] - matrix[1][2] * matrix[2][1]) -
+        matrix[0][1] * (matrix[1][0] * matrix[2][2] - matrix[1][2] * matrix[2][0]) +
+        matrix[0][2] * (matrix[1][0] * matrix[2][1] - matrix[1][1] * matrix[2][0]);
+    if (!std.math.isFinite(determinant) or @abs(determinant) < 1e-12) return null;
+    const inverse = 1.0 / determinant;
+    return .{
+        .{ (matrix[1][1] * matrix[2][2] - matrix[1][2] * matrix[2][1]) * inverse, (matrix[0][2] * matrix[2][1] - matrix[0][1] * matrix[2][2]) * inverse, (matrix[0][1] * matrix[1][2] - matrix[0][2] * matrix[1][1]) * inverse },
+        .{ (matrix[1][2] * matrix[2][0] - matrix[1][0] * matrix[2][2]) * inverse, (matrix[0][0] * matrix[2][2] - matrix[0][2] * matrix[2][0]) * inverse, (matrix[0][2] * matrix[1][0] - matrix[0][0] * matrix[1][2]) * inverse },
+        .{ (matrix[1][0] * matrix[2][1] - matrix[1][1] * matrix[2][0]) * inverse, (matrix[0][1] * matrix[2][0] - matrix[0][0] * matrix[2][1]) * inverse, (matrix[0][0] * matrix[1][1] - matrix[0][1] * matrix[1][0]) * inverse },
+    };
+}
+
+fn colorFloats(
+    color: render.Color,
+    output_description: render.ColorDescription,
+) [4]f32 {
+    const inverse: f32 = 1.0 / 255.0;
+    const alpha = @as(f32, @floatFromInt(color.alpha)) * inverse;
+    if (alpha == 0) return .{ 0, 0, 0, 0 };
+    const red = @as(f32, @floatFromInt(color.red)) * inverse / alpha;
+    const green = @as(f32, @floatFromInt(color.green)) * inverse / alpha;
+    const blue = @as(f32, @floatFromInt(color.blue)) * inverse / alpha;
+    const sdr: render.ColorDescription = .{};
+    const sdr_black = @as(f32, @floatFromInt(sdr.min_luminance)) / 10000.0;
+    const sdr_white: f32 = @floatFromInt(sdr.max_luminance);
+    const linear: [3]f64 = .{
+        ((sdr_white - sdr_black) * std.math.pow(f32, @max(red, 0), 2.2) + sdr_black) / sdr_white,
+        ((sdr_white - sdr_black) * std.math.pow(f32, @max(green, 0), 2.2) + sdr_black) / sdr_white,
+        ((sdr_white - sdr_black) * std.math.pow(f32, @max(blue, 0), 2.2) + sdr_black) / sdr_white,
+    };
+    const matrix = colorConversionMatrix(
+        render.srgb_chromaticities,
+        output_description.primaries,
+    ) orelse identityMatrix3();
+    const converted = multiplyMatrixVector(matrix, linear);
+    return .{
+        @floatCast(converted[0] * alpha),
+        @floatCast(converted[1] * alpha),
+        @floatCast(converted[2] * alpha),
+        alpha,
     };
 }
 
@@ -4568,6 +4968,7 @@ fn transitionRenderToExternal(
         .framebuffer = .null_handle,
         .size = .{ .width = 0, .height = 0 },
         .last_used = 0,
+        .linear = undefined,
     };
     self.transitionExternal(
         command_buffer,
@@ -4596,6 +4997,7 @@ fn transitionExternalSourceToSample(
         .framebuffer = .null_handle,
         .size = .{ .width = 0, .height = 0 },
         .last_used = 0,
+        .linear = undefined,
     };
     self.transitionExternal(
         command_buffer,
@@ -4624,6 +5026,7 @@ fn transitionSampleToExternal(
         .framebuffer = .null_handle,
         .size = .{ .width = 0, .height = 0 },
         .last_used = 0,
+        .linear = undefined,
     };
     self.transitionExternal(
         command_buffer,
@@ -4856,6 +5259,10 @@ test "backdrop cache keys ignore owner changes and track lower content" {
     try std.testing.expect(original != backdropCacheKey(commands[0..3]).?);
     commands[1].image.buffer.source_cache.?.version = 1;
 
+    commands[1].image.buffer.color_description.transfer_function = .st2084_pq;
+    try std.testing.expect(original != backdropCacheKey(commands[0..3]).?);
+    commands[1].image.buffer.color_description = .{};
+
     commands[2].backdrop_blur.radius = 9;
     try std.testing.expect(original != backdropCacheKey(commands[0..3]).?);
     commands[1].image.buffer.source_cache = null;
@@ -4894,7 +5301,7 @@ test "base backdrop cache is shared only across untouched regions" {
         .size = .{ .width = 64, .height = 32 },
         .commands = &commands,
     };
-    try renderer.compileDrawRuns(frame, &.{});
+    try renderer.compileDrawRuns(frame, &.{}, .{});
     try std.testing.expectEqual(@as(usize, 2), renderer.blur_ops.items.len);
     try std.testing.expectEqual(@as(?u32, 0), renderer.blur_ops.items[1].reuse_op_index);
 
@@ -4903,7 +5310,7 @@ test "base backdrop cache is shared only across untouched regions" {
     renderer.blur_ops.clearRetainingCapacity();
     const unrelated_damage = [_]render.Rect{.{ .x = 0, .y = 0, .width = 4, .height = 4 }};
     frame.damage = &unrelated_damage;
-    try renderer.compileDrawRuns(frame, &.{});
+    try renderer.compileDrawRuns(frame, &.{}, .{});
     try std.testing.expectEqual(@as(usize, 0), renderer.blur_ops.items.len);
 
     renderer.instances.clearRetainingCapacity();
@@ -4911,7 +5318,7 @@ test "base backdrop cache is shared only across untouched regions" {
     renderer.blur_ops.clearRetainingCapacity();
     frame.damage = null;
     commands[2].solid_rect.rect.x = 40;
-    try renderer.compileDrawRuns(frame, &.{});
+    try renderer.compileDrawRuns(frame, &.{}, .{});
     try std.testing.expectEqual(@as(usize, 1), renderer.blur_ops.items.len);
     try std.testing.expectEqual(@as(?u32, null), renderer.blur_ops.items[0].reuse_op_index);
 }
@@ -5073,7 +5480,8 @@ test "Vulkan renderer applies ordered backdrop blurs on GPU" {
 
     try std.testing.expectEqual(@as(u32, 0xff000000), pixels[1]);
     const blurred = pixels[2] & 0xff;
-    try std.testing.expect(blurred >= 27 and blurred <= 29);
+    // The blur is composited in linear light and encoded only at output.
+    try std.testing.expect(blurred >= 92 and blurred <= 95);
     try std.testing.expectEqual(@as(u32, 0xff000000), pixels[3]);
 }
 
@@ -5223,6 +5631,41 @@ test "Vulkan transfer commands preserve pixels outside frame damage" {
     );
 }
 
+test "Vulkan output color changes redraw retained pixels outside frame damage" {
+    var renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
+        error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+
+    const size: render.Size = .{ .width = 2, .height = 1 };
+    var pixels = [_]u32{0} ** 2;
+    const target: render.PixelBuffer = .{
+        .size = size,
+        .stride_pixels = size.width,
+        .pixels = &pixels,
+    };
+    const commands = [_]render.Command{.{ .clear = render.Color.rgba(255, 0, 0, 255) }};
+    try renderer.renderFrame(.{
+        .size = size,
+        .commands = &commands,
+    }, .{ .pixels = target });
+    try std.testing.expectEqualSlices(u32, &.{ 0xffff0000, 0xffff0000 }, &pixels);
+
+    try renderer.renderFrame(.{
+        .size = size,
+        .commands = &commands,
+        .damage = &.{.{ .x = 0, .y = 0, .width = 1, .height = 1 }},
+        .output_color_description = .{
+            .primaries = render.display_p3_chromaticities,
+            .named_primaries = .display_p3,
+        },
+    }, .{ .pixels = target });
+
+    try std.testing.expect(pixels[0] != 0xffff0000);
+    try expectArgbNear(pixels[0], pixels[1], 1);
+}
+
 test "Vulkan renderer composites image commands" {
     var renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
         error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
@@ -5244,7 +5687,60 @@ test "Vulkan renderer composites image commands" {
         .pixels = &target_pixels,
     } });
 
-    try std.testing.expectEqual(source_pixels[0], target_pixels[0]);
+    try expectArgbNear(source_pixels[0], target_pixels[0], 1);
+}
+
+test "Vulkan HDR tone mapping preserves reference white" {
+    var renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
+        error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+
+    const source_size: render.Size = .{ .width = 1, .height = 1 };
+    var pq_reference_white = [_]u32{0xff949494};
+    var sdr_reference_white = [_]u32{0xffffffff};
+    var target_pixels = [_]u32{0} ** 2;
+    const commands = [_]render.Command{
+        .{ .image = .{
+            .x = 0,
+            .y = 0,
+            .size = source_size,
+            .buffer = .{
+                .size = source_size,
+                .stride_pixels = 1,
+                .pixels = &pq_reference_white,
+                .color_description = .{
+                    .primaries = render.bt2020_chromaticities,
+                    .named_primaries = .bt2020,
+                    .transfer_function = .st2084_pq,
+                    .min_luminance = 50,
+                    .max_luminance = 10000,
+                    .reference_luminance = 203,
+                },
+            },
+        } },
+        .{ .image = .{
+            .x = 1,
+            .y = 0,
+            .size = source_size,
+            .buffer = .{
+                .size = source_size,
+                .stride_pixels = 1,
+                .pixels = &sdr_reference_white,
+            },
+        } },
+    };
+    try renderer.renderFrame(.{
+        .size = .{ .width = 2, .height = 1 },
+        .commands = &commands,
+    }, .{ .pixels = .{
+        .size = .{ .width = 2, .height = 1 },
+        .stride_pixels = 2,
+        .pixels = &target_pixels,
+    } });
+
+    try expectArgbNear(target_pixels[1], target_pixels[0], 2);
 }
 
 test "Vulkan renderer preserves image orientation and source rectangles" {
@@ -5458,7 +5954,7 @@ test "Vulkan renderer samples an ABGR GBM dmabuf without a CPU upload" {
     try std.testing.expect(renderer.textures.get(cache_id).?.imported);
 }
 
-test "Vulkan renderer blends premultiplied alpha" {
+test "Vulkan renderer blends premultiplied alpha in linear light" {
     var renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
         error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
         else => return err,
@@ -5482,7 +5978,7 @@ test "Vulkan renderer blends premultiplied alpha" {
         },
     }, .{ .pixels = .{ .size = size, .stride_pixels = 1, .pixels = &pixel } });
 
-    try std.testing.expectEqual(@as(u32, 0xff40803f), pixel[0]);
+    try expectArgbNear(0xff88ba88, pixel[0], 1);
 }
 
 test "Vulkan renderer applies image alpha multiplier" {
@@ -5511,7 +6007,19 @@ test "Vulkan renderer applies image alpha multiplier" {
         .pixels = &target,
     } });
 
-    try std.testing.expectEqual(@as(u32, 0xff80007f), target[0]);
+    try expectArgbNear(0xffba00ba, target[0], 1);
+}
+
+fn expectArgbNear(expected: u32, actual: u32, tolerance: u8) !void {
+    inline for ([_]u5{ 0, 8, 16, 24 }) |shift| {
+        const expected_channel: u8 = @truncate(expected >> shift);
+        const actual_channel: u8 = @truncate(actual >> shift);
+        const difference = if (expected_channel > actual_channel)
+            expected_channel - actual_channel
+        else
+            actual_channel - expected_channel;
+        try std.testing.expect(difference <= tolerance);
+    }
 }
 
 test "Vulkan renderer uploads cached image content only for a new version" {

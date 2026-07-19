@@ -30,6 +30,7 @@ pub const Renderer = struct {
         damage: ?[]const render_types.Rect,
         scale: render_types.Scale,
         origin: render_types.Position,
+        color_description: render_types.ColorDescription,
     };
 
     pub fn init(allocator: std.mem.Allocator, kind: Kind) VulkanRenderer.InitError!Renderer {
@@ -68,6 +69,13 @@ pub const Renderer = struct {
         };
     }
 
+    pub fn supportsColorManagement(self: *const Renderer) bool {
+        return switch (self.backend) {
+            .cpu => false,
+            .vulkan => true,
+        };
+    }
+
     pub fn backdropBlurFootprint(
         self: *const Renderer,
         radius: u32,
@@ -85,6 +93,7 @@ pub const Renderer = struct {
         scale: render_types.Scale,
         origin: render_types.Position,
         damage: ?[]const render_types.Rect,
+        color_description: render_types.ColorDescription,
     ) Error!void {
         // Damage and buffers referenced by appended commands must remain valid through finishFrame.
         std.debug.assert(self.active_frame == null);
@@ -98,6 +107,7 @@ pub const Renderer = struct {
             .damage = damage,
             .scale = scale,
             .origin = origin,
+            .color_description = color_description,
         };
     }
 
@@ -167,6 +177,7 @@ pub const Renderer = struct {
             .size = active.target.size(),
             .commands = self.commands.items,
             .damage = active.damage,
+            .output_color_description = active.color_description,
         }, active.target);
     }
 
@@ -184,6 +195,7 @@ pub const Renderer = struct {
             .size = active.target.size(),
             .commands = self.commands.items,
             .damage = active.damage,
+            .output_color_description = active.color_description,
         };
         return switch (self.backend) {
             .cpu => |*renderer| switch (active.target) {
@@ -230,6 +242,7 @@ pub const Renderer = struct {
             image.rounded_clip != null or image.clip != null) return null;
         if (image.buffer.dmabuf == null or image.buffer.dmabuf.?.y_inverted) return null;
         if (image.buffer.source_cache == null) return null;
+        if (!std.meta.eql(image.buffer.color_description, active.color_description)) return null;
         return image.buffer;
     }
 
@@ -244,7 +257,13 @@ pub const Renderer = struct {
         frame: render_types.Frame,
         target: render_types.PixelBuffer,
     ) Error!void {
-        try self.beginFrame(.{ .pixels = target }, frame.scale, frame.origin, frame.damage);
+        try self.beginFrame(
+            .{ .pixels = target },
+            frame.scale,
+            frame.origin,
+            frame.damage,
+            frame.output_color_description,
+        );
         var active = true;
         errdefer if (active) self.cancelFrame();
         try self.append(frame.commands);
@@ -480,7 +499,7 @@ test "renderer submits accumulated commands as one frame" {
     var renderer = try Renderer.init(std.testing.allocator, .cpu);
     defer renderer.deinit();
 
-    try renderer.beginFrame(.{ .pixels = output.target() }, .{}, .{}, null);
+    try renderer.beginFrame(.{ .pixels = output.target() }, .{}, .{}, null, .{});
     try renderer.append(&.{.{ .clear = render_types.Color.rgba(10, 20, 30, 255) }});
     try std.testing.expectEqual(@as(u32, 0), output.pixel(0, 0));
     try renderer.append(&.{.{ .solid_rect = .{
@@ -500,7 +519,7 @@ test "cancelled renderer frame does not leak commands" {
     var renderer = try Renderer.init(std.testing.allocator, .cpu);
     defer renderer.deinit();
 
-    try renderer.beginFrame(.{ .pixels = output.target() }, .{}, .{}, null);
+    try renderer.beginFrame(.{ .pixels = output.target() }, .{}, .{}, null, .{});
     try renderer.append(&.{.{ .clear = render_types.Color.rgba(255, 0, 0, 255) }});
     renderer.cancelFrame();
     try renderer.render(
@@ -568,8 +587,24 @@ test "direct scanout candidate requires a final exact opaque DMA-BUF image" {
 
     var renderer = try Renderer.init(std.testing.allocator, .cpu);
     defer renderer.deinit();
-    try renderer.beginFrame(target, .{}, .{}, null);
+    try renderer.beginFrame(target, .{}, .{}, null, .{});
     try renderer.append(&direct_commands);
+    try std.testing.expect(renderer.directScanoutCandidate() != null);
+    renderer.cancelFrame();
+
+    const p3: render_types.ColorDescription = .{
+        .primaries = render_types.display_p3_chromaticities,
+        .named_primaries = .display_p3,
+    };
+    try renderer.beginFrame(target, .{}, .{}, null, p3);
+    try renderer.append(&direct_commands);
+    try std.testing.expect(renderer.directScanoutCandidate() == null);
+    renderer.cancelFrame();
+
+    var matching_color_commands = direct_commands;
+    matching_color_commands[1].image.buffer.color_description = p3;
+    try renderer.beginFrame(target, .{}, .{}, null, p3);
+    try renderer.append(&matching_color_commands);
     try std.testing.expect(renderer.directScanoutCandidate() != null);
     renderer.cancelFrame();
 
@@ -580,21 +615,21 @@ test "direct scanout candidate requires a final exact opaque DMA-BUF image" {
         } },
         direct_commands[1],
     };
-    try renderer.beginFrame(target, .{}, .{}, null);
+    try renderer.beginFrame(target, .{}, .{}, null, .{});
     try renderer.append(&covered_commands);
     try std.testing.expect(renderer.directScanoutCandidate() != null);
     renderer.cancelFrame();
 
     var scaled_commands = direct_commands;
     scaled_commands[1].image.buffer.size = .{ .width = 3, .height = 3 };
-    try renderer.beginFrame(target, .{}, .{}, null);
+    try renderer.beginFrame(target, .{}, .{}, null, .{});
     try renderer.append(&scaled_commands);
     try std.testing.expect(renderer.directScanoutCandidate() != null);
     renderer.cancelFrame();
 
     var transparent_commands = direct_commands;
     transparent_commands[1].image.is_opaque = false;
-    try renderer.beginFrame(target, .{}, .{}, null);
+    try renderer.beginFrame(target, .{}, .{}, null, .{});
     try renderer.append(&transparent_commands);
     try std.testing.expectEqual(
         @as(?render_types.PixelBuffer, null),
@@ -604,7 +639,7 @@ test "direct scanout candidate requires a final exact opaque DMA-BUF image" {
 
     var alpha_commands = direct_commands;
     alpha_commands[1].image.alpha_multiplier = 0x8000_0000;
-    try renderer.beginFrame(target, .{}, .{}, null);
+    try renderer.beginFrame(target, .{}, .{}, null, .{});
     try renderer.append(&alpha_commands);
     try std.testing.expectEqual(
         @as(?render_types.PixelBuffer, null),
@@ -612,7 +647,7 @@ test "direct scanout candidate requires a final exact opaque DMA-BUF image" {
     );
     renderer.cancelFrame();
 
-    try renderer.beginFrame(target, .{}, .{}, null);
+    try renderer.beginFrame(target, .{}, .{}, null, .{});
     try renderer.append(&direct_commands);
     try renderer.append(&.{.{ .solid_rect = .{
         .rect = .{ .x = 0, .y = 0, .width = 1, .height = 1 },

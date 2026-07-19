@@ -8,6 +8,7 @@ pub const image_alpha_instanced = spirvWords(@embedFile("vulkan-image"));
 pub const shadow_instanced = spirvWords(@embedFile("vulkan-shadow"));
 pub const blur_horizontal_paired = spirvWords(@embedFile("vulkan-blur-horizontal"));
 pub const blur_vertical_paired = spirvWords(@embedFile("vulkan-blur-vertical"));
+pub const output_encode = spirvWords(@embedFile("vulkan-encode"));
 
 fn spirvWords(comptime bytes: []const u8) [bytes.len / @sizeOf(u32)]u32 {
     @setEvalBranchQuota(10_000);

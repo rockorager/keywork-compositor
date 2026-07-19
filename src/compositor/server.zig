@@ -218,6 +218,7 @@ const RenderOutput = struct {
     server: *Self,
     backend: OutputBackend,
     protocol_id: OutputLayout.Id,
+    color_description: render.ColorDescription,
     timer: ?*wl.EventSource,
     repaint_idle: ?*wl.EventSource,
     damage: Region,
@@ -835,7 +836,12 @@ pub fn createWithVirtualOutput(
     errdefer self.security_context.deinit();
     self.outputs.init(allocator, display, self.compositor.surfaceStore());
     errdefer self.outputs.deinit();
-    try self.color_management.init(allocator, display, &self.outputs);
+    try self.color_management.init(
+        allocator,
+        display,
+        &self.outputs,
+        self.renderer.supportsColorManagement(),
+    );
     errdefer self.color_management.deinit();
     try self.color_representation.init(allocator, display);
     errdefer self.color_representation.deinit();
@@ -1412,6 +1418,7 @@ pub fn createWithVirtualOutput(
         .failed = drmDeviceFailed,
         .activated = drmDeviceActivated,
         .deactivating = drmDeviceDeactivating,
+        .changed = drmOutputChanged,
         .lease_revoked = drmLeaseRevoked,
     });
 
@@ -1580,6 +1587,7 @@ fn addRenderOutput(
         .server = self,
         .backend = undefined,
         .protocol_id = undefined,
+        .color_description = .{},
         .timer = null,
         .repaint_idle = null,
         .damage = Region.init(),
@@ -1606,6 +1614,12 @@ fn addRenderOutput(
         self.renderer.offscreenAccess(),
     );
     errdefer render_output.backend.deinit();
+    if (self.renderer.supportsColorManagement()) {
+        render_output.color_description = render_output.backend.colorDescription();
+    }
+    const color_identity = try self.color_management.identityForDescription(
+        render_output.color_description,
+    );
     render_output.protocol_id = try self.outputs.add(.{
         .position = config.position,
         .size = render_output.backend.size(),
@@ -1615,6 +1629,8 @@ fn addRenderOutput(
         .refresh_millihertz = render_output.backend.refreshMillihertz(),
         .scale = render_output.backend.clientScale(),
         .preferred_scale = render_output.backend.renderScale(),
+        .color_description = render_output.color_description,
+        .color_identity = color_identity,
         .name = render_output.backend.name(config.name),
         .description = render_output.backend.description(config.description),
         .make = render_output.backend.make(config.make),
@@ -1839,6 +1855,7 @@ fn removeRenderOutput(self: *Self, id: RenderOutputId) bool {
     if (self.xdg_output_initialized) self.xdg_output.removeOutput(protocol_output);
     self.color_management.removeOutput(protocol_output);
     std.debug.assert(self.outputs.remove(render_output.protocol_id));
+    self.color_management.refreshPreferred();
     if (self.session_lock_initialized) {
         self.session_lock.outputRemoved(render_output.protocol_id);
         self.session_lock.refreshOutputs();
@@ -1887,6 +1904,13 @@ fn drmOutputAdded(context: *anyopaque, drm_output: *DrmOutput) void {
         self.drm_lease.addConnector(drm_output) catch return self.terminate();
     }
     requestRepaint(self);
+}
+
+fn drmOutputChanged(context: *anyopaque, drm_output: *DrmOutput) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const render_output = self.findDrmRenderOutput(drm_output) orelse return;
+    self.refreshRenderOutputColorDescription(render_output.output) catch
+        self.terminate();
 }
 
 fn findDrmRenderOutput(self: *Self, drm_output: *DrmOutput) ?struct {
@@ -2350,8 +2374,29 @@ fn revokeDrmLease(context: *anyopaque, lessee_id: u32) void {
 
 fn drmDeviceActivated(context: *anyopaque) void {
     const self: *Self = @ptrCast(@alignCast(context));
+    var outputs = self.render_outputs.iterator();
+    while (outputs.next()) |entry| {
+        const render_output = entry.value.*;
+        if (render_output.backend.drmOutput() == null) continue;
+        self.refreshRenderOutputColorDescription(render_output) catch
+            return self.terminate();
+    }
     if (self.gamma_control_initialized) self.gamma_control.refreshOutputs();
     if (self.drm_lease_initialized) self.drm_lease.@"resume"();
+}
+
+fn refreshRenderOutputColorDescription(
+    self: *Self,
+    render_output: *RenderOutput,
+) !void {
+    if (!self.renderer.supportsColorManagement()) return;
+    const description = render_output.backend.colorDescription();
+    if (std.meta.eql(description, render_output.color_description)) return;
+    const identity = try self.color_management.identityForDescription(description);
+    render_output.color_description = description;
+    const output = self.outputs.get(render_output.protocol_id) orelse unreachable;
+    self.color_management.updateOutputColorDescription(output, description, identity);
+    self.damageFullOutput(render_output);
 }
 
 fn drmDeviceDeactivating(context: *anyopaque) void {
@@ -5584,6 +5629,7 @@ fn captureCursor(
         state.scale,
         .{ .x = state.bounds.x, .y = state.bounds.y },
         null,
+        .{},
     );
     var renderer_frame_active = true;
     errdefer if (renderer_frame_active) self.renderer.cancelFrame();
@@ -5772,6 +5818,7 @@ fn captureOutputRegion(
         scale,
         .{ .x = visible_rect.x, .y = visible_rect.y },
         null,
+        .{},
     );
     var renderer_frame_active = true;
     errdefer if (renderer_frame_active) self.renderer.cancelFrame();
@@ -5818,6 +5865,7 @@ fn captureToplevel(
         .{},
         .{ .x = bounds.x, .y = bounds.y },
         null,
+        .{},
     );
     var renderer_frame_active = true;
     errdefer if (renderer_frame_active) self.renderer.cancelFrame();
@@ -6193,7 +6241,13 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
         null;
     const scale = render_output.backend.renderScale();
     const origin: render.Position = .{ .x = position.x, .y = position.y };
-    try self.renderer.beginFrame(render_target, scale, origin, damage);
+    try self.renderer.beginFrame(
+        render_target,
+        scale,
+        origin,
+        damage,
+        render_output.color_description,
+    );
     var renderer_frame_active = true;
     errdefer if (renderer_frame_active) self.renderer.cancelFrame();
     const frame: OutputFrame = .{
@@ -6266,6 +6320,7 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
         render_output.commitFrame(.composited);
     }
     output.endFrame();
+    self.color_management.refreshPreferred();
     self.foreign_toplevel_list.syncOutput(render_output.protocol_id);
 
     self.submitLayerSurfaces(output, .background);
@@ -6413,6 +6468,7 @@ fn presentSessionLockFrame(
     frame.render_output.commitFrame(.composited);
     frame.render_output.lock_frame_pending = true;
     frame.output.endFrame();
+    self.color_management.refreshPreferred();
     self.foreign_toplevel_list.syncOutput(frame.render_output.protocol_id);
     if (lock_surface) |info| self.submitSurfaceTree(frame.output, info.surface_id);
     self.submitSeatCursor(frame.output, &self.seat, true);

@@ -52,6 +52,8 @@ pub const State = struct {
     current_viewport: ViewportState,
     pending_content_type: ContentType,
     current_content_type: ContentType,
+    pending_color_description: render_types.ColorDescription,
+    current_color_description: render_types.ColorDescription,
     pending_color_representation: ColorRepresentationState,
     current_color_representation: ColorRepresentationState,
     pending_alpha_multiplier: u32,
@@ -106,6 +108,8 @@ pub const State = struct {
             .current_viewport = .{},
             .pending_content_type = .none,
             .current_content_type = .none,
+            .pending_color_description = .{},
+            .current_color_description = .{},
             .pending_color_representation = .{},
             .current_color_representation = .{},
             .pending_alpha_multiplier = std.math.maxInt(u32),
@@ -314,6 +318,19 @@ pub fn setPendingContentType(self: *Self, content_type: ContentType) void {
 pub fn currentContentType(store: *Store, id: Id) ?ContentType {
     const surface_state = store.get(id) orelse return null;
     return surface_state.current_content_type;
+}
+
+pub fn setPendingColorDescription(self: *Self, value: render_types.ColorDescription) void {
+    self.state().pending_color_description = value;
+}
+
+pub fn pendingColorDescription(self: *Self) render_types.ColorDescription {
+    return self.state().pending_color_description;
+}
+
+pub fn currentColorDescription(store: *Store, id: Id) ?render_types.ColorDescription {
+    const surface_state = store.get(id) orelse return null;
+    return surface_state.current_color_description;
 }
 
 pub const ColorRepresentationState = struct {
@@ -580,6 +597,7 @@ const CachedCommit = struct {
     transform: wl.Output.Transform,
     viewport: ViewportState,
     content_type: ContentType,
+    color_description: render_types.ColorDescription,
     color_representation: ColorRepresentationState,
     alpha_multiplier: u32,
     presentation_hint: PresentationHint,
@@ -1242,12 +1260,18 @@ fn applyPending(self: *Self, commit_info: CommitInfo) void {
             postBufferError(self, err);
             return;
         };
+        current.color_description = surface_state.pending_color_description;
     }
 
     surface_state.current_scale = surface_state.pending_scale;
     surface_state.current_transform = surface_state.pending_transform;
     surface_state.current_viewport = surface_state.pending_viewport;
     surface_state.current_content_type = surface_state.pending_content_type;
+    const color_description_changed = !std.meta.eql(
+        surface_state.current_color_description,
+        surface_state.pending_color_description,
+    );
+    surface_state.current_color_description = surface_state.pending_color_description;
     surface_state.current_color_representation = surface_state.pending_color_representation;
     const alpha_changed = surface_state.current_alpha_multiplier != surface_state.pending_alpha_multiplier;
     surface_state.current_alpha_multiplier = surface_state.pending_alpha_multiplier;
@@ -1262,6 +1286,7 @@ fn applyPending(self: *Self, commit_info: CommitInfo) void {
         offset_changed,
     );
     if (alpha_changed) surface_state.current_damage_precise = false;
+    if (color_description_changed) surface_state.current_damage_precise = false;
     if (surface_state.pending_blur_region_changed) {
         surface_state.current_damage_precise = false;
     }
@@ -1346,6 +1371,7 @@ fn cachePending(self: *Self, role_ready: bool) bool {
         .transform = surface_state.pending_transform,
         .viewport = surface_state.pending_viewport,
         .content_type = surface_state.pending_content_type,
+        .color_description = surface_state.pending_color_description,
         .color_representation = surface_state.pending_color_representation,
         .alpha_multiplier = surface_state.pending_alpha_multiplier,
         .presentation_hint = surface_state.pending_presentation_hint,
@@ -1464,12 +1490,18 @@ fn applyCached(self: *Self, cached: *CachedCommit) void {
             cached.transform,
             cached.viewport,
         ) catch unreachable;
+        current.color_description = cached.color_description;
     }
 
     surface_state.current_scale = cached.scale;
     surface_state.current_transform = cached.transform;
     surface_state.current_viewport = cached.viewport;
     surface_state.current_content_type = cached.content_type;
+    const color_description_changed = !std.meta.eql(
+        surface_state.current_color_description,
+        cached.color_description,
+    );
+    surface_state.current_color_description = cached.color_description;
     surface_state.current_color_representation = cached.color_representation;
     const alpha_changed = surface_state.current_alpha_multiplier != cached.alpha_multiplier;
     surface_state.current_alpha_multiplier = cached.alpha_multiplier;
@@ -1484,6 +1516,7 @@ fn applyCached(self: *Self, cached: *CachedCommit) void {
         offset_changed,
     );
     if (alpha_changed) surface_state.current_damage_precise = false;
+    if (color_description_changed) surface_state.current_damage_precise = false;
     if (cached.blur_region_changed) surface_state.current_damage_precise = false;
     applyFifoSet(surface_state, cached.fifo_set);
     if (surface_state.presentation_output != null) surface_state.commit_after_submission = true;
@@ -1569,6 +1602,7 @@ fn snapshotPendingAttachment(
         )
     else
         return null;
+    snapshot.color_description = surface_state.pending_color_description;
     if (snapshot.retainsClientBuffer()) {
         const generation = surface_state.next_release_generation;
         surface_state.next_release_generation +%= 1;
@@ -2229,6 +2263,7 @@ pub const BufferSnapshot = struct {
     force_opaque: bool,
     pixels: []u32,
     dmabuf: ?*DmabufUse = null,
+    color_description: render_types.ColorDescription = .{},
     source_cache: render_types.SourceCache,
     source_damage: ?[]const render_types.Rect,
 
@@ -2430,6 +2465,7 @@ pub const BufferSnapshot = struct {
                 self.buffer_size.width,
             .pixels = self.pixels,
             .dmabuf = if (self.dmabuf) |dmabuf| dmabuf.renderSource() else null,
+            .color_description = self.color_description,
             .source_cache = self.source_cache,
             .source_damage = self.source_damage,
         };
@@ -2863,6 +2899,7 @@ fn testCachedCommit(
         .transform = .normal,
         .viewport = .{},
         .content_type = .none,
+        .color_description = .{},
         .alpha_multiplier = std.math.maxInt(u32),
         .color_representation = .{},
         .presentation_hint = .vsync,
@@ -3043,6 +3080,7 @@ test "synchronized application ignores FIFO waits while desynchronized applicati
         .transform = .normal,
         .viewport = .{},
         .content_type = .none,
+        .color_description = .{},
         .color_representation = .{},
         .alpha_multiplier = std.math.maxInt(u32),
         .presentation_hint = .vsync,

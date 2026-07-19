@@ -19,6 +19,8 @@ physical_size: render.Size,
 mode_preferred: bool,
 scale: i32,
 preferred_scale: render.Scale,
+color_description: render.ColorDescription,
+color_identity: u64,
 refresh_millihertz: i32,
 name_value: [:0]u8,
 description_value: [:0]u8,
@@ -44,6 +46,8 @@ pub const Config = struct {
     refresh_millihertz: i32 = 60_000,
     scale: u32,
     preferred_scale: render.Scale = .{},
+    color_description: render.ColorDescription = .{},
+    color_identity: u64 = 1,
     name: []const u8,
     description: []const u8,
     make: []const u8 = "keywork",
@@ -106,6 +110,8 @@ pub fn init(
         .mode_preferred = config.mode_preferred,
         .scale = @intCast(config.scale),
         .preferred_scale = config.preferred_scale,
+        .color_description = config.color_description,
+        .color_identity = config.color_identity,
         .refresh_millihertz = config.refresh_millihertz,
         .name_value = name_value,
         .description_value = description_value,
@@ -191,6 +197,33 @@ pub fn setScale(
 
 pub fn preferredScale(self: *const Self) render.Scale {
     return self.preferred_scale;
+}
+
+pub fn colorDescription(self: *const Self) render.ColorDescription {
+    return self.color_description;
+}
+
+pub fn colorIdentity(self: *const Self) u64 {
+    return self.color_identity;
+}
+
+pub fn setColorDescription(
+    self: *Self,
+    color_description: render.ColorDescription,
+    identity: u64,
+) bool {
+    std.debug.assert(identity != 0);
+    if (std.meta.eql(self.color_description, color_description) and
+        self.color_identity == identity) return false;
+    self.color_description = color_description;
+    self.color_identity = identity;
+    return true;
+}
+
+pub fn sendDone(self: *Self) void {
+    for (self.resources.items) |resource| {
+        if (resource.getVersion() >= wl.Output.done_since_version) resource.sendDone();
+    }
 }
 
 pub fn clientScale(self: *const Self) u32 {

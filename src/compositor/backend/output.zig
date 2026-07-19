@@ -92,6 +92,13 @@ pub fn description(self: *const Self, fallback: []const u8) []const u8 {
     };
 }
 
+pub fn colorDescription(self: *const Self) render.ColorDescription {
+    return switch (self.backend) {
+        .drm => |output| output.colorDescription(),
+        .headless, .nested => .{},
+    };
+}
+
 pub fn make(self: *const Self, fallback: []const u8) []const u8 {
     return switch (self.backend) {
         .drm => |output| output.make() orelse fallback,
