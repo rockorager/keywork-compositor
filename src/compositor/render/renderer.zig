@@ -227,23 +227,36 @@ pub const Renderer = struct {
         }
     }
 
-    pub fn directScanoutCandidate(self: *Renderer) ?render_types.PixelBuffer {
-        const active = self.active_frame orelse return null;
-        const last_command = self.commands.getLastOrNull() orelse return null;
+    pub fn directScanoutCandidate(self: *Renderer) render_types.DirectScanoutCandidate {
+        const active = self.active_frame orelse return .{ .rejected = .no_fullscreen_surface };
+        const last_command = self.commands.getLastOrNull() orelse
+            return .{ .rejected = .no_fullscreen_surface };
         const image = switch (last_command) {
             .image => |image| image,
-            else => return null,
+            else => return .{ .rejected = .no_fullscreen_surface },
         };
-        if (!image.is_opaque) return null;
-        if (image.alpha_multiplier != std.math.maxInt(u32)) return null;
-        if (image.x != 0 or image.y != 0) return null;
-        if (!std.meta.eql(image.size, active.target.size())) return null;
+        if (image.x != 0 or image.y != 0 or
+            !std.meta.eql(image.size, active.target.size()))
+        {
+            return .{ .rejected = .no_fullscreen_surface };
+        }
+        if (!image.is_opaque or image.alpha_multiplier != std.math.maxInt(u32)) {
+            return .{ .rejected = .non_opaque_surface };
+        }
         if (image.source != null or image.transform != .normal or
-            image.rounded_clip != null or image.clip != null) return null;
-        if (image.buffer.dmabuf == null or image.buffer.dmabuf.?.y_inverted) return null;
-        if (image.buffer.source_cache == null) return null;
-        if (!std.meta.eql(image.buffer.color_description, active.color_description)) return null;
-        return image.buffer;
+            image.rounded_clip != null or image.clip != null)
+        {
+            return .{ .rejected = .surface_transform };
+        }
+        const dmabuf = image.buffer.dmabuf orelse return .{ .rejected = .non_dmabuf };
+        if (dmabuf.y_inverted) return .{ .rejected = .y_inverted };
+        if (image.buffer.source_cache == null) {
+            return .{ .rejected = .missing_buffer_identity };
+        }
+        if (!std.meta.eql(image.buffer.color_description, active.color_description)) {
+            return .{ .rejected = .color_conversion };
+        }
+        return .{ .candidate = image.buffer };
     }
 
     pub fn cancelFrame(self: *Renderer) void {
@@ -589,7 +602,7 @@ test "direct scanout candidate requires a final exact opaque DMA-BUF image" {
     defer renderer.deinit();
     try renderer.beginFrame(target, .{}, .{}, null, .{});
     try renderer.append(&direct_commands);
-    try std.testing.expect(renderer.directScanoutCandidate() != null);
+    try expectDirectScanoutCandidate(renderer.directScanoutCandidate());
     renderer.cancelFrame();
 
     const p3: render_types.ColorDescription = .{
@@ -598,14 +611,14 @@ test "direct scanout candidate requires a final exact opaque DMA-BUF image" {
     };
     try renderer.beginFrame(target, .{}, .{}, null, p3);
     try renderer.append(&direct_commands);
-    try std.testing.expect(renderer.directScanoutCandidate() == null);
+    try expectDirectScanoutRejection(.color_conversion, renderer.directScanoutCandidate());
     renderer.cancelFrame();
 
     var matching_color_commands = direct_commands;
     matching_color_commands[1].image.buffer.color_description = p3;
     try renderer.beginFrame(target, .{}, .{}, null, p3);
     try renderer.append(&matching_color_commands);
-    try std.testing.expect(renderer.directScanoutCandidate() != null);
+    try expectDirectScanoutCandidate(renderer.directScanoutCandidate());
     renderer.cancelFrame();
 
     const covered_commands = [_]render_types.Command{
@@ -617,34 +630,56 @@ test "direct scanout candidate requires a final exact opaque DMA-BUF image" {
     };
     try renderer.beginFrame(target, .{}, .{}, null, .{});
     try renderer.append(&covered_commands);
-    try std.testing.expect(renderer.directScanoutCandidate() != null);
+    try expectDirectScanoutCandidate(renderer.directScanoutCandidate());
     renderer.cancelFrame();
 
     var scaled_commands = direct_commands;
     scaled_commands[1].image.buffer.size = .{ .width = 3, .height = 3 };
     try renderer.beginFrame(target, .{}, .{}, null, .{});
     try renderer.append(&scaled_commands);
-    try std.testing.expect(renderer.directScanoutCandidate() != null);
+    try expectDirectScanoutCandidate(renderer.directScanoutCandidate());
     renderer.cancelFrame();
 
     var transparent_commands = direct_commands;
     transparent_commands[1].image.is_opaque = false;
     try renderer.beginFrame(target, .{}, .{}, null, .{});
     try renderer.append(&transparent_commands);
-    try std.testing.expectEqual(
-        @as(?render_types.PixelBuffer, null),
-        renderer.directScanoutCandidate(),
-    );
+    try expectDirectScanoutRejection(.non_opaque_surface, renderer.directScanoutCandidate());
     renderer.cancelFrame();
 
     var alpha_commands = direct_commands;
     alpha_commands[1].image.alpha_multiplier = 0x8000_0000;
     try renderer.beginFrame(target, .{}, .{}, null, .{});
     try renderer.append(&alpha_commands);
-    try std.testing.expectEqual(
-        @as(?render_types.PixelBuffer, null),
-        renderer.directScanoutCandidate(),
-    );
+    try expectDirectScanoutRejection(.non_opaque_surface, renderer.directScanoutCandidate());
+    renderer.cancelFrame();
+
+    var transformed_commands = direct_commands;
+    transformed_commands[1].image.transform = .rotate_90;
+    try renderer.beginFrame(target, .{}, .{}, null, .{});
+    try renderer.append(&transformed_commands);
+    try expectDirectScanoutRejection(.surface_transform, renderer.directScanoutCandidate());
+    renderer.cancelFrame();
+
+    var non_dmabuf_commands = direct_commands;
+    non_dmabuf_commands[1].image.buffer.dmabuf = null;
+    try renderer.beginFrame(target, .{}, .{}, null, .{});
+    try renderer.append(&non_dmabuf_commands);
+    try expectDirectScanoutRejection(.non_dmabuf, renderer.directScanoutCandidate());
+    renderer.cancelFrame();
+
+    var inverted_commands = direct_commands;
+    inverted_commands[1].image.buffer.dmabuf.?.y_inverted = true;
+    try renderer.beginFrame(target, .{}, .{}, null, .{});
+    try renderer.append(&inverted_commands);
+    try expectDirectScanoutRejection(.y_inverted, renderer.directScanoutCandidate());
+    renderer.cancelFrame();
+
+    var unidentified_commands = direct_commands;
+    unidentified_commands[1].image.buffer.source_cache = null;
+    try renderer.beginFrame(target, .{}, .{}, null, .{});
+    try renderer.append(&unidentified_commands);
+    try expectDirectScanoutRejection(.missing_buffer_identity, renderer.directScanoutCandidate());
     renderer.cancelFrame();
 
     try renderer.beginFrame(target, .{}, .{}, null, .{});
@@ -653,8 +688,28 @@ test "direct scanout candidate requires a final exact opaque DMA-BUF image" {
         .rect = .{ .x = 0, .y = 0, .width = 1, .height = 1 },
         .color = render_types.Color.rgba(255, 255, 255, 255),
     } }});
-    try std.testing.expectEqual(@as(?render_types.PixelBuffer, null), renderer.directScanoutCandidate());
+    try expectDirectScanoutRejection(.no_fullscreen_surface, renderer.directScanoutCandidate());
     renderer.cancelFrame();
+}
+
+fn expectDirectScanoutCandidate(candidate: render_types.DirectScanoutCandidate) !void {
+    switch (candidate) {
+        .candidate => {},
+        .rejected => |reason| {
+            std.debug.print("unexpected direct scanout rejection: {t}\n", .{reason});
+            return error.TestUnexpectedResult;
+        },
+    }
+}
+
+fn expectDirectScanoutRejection(
+    expected: render_types.DirectScanoutRejection,
+    candidate: render_types.DirectScanoutCandidate,
+) !void {
+    switch (candidate) {
+        .candidate => return error.TestUnexpectedResult,
+        .rejected => |reason| try std.testing.expectEqual(expected, reason),
+    }
 }
 
 test "renderer scales logical commands into a physical target" {

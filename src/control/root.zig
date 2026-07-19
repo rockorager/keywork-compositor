@@ -16,6 +16,24 @@ pub const LatencyStatistics = struct {
     maximum_microseconds: i64,
 };
 
+pub const DirectScanoutRejections = struct {
+    no_fullscreen_surface: i64,
+    non_opaque_surface: i64,
+    surface_transform: i64,
+    non_dmabuf: i64,
+    y_inverted: i64,
+    missing_buffer_identity: i64,
+    color_conversion: i64,
+    unsupported_backend: i64,
+    output_unavailable: i64,
+    output_busy: i64,
+    device_inactive: i64,
+    unsupported_format_or_modifier: i64,
+    unsupported_layout: i64,
+    framebuffer_import_failed: i64,
+    page_flip_failed: i64,
+};
+
 pub const OutputStatistics = struct {
     name: []const u8,
     width: i64,
@@ -29,6 +47,7 @@ pub const OutputStatistics = struct {
     composited_frames: i64,
     direct_scanout_candidates: i64,
     direct_scanout_frames: i64,
+    direct_scanout_rejections: DirectScanoutRejections,
     frames_over_budget: i64,
     gpu_execution: LatencyStatistics,
     gpu_composition: LatencyStatistics,

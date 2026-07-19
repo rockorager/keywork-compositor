@@ -264,6 +264,6 @@ pub fn tryDirectScanout(
 ) DirectScanoutResult {
     return switch (self.backend) {
         .drm => |output| output.tryDirectScanout(buffer, allow_tearing),
-        .headless, .nested => .{},
+        .headless, .nested => .{ .rejected = .unsupported_backend },
     };
 }

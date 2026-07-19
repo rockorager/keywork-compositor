@@ -442,6 +442,29 @@ pub const PixelBuffer = struct {
     source_damage: ?[]const Rect = null,
 };
 
+pub const DirectScanoutRejection = enum(u8) {
+    no_fullscreen_surface,
+    non_opaque_surface,
+    surface_transform,
+    non_dmabuf,
+    y_inverted,
+    missing_buffer_identity,
+    color_conversion,
+    unsupported_backend,
+    output_unavailable,
+    output_busy,
+    device_inactive,
+    unsupported_format_or_modifier,
+    unsupported_layout,
+    framebuffer_import_failed,
+    page_flip_failed,
+};
+
+pub const DirectScanoutCandidate = union(enum) {
+    candidate: PixelBuffer,
+    rejected: DirectScanoutRejection,
+};
+
 pub const DmabufSource = struct {
     context: *anyopaque,
     fd: std.posix.fd_t,

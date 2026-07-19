@@ -147,8 +147,9 @@ const AtomicPlaneDisableProperties = struct {
     }
 };
 
-pub const DirectScanoutResult = struct {
-    accepted: bool = false,
+pub const DirectScanoutResult = union(enum) {
+    accepted,
+    rejected: render.DirectScanoutRejection,
 };
 
 const max_direct_framebuffers = 8;
@@ -506,20 +507,33 @@ pub fn tryDirectScanout(
     buffer: render.PixelBuffer,
     allow_tearing: bool,
 ) DirectScanoutResult {
-    const source = buffer.dmabuf orelse return .{};
-    const source_cache = buffer.source_cache orelse return .{};
-    if (!self.mode_set or self.acquired == null or self.pending != null or
-        self.direct_pending != null or source.y_inverted or
-        render.DmabufFormat.fromFourcc(source.format) == null or
-        (self.atomic_plane == null and (!std.meta.eql(buffer.size, self.size) or
-            !self.legacyFramebufferLayoutMatches(buffer))))
+    const source = buffer.dmabuf orelse return .{ .rejected = .non_dmabuf };
+    const source_cache = buffer.source_cache orelse
+        return .{ .rejected = .missing_buffer_identity };
+    if (!self.mode_set) return .{ .rejected = .output_unavailable };
+    if (self.acquired == null or self.pending != null or self.direct_pending != null) {
+        return .{ .rejected = .output_busy };
+    }
+    if (source.y_inverted) return .{ .rejected = .y_inverted };
+    if (render.DmabufFormat.fromFourcc(source.format) == null) {
+        return .{ .rejected = .unsupported_format_or_modifier };
+    }
+    if (self.atomic_plane == null and (!std.meta.eql(buffer.size, self.size) or
+        !self.legacyFramebufferLayoutMatches(buffer)))
     {
-        return .{};
+        return .{ .rejected = .unsupported_layout };
     }
     const fd = self.device_access.fd(self.device_access.context) orelse
-        return .{};
-    if (!self.device_access.active(self.device_access.context)) return .{};
-    const framebuffer = self.directFramebuffer(fd, buffer) catch return .{};
+        return .{ .rejected = .device_inactive };
+    if (!self.device_access.active(self.device_access.context)) {
+        return .{ .rejected = .device_inactive };
+    }
+    const framebuffer = self.directFramebuffer(fd, buffer) catch |err| return .{
+        .rejected = if (err == error.UnsupportedModifier)
+            .unsupported_format_or_modifier
+        else
+            .framebuffer_import_failed,
+    };
 
     source.retain(source.context);
     const page_flip = self.queuePageFlip(
@@ -530,7 +544,7 @@ pub fn tryDirectScanout(
         allow_tearing,
     ) orelse {
         source.release(source.context);
-        return .{};
+        return .{ .rejected = .page_flip_failed };
     };
     self.direct_pending = .{
         .source = source,
@@ -539,7 +553,7 @@ pub fn tryDirectScanout(
     self.pending_page_flip = page_flip;
     self.acquired = null;
     self.resetBufferDamage(self.size);
-    return .{ .accepted = true };
+    return .accepted;
 }
 
 pub fn activate(self: *Self, fd: std.posix.fd_t, selection: Selection, device_path: []const u8) !void {

@@ -39,7 +39,7 @@ mode.
 - [x] Report rolling GPU total, composition/effects, and output-encode timings
   per output through `keyworkctl stats`.
 - [ ] Count CPU uploads and imported DMA-BUFs.
-- [ ] Report direct-scanout rejection reasons, including renderer eligibility
+- [x] Report direct-scanout rejection reasons, including renderer eligibility
   and KMS presentation failures.
 - [ ] Record the working format, scanout format, output transform, damage, and
   active render path for diagnostic captures.

@@ -293,6 +293,7 @@ const RenderOutput = struct {
 
 const frame_latency_capacity = 1024;
 const frame_budget_tolerance_nanoseconds = std.time.ns_per_ms;
+const direct_scanout_rejection_count = std.meta.fields(render.DirectScanoutRejection).len;
 
 const FramePath = enum { composited, direct_scanout };
 
@@ -333,6 +334,7 @@ const FrameStatistics = struct {
     composited_frames: u64 = 0,
     direct_scanout_candidates: u64 = 0,
     direct_scanout_frames: u64 = 0,
+    direct_scanout_rejections: [direct_scanout_rejection_count]u64 = @splat(0),
     frames_over_budget: u64 = 0,
     latency_samples: [frame_latency_capacity]FrameLatency = undefined,
     latency_count: usize = 0,
@@ -392,6 +394,13 @@ const FrameStatistics = struct {
         self.gpu_execution_count = @min(self.gpu_execution_count + 1, frame_latency_capacity);
     }
 
+    fn rejectDirectScanout(
+        self: *FrameStatistics,
+        reason: render.DirectScanoutRejection,
+    ) void {
+        increment(&self.direct_scanout_rejections[@intFromEnum(reason)]);
+    }
+
     fn snapshot(
         self: *const FrameStatistics,
         name: []const u8,
@@ -411,6 +420,23 @@ const FrameStatistics = struct {
             .composited_frames = wireInteger(self.composited_frames),
             .direct_scanout_candidates = wireInteger(self.direct_scanout_candidates),
             .direct_scanout_frames = wireInteger(self.direct_scanout_frames),
+            .direct_scanout_rejections = .{
+                .no_fullscreen_surface = self.directScanoutRejection(.no_fullscreen_surface),
+                .non_opaque_surface = self.directScanoutRejection(.non_opaque_surface),
+                .surface_transform = self.directScanoutRejection(.surface_transform),
+                .non_dmabuf = self.directScanoutRejection(.non_dmabuf),
+                .y_inverted = self.directScanoutRejection(.y_inverted),
+                .missing_buffer_identity = self.directScanoutRejection(.missing_buffer_identity),
+                .color_conversion = self.directScanoutRejection(.color_conversion),
+                .unsupported_backend = self.directScanoutRejection(.unsupported_backend),
+                .output_unavailable = self.directScanoutRejection(.output_unavailable),
+                .output_busy = self.directScanoutRejection(.output_busy),
+                .device_inactive = self.directScanoutRejection(.device_inactive),
+                .unsupported_format_or_modifier = self.directScanoutRejection(.unsupported_format_or_modifier),
+                .unsupported_layout = self.directScanoutRejection(.unsupported_layout),
+                .framebuffer_import_failed = self.directScanoutRejection(.framebuffer_import_failed),
+                .page_flip_failed = self.directScanoutRejection(.page_flip_failed),
+            },
             .frames_over_budget = wireInteger(self.frames_over_budget),
             .gpu_execution = self.gpuExecutionSummary(.total),
             .gpu_composition = self.gpuExecutionSummary(.composition),
@@ -420,6 +446,13 @@ const FrameStatistics = struct {
             .render_to_commit = self.latencySummary(.render_to_commit),
             .commit_to_presentation = self.latencySummary(.commit_to_presentation),
         };
+    }
+
+    fn directScanoutRejection(
+        self: *const FrameStatistics,
+        reason: render.DirectScanoutRejection,
+    ) i64 {
+        return wireInteger(self.direct_scanout_rejections[@intFromEnum(reason)]);
     }
 
     fn latencySummary(
@@ -555,6 +588,12 @@ test "frame statistics summarize rolling latency and classify over-budget frames
     try std.testing.expectEqual(@as(i64, 400), summary.p99_microseconds);
     try std.testing.expectEqual(@as(i64, 400), summary.maximum_microseconds);
 
+    statistics.rejectDirectScanout(.color_conversion);
+    statistics.rejectDirectScanout(.color_conversion);
+    statistics.rejectDirectScanout(.page_flip_failed);
+    try std.testing.expectEqual(@as(i64, 2), statistics.directScanoutRejection(.color_conversion));
+    try std.testing.expectEqual(@as(i64, 1), statistics.directScanoutRejection(.page_flip_failed));
+
     statistics.addGpuExecution(.{
         .tag = 0,
         .total_nanoseconds = 1_100 * std.time.ns_per_us,
@@ -599,6 +638,7 @@ test "frame statistics summarize rolling latency and classify over-budget frames
     try std.testing.expectEqual(@as(usize, 0), statistics.latency_count);
     try std.testing.expectEqual(@as(usize, 0), statistics.gpu_execution_count);
     try std.testing.expectEqual(@as(u64, 0), statistics.frames_presented);
+    try std.testing.expectEqual(@as(i64, 0), statistics.directScanoutRejection(.color_conversion));
 
     for (0..frame_latency_capacity + 1) |value| statistics.addLatency(.{
         .request_to_presentation_microseconds = value,
@@ -6338,15 +6378,20 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
         false;
     var presented: ?presentation.Info = null;
     var direct_scanout = false;
-    if (self.renderer.directScanoutCandidate()) |candidate| {
-        increment(&render_output.frame_statistics.direct_scanout_candidates);
-        const result = render_output.backend.tryDirectScanout(candidate, allow_tearing);
-        if (result.accepted) {
-            self.renderer.cancelFrame();
-            renderer_frame_active = false;
-            direct_scanout = true;
-            render_output.commitFrame(.direct_scanout);
-        }
+    switch (self.renderer.directScanoutCandidate()) {
+        .candidate => |candidate| {
+            increment(&render_output.frame_statistics.direct_scanout_candidates);
+            switch (render_output.backend.tryDirectScanout(candidate, allow_tearing)) {
+                .accepted => {
+                    self.renderer.cancelFrame();
+                    renderer_frame_active = false;
+                    direct_scanout = true;
+                    render_output.commitFrame(.direct_scanout);
+                },
+                .rejected => |reason| render_output.frame_statistics.rejectDirectScanout(reason),
+            }
+        },
+        .rejected => |reason| render_output.frame_statistics.rejectDirectScanout(reason),
     }
     if (!direct_scanout) {
         renderer_frame_active = false;

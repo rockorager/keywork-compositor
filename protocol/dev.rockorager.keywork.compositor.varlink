@@ -19,6 +19,25 @@ type LatencyStatistics (
     maximum_microseconds: int
 )
 
+# Reasons composited frames could not use direct scanout.
+type DirectScanoutRejections (
+    no_fullscreen_surface: int,
+    non_opaque_surface: int,
+    surface_transform: int,
+    non_dmabuf: int,
+    y_inverted: int,
+    missing_buffer_identity: int,
+    color_conversion: int,
+    unsupported_backend: int,
+    output_unavailable: int,
+    output_busy: int,
+    device_inactive: int,
+    unsupported_format_or_modifier: int,
+    unsupported_layout: int,
+    framebuffer_import_failed: int,
+    page_flip_failed: int
+)
+
 # Per-output frame processing and presentation statistics.
 type OutputStatistics (
     name: string,
@@ -33,6 +52,7 @@ type OutputStatistics (
     composited_frames: int,
     direct_scanout_candidates: int,
     direct_scanout_frames: int,
+    direct_scanout_rejections: DirectScanoutRejections,
     frames_over_budget: int,
     gpu_execution: LatencyStatistics,
     gpu_composition: LatencyStatistics,
