@@ -7028,7 +7028,7 @@ test "Vulkan renderer applies a three-dimensional output calibration LUT" {
     try expectArgbNear(0xff008000, pixel[0], 1);
 }
 
-test "Vulkan renderer applies ordered backdrop blurs on GPU" {
+test "reproducible scene: Vulkan applies ordered backdrop blurs on GPU" {
     var renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
         error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
         else => return err,
@@ -7141,7 +7141,7 @@ test "Vulkan base backdrop cache survives partial background and owner changes" 
     try std.testing.expectEqualSlices(u32, &reference_pixels, &cached_pixels);
 }
 
-test "Vulkan partial backdrop blur matches a full redraw" {
+test "reproducible scene: Vulkan partial backdrop blur matches a full redraw" {
     var partial_renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
         error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
         else => return err,
@@ -7179,7 +7179,7 @@ test "Vulkan partial backdrop blur matches a full redraw" {
     try std.testing.expectEqualSlices(u32, &full_pixels, &partial_pixels);
 }
 
-test "Vulkan transfer commands preserve pixels outside frame damage" {
+test "reproducible scene: Vulkan preserves pixels outside frame damage" {
     var renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
         error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
         else => return err,
@@ -7265,7 +7265,7 @@ test "Vulkan renderer composites image commands" {
     try expectArgbNear(source_pixels[0], target_pixels[0], 1);
 }
 
-test "renderer conformance: Vulkan transfer functions preserve encoded round trips" {
+test "renderer conformance: reproducible scene: Vulkan SDR and HDR transfer round trips" {
     var renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
         error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
         else => return err,
@@ -7577,7 +7577,7 @@ test "renderer conformance: Vulkan area minification follows transforms and prem
     try expectArgbNear(0x40400000, alpha_target[0], 1);
 }
 
-test "renderer conformance: Vulkan HDR tone mapping reserves SDR highlight headroom" {
+test "renderer conformance: reproducible scene: Vulkan HDR tone mapping reserves SDR highlight headroom" {
     var renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
         error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
         else => return err,
@@ -7637,7 +7637,7 @@ test "renderer conformance: Vulkan HDR tone mapping reserves SDR highlight headr
     try std.testing.expectEqual(@as(u32, 0xffffffff), target_pixels[1]);
 }
 
-test "renderer conformance: Vulkan HDR tone mapping preserves highlight hue" {
+test "renderer conformance: reproducible scene: Vulkan HDR tone mapping preserves highlight hue" {
     var renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
         error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
         else => return err,
@@ -7686,7 +7686,7 @@ test "renderer conformance: Vulkan HDR tone mapping preserves highlight hue" {
     try std.testing.expect(blue >= 125 and blue <= 150);
 }
 
-test "renderer conformance: Vulkan HDR tone mapping preserves highlight gradation" {
+test "renderer conformance: reproducible scene: Vulkan HDR tone mapping preserves highlight gradation" {
     var renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
         error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
         else => return err,
@@ -8361,20 +8361,20 @@ fn expectVideoImport(
     }
 }
 
-test "renderer conformance: Vulkan converts known NV12 pixels with an immutable sampler" {
+test "renderer conformance: reproducible scene: Vulkan converts known NV12 pixels with an immutable sampler" {
     try expectVideoImport(.nv12, .type_0, .uniform_red, .limited);
 }
 
-test "renderer conformance: Vulkan manually reconstructs known NV12 pixels" {
+test "renderer conformance: reproducible scene: Vulkan manually reconstructs known NV12 pixels" {
     try expectVideoImport(.nv12, .type_4, .uniform_red, .limited);
     try expectVideoImport(.nv12, .type_4, .uniform_red, .full);
 }
 
-test "renderer conformance: Vulkan manually reconstructs known P010 pixels" {
+test "renderer conformance: reproducible scene: Vulkan manually reconstructs known P010 pixels" {
     try expectVideoImport(.p010, .type_5, .uniform_red, .limited);
 }
 
-test "renderer conformance: Vulkan reconstructs bottom-sited NV12 chroma" {
+test "renderer conformance: reproducible scene: Vulkan reconstructs bottom-sited NV12 chroma" {
     try expectVideoImport(.nv12, .type_4, .isolated_chroma, .limited);
     try expectVideoImport(.nv12, .type_5, .isolated_chroma, .limited);
 }
@@ -8538,7 +8538,7 @@ test "Vulkan renderer uploads only source-damaged texture pixels" {
     );
 }
 
-test "Vulkan renderer preserves command order in a mixed GPU frame" {
+test "reproducible scene: Vulkan preserves command order in a mixed GPU frame" {
     var renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
         error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
         else => return err,

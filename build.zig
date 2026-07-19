@@ -295,6 +295,16 @@ pub fn build(b: *std.Build) void {
     );
     renderer_conformance_step.dependOn(&b.addRunArtifact(renderer_conformance_tests).step);
 
+    const renderer_scene_tests = b.addTest(.{
+        .root_module = compositor,
+        .filters = &.{"reproducible scene:"},
+    });
+    const renderer_scene_step = b.step(
+        "renderer-scenes",
+        "Run reproducible renderer scene tests",
+    );
+    renderer_scene_step.dependOn(&b.addRunArtifact(renderer_scene_tests).step);
+
     const fmt_step = b.step("fmt", "Check code formatting");
     const fmt_check = b.addFmt(.{ .paths = &.{ "src", "build.zig", "build.zig.zon" }, .check = true });
     fmt_step.dependOn(&fmt_check.step);

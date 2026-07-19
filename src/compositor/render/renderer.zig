@@ -720,7 +720,7 @@ test "renderer prefers PQ then HLG output for visible HDR images" {
     renderer.cancelFrame();
 }
 
-test "direct scanout candidate requires a final exact opaque DMA-BUF image" {
+test "reproducible scene: direct scanout requires a final exact opaque DMA-BUF image" {
     const NoopSource = struct {
         fn retain(_: *anyopaque) void {}
         fn release(_: *anyopaque) void {}

@@ -121,13 +121,15 @@ Current commands:
 
 - `zig build renderer-conformance --summary all` runs the deterministic renderer
   reference-vector corpus independently from the broader unit suite.
+- `zig build renderer-scenes --summary all` runs reproducible direct-scanout,
+  mixed-content, damage, blur, video, SDR, and HDR scenes.
 - `keyworkctl stats --json` captures machine-readable live path, latency,
   bandwidth-proxy, import, copy, and frame-budget statistics. Add `--reset` to
   start a repeatable measurement window.
 
 - [x] Build reference image tests for transfer functions, primaries, blending,
   tone mapping, gamut mapping, scaling, and YCbCr conversion.
-- Add reproducible scenes for direct scanout, mixed windows, damage, blur,
+- [x] Add reproducible scenes for direct scanout, mixed windows, damage, blur,
   video, SDR, and HDR.
 - Track CPU time, GPU pass time, memory bandwidth proxies, copies, imports,
   missed frame budgets, and presentation latency.
