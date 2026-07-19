@@ -88,8 +88,8 @@ displayed: ?usize,
 direct_pending: ?DirectScanout,
 direct_displayed: ?DirectScanout,
 pending_page_flip: ?PageFlipMode,
-direct_framebuffers: std.AutoHashMapUnmanaged(u64, DirectFramebuffer),
-direct_frame_number: u64,
+scanout_framebuffers: std.AutoHashMapUnmanaged(ScanoutFramebufferKey, ScanoutFramebuffer),
+scanout_frame_number: u64,
 direct_scanout_active: bool,
 enabled: bool,
 powered: bool,
@@ -108,7 +108,12 @@ const Buffer = struct {
     stride_pixels: u32 = 0,
 };
 
-const DirectFramebuffer = struct {
+const ScanoutFramebufferKey = struct {
+    cache_id: u64,
+    format: u32,
+};
+
+const ScanoutFramebuffer = struct {
     framebuffer_id: u32,
     size: render.Size,
     format: u32,
@@ -120,7 +125,7 @@ const DirectFramebuffer = struct {
 
 const DirectScanout = struct {
     source: render.DmabufSource,
-    cache_id: u64,
+    framebuffer_key: ScanoutFramebufferKey,
 
     fn release(self: DirectScanout) void {
         self.source.release(self.source.context);
@@ -265,7 +270,7 @@ pub const DirectScanoutResult = union(enum) {
     rejected: render.DirectScanoutRejection,
 };
 
-const max_direct_framebuffers = 8;
+const max_scanout_framebuffers = 8;
 
 pub const Selection = struct {
     modes: []Mode,
@@ -385,8 +390,8 @@ pub fn init(
         .direct_pending = null,
         .direct_displayed = null,
         .pending_page_flip = null,
-        .direct_framebuffers = .empty,
-        .direct_frame_number = 0,
+        .scanout_framebuffers = .empty,
+        .scanout_frame_number = 0,
         .direct_scanout_active = false,
         .enabled = true,
         .powered = true,
@@ -401,8 +406,8 @@ pub fn deinit(self: *Self) void {
     std.debug.assert(self.hdr_metadata_blob == 0);
     std.debug.assert(self.shadow_pixels.len == 0);
     std.debug.assert(self.direct_pending == null and self.direct_displayed == null);
-    std.debug.assert(self.direct_framebuffers.count() == 0);
-    self.direct_framebuffers.deinit(self.allocator);
+    std.debug.assert(self.scanout_framebuffers.count() == 0);
+    self.scanout_framebuffers.deinit(self.allocator);
     self.clearIdentity();
     if (self.icc_profile) |*profile| profile.deinit(self.allocator);
     if (self.icc_profile_path) |path| self.allocator.free(path);
@@ -742,8 +747,7 @@ pub fn tryDirectScanout(
     allow_tearing: bool,
 ) DirectScanoutResult {
     const source = buffer.dmabuf orelse return .{ .rejected = .non_dmabuf };
-    const source_cache = buffer.source_cache orelse
-        return .{ .rejected = .missing_buffer_identity };
+    if (buffer.source_cache == null) return .{ .rejected = .missing_buffer_identity };
     if (self.output_color_dirty) return .{ .rejected = .color_conversion };
     if (!self.mode_set) return .{ .rejected = .output_unavailable };
     if (self.acquired == null or self.pending != null or self.direct_pending != null) {
@@ -764,7 +768,12 @@ pub fn tryDirectScanout(
         return .{ .rejected = .device_inactive };
     }
     if (source.plane_count != 1) return .{ .rejected = .unsupported_layout };
-    const framebuffer = self.directFramebuffer(fd, buffer) catch |err| return .{
+    const framebuffer = self.scanoutFramebuffer(
+        fd,
+        buffer,
+        self.scanout_formats,
+        self.implicit_scanout,
+    ) catch |err| return .{
         .rejected = if (err == error.UnsupportedModifier)
             .unsupported_format_or_modifier
         else
@@ -784,7 +793,7 @@ pub fn tryDirectScanout(
     };
     self.direct_pending = .{
         .source = source,
-        .cache_id = source_cache.id,
+        .framebuffer_key = framebuffer.key,
     };
     self.pending_page_flip = page_flip;
     self.acquired = null;
@@ -1186,7 +1195,7 @@ fn release(self: *Self, fd: std.posix.fd_t) void {
     self.displayed = null;
     self.pending_page_flip = null;
     self.releaseDirectScanouts();
-    self.destroyDirectFramebuffers(fd);
+    self.destroyScanoutFramebuffers(fd);
     self.destroyPair(fd, &self.buffers, self.shadow_pixels);
     self.shadow_pixels = &.{};
     for (&self.buffer_damage) |*damage| damage.clear();
@@ -1236,7 +1245,7 @@ pub fn setPowered(self: *Self, fd: std.posix.fd_t, powered: bool) !void {
     self.mode_set = false;
     self.displayed = null;
     self.releaseDirectScanouts();
-    self.destroyDirectFramebuffers(fd);
+    self.destroyScanoutFramebuffers(fd);
     self.notifyDeactivated();
     self.destroyPair(fd, &self.buffers, self.shadow_pixels);
     self.shadow_pixels = &.{};
@@ -1267,7 +1276,7 @@ pub fn setMode(self: *Self, fd: std.posix.fd_t, mode_index: usize) !void {
         self.destroyPair(fd, &old_buffers, old_shadow_pixels);
         self.displayed = null;
         self.releaseDirectScanouts();
-        self.destroyDirectFramebuffers(fd);
+        self.destroyScanoutFramebuffers(fd);
         self.mode_set = false;
     }
 
@@ -2114,41 +2123,45 @@ fn copyShadowDamage(
     }
 }
 
-fn directFramebuffer(
+fn scanoutFramebuffer(
     self: *Self,
     fd: std.posix.fd_t,
     buffer: render.PixelBuffer,
-) !*DirectFramebuffer {
+    formats: []const render.DmabufFormatModifier,
+    implicit_scanout: bool,
+) !struct { key: ScanoutFramebufferKey, framebuffer_id: u32 } {
     const source = buffer.dmabuf orelse return error.InvalidBuffer;
     if (source.plane_count != 1) return error.InvalidBuffer;
     const plane = source.planes[0];
-    const cache_id = buffer.source_cache.?.id;
-    self.direct_frame_number +%= 1;
-    if (self.direct_frame_number == 0) self.direct_frame_number = 1;
-    if (self.direct_framebuffers.getPtr(cache_id)) |framebuffer| {
+    const framebuffer_format = scanoutFramebufferFormat(
+        formats,
+        source.format,
+        source.modifier,
+    ) orelse return error.UnsupportedModifier;
+    const modifier_supported = render.DmabufFormatModifier.contains(
+        formats,
+        framebuffer_format,
+        source.modifier,
+    );
+    if (!modifier_supported and !(implicit_scanout and
+        source.modifier == drm_format_mod_linear)) return error.UnsupportedModifier;
+    const key: ScanoutFramebufferKey = .{
+        .cache_id = buffer.source_cache.?.id,
+        .format = framebuffer_format,
+    };
+    self.scanout_frame_number +%= 1;
+    if (self.scanout_frame_number == 0) self.scanout_frame_number = 1;
+    if (self.scanout_framebuffers.getPtr(key)) |framebuffer| {
         if (!std.meta.eql(framebuffer.size, buffer.size) or
             framebuffer.format != source.format or framebuffer.modifier != source.modifier or
             framebuffer.stride != plane.stride or framebuffer.offset != plane.offset)
         {
             return error.CacheIdentityMismatch;
         }
-        framebuffer.last_used = self.direct_frame_number;
-        return framebuffer;
+        framebuffer.last_used = self.scanout_frame_number;
+        return .{ .key = key, .framebuffer_id = framebuffer.framebuffer_id };
     }
-    try self.makeDirectFramebufferRoom(fd);
-
-    const framebuffer_format = scanoutFramebufferFormat(
-        self.scanout_formats,
-        source.format,
-        source.modifier,
-    ) orelse return error.UnsupportedModifier;
-    const modifier_supported = render.DmabufFormatModifier.contains(
-        self.scanout_formats,
-        framebuffer_format,
-        source.modifier,
-    );
-    if (!modifier_supported and !(self.implicit_scanout and
-        source.modifier == drm_format_mod_linear)) return error.UnsupportedModifier;
+    try self.makeScanoutFramebufferRoom(fd);
 
     var handle: u32 = 0;
     if (c.drmPrimeFDToHandle(fd, plane.fd, &handle) != 0) return error.ImportHandleFailed;
@@ -2175,7 +2188,7 @@ fn directFramebuffer(
             c.DRM_MODE_FB_MODIFIERS,
         );
     }
-    if (add_result != 0 and source.modifier == drm_format_mod_linear and self.implicit_scanout) {
+    if (add_result != 0 and source.modifier == drm_format_mod_linear and implicit_scanout) {
         add_result = c.drmModeAddFB2(
             fd,
             buffer.size.width,
@@ -2191,16 +2204,16 @@ fn directFramebuffer(
     if (add_result != 0) return error.AddFramebufferFailed;
     errdefer _ = c.drmModeRmFB(fd, framebuffer_id);
 
-    try self.direct_framebuffers.put(self.allocator, cache_id, .{
+    try self.scanout_framebuffers.put(self.allocator, key, .{
         .framebuffer_id = framebuffer_id,
         .size = buffer.size,
         .format = source.format,
         .modifier = source.modifier,
         .stride = plane.stride,
         .offset = plane.offset,
-        .last_used = self.direct_frame_number,
+        .last_used = self.scanout_frame_number,
     });
-    return self.direct_framebuffers.getPtr(cache_id).?;
+    return .{ .key = key, .framebuffer_id = framebuffer_id };
 }
 
 fn legacyFramebufferLayoutMatches(self: *const Self, buffer: render.PixelBuffer) bool {
@@ -2213,7 +2226,7 @@ fn legacyFramebufferLayoutMatches(self: *const Self, buffer: render.PixelBuffer)
         c.DRM_FORMAT_XRGB8888;
     if (source.format != compositor_format) return false;
     if (self.direct_displayed) |displayed| {
-        const current = self.direct_framebuffers.get(displayed.cache_id) orelse return false;
+        const current = self.scanout_framebuffers.get(displayed.framebuffer_key) orelse return false;
         return current.format == source.format and
             std.meta.eql(current.size, buffer.size) and
             current.modifier == source.modifier and
@@ -2818,23 +2831,25 @@ fn boundedU32(value: u64) u32 {
     return @intCast(@min(value, std.math.maxInt(u32)));
 }
 
-fn makeDirectFramebufferRoom(self: *Self, fd: std.posix.fd_t) !void {
-    if (self.direct_framebuffers.count() < max_direct_framebuffers) return;
-    var oldest_id: ?u64 = null;
+fn makeScanoutFramebufferRoom(self: *Self, fd: std.posix.fd_t) !void {
+    if (self.scanout_framebuffers.count() < max_scanout_framebuffers) return;
+    var oldest_key: ?ScanoutFramebufferKey = null;
     var oldest_frame: u64 = std.math.maxInt(u64);
-    var iterator = self.direct_framebuffers.iterator();
+    var iterator = self.scanout_framebuffers.iterator();
     while (iterator.next()) |entry| {
-        const id = entry.key_ptr.*;
-        if ((self.direct_pending != null and self.direct_pending.?.cache_id == id) or
-            (self.direct_displayed != null and self.direct_displayed.?.cache_id == id) or
+        const key = entry.key_ptr.*;
+        if ((self.direct_pending != null and
+            std.meta.eql(self.direct_pending.?.framebuffer_key, key)) or
+            (self.direct_displayed != null and
+                std.meta.eql(self.direct_displayed.?.framebuffer_key, key)) or
             entry.value_ptr.last_used >= oldest_frame) continue;
-        oldest_id = id;
+        oldest_key = key;
         oldest_frame = entry.value_ptr.last_used;
     }
-    const id = oldest_id orelse return error.CacheFull;
-    const framebuffer = self.direct_framebuffers.fetchRemove(id).?.value;
+    const key = oldest_key orelse return error.CacheFull;
+    const framebuffer = self.scanout_framebuffers.fetchRemove(key).?.value;
     if (c.drmModeRmFB(fd, framebuffer.framebuffer_id) != 0) {
-        log.err("failed to remove direct-scanout framebuffer {d}", .{framebuffer.framebuffer_id});
+        log.err("failed to remove scanout framebuffer {d}", .{framebuffer.framebuffer_id});
     }
 }
 
@@ -2846,13 +2861,13 @@ fn releaseDirectScanouts(self: *Self) void {
     self.setDirectScanoutActive(false);
 }
 
-fn destroyDirectFramebuffers(self: *Self, fd: std.posix.fd_t) void {
-    while (self.direct_framebuffers.count() > 0) {
-        var iterator = self.direct_framebuffers.iterator();
-        const id = iterator.next().?.key_ptr.*;
-        const framebuffer = self.direct_framebuffers.fetchRemove(id).?.value;
+fn destroyScanoutFramebuffers(self: *Self, fd: std.posix.fd_t) void {
+    while (self.scanout_framebuffers.count() > 0) {
+        var iterator = self.scanout_framebuffers.iterator();
+        const key = iterator.next().?.key_ptr.*;
+        const framebuffer = self.scanout_framebuffers.fetchRemove(key).?.value;
         if (c.drmModeRmFB(fd, framebuffer.framebuffer_id) != 0) {
-            log.err("failed to remove direct-scanout framebuffer {d}", .{framebuffer.framebuffer_id});
+            log.err("failed to remove scanout framebuffer {d}", .{framebuffer.framebuffer_id});
         }
     }
 }
