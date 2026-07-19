@@ -333,10 +333,14 @@ pub const Renderer = struct {
         const format = render_types.DmabufFormat.fromFourcc(dmabuf.format) orelse
             return .{ .rejected = .non_rgb_surface };
         const rgb_representation: render_types.ColorRepresentation = .{};
-        if (!format.isPackedRgb() or
-            !std.meta.eql(image.buffer.color_representation, rgb_representation))
+        if (format.isPackedRgb()) {
+            if (!std.meta.eql(image.buffer.color_representation, rgb_representation)) {
+                return .{ .rejected = .non_rgb_surface };
+            }
+        } else if (image.buffer.color_representation.coefficients == .identity or
+            image.buffer.color_representation.chroma_location != .type_0)
         {
-            return .{ .rejected = .non_rgb_surface };
+            return .{ .rejected = .color_conversion };
         }
         if (dmabuf.y_inverted) return .{ .rejected = .y_inverted };
         if (image.buffer.source_cache == null) {
@@ -790,6 +794,26 @@ test "direct scanout candidate requires a final exact opaque DMA-BUF image" {
         overlay.destination,
     );
     try std.testing.expect(overlay.buffer.dmabuf.?.force_opaque);
+    renderer.cancelFrame();
+
+    var video_commands = direct_commands;
+    video_commands[1].image.buffer.dmabuf.?.format = @intFromEnum(render_types.DmabufFormat.nv12);
+    video_commands[1].image.buffer.dmabuf.?.plane_count = 2;
+    video_commands[1].image.buffer.color_representation = .{
+        .coefficients = .bt709,
+        .range = .limited,
+        .chroma_location = .type_0,
+    };
+    try renderer.beginFrame(target, .{}, .{}, null, .{});
+    try renderer.append(&video_commands);
+    const video_overlay = try expectOverlayScanoutCandidate(renderer.overlayScanoutCandidate());
+    try std.testing.expectEqual(@as(u8, 2), video_overlay.buffer.dmabuf.?.plane_count);
+    renderer.cancelFrame();
+
+    video_commands[1].image.buffer.color_representation.chroma_location = .type_1;
+    try renderer.beginFrame(target, .{}, .{}, null, .{});
+    try renderer.append(&video_commands);
+    try expectOverlayScanoutRejection(.color_conversion, renderer.overlayScanoutCandidate());
     renderer.cancelFrame();
 
     const p3: render_types.ColorDescription = .{

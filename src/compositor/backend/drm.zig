@@ -17,6 +17,7 @@ const c = @cImport({
     @cInclude("libdrm/drm_fourcc.h");
     @cInclude("linux/dma-buf.h");
     @cInclude("sys/ioctl.h");
+    @cInclude("sys/stat.h");
     @cInclude("xf86drm.h");
     @cInclude("xf86drmMode.h");
 });
@@ -141,6 +142,7 @@ const AtomicOverlay = struct {
     source_size: render.Size,
     destination: render.Rect,
     framebuffer_id: u32,
+    color: ?AtomicPlaneColorState,
 };
 
 const PreparedOverlay = struct {
@@ -896,15 +898,31 @@ fn prepareOverlay(
     if (candidate.buffer.source_cache == null) {
         return .{ .rejected = .missing_buffer_identity };
     }
-    if (source.plane_count != 1) return .{ .rejected = .unsupported_layout };
     const format = render.DmabufFormat.fromFourcc(source.format) orelse
         return .{ .rejected = .unsupported_format_or_modifier };
     const rgb_representation: render.ColorRepresentation = .{};
-    if (!format.isPackedRgb() or
-        !std.meta.eql(candidate.buffer.color_representation, rgb_representation))
-    {
-        return .{ .rejected = .non_rgb_surface };
+    if (source.plane_count != format.planeCount()) {
+        return .{ .rejected = .unsupported_layout };
     }
+    const color_state: ?AtomicPlaneColorState = if (format.isPackedRgb()) rgb: {
+        if (!std.meta.eql(candidate.buffer.color_representation, rgb_representation)) {
+            return .{ .rejected = .non_rgb_surface };
+        }
+        break :rgb null;
+    } else video: {
+        // KMS has no chroma-location property, so only Keywork's conventional
+        // native-video siting can preserve the composed result.
+        if (candidate.buffer.color_representation.chroma_location != .type_0) {
+            return .{ .rejected = .color_conversion };
+        }
+        // One plane has one acquire fence. A shared allocation ensures its
+        // reservation object covers every image plane.
+        if (!dmabufPlanesShareAllocation(source.planeSlice())) {
+            return .{ .rejected = .unsupported_layout };
+        }
+        break :video plane.atomic.color.state(candidate.buffer.color_representation) orelse
+            return .{ .rejected = .color_conversion };
+    };
     if (!std.meta.eql(candidate.buffer.color_description, self.color_description) or
         self.outputCalibration() != null)
     {
@@ -938,6 +956,7 @@ fn prepareOverlay(
             .source_size = candidate.buffer.size,
             .destination = candidate.destination,
             .framebuffer_id = framebuffer.framebuffer_id,
+            .color = color_state,
         },
         .scanout = .{
             .source = source,
@@ -2509,6 +2528,48 @@ fn closeImportedBufferHandles(
     }
 }
 
+fn dmabufPlanesShareAllocation(planes: []const render.DmabufPlane) bool {
+    if (planes.len == 0) return false;
+    var first: c.struct_stat = undefined;
+    if (c.fstat(planes[0].fd, &first) != 0) return false;
+    for (planes[1..]) |plane| {
+        var current: c.struct_stat = undefined;
+        if (c.fstat(plane.fd, &current) != 0 or
+            current.st_dev != first.st_dev or current.st_ino != first.st_ino)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+test "overlay synchronization requires one shared DMA-BUF allocation" {
+    var first_pipe: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe2(&first_pipe, .{ .CLOEXEC = true }));
+    defer {
+        for (first_pipe) |fd| _ = std.c.close(fd);
+    }
+
+    var second_pipe: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe2(&second_pipe, .{ .CLOEXEC = true }));
+    defer {
+        for (second_pipe) |fd| _ = std.c.close(fd);
+    }
+
+    const duplicate = std.c.dup(first_pipe[0]);
+    try std.testing.expect(duplicate >= 0);
+    defer _ = std.c.close(duplicate);
+
+    try std.testing.expect(dmabufPlanesShareAllocation(&.{
+        .{ .fd = first_pipe[0] },
+        .{ .fd = duplicate },
+    }));
+    try std.testing.expect(!dmabufPlanesShareAllocation(&.{
+        .{ .fd = first_pipe[0] },
+        .{ .fd = second_pipe[0] },
+    }));
+}
+
 test "scanout framebuffer cache validates every DMA-BUF plane" {
     const NoopSource = struct {
         fn retain(_: *anyopaque) void {}
@@ -2656,6 +2717,7 @@ fn queuePageFlip(
         self.crtc_id,
         source_size,
         .{ .x = 0, .y = 0, .width = self.size.width, .height = self.size.height },
+        null,
         fence_fd,
         null,
     )) return null;
@@ -2680,6 +2742,7 @@ fn queuePageFlip(
                 self.crtc_id,
                 value.source_size,
                 value.destination,
+                value.color,
                 in_fence_fd,
                 if (plane.zpos_property) |property_id|
                     .{ .property_id = property_id, .value = plane.zpos }
@@ -2845,6 +2908,7 @@ fn addAtomicPlaneState(
     crtc_id: u32,
     source_size: render.Size,
     destination: render.Rect,
+    color: ?AtomicPlaneColorState,
     in_fence_fd: ?std.posix.fd_t,
     zpos: ?AtomicZpos,
 ) bool {
@@ -2864,6 +2928,19 @@ fn addAtomicPlaneState(
         !addAtomicProperty(request, plane_id, properties.crtc_h, destination.height))
     {
         return false;
+    }
+    if (color) |value| {
+        if (!addAtomicProperty(
+            request,
+            plane_id,
+            value.encoding_property,
+            value.encoding,
+        ) or !addAtomicProperty(
+            request,
+            plane_id,
+            value.range_property,
+            value.range,
+        )) return false;
     }
     if (in_fence_fd) |value| {
         if (properties.in_fence_fd == 0 or !addAtomicProperty(
