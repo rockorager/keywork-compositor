@@ -5,6 +5,7 @@ const std = @import("std");
 pub const quad_instanced = spirvWords(@embedFile("vulkan-quad"));
 pub const solid_instanced = spirvWords(@embedFile("vulkan-solid"));
 pub const image_alpha_instanced = spirvWords(@embedFile("vulkan-image"));
+pub const video_manual_instanced = spirvWords(@embedFile("vulkan-video-manual"));
 pub const shadow_instanced = spirvWords(@embedFile("vulkan-shadow"));
 pub const blur_horizontal_paired = spirvWords(@embedFile("vulkan-blur-horizontal"));
 pub const blur_vertical_paired = spirvWords(@embedFile("vulkan-blur-vertical"));

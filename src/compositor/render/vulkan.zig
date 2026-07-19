@@ -183,10 +183,12 @@ const Texture = struct {
     image: vk.Image,
     memory: vk.DeviceMemory,
     view: vk.ImageView,
+    secondary_view: ?vk.ImageView = null,
     descriptor_set: vk.DescriptorSet,
     pipeline: vk.Pipeline = .null_handle,
     pipeline_layout: vk.PipelineLayout = .null_handle,
     video_representation: ?render.ColorRepresentation = null,
+    manual_ycbcr: ?ManualYcbcr = null,
     size: render.Size,
     version: u64 = 0,
     initialized: bool = false,
@@ -233,7 +235,7 @@ const FramePush = extern struct {
     texture_size: [2]f32,
     swap_red_blue: f32,
     quantization_levels: f32 = 255,
-    padding: [2]f32 = @splat(0),
+    ycbcr_coefficients: [2]f32 = @splat(0),
     color_matrix_0: [4]f32 = .{ 1, 0, 0, 0 },
     color_matrix_1: [4]f32 = .{ 0, 1, 0, 0 },
     color_matrix_2: [4]f32 = .{ 0, 0, 1, 0 },
@@ -299,6 +301,7 @@ const DrawRun = struct {
     first_instance: u32,
     instance_count: u32,
     color_transform: ColorTransform = .{},
+    manual_ycbcr: ?ManualYcbcr = null,
 };
 
 const UploadRun = struct {
@@ -940,8 +943,16 @@ const YcbcrConversion = struct {
     y_chroma_offset: vk.ChromaLocation,
 };
 
+const ManualYcbcr = struct {
+    quantization_levels: f32,
+    narrow_range: bool,
+    coefficients: [2]f32,
+    chroma_location: render.ChromaLocation,
+};
+
 const VideoGraphicsKey = struct {
     format: vk.Format,
+    manual: bool = false,
     model: vk.SamplerYcbcrModelConversion,
     range: vk.SamplerYcbcrRange,
     x_chroma_offset: vk.ChromaLocation,
@@ -949,7 +960,7 @@ const VideoGraphicsKey = struct {
 };
 
 const VideoGraphics = struct {
-    conversion: vk.SamplerYcbcrConversion,
+    conversion: ?vk.SamplerYcbcrConversion,
     sampler: vk.Sampler,
     descriptor_set_layout: vk.DescriptorSetLayout,
     pipeline_layout: vk.PipelineLayout,
@@ -992,6 +1003,34 @@ fn ycbcrConversion(representation: render.ColorRepresentation) ?YcbcrConversion 
     };
 }
 
+fn manualYcbcrConversion(
+    format: vk.Format,
+    representation: render.ColorRepresentation,
+) ?ManualYcbcr {
+    const quantization_levels: f32 = switch (format) {
+        .g8_b8r8_2plane_420_unorm => 255,
+        .g10x6_b10x6r10x6_2plane_420_unorm_3pack16 => 1023,
+        else => return null,
+    };
+    const coefficients: [2]f32 = switch (representation.coefficients) {
+        .identity => return null,
+        .bt601 => .{ 0.299, 0.114 },
+        .bt709 => .{ 0.2126, 0.0722 },
+        .bt2020 => .{ 0.2627, 0.0593 },
+    };
+    const chroma_location = representation.chroma_location orelse return null;
+    switch (chroma_location) {
+        .type_0, .type_1, .type_2, .type_3 => return null,
+        .type_4, .type_5 => {},
+    }
+    return .{
+        .quantization_levels = quantization_levels,
+        .narrow_range = representation.range == .limited,
+        .coefficients = coefficients,
+        .chroma_location = chroma_location,
+    };
+}
+
 fn videoGraphicsKey(format: vk.Format, conversion: YcbcrConversion) VideoGraphicsKey {
     return .{
         .format = format,
@@ -999,6 +1038,17 @@ fn videoGraphicsKey(format: vk.Format, conversion: YcbcrConversion) VideoGraphic
         .range = conversion.range,
         .x_chroma_offset = conversion.x_chroma_offset,
         .y_chroma_offset = conversion.y_chroma_offset,
+    };
+}
+
+fn manualVideoGraphicsKey(format: vk.Format) VideoGraphicsKey {
+    return .{
+        .format = format,
+        .manual = true,
+        .model = .rgb_identity,
+        .range = .itu_full,
+        .x_chroma_offset = .cosited_even,
+        .y_chroma_offset = .cosited_even,
     };
 }
 
@@ -1013,29 +1063,34 @@ fn getVideoGraphics(self: *Self, key: VideoGraphicsKey) Error!VideoGraphics {
 }
 
 fn createVideoGraphics(self: *Self, key: VideoGraphicsKey) Error!VideoGraphics {
-    const conversion = self.device_wrapper.createSamplerYcbcrConversionKHR(self.device, &.{
-        .format = key.format,
-        .ycbcr_model = key.model,
-        .ycbcr_range = key.range,
-        .components = .{
-            .r = .identity,
-            .g = .identity,
-            .b = .identity,
-            .a = .identity,
-        },
-        .x_chroma_offset = key.x_chroma_offset,
-        .y_chroma_offset = key.y_chroma_offset,
-        .chroma_filter = .linear,
-        .force_explicit_reconstruction = .false,
-    }, null) catch return error.VulkanFailure;
-    errdefer self.device_wrapper.destroySamplerYcbcrConversionKHR(
+    const conversion: ?vk.SamplerYcbcrConversion = if (key.manual)
+        null
+    else
+        self.device_wrapper.createSamplerYcbcrConversionKHR(self.device, &.{
+            .format = key.format,
+            .ycbcr_model = key.model,
+            .ycbcr_range = key.range,
+            .components = .{
+                .r = .identity,
+                .g = .identity,
+                .b = .identity,
+                .a = .identity,
+            },
+            .x_chroma_offset = key.x_chroma_offset,
+            .y_chroma_offset = key.y_chroma_offset,
+            .chroma_filter = .linear,
+            .force_explicit_reconstruction = .false,
+        }, null) catch return error.VulkanFailure;
+    errdefer if (conversion) |value| self.device_wrapper.destroySamplerYcbcrConversionKHR(
         self.device,
-        conversion,
+        value,
         null,
     );
-    const conversion_info: vk.SamplerYcbcrConversionInfo = .{ .conversion = conversion };
+    const conversion_info: vk.SamplerYcbcrConversionInfo = .{
+        .conversion = conversion orelse .null_handle,
+    };
     const sampler = self.device_wrapper.createSampler(self.device, &.{
-        .p_next = &conversion_info,
+        .p_next = if (conversion != null) &conversion_info else null,
         .mag_filter = .linear,
         .min_filter = .linear,
         .mipmap_mode = .nearest,
@@ -1053,16 +1108,34 @@ fn createVideoGraphics(self: *Self, key: VideoGraphicsKey) Error!VideoGraphics {
         .unnormalized_coordinates = .false,
     }, null) catch return error.VulkanFailure;
     errdefer self.device_wrapper.destroySampler(self.device, sampler, null);
-    const binding: vk.DescriptorSetLayoutBinding = .{
+    const automatic_bindings = [_]vk.DescriptorSetLayoutBinding{.{
         .binding = 0,
         .descriptor_type = .combined_image_sampler,
         .descriptor_count = 1,
         .stage_flags = .{ .fragment_bit = true },
         .p_immutable_samplers = @ptrCast(&sampler),
+    }};
+    const manual_bindings = [_]vk.DescriptorSetLayoutBinding{
+        .{
+            .binding = 0,
+            .descriptor_type = .combined_image_sampler,
+            .descriptor_count = 1,
+            .stage_flags = .{ .fragment_bit = true },
+        },
+        .{
+            .binding = 1,
+            .descriptor_type = .combined_image_sampler,
+            .descriptor_count = 1,
+            .stage_flags = .{ .fragment_bit = true },
+        },
     };
+    const bindings: []const vk.DescriptorSetLayoutBinding = if (key.manual)
+        &manual_bindings
+    else
+        &automatic_bindings;
     const descriptor_set_layout = self.device_wrapper.createDescriptorSetLayout(self.device, &.{
-        .binding_count = 1,
-        .p_bindings = @ptrCast(&binding),
+        .binding_count = @intCast(bindings.len),
+        .p_bindings = bindings.ptr,
     }, null) catch return error.VulkanFailure;
     errdefer self.device_wrapper.destroyDescriptorSetLayout(
         self.device,
@@ -1087,8 +1160,14 @@ fn createVideoGraphics(self: *Self, key: VideoGraphicsKey) Error!VideoGraphics {
     }, null) catch return error.VulkanFailure;
     defer self.device_wrapper.destroyShaderModule(self.device, vertex_shader, null);
     const image_shader = self.device_wrapper.createShaderModule(self.device, &.{
-        .code_size = @sizeOf(@TypeOf(shaders.image_alpha_instanced)),
-        .p_code = &shaders.image_alpha_instanced,
+        .code_size = if (key.manual)
+            @sizeOf(@TypeOf(shaders.video_manual_instanced))
+        else
+            @sizeOf(@TypeOf(shaders.image_alpha_instanced)),
+        .p_code = if (key.manual)
+            &shaders.video_manual_instanced
+        else
+            &shaders.image_alpha_instanced,
     }, null) catch return error.VulkanFailure;
     defer self.device_wrapper.destroyShaderModule(self.device, image_shader, null);
     const pipeline = createPipeline(
@@ -1118,11 +1197,13 @@ fn destroyVideoGraphics(self: *Self, graphics: VideoGraphics) void {
         null,
     );
     self.device_wrapper.destroySampler(self.device, graphics.sampler, null);
-    self.device_wrapper.destroySamplerYcbcrConversionKHR(
-        self.device,
-        graphics.conversion,
-        null,
-    );
+    if (graphics.conversion) |conversion| {
+        self.device_wrapper.destroySamplerYcbcrConversionKHR(
+            self.device,
+            conversion,
+            null,
+        );
+    }
 }
 
 test "color representation maps to Vulkan YCbCr conversion" {
@@ -1174,6 +1255,37 @@ test "unsupported YCbCr conversion metadata is rejected" {
     }
 }
 
+test "manual YCbCr conversion preserves video precision and metadata" {
+    const nv12 = manualYcbcrConversion(.g8_b8r8_2plane_420_unorm, .{
+        .coefficients = .bt601,
+        .range = .full,
+        .chroma_location = .type_4,
+    }).?;
+    try std.testing.expectEqual(@as(f32, 255), nv12.quantization_levels);
+    try std.testing.expect(!nv12.narrow_range);
+    try std.testing.expectEqual([2]f32{ 0.299, 0.114 }, nv12.coefficients);
+    try std.testing.expectEqual(render.ChromaLocation.type_4, nv12.chroma_location);
+
+    const p010 = manualYcbcrConversion(
+        .g10x6_b10x6r10x6_2plane_420_unorm_3pack16,
+        .{
+            .coefficients = .bt2020,
+            .range = .limited,
+            .chroma_location = .type_5,
+        },
+    ).?;
+    try std.testing.expectEqual(@as(f32, 1023), p010.quantization_levels);
+    try std.testing.expect(p010.narrow_range);
+    try std.testing.expectEqual([2]f32{ 0.2627, 0.0593 }, p010.coefficients);
+    try std.testing.expectEqual(render.ChromaLocation.type_5, p010.chroma_location);
+
+    try std.testing.expect(manualYcbcrConversion(.g8_b8r8_2plane_420_unorm, .{
+        .coefficients = .bt709,
+        .range = .limited,
+        .chroma_location = .type_3,
+    }) == null);
+}
+
 test "Vulkan caches immutable YCbCr sampler pipelines" {
     var renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
         error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
@@ -1191,7 +1303,19 @@ test "Vulkan caches immutable YCbCr sampler pipelines" {
     try std.testing.expectEqual(first.descriptor_set_layout, second.descriptor_set_layout);
     try std.testing.expectEqual(first.pipeline_layout, second.pipeline_layout);
     try std.testing.expectEqual(first.pipeline, second.pipeline);
-    try std.testing.expectEqual(@as(usize, 1), renderer.video_graphics.count());
+
+    const manual_key = manualVideoGraphicsKey(.g8_b8r8_2plane_420_unorm);
+    const manual_first = try renderer.getVideoGraphics(manual_key);
+    const manual_second = try renderer.getVideoGraphics(manual_key);
+    try std.testing.expect(manual_first.conversion == null);
+    try std.testing.expectEqual(manual_first.sampler, manual_second.sampler);
+    try std.testing.expectEqual(
+        manual_first.descriptor_set_layout,
+        manual_second.descriptor_set_layout,
+    );
+    try std.testing.expectEqual(manual_first.pipeline_layout, manual_second.pipeline_layout);
+    try std.testing.expectEqual(manual_first.pipeline, manual_second.pipeline);
+    try std.testing.expectEqual(@as(usize, 2), renderer.video_graphics.count());
 }
 
 fn dmabufPlanesShareAllocation(planes: []const render.DmabufPlane) bool {
@@ -3073,10 +3197,23 @@ fn renderFrameWithCompletion(
                 .texture_size = sizeFloats(run.texture_size),
                 // Scratch images use the output's format, so their sampled and
                 // attachment component order already agrees on every device.
-                .swap_red_blue = if (run.pipeline == .blur_composite)
+                .swap_red_blue = if (run.manual_ycbcr) |manual|
+                    @floatFromInt(@intFromEnum(manual.chroma_location))
+                else if (run.pipeline == .blur_composite)
                     0
                 else
                     @floatFromInt(@intFromBool(self.swap_red_blue)),
+                .quantization_levels = if (run.manual_ycbcr) |manual|
+                    if (manual.narrow_range)
+                        -manual.quantization_levels
+                    else
+                        manual.quantization_levels
+                else
+                    255,
+                .ycbcr_coefficients = if (run.manual_ycbcr) |manual|
+                    manual.coefficients
+                else
+                    @splat(0),
                 .color_matrix_0 = run.color_transform.color_matrix_0,
                 .color_matrix_1 = run.color_transform.color_matrix_1,
                 .color_matrix_2 = run.color_transform.color_matrix_2,
@@ -4474,15 +4611,23 @@ fn createImportedTexture(
     const format_info = render.DmabufFormat.fromFourcc(source.format) orelse
         return error.InvalidTarget;
     const source_format = dmabufSourceVkFormat(source.format) orelse return error.InvalidTarget;
-    const conversion_parameters = if (format_info.isPackedRgb())
+    const conversion_parameters: ?YcbcrConversion = if (format_info.isPackedRgb())
         null
     else
-        ycbcrConversion(representation) orelse return error.InvalidTarget;
+        ycbcrConversion(representation);
+    const manual_parameters: ?ManualYcbcr = if (format_info.isPackedRgb() or
+        conversion_parameters != null)
+        null
+    else
+        manualYcbcrConversion(source_format, representation) orelse
+            return error.InvalidTarget;
     if (!format_info.isPackedRgb() and !dmabufPlanesShareAllocation(source.planeSlice())) {
         return error.InvalidTarget;
     }
     const video_graphics: ?VideoGraphics = if (conversion_parameters) |parameters|
         try self.getVideoGraphics(videoGraphicsKey(source_format, parameters))
+    else if (manual_parameters != null)
+        try self.getVideoGraphics(manualVideoGraphicsKey(source_format))
     else
         null;
     const duplicate_fd = std.c.dup(source.planes[0].fd);
@@ -4506,12 +4651,22 @@ fn createImportedTexture(
         .drm_format_modifier_plane_count = source.plane_count,
         .p_plane_layouts = &plane_layouts,
     };
+    var plane_view_formats = if (manual_parameters != null)
+        videoPlaneViewFormats(source_format)
+    else
+        null;
+    var format_list: vk.ImageFormatListCreateInfo = .{ .p_next = &modifier_info };
+    if (plane_view_formats) |*formats| {
+        format_list.view_format_count = formats.len;
+        format_list.p_view_formats = formats;
+    }
     const external_info: vk.ExternalMemoryImageCreateInfo = .{
-        .p_next = &modifier_info,
+        .p_next = if (plane_view_formats != null) &format_list else &modifier_info,
         .handle_types = .{ .dma_buf_bit_ext = true },
     };
     const image = self.device_wrapper.createImage(self.device, &.{
         .p_next = &external_info,
+        .flags = .{ .mutable_format_bit = plane_view_formats != null },
         .image_type = .@"2d",
         .format = source_format,
         .extent = extent(size),
@@ -4550,26 +4705,55 @@ fn createImportedTexture(
     errdefer self.device_wrapper.freeMemory(self.device, memory, null);
     self.device_wrapper.bindImageMemory(self.device, image, memory, 0) catch
         return error.VulkanFailure;
+    const conversion = if (video_graphics) |graphics| graphics.conversion else null;
     const conversion_info: vk.SamplerYcbcrConversionInfo = .{
-        .conversion = if (video_graphics) |graphics|
-            graphics.conversion
-        else
-            .null_handle,
+        .conversion = conversion orelse .null_handle,
     };
+    const primary_range: vk.ImageSubresourceRange = if (manual_parameters != null) .{
+        .aspect_mask = .{ .plane_0_bit = true },
+        .base_mip_level = 0,
+        .level_count = 1,
+        .base_array_layer = 0,
+        .layer_count = 1,
+    } else colorSubresourceRange();
     const view = self.device_wrapper.createImageView(self.device, &.{
-        .p_next = if (video_graphics != null) &conversion_info else null,
+        .p_next = if (conversion != null) &conversion_info else null,
         .image = image,
         .view_type = .@"2d",
-        .format = source_format,
+        .format = if (manual_parameters != null) plane_view_formats.?[0] else source_format,
         .components = .{
             .r = .identity,
             .g = .identity,
             .b = .identity,
-            .a = if (video_graphics == null and source.force_opaque) .one else .identity,
+            .a = if (format_info.isPackedRgb() and source.force_opaque) .one else .identity,
         },
-        .subresource_range = colorSubresourceRange(),
+        .subresource_range = primary_range,
     }, null) catch return error.VulkanFailure;
     errdefer self.device_wrapper.destroyImageView(self.device, view, null);
+    const secondary_view: ?vk.ImageView = if (manual_parameters != null)
+        self.device_wrapper.createImageView(self.device, &.{
+            .image = image,
+            .view_type = .@"2d",
+            .format = plane_view_formats.?[1],
+            .components = .{
+                .r = .identity,
+                .g = .identity,
+                .b = .identity,
+                .a = .identity,
+            },
+            .subresource_range = .{
+                .aspect_mask = .{ .plane_1_bit = true },
+                .base_mip_level = 0,
+                .level_count = 1,
+                .base_array_layer = 0,
+                .layer_count = 1,
+            },
+        }, null) catch return error.VulkanFailure
+    else
+        null;
+    errdefer if (secondary_view) |secondary| {
+        self.device_wrapper.destroyImageView(self.device, secondary, null);
+    };
     const descriptor_set_layout = if (video_graphics) |graphics|
         graphics.descriptor_set_layout
     else
@@ -4585,32 +4769,59 @@ fn createImportedTexture(
         self.descriptor_pool,
         &.{descriptor_set},
     ) catch {};
-    const image_info: vk.DescriptorImageInfo = .{
-        .sampler = if (video_graphics) |graphics| graphics.sampler else self.sampler,
-        .image_view = view,
-        .image_layout = .shader_read_only_optimal,
+    const sampler = if (video_graphics) |graphics| graphics.sampler else self.sampler;
+    const image_infos = [_]vk.DescriptorImageInfo{
+        .{
+            .sampler = sampler,
+            .image_view = view,
+            .image_layout = .shader_read_only_optimal,
+        },
+        .{
+            .sampler = sampler,
+            .image_view = secondary_view orelse view,
+            .image_layout = .shader_read_only_optimal,
+        },
     };
-    self.device_wrapper.updateDescriptorSets(self.device, &.{.{
-        .dst_set = descriptor_set,
-        .dst_binding = 0,
-        .dst_array_element = 0,
-        .descriptor_count = 1,
-        .descriptor_type = .combined_image_sampler,
-        .p_image_info = @ptrCast(&image_info),
-        .p_buffer_info = undefined,
-        .p_texel_buffer_view = undefined,
-    }}, null);
+    const descriptor_writes = [_]vk.WriteDescriptorSet{
+        .{
+            .dst_set = descriptor_set,
+            .dst_binding = 0,
+            .dst_array_element = 0,
+            .descriptor_count = 1,
+            .descriptor_type = .combined_image_sampler,
+            .p_image_info = @ptrCast(&image_infos[0]),
+            .p_buffer_info = undefined,
+            .p_texel_buffer_view = undefined,
+        },
+        .{
+            .dst_set = descriptor_set,
+            .dst_binding = 1,
+            .dst_array_element = 0,
+            .descriptor_count = 1,
+            .descriptor_type = .combined_image_sampler,
+            .p_image_info = @ptrCast(&image_infos[1]),
+            .p_buffer_info = undefined,
+            .p_texel_buffer_view = undefined,
+        },
+    };
+    self.device_wrapper.updateDescriptorSets(
+        self.device,
+        descriptor_writes[0..if (manual_parameters != null) 2 else 1],
+        null,
+    );
     const texture: Texture = .{
         .image = image,
         .memory = memory,
         .view = view,
+        .secondary_view = secondary_view,
         .descriptor_set = descriptor_set,
         .pipeline = if (video_graphics) |graphics| graphics.pipeline else .null_handle,
         .pipeline_layout = if (video_graphics) |graphics|
             graphics.pipeline_layout
         else
             .null_handle,
-        .video_representation = if (conversion_parameters != null) representation else null,
+        .video_representation = if (format_info.isPackedRgb()) null else representation,
+        .manual_ycbcr = manual_parameters,
         .size = size,
         .initialized = true,
         .imported = true,
@@ -4627,6 +4838,9 @@ fn destroyTexture(self: *Self, texture: Texture) void {
         self.descriptor_pool,
         &.{texture.descriptor_set},
     ) catch {};
+    if (texture.secondary_view) |view| {
+        self.device_wrapper.destroyImageView(self.device, view, null);
+    }
     self.device_wrapper.destroyImageView(self.device, texture.view, null);
     self.device_wrapper.destroyImage(self.device, texture.image, null);
     self.device_wrapper.freeMemory(self.device, texture.memory, null);
@@ -5180,7 +5394,7 @@ fn compileDrawRuns(
                 .width = frame.size.width,
                 .height = frame.size.height,
             };
-            try self.emitDamaged(frame, rect, .replace, .null_handle, .null_handle, null, .{ .width = 1, .height = 1 }, .{}, .{
+            try self.emitDamaged(frame, rect, .replace, .null_handle, .null_handle, null, .{ .width = 1, .height = 1 }, .{}, null, .{
                 .destination = rectFloats(rect),
                 .source = .{ 0, 0, 1, 1 },
                 .clip = undefined,
@@ -5192,7 +5406,7 @@ fn compileDrawRuns(
         .solid_rect => |solid| {
             var clipped = solid.rect.clipTo(frame.size) orelse continue;
             if (solid.clip) |clip| clipped = clipped.intersection(clip) orelse continue;
-            try self.emitDamaged(frame, clipped, .blend, .null_handle, .null_handle, null, .{ .width = 1, .height = 1 }, .{}, .{
+            try self.emitDamaged(frame, clipped, .blend, .null_handle, .null_handle, null, .{ .width = 1, .height = 1 }, .{}, null, .{
                 .destination = rectFloats(clipped),
                 .source = .{ 0, 0, 1, 1 },
                 .clip = undefined,
@@ -5240,6 +5454,7 @@ fn compileDrawRuns(
                     image.buffer.color_description,
                     output_color_description,
                 ),
+                prepared.texture.manual_ycbcr,
                 .{
                     .destination = rectFloats(destination),
                     .source = .{
@@ -5295,7 +5510,7 @@ fn compileDrawRuns(
                 cutout.radius,
                 @min(cutout.rect.width, cutout.rect.height) / 2,
             );
-            try self.emitDamaged(frame, clipped, .shadow, .null_handle, .null_handle, null, .{ .width = 1, .height = 1 }, .{}, .{
+            try self.emitDamaged(frame, clipped, .shadow, .null_handle, .null_handle, null, .{ .width = 1, .height = 1 }, .{}, null, .{
                 .destination = rectFloats(cutout.rect),
                 .source = .{ 0, 0, 1, 1 },
                 .clip = undefined,
@@ -5466,6 +5681,7 @@ fn emitDamaged(
     descriptor_set: ?vk.DescriptorSet,
     texture_size: render.Size,
     color_transform: ColorTransform,
+    manual_ycbcr: ?ManualYcbcr,
     instance: Instance,
 ) Error!void {
     if (frame.damage) |damage| {
@@ -5479,6 +5695,7 @@ fn emitDamaged(
                 descriptor_set,
                 texture_size,
                 color_transform,
+                manual_ycbcr,
                 instance,
                 clipped,
             );
@@ -5491,6 +5708,7 @@ fn emitDamaged(
             descriptor_set,
             texture_size,
             color_transform,
+            manual_ycbcr,
             instance,
             visible_rect,
         );
@@ -5536,6 +5754,7 @@ fn emitInstance(
     descriptor_set: ?vk.DescriptorSet,
     texture_size: render.Size,
     color_transform: ColorTransform,
+    manual_ycbcr: ?ManualYcbcr,
     template: Instance,
     clip: render.Rect,
 ) Error!void {
@@ -5552,7 +5771,8 @@ fn emitInstance(
             last.pipeline_layout == pipeline_layout and
             last.descriptor_set == descriptor_set and
             std.meta.eql(last.texture_size, texture_size) and
-            std.meta.eql(last.color_transform, color_transform))
+            std.meta.eql(last.color_transform, color_transform) and
+            std.meta.eql(last.manual_ycbcr, manual_ycbcr))
         {
             last.instance_count = std.math.add(u32, last.instance_count, 1) catch
                 return error.InvalidTarget;
@@ -5568,6 +5788,7 @@ fn emitInstance(
         .first_instance = instance_index,
         .instance_count = 1,
         .color_transform = color_transform,
+        .manual_ycbcr = manual_ycbcr,
     });
 }
 

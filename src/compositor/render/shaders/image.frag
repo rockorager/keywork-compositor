@@ -1,9 +1,16 @@
 #version 450
+#ifdef KEYWORK_MANUAL_YCBCR
+layout(set=0,binding=0) uniform sampler2D luma_plane;
+layout(set=0,binding=1) uniform sampler2D chroma_plane;
+#else
 layout(set=0,binding=0) uniform sampler2D tex;
+#endif
 layout(push_constant) uniform Push {
     vec2 target_size;
     vec2 texture_size;
     float swap_rb;
+    float quantization_levels;
+    vec2 ycbcr_coefficients;
     layout(offset=32) vec4 color_matrix_0;
     vec4 color_matrix_1;
     vec4 color_matrix_2;
@@ -127,6 +134,36 @@ vec3 decodeColor(vec3 electrical) {
     ));
 }
 
+#ifdef KEYWORK_MANUAL_YCBCR
+vec4 sampleSource(vec2 coordinate) {
+    float y_sample=texture(luma_plane,coordinate/pc.texture_size).r;
+    float horizontal_offset=pc.swap_rb>4.5 ? 0.5 : 0.0;
+    vec2 chroma_coordinate=(coordinate+vec2(0.5)-vec2(horizontal_offset,1.0))/
+        pc.texture_size;
+    vec2 cbcr_sample=texture(chroma_plane,chroma_coordinate).rg;
+    float levels=abs(pc.quantization_levels);
+    float code_scale=(levels+1.0)/256.0;
+    float y;
+    vec2 cbcr;
+    if (pc.quantization_levels<0.0) {
+        y=(y_sample*levels-16.0*code_scale)/(219.0*code_scale);
+        cbcr=(cbcr_sample*levels-vec2(128.0*code_scale))/(224.0*code_scale);
+    } else {
+        y=y_sample;
+        cbcr=cbcr_sample-vec2((levels+1.0)/(2.0*levels));
+    }
+    float kr=pc.ycbcr_coefficients.x;
+    float kb=pc.ycbcr_coefficients.y;
+    float kg=1.0-kr-kb;
+    return vec4(
+        y+2.0*(1.0-kr)*cbcr.y,
+        y-2.0*(kb*(1.0-kb)*cbcr.x+kr*(1.0-kr)*cbcr.y)/kg,
+        y+2.0*(1.0-kb)*cbcr.x,
+        1.0
+    );
+}
+#endif
+
 void main() {
     vec2 q=(pixel-dest.xy)/dest.zw;
     vec2 transformed=source.xy+q*source.zw;
@@ -142,9 +179,13 @@ void main() {
         default: coordinate=transformed; break;
     }
     if (parameters.z>0.5) coordinate.y=pc.texture_size.y-coordinate.y;
+#ifdef KEYWORK_MANUAL_YCBCR
+    vec4 color=sampleSource(coordinate);
+#else
     vec2 uv=coordinate/pc.texture_size;
     vec4 color=texture(tex,uv);
     if (pc.swap_rb>0.5) color=color.bgra;
+#endif
     vec3 straight=color.a>0.0 ? color.rgb/color.a : vec3(0.0);
     color.rgb=decodeColor(straight)*color.a;
     color*=parameters.w;

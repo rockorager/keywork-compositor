@@ -171,6 +171,13 @@ pub fn build(b: *std.Build) void {
     addVulkanShader(b, compositor, "vulkan-quad", "src/compositor/render/shaders/quad.vert");
     addVulkanShader(b, compositor, "vulkan-solid", "src/compositor/render/shaders/solid.frag");
     addVulkanShader(b, compositor, "vulkan-image", "src/compositor/render/shaders/image.frag");
+    addVulkanShaderVariant(
+        b,
+        compositor,
+        "vulkan-video-manual",
+        "src/compositor/render/shaders/image.frag",
+        "KEYWORK_MANUAL_YCBCR",
+    );
     addVulkanShader(b, compositor, "vulkan-shadow", "src/compositor/render/shaders/shadow.frag");
     addVulkanShader(b, compositor, "vulkan-blur-horizontal", "src/compositor/render/shaders/blur_horizontal.frag");
     addVulkanShader(b, compositor, "vulkan-blur-vertical", "src/compositor/render/shaders/blur_vertical.frag");
@@ -269,7 +276,18 @@ fn addVulkanShader(
     name: []const u8,
     source_path: []const u8,
 ) void {
+    addVulkanShaderVariant(b, module, name, source_path, null);
+}
+
+fn addVulkanShaderVariant(
+    b: *std.Build,
+    module: *std.Build.Module,
+    name: []const u8,
+    source_path: []const u8,
+    define: ?[]const u8,
+) void {
     const compile = b.addSystemCommand(&.{ "glslc", "-O" });
+    if (define) |value| compile.addArg(b.fmt("-D{s}", .{value}));
     compile.addFileArg(b.path(source_path));
     compile.addArg("-o");
     const spirv = compile.addOutputFileArg(b.fmt("{s}.spv", .{name}));
