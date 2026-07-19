@@ -7738,20 +7738,25 @@ fn fillTestVideoBuffer(
     chroma_offset: u32,
     chroma_stride: u32,
     pattern: TestVideoPattern,
+    range: render.ColorRange,
 ) void {
     switch (format) {
         .nv12 => {
+            const y_code: u8 = if (range == .limited) 63 else 54;
+            const cb_code: u8 = if (range == .limited) 102 else 99;
+            const cr_code: u8 = if (range == .limited) 240 else 255;
             for (0..size.height) |y| {
-                @memset(mapping[y * luma_stride ..][0..size.width], 63);
+                @memset(mapping[y * luma_stride ..][0..size.width], y_code);
             }
             for (0..size.height / 2) |y| {
                 const row = mapping[@as(usize, chroma_offset) + y * chroma_stride ..];
                 for (0..size.width / 2) |x| {
-                    row[x * 2] = if (pattern == .uniform_red) 102 else 128;
-                    row[x * 2 + 1] = if (pattern == .uniform_red) 240 else 128;
+                    row[x * 2] = if (pattern == .uniform_red) cb_code else 128;
+                    row[x * 2 + 1] = if (pattern == .uniform_red) cr_code else 128;
                 }
             }
             if (pattern == .isolated_chroma) {
+                std.debug.assert(range == .limited);
                 const row = mapping[@as(usize, chroma_offset) + 16 * chroma_stride ..];
                 row[16 * 2] = 102;
                 row[16 * 2 + 1] = 240;
@@ -7759,9 +7764,9 @@ fn fillTestVideoBuffer(
         },
         .p010 => {
             std.debug.assert(pattern == .uniform_red);
-            const y_code: u16 = 252 << 6;
-            const cb_code: u16 = 408 << 6;
-            const cr_code: u16 = 960 << 6;
+            const y_code: u16 = @as(u16, if (range == .limited) 252 else 217) << 6;
+            const cb_code: u16 = @as(u16, if (range == .limited) 408 else 395) << 6;
+            const cr_code: u16 = @as(u16, if (range == .limited) 960 else 1023) << 6;
             for (0..size.height) |y| {
                 const row = mapping[y * luma_stride ..];
                 for (0..size.width) |x| {
@@ -7784,6 +7789,7 @@ fn expectVideoImport(
     format: render.DmabufFormat,
     chroma_location: render.ChromaLocation,
     pattern: TestVideoPattern,
+    range: render.ColorRange,
 ) !void {
     const fd = std.c.open("/dev/dri/renderD128", std.c.O{
         .ACCMODE = .RDWR,
@@ -7855,6 +7861,7 @@ fn expectVideoImport(
         chroma_offset,
         chroma_stride,
         pattern,
+        range,
     );
     if (!syncTestDmaBuf(
         storage.fd,
@@ -7921,7 +7928,7 @@ fn expectVideoImport(
                 .source_cache = .{ .id = cache_id, .version = 1 },
                 .color_representation = .{
                     .coefficients = .bt709,
-                    .range = .limited,
+                    .range = range,
                     .chroma_location = chroma_location,
                 },
             },
@@ -7964,20 +7971,21 @@ fn expectVideoImport(
 }
 
 test "Vulkan converts known NV12 pixels with an immutable sampler" {
-    try expectVideoImport(.nv12, .type_0, .uniform_red);
+    try expectVideoImport(.nv12, .type_0, .uniform_red, .limited);
 }
 
 test "Vulkan manually reconstructs known NV12 pixels" {
-    try expectVideoImport(.nv12, .type_4, .uniform_red);
+    try expectVideoImport(.nv12, .type_4, .uniform_red, .limited);
+    try expectVideoImport(.nv12, .type_4, .uniform_red, .full);
 }
 
 test "Vulkan manually reconstructs known P010 pixels" {
-    try expectVideoImport(.p010, .type_5, .uniform_red);
+    try expectVideoImport(.p010, .type_5, .uniform_red, .limited);
 }
 
 test "Vulkan reconstructs bottom-sited NV12 chroma" {
-    try expectVideoImport(.nv12, .type_4, .isolated_chroma);
-    try expectVideoImport(.nv12, .type_5, .isolated_chroma);
+    try expectVideoImport(.nv12, .type_4, .isolated_chroma, .limited);
+    try expectVideoImport(.nv12, .type_5, .isolated_chroma, .limited);
 }
 
 test "Vulkan renderer blends premultiplied alpha in linear light" {
