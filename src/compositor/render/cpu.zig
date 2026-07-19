@@ -644,7 +644,15 @@ fn compositePixels(
             &transform,
             &floating_transform,
         ) == 0 or pixman.pixman_image_set_transform(source, &transform) == 0 or
-            pixman.pixman_image_set_filter(source, pixman.PIXMAN_FILTER_BILINEAR, null, 0) == 0)
+            pixman.pixman_image_set_filter(
+                source,
+                if (image.samplingFilter() == .nearest)
+                    pixman.PIXMAN_FILTER_NEAREST
+                else
+                    pixman.PIXMAN_FILTER_BILINEAR,
+                null,
+                0,
+            ) == 0)
         {
             return error.OutOfMemory;
         }

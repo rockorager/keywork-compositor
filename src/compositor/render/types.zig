@@ -346,6 +346,28 @@ pub const Image = struct {
     clip: ?Rect = null,
     is_opaque: bool = false,
     alpha_multiplier: u32 = std.math.maxInt(u32),
+
+    pub fn samplingFilter(self: Image) SamplingFilter {
+        const transformed_size = self.transform.applyToSize(self.buffer.size);
+        const source = self.source orelse SourceRect{
+            .x = 0,
+            .y = 0,
+            .width = @floatFromInt(transformed_size.width),
+            .height = @floatFromInt(transformed_size.height),
+        };
+        if (source.x != @trunc(source.x) or source.y != @trunc(source.y) or
+            source.width != @as(f64, @floatFromInt(self.size.width)) or
+            source.height != @as(f64, @floatFromInt(self.size.height)))
+        {
+            return .reconstruction;
+        }
+        return .nearest;
+    }
+};
+
+pub const SamplingFilter = enum {
+    nearest,
+    reconstruction,
 };
 
 pub fn shadowBlurExtent(blur_radius: u32) u32 {
@@ -775,6 +797,34 @@ test "fractional scale floors logical output dimensions" {
         error.InvalidDimensions,
         (Scale{ .numerator = 240 }).logicalSize(.{ .width = 1, .height = 1 }),
     );
+}
+
+test "image sampling preserves exact texel alignment" {
+    const buffer: PixelBuffer = .{
+        .size = .{ .width = 3, .height = 2 },
+        .stride_pixels = 3,
+    };
+    var image: Image = .{
+        .x = 0,
+        .y = 0,
+        .size = buffer.size,
+        .buffer = buffer,
+    };
+    try std.testing.expectEqual(SamplingFilter.nearest, image.samplingFilter());
+
+    image.size = .{ .width = 6, .height = 4 };
+    try std.testing.expectEqual(SamplingFilter.reconstruction, image.samplingFilter());
+
+    image.size = .{ .width = 2, .height = 2 };
+    image.source = .{ .x = 1, .y = 0, .width = 2, .height = 2 };
+    try std.testing.expectEqual(SamplingFilter.nearest, image.samplingFilter());
+    image.source.?.x = 0.5;
+    try std.testing.expectEqual(SamplingFilter.reconstruction, image.samplingFilter());
+
+    image.source = null;
+    image.transform = .rotate_90;
+    image.size = .{ .width = 2, .height = 3 };
+    try std.testing.expectEqual(SamplingFilter.nearest, image.samplingFilter());
 }
 
 test "shadow blur extent covers the three sigma tail" {
