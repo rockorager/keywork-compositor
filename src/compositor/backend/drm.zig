@@ -121,8 +121,9 @@ const ScanoutFramebuffer = struct {
     size: render.Size,
     format: u32,
     modifier: u64,
-    stride: u32,
-    offset: u32,
+    plane_count: u8,
+    strides: [render.max_dmabuf_planes]u32,
+    offsets: [render.max_dmabuf_planes]u32,
     last_used: u64,
 };
 
@@ -2347,8 +2348,9 @@ fn scanoutFramebuffer(
     implicit_scanout: bool,
 ) !struct { key: ScanoutFramebufferKey, framebuffer_id: u32 } {
     const source = buffer.dmabuf orelse return error.InvalidBuffer;
-    if (source.plane_count != 1) return error.InvalidBuffer;
-    const plane = source.planes[0];
+    if (source.plane_count == 0 or source.plane_count > render.max_dmabuf_planes) {
+        return error.InvalidBuffer;
+    }
     const framebuffer_format = scanoutFramebufferFormat(
         formats,
         source.format,
@@ -2368,10 +2370,7 @@ fn scanoutFramebuffer(
     self.scanout_frame_number +%= 1;
     if (self.scanout_frame_number == 0) self.scanout_frame_number = 1;
     if (self.scanout_framebuffers.getPtr(key)) |framebuffer| {
-        if (!std.meta.eql(framebuffer.size, buffer.size) or
-            framebuffer.format != source.format or framebuffer.modifier != source.modifier or
-            framebuffer.stride != plane.stride or framebuffer.offset != plane.offset)
-        {
+        if (!scanoutFramebufferLayoutMatches(framebuffer.*, buffer.size, source)) {
             return error.CacheIdentityMismatch;
         }
         framebuffer.last_used = self.scanout_frame_number;
@@ -2379,18 +2378,22 @@ fn scanoutFramebuffer(
     }
     try self.makeScanoutFramebufferRoom(fd);
 
-    var handle: u32 = 0;
-    if (c.drmPrimeFDToHandle(fd, plane.fd, &handle) != 0) return error.ImportHandleFailed;
-    defer if (c.drmCloseBufferHandle(fd, handle) != 0) {
-        log.err("failed to close imported DRM buffer handle {d}", .{handle});
-    };
-    var handles = [_]u32{ handle, 0, 0, 0 };
-    var pitches = [_]u32{ plane.stride, 0, 0, 0 };
-    var offsets = [_]u32{ plane.offset, 0, 0, 0 };
+    var handles: [render.max_dmabuf_planes]u32 = @splat(0);
+    defer closeImportedBufferHandles(fd, handles);
+    var pitches: [render.max_dmabuf_planes]u32 = @splat(0);
+    var offsets: [render.max_dmabuf_planes]u32 = @splat(0);
+    for (source.planeSlice(), 0..) |plane, index| {
+        if (c.drmPrimeFDToHandle(fd, plane.fd, &handles[index]) != 0) {
+            return error.ImportHandleFailed;
+        }
+        pitches[index] = plane.stride;
+        offsets[index] = plane.offset;
+    }
     var framebuffer_id: u32 = 0;
     var add_result: c_int = -1;
     if (modifier_supported) {
-        var modifiers = [_]u64{ source.modifier, 0, 0, 0 };
+        var modifiers: [render.max_dmabuf_planes]u64 = @splat(0);
+        for (modifiers[0..source.plane_count]) |*modifier| modifier.* = source.modifier;
         add_result = c.drmModeAddFB2WithModifiers(
             fd,
             buffer.size.width,
@@ -2425,11 +2428,102 @@ fn scanoutFramebuffer(
         .size = buffer.size,
         .format = source.format,
         .modifier = source.modifier,
-        .stride = plane.stride,
-        .offset = plane.offset,
+        .plane_count = source.plane_count,
+        .strides = pitches,
+        .offsets = offsets,
         .last_used = self.scanout_frame_number,
     });
     return .{ .key = key, .framebuffer_id = framebuffer_id };
+}
+
+fn scanoutFramebufferLayoutMatches(
+    framebuffer: ScanoutFramebuffer,
+    size: render.Size,
+    source: render.DmabufSource,
+) bool {
+    if (!std.meta.eql(framebuffer.size, size) or
+        framebuffer.format != source.format or
+        framebuffer.modifier != source.modifier or
+        framebuffer.plane_count != source.plane_count)
+    {
+        return false;
+    }
+    for (source.planeSlice(), 0..) |plane, index| {
+        if (framebuffer.strides[index] != plane.stride or
+            framebuffer.offsets[index] != plane.offset) return false;
+    }
+    return true;
+}
+
+fn closeImportedBufferHandles(
+    fd: std.posix.fd_t,
+    handles: [render.max_dmabuf_planes]u32,
+) void {
+    handle_loop: for (handles, 0..) |handle, index| {
+        if (handle == 0) continue;
+        for (handles[0..index]) |previous| if (previous == handle) continue :handle_loop;
+        if (c.drmCloseBufferHandle(fd, handle) != 0) {
+            log.err("failed to close imported DRM buffer handle {d}", .{handle});
+        }
+    }
+}
+
+test "scanout framebuffer cache validates every DMA-BUF plane" {
+    const NoopSource = struct {
+        fn retain(_: *anyopaque) void {}
+        fn release(_: *anyopaque) void {}
+        fn begin(_: *anyopaque) bool {
+            return true;
+        }
+        fn end(_: *anyopaque) bool {
+            return true;
+        }
+        fn exportFence(_: *anyopaque, _: u8) ?std.posix.fd_t {
+            return null;
+        }
+    };
+
+    var context: u8 = 0;
+    var source: render.DmabufSource = .{
+        .context = &context,
+        .format = @intFromEnum(render.DmabufFormat.nv12),
+        .modifier = 7,
+        .planes = .{
+            .{ .stride = 128, .offset = 0 },
+            .{ .stride = 64, .offset = 8192 },
+            .{},
+            .{},
+        },
+        .plane_count = 2,
+        .y_inverted = false,
+        .force_opaque = true,
+        .retain = NoopSource.retain,
+        .release = NoopSource.release,
+        .begin_cpu_read = NoopSource.begin,
+        .end_cpu_read = NoopSource.end,
+        .export_read_fence = NoopSource.exportFence,
+    };
+    const framebuffer: ScanoutFramebuffer = .{
+        .framebuffer_id = 1,
+        .size = .{ .width = 64, .height = 64 },
+        .format = source.format,
+        .modifier = source.modifier,
+        .plane_count = source.plane_count,
+        .strides = .{ 128, 64, 0, 0 },
+        .offsets = .{ 0, 8192, 0, 0 },
+        .last_used = 1,
+    };
+    try std.testing.expect(scanoutFramebufferLayoutMatches(
+        framebuffer,
+        framebuffer.size,
+        source,
+    ));
+    source.planes[1].offset += 64;
+    try std.testing.expect(!scanoutFramebufferLayoutMatches(
+        framebuffer,
+        framebuffer.size,
+        source,
+    ));
 }
 
 fn legacyFramebufferLayoutMatches(self: *const Self, buffer: render.PixelBuffer) bool {
@@ -2446,8 +2540,9 @@ fn legacyFramebufferLayoutMatches(self: *const Self, buffer: render.PixelBuffer)
         return current.format == source.format and
             std.meta.eql(current.size, buffer.size) and
             current.modifier == source.modifier and
-            current.stride == plane.stride and
-            current.offset == plane.offset;
+            current.plane_count == 1 and
+            current.strides[0] == plane.stride and
+            current.offsets[0] == plane.offset;
     }
 
     const index = self.displayed orelse return false;
