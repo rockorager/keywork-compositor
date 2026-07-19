@@ -5991,7 +5991,7 @@ test "Vulkan renderer composites image commands" {
     try expectArgbNear(source_pixels[0], target_pixels[0], 1);
 }
 
-test "Vulkan HDR tone mapping preserves reference white" {
+test "Vulkan HDR tone mapping reserves SDR highlight headroom" {
     var renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
         error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
         else => return err,
@@ -6041,7 +6041,108 @@ test "Vulkan HDR tone mapping preserves reference white" {
         .pixels = &target_pixels,
     } });
 
-    try expectArgbNear(target_pixels[1], target_pixels[0], 2);
+    const mapped_white: u8 = @truncate(target_pixels[0]);
+    try std.testing.expect(mapped_white >= 225 and mapped_white <= 240);
+    try expectArgbNear(
+        0xff000000 | @as(u32, mapped_white) * 0x010101,
+        target_pixels[0],
+        1,
+    );
+    try std.testing.expectEqual(@as(u32, 0xffffffff), target_pixels[1]);
+}
+
+test "Vulkan HDR tone mapping preserves highlight hue" {
+    var renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
+        error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+
+    const size: render.Size = .{ .width = 1, .height = 1 };
+    // PQ code values representing approximately 1000, 500, and 250 nits.
+    var source_pixels = [_]u32{0xffc0ad9a};
+    var target_pixels = [_]u32{0};
+    try renderer.renderFrame(.{
+        .size = size,
+        .commands = &.{.{ .image = .{
+            .x = 0,
+            .y = 0,
+            .size = size,
+            .buffer = .{
+                .size = size,
+                .stride_pixels = 1,
+                .pixels = &source_pixels,
+                .color_description = .{
+                    .primaries = render.bt2020_chromaticities,
+                    .named_primaries = .bt2020,
+                    .transfer_function = .st2084_pq,
+                    .min_luminance = 50,
+                    .max_luminance = 10000,
+                    .reference_luminance = 203,
+                },
+            },
+        } }},
+        .output_color_description = .{
+            .primaries = render.bt2020_chromaticities,
+            .named_primaries = .bt2020,
+        },
+    }, .{ .pixels = .{
+        .size = size,
+        .stride_pixels = 1,
+        .pixels = &target_pixels,
+    } });
+
+    const red: u8 = @truncate(target_pixels[0] >> 16);
+    const green: u8 = @truncate(target_pixels[0] >> 8);
+    const blue: u8 = @truncate(target_pixels[0]);
+    try std.testing.expectEqual(@as(u8, 255), red);
+    try std.testing.expect(green >= 175 and green <= 200);
+    try std.testing.expect(blue >= 125 and blue <= 150);
+}
+
+test "Vulkan HDR tone mapping preserves highlight gradation" {
+    var renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
+        error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+
+    const size: render.Size = .{ .width = 2, .height = 1 };
+    // Neutral PQ code values representing approximately 400 and 1000 nits.
+    var source_pixels = [_]u32{ 0xffa6a6a6, 0xffc0c0c0 };
+    var target_pixels = [_]u32{0} ** 2;
+    try renderer.renderFrame(.{
+        .size = size,
+        .commands = &.{.{ .image = .{
+            .x = 0,
+            .y = 0,
+            .size = size,
+            .buffer = .{
+                .size = size,
+                .stride_pixels = 2,
+                .pixels = &source_pixels,
+                .color_description = .{
+                    .primaries = render.bt2020_chromaticities,
+                    .named_primaries = .bt2020,
+                    .transfer_function = .st2084_pq,
+                    .min_luminance = 50,
+                    .max_luminance = 10000,
+                    .reference_luminance = 203,
+                },
+            },
+        } }},
+    }, .{ .pixels = .{
+        .size = size,
+        .stride_pixels = 2,
+        .pixels = &target_pixels,
+    } });
+
+    const lower: u8 = @truncate(target_pixels[0]);
+    const upper: u8 = @truncate(target_pixels[1]);
+    try expectArgbNear(0xff000000 | @as(u32, lower) * 0x010101, target_pixels[0], 1);
+    try expectArgbNear(0xff000000 | @as(u32, upper) * 0x010101, target_pixels[1], 1);
+    try std.testing.expect(lower + 3 < upper);
+    try std.testing.expect(upper < 250);
 }
 
 test "Vulkan renderer preserves image orientation and source rectangles" {

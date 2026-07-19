@@ -56,10 +56,22 @@ vec3 toneMapHdr(vec3 nits) {
     float reference_nits=pc.transfer.z;
     float peak_nits=max(pc.transfer.w,reference_nits+0.001);
     vec3 relative=max(nits,vec3(0.0))/reference_nits;
+    float relative_luminance=max(dot(pc.transfer_aux.yzw,relative),0.0);
     float output_peak=max(pc.output_transfer.w/pc.output_transfer.z,1.0);
-    vec3 high=vec3(1.0)+(output_peak-1.0)*
-        log(max(relative,vec3(1.0)))/log(peak_nits/reference_nits);
-    return min(mix(relative,high,greaterThan(relative,vec3(1.0))),vec3(output_peak));
+    float input_peak=max(peak_nits/reference_nits,1.01);
+    float mapped_luminance=relative_luminance;
+    if (input_peak>output_peak) {
+        float knee=min(1.0,0.8*output_peak);
+        if (relative_luminance>knee) {
+            mapped_luminance=knee+(output_peak-knee)*
+                log(relative_luminance/knee)/log(input_peak/knee);
+            mapped_luminance=min(mapped_luminance,output_peak);
+        }
+    }
+    vec3 mapped=relative_luminance>0.000001 ?
+        relative*(mapped_luminance/relative_luminance) : vec3(0.0);
+    float mapped_peak=max(mapped.r,max(mapped.g,mapped.b));
+    return mapped_peak>output_peak ? mapped*(output_peak/mapped_peak) : mapped;
 }
 
 vec3 decodeColor(vec3 electrical) {

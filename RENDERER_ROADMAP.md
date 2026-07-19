@@ -62,7 +62,7 @@ with the intended primaries, transfer function, luminance metadata, and no
 
 ## 3. Perceptual tone mapping and gamut mapping
 
-- Replace channel-wise clipping with hue-preserving luminance tone mapping.
+- [x] Replace channel-wise clipping with hue-preserving luminance tone mapping.
 - Add perceptual gamut compression for wide-gamut content on narrower outputs.
 - Keep source and output reference luminance explicit throughout the pipeline.
 
