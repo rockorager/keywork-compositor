@@ -85,8 +85,10 @@ presentation_clock_id: u32,
 acquired: ?usize,
 pending: ?usize,
 displayed: ?usize,
-direct_pending: ?DirectScanout,
-direct_displayed: ?DirectScanout,
+direct_pending: ?ClientScanout,
+direct_displayed: ?ClientScanout,
+overlay_pending: ?ClientScanout,
+overlay_displayed: ?ClientScanout,
 pending_page_flip: ?PageFlipMode,
 scanout_framebuffers: std.AutoHashMapUnmanaged(ScanoutFramebufferKey, ScanoutFramebuffer),
 scanout_frame_number: u64,
@@ -123,13 +125,35 @@ const ScanoutFramebuffer = struct {
     last_used: u64,
 };
 
-const DirectScanout = struct {
+const ClientScanout = struct {
     source: render.DmabufSource,
     framebuffer_key: ScanoutFramebufferKey,
 
-    fn release(self: DirectScanout) void {
+    fn release(self: ClientScanout) void {
         self.source.release(self.source.context);
     }
+};
+
+const AtomicOverlay = struct {
+    source: render.DmabufSource,
+    source_size: render.Size,
+    destination: render.Rect,
+    framebuffer_id: u32,
+};
+
+const PreparedOverlay = struct {
+    atomic: AtomicOverlay,
+    scanout: ClientScanout,
+};
+
+const PreparedOverlayResult = union(enum) {
+    prepared: PreparedOverlay,
+    rejected: render.OverlayScanoutRejection,
+};
+
+const FramePresentation = struct {
+    presentation_info: ?presentation.Info,
+    overlay_scanout: ?OverlayScanoutResult,
 };
 
 const PageFlipMode = enum {
@@ -189,7 +213,7 @@ const OverlayPlane = struct {
     id: u32,
     formats: []render.DmabufFormatModifier,
     atomic: AtomicPlaneProperties,
-    zpos_property: u32,
+    zpos_property: ?u32,
     zpos: u64,
 
     fn deinit(self: OverlayPlane, allocator: std.mem.Allocator) void {
@@ -268,6 +292,16 @@ const OutputColorMode = enum {
 pub const DirectScanoutResult = union(enum) {
     accepted,
     rejected: render.DirectScanoutRejection,
+};
+
+pub const OverlayScanoutResult = union(enum) {
+    accepted,
+    rejected: render.OverlayScanoutRejection,
+};
+
+pub const OverlayPresentation = struct {
+    presentation_info: ?presentation.Info,
+    scanout: OverlayScanoutResult,
 };
 
 const max_scanout_framebuffers = 8;
@@ -389,6 +423,8 @@ pub fn init(
         .displayed = null,
         .direct_pending = null,
         .direct_displayed = null,
+        .overlay_pending = null,
+        .overlay_displayed = null,
         .pending_page_flip = null,
         .scanout_framebuffers = .empty,
         .scanout_frame_number = 0,
@@ -406,6 +442,7 @@ pub fn deinit(self: *Self) void {
     std.debug.assert(self.hdr_metadata_blob == 0);
     std.debug.assert(self.shadow_pixels.len == 0);
     std.debug.assert(self.direct_pending == null and self.direct_displayed == null);
+    std.debug.assert(self.overlay_pending == null and self.overlay_displayed == null);
     std.debug.assert(self.scanout_framebuffers.count() == 0);
     self.scanout_framebuffers.deinit(self.allocator);
     self.clearIdentity();
@@ -455,7 +492,7 @@ pub fn detach(self: *Self) void {
 }
 
 pub fn releaseClientBuffers(self: *Self) void {
-    self.releaseDirectScanouts();
+    self.releaseClientScanouts();
 }
 
 pub fn name(self: *const Self) []const u8 {
@@ -621,6 +658,32 @@ pub fn present(
     render_fence_fd: ?std.posix.fd_t,
     allow_tearing: bool,
 ) !?presentation.Info {
+    const result = try self.presentFrame(frame_damage, render_fence_fd, allow_tearing, null);
+    std.debug.assert(result.overlay_scanout == null);
+    return result.presentation_info;
+}
+
+pub fn presentOverlay(
+    self: *Self,
+    frame_damage: *const Region,
+    render_fence_fd: ?std.posix.fd_t,
+    allow_tearing: bool,
+    overlay: render.OverlayScanout,
+) !OverlayPresentation {
+    const result = try self.presentFrame(frame_damage, render_fence_fd, allow_tearing, overlay);
+    return .{
+        .presentation_info = result.presentation_info,
+        .scanout = result.overlay_scanout.?,
+    };
+}
+
+fn presentFrame(
+    self: *Self,
+    frame_damage: *const Region,
+    render_fence_fd: ?std.posix.fd_t,
+    allow_tearing: bool,
+    overlay: ?render.OverlayScanout,
+) !FramePresentation {
     const index = self.acquired orelse return error.NoAcquiredBuffer;
     const fd = self.device_access.fd(self.device_access.context) orelse return error.SessionInactive;
     if (!self.device_access.active(self.device_access.context)) return error.SessionInactive;
@@ -681,30 +744,85 @@ pub fn present(
         self.setDirectScanoutActive(false);
         const clock: std.Io.Clock = if (self.presentation_clock_id ==
             presentation.monotonic_clock_id) .awake else .real;
-        return .{
+        const presentation_info: presentation.Info = .{
             .timestamp = .fromNanoseconds(clock.now(self.io).nanoseconds),
             .refresh_nanoseconds = self.refresh_nanoseconds,
         };
+        return .{
+            .presentation_info = presentation_info,
+            .overlay_scanout = if (overlay != null)
+                .{ .rejected = .output_unavailable }
+            else
+                null,
+        };
     }
 
-    const page_flip = self.queuePageFlip(
-        fd,
-        buffer.framebuffer_id,
-        self.size,
-        null,
-        allow_tearing,
-    ) orelse {
+    var overlay_result: ?OverlayScanoutResult = null;
+    const prepared_overlay = if (overlay) |candidate| prepared: {
+        switch (self.prepareOverlay(fd, candidate)) {
+            .prepared => |prepared| break :prepared prepared,
+            .rejected => |reason| {
+                overlay_result = .{ .rejected = reason };
+                break :prepared null;
+            },
+        }
+    } else null;
+    const page_flip = queued: {
+        if (prepared_overlay) |prepared| {
+            prepared.scanout.source.retain(prepared.scanout.source.context);
+            const overlay_page_flip = self.queuePageFlip(
+                fd,
+                buffer.framebuffer_id,
+                self.size,
+                null,
+                prepared.atomic,
+                allow_tearing,
+            ) catch |err| {
+                prepared.scanout.release();
+                overlay_result = .{ .rejected = switch (err) {
+                    error.AtomicTestFailed => .atomic_test_failed,
+                    error.OverlaySynchronizationFailed => .synchronization_failed,
+                } };
+                break :queued null;
+            };
+            if (overlay_page_flip) |queued_page_flip| {
+                self.overlay_pending = prepared.scanout;
+                overlay_result = .accepted;
+                break :queued queued_page_flip;
+            }
+            prepared.scanout.release();
+            overlay_result = .{ .rejected = .page_flip_failed };
+        }
+        break :queued null;
+    } orelse fallback: {
         if (self.color_fallback_pending) {
             self.acquired = null;
             self.color_fallback_pending = false;
             return error.OutputColorFallback;
         }
-        return error.PageFlipFailed;
+        break :fallback self.queuePageFlip(
+            fd,
+            buffer.framebuffer_id,
+            self.size,
+            null,
+            null,
+            allow_tearing,
+        ) catch unreachable orelse {
+            if (self.color_fallback_pending) {
+                self.acquired = null;
+                self.color_fallback_pending = false;
+                return error.OutputColorFallback;
+            }
+            return error.PageFlipFailed;
+        };
     };
     self.pending = index;
     self.pending_page_flip = page_flip;
     self.acquired = null;
-    return null;
+    return .{
+        .presentation_info = null,
+        .overlay_scanout = overlay_result,
+    };
 }
 
 fn importSyncFile(dmabuf_fd: std.posix.fd_t, sync_file_fd: std.posix.fd_t) bool {
@@ -739,6 +857,69 @@ fn waitSyncFile(sync_file_fd: std.posix.fd_t) !void {
     {
         return error.RenderFenceWaitFailed;
     }
+}
+
+fn prepareOverlay(
+    self: *Self,
+    fd: std.posix.fd_t,
+    candidate: render.OverlayScanout,
+) PreparedOverlayResult {
+    const plane = self.overlay_plane orelse return .{ .rejected = .no_overlay_plane };
+    if (self.atomic_plane == null) return .{ .rejected = .no_overlay_plane };
+    const source = candidate.buffer.dmabuf orelse return .{ .rejected = .non_dmabuf };
+    if (!source.force_opaque) return .{ .rejected = .non_opaque_surface };
+    if (source.y_inverted) return .{ .rejected = .y_inverted };
+    if (candidate.buffer.source_cache == null) {
+        return .{ .rejected = .missing_buffer_identity };
+    }
+    if (source.plane_count != 1) return .{ .rejected = .unsupported_layout };
+    const format = render.DmabufFormat.fromFourcc(source.format) orelse
+        return .{ .rejected = .unsupported_format_or_modifier };
+    const rgb_representation: render.ColorRepresentation = .{};
+    if (!format.isPackedRgb() or
+        !std.meta.eql(candidate.buffer.color_representation, rgb_representation))
+    {
+        return .{ .rejected = .non_rgb_surface };
+    }
+    if (!std.meta.eql(candidate.buffer.color_description, self.color_description) or
+        self.outputCalibration() != null)
+    {
+        return .{ .rejected = .color_conversion };
+    }
+    if (!std.meta.eql(candidate.buffer.size, .{
+        .width = candidate.destination.width,
+        .height = candidate.destination.height,
+    })) return .{ .rejected = .scaled_surface };
+    const right = @as(i64, candidate.destination.x) + candidate.destination.width;
+    const bottom = @as(i64, candidate.destination.y) + candidate.destination.height;
+    if (candidate.destination.x < 0 or candidate.destination.y < 0 or
+        candidate.destination.width == 0 or candidate.destination.height == 0 or
+        right > self.size.width or bottom > self.size.height)
+    {
+        return .{ .rejected = .outside_output };
+    }
+    const framebuffer = self.scanoutFramebuffer(
+        fd,
+        candidate.buffer,
+        plane.formats,
+        false,
+    ) catch |err| return .{ .rejected = switch (err) {
+        error.UnsupportedModifier => .unsupported_format_or_modifier,
+        error.InvalidBuffer => .unsupported_layout,
+        else => .framebuffer_import_failed,
+    } };
+    return .{ .prepared = .{
+        .atomic = .{
+            .source = source,
+            .source_size = candidate.buffer.size,
+            .destination = candidate.destination,
+            .framebuffer_id = framebuffer.framebuffer_id,
+        },
+        .scanout = .{
+            .source = source,
+            .framebuffer_key = framebuffer.key,
+        },
+    } };
 }
 
 pub fn tryDirectScanout(
@@ -786,8 +967,9 @@ pub fn tryDirectScanout(
         framebuffer.framebuffer_id,
         buffer.size,
         source,
+        null,
         allow_tearing,
-    ) orelse {
+    ) catch unreachable orelse {
         source.release(source.context);
         return .{ .rejected = .page_flip_failed };
     };
@@ -1194,7 +1376,7 @@ fn release(self: *Self, fd: std.posix.fd_t) void {
     self.pending = null;
     self.displayed = null;
     self.pending_page_flip = null;
-    self.releaseDirectScanouts();
+    self.releaseClientScanouts();
     self.destroyScanoutFramebuffers(fd);
     self.destroyPair(fd, &self.buffers, self.shadow_pixels);
     self.shadow_pixels = &.{};
@@ -1244,7 +1426,7 @@ pub fn setPowered(self: *Self, fd: std.posix.fd_t, powered: bool) !void {
     self.powered = false;
     self.mode_set = false;
     self.displayed = null;
-    self.releaseDirectScanouts();
+    self.releaseClientScanouts();
     self.destroyScanoutFramebuffers(fd);
     self.notifyDeactivated();
     self.destroyPair(fd, &self.buffers, self.shadow_pixels);
@@ -1275,7 +1457,7 @@ pub fn setMode(self: *Self, fd: std.posix.fd_t, mode_index: usize) !void {
         self.resetBufferDamage(size);
         self.destroyPair(fd, &old_buffers, old_shadow_pixels);
         self.displayed = null;
-        self.releaseDirectScanouts();
+        self.releaseClientScanouts();
         self.destroyScanoutFramebuffers(fd);
         self.mode_set = false;
     }
@@ -1429,6 +1611,9 @@ fn handlePageFlip(
         self.pending = null;
         self.setDirectScanoutActive(false);
     }
+    if (self.overlay_displayed) |displayed| displayed.release();
+    self.overlay_displayed = self.overlay_pending;
+    self.overlay_pending = null;
     const listener = self.listener orelse return;
     listener.presented(listener.context, .{
         .timestamp = .{
@@ -1762,6 +1947,10 @@ fn overlayZpos(zpos: PlaneZpos, primary_zpos: u64) ?u64 {
     return primary_zpos + 1;
 }
 
+fn writableZposProperty(zpos: PlaneZpos) ?u32 {
+    return if (zpos.immutable) null else zpos.property_id;
+}
+
 fn overlayPlane(
     fd: std.posix.fd_t,
     crtc_id: u32,
@@ -1811,7 +2000,7 @@ fn overlayPlane(
             .id = plane_id,
             .formats = formats,
             .atomic = atomic,
-            .zpos_property = zpos.property_id,
+            .zpos_property = writableZposProperty(zpos),
             .zpos = selected_zpos,
         };
         selected_rank = rank;
@@ -2250,14 +2439,17 @@ fn queuePageFlip(
     framebuffer_id: u32,
     source_size: render.Size,
     source: ?render.DmabufSource,
+    overlay: ?AtomicOverlay,
     allow_tearing: bool,
-) ?PageFlipMode {
+) error{ AtomicTestFailed, OverlaySynchronizationFailed }!?PageFlipMode {
     const preferred_mode: PageFlipMode = if (!self.output_color_dirty and
-        allow_tearing and self.async_page_flip_supported)
+        allow_tearing and self.async_page_flip_supported and overlay == null and
+        self.overlay_displayed == null)
         .async
     else
         .vsync;
     const properties = self.atomic_plane orelse {
+        std.debug.assert(overlay == null);
         if (c.drmModePageFlip(
             fd,
             self.crtc_id,
@@ -2285,6 +2477,13 @@ fn queuePageFlip(
     defer {
         if (fence_fd) |value| _ = std.c.close(value);
     }
+    const overlay_fence_fd = if (overlay) |value|
+        value.source.export_read_fence(value.source.context, 0)
+    else
+        null;
+    defer {
+        if (overlay_fence_fd) |value| _ = std.c.close(value);
+    }
     if (!addAtomicPlaneState(
         request,
         plane_id,
@@ -2296,6 +2495,36 @@ fn queuePageFlip(
         fence_fd,
         null,
     )) return null;
+    if (self.overlay_plane) |plane| {
+        if (overlay) |value| {
+            const in_fence_fd = if (plane.atomic.in_fence_fd != 0)
+                overlay_fence_fd
+            else
+                null;
+            if (overlay_fence_fd) |value_fence_fd| if (in_fence_fd == null and
+                (!self.sync_file_import_supported or
+                    !importSyncFile(value.source.planes[0].fd, value_fence_fd)))
+            {
+                return error.OverlaySynchronizationFailed;
+            };
+            if (!addAtomicPlaneState(
+                request,
+                plane.id,
+                plane.atomic,
+                value.framebuffer_id,
+                self.crtc_id,
+                value.source_size,
+                value.destination,
+                in_fence_fd,
+                if (plane.zpos_property) |property_id|
+                    .{ .property_id = property_id, .value = plane.zpos }
+                else
+                    null,
+            )) return null;
+        } else if (!addAtomicPlaneDisabled(request, plane.id, plane.atomic)) {
+            return null;
+        }
+    } else std.debug.assert(overlay == null);
     const color_dirty = self.output_color_dirty;
     if (color_dirty or self.output_color_mode != .sdr) {
         const color_added = self.addOutputColorState(
@@ -2322,6 +2551,9 @@ fn queuePageFlip(
         @intCast(c.DRM_MODE_ATOMIC_ALLOW_MODESET)
     else
         @intCast(c.DRM_MODE_ATOMIC_NONBLOCK);
+    if (overlay != null and !testAtomicRequest(fd, request, color_dirty)) {
+        return error.AtomicTestFailed;
+    }
     if (c.drmModeAtomicCommit(
         fd,
         request,
@@ -2476,6 +2708,15 @@ fn addAtomicPlaneState(
         if (!addAtomicProperty(request, plane_id, value.property_id, value.value)) return false;
     }
     return true;
+}
+
+fn addAtomicPlaneDisabled(
+    request: *c.drmModeAtomicReq,
+    plane_id: u32,
+    properties: AtomicPlaneProperties,
+) bool {
+    return addAtomicProperty(request, plane_id, properties.fb_id, 0) and
+        addAtomicProperty(request, plane_id, properties.crtc_id, 0);
 }
 
 fn testAtomicRequest(fd: std.posix.fd_t, request: *c.drmModeAtomicReq, allow_modeset: bool) bool {
@@ -2842,6 +3083,10 @@ fn makeScanoutFramebufferRoom(self: *Self, fd: std.posix.fd_t) !void {
             std.meta.eql(self.direct_pending.?.framebuffer_key, key)) or
             (self.direct_displayed != null and
                 std.meta.eql(self.direct_displayed.?.framebuffer_key, key)) or
+            (self.overlay_pending != null and
+                std.meta.eql(self.overlay_pending.?.framebuffer_key, key)) or
+            (self.overlay_displayed != null and
+                std.meta.eql(self.overlay_displayed.?.framebuffer_key, key)) or
             entry.value_ptr.last_used >= oldest_frame) continue;
         oldest_key = key;
         oldest_frame = entry.value_ptr.last_used;
@@ -2853,11 +3098,15 @@ fn makeScanoutFramebufferRoom(self: *Self, fd: std.posix.fd_t) !void {
     }
 }
 
-fn releaseDirectScanouts(self: *Self) void {
+fn releaseClientScanouts(self: *Self) void {
     if (self.direct_pending) |scanout| scanout.release();
     if (self.direct_displayed) |scanout| scanout.release();
+    if (self.overlay_pending) |scanout| scanout.release();
+    if (self.overlay_displayed) |scanout| scanout.release();
     self.direct_pending = null;
     self.direct_displayed = null;
+    self.overlay_pending = null;
+    self.overlay_displayed = null;
     self.setDirectScanoutActive(false);
 }
 
@@ -3418,18 +3667,22 @@ test "overlay plane ranking preserves assignments and constrained planes" {
 }
 
 test "overlay plane zpos must remain above primary" {
-    try std.testing.expectEqual(@as(?u64, 2), overlayZpos(.{
+    const immutable: PlaneZpos = .{
         .property_id = 1,
         .current = 2,
         .maximum = 2,
         .immutable = true,
-    }, 0));
-    try std.testing.expectEqual(@as(?u64, 1), overlayZpos(.{
+    };
+    const mutable: PlaneZpos = .{
         .property_id = 1,
         .current = 0,
         .maximum = 3,
         .immutable = false,
-    }, 0));
+    };
+    try std.testing.expectEqual(@as(?u64, 2), overlayZpos(immutable, 0));
+    try std.testing.expectEqual(@as(?u64, 1), overlayZpos(mutable, 0));
+    try std.testing.expectEqual(@as(?u32, null), writableZposProperty(immutable));
+    try std.testing.expectEqual(@as(?u32, 1), writableZposProperty(mutable));
     try std.testing.expectEqual(@as(?u64, null), overlayZpos(.{
         .property_id = 1,
         .current = 0,

@@ -624,6 +624,7 @@ pub const OverlayScanoutRejection = enum(u8) {
     no_overlay_plane,
     unsupported_format_or_modifier,
     unsupported_layout,
+    synchronization_failed,
     framebuffer_import_failed,
     atomic_test_failed,
     page_flip_failed,
