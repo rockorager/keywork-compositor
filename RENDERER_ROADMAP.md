@@ -94,22 +94,22 @@ Acceptance: supported video buffers incur no CPU upload, limited/full range and
 chroma siting are correct, and P010 remains greater than 8-bit through the
 render path.
 
-## 6. High-quality fractional scaling
+## 6. High-quality fractional scaling — complete
 
-- Select filters by transform: exact nearest-neighbor for pixel-aligned content
+- [x] Select filters by transform: exact nearest-neighbor for pixel-aligned content
   and a high-quality reconstruction filter for fractional scaling.
-- Reduce repeated resampling when surface and output transforms can be folded
+- [x] Reduce repeated resampling when surface and output transforms can be folded
   into one operation.
 
 Acceptance: the scaling corpus has no half-pixel instability or unintended
 blur at integer scales, fractional-scale quality beats bilinear reconstruction,
 and the quality path stays inside the target frame budget.
 
-## 7. Color-aware DRM overlay planes
+## 7. Color-aware DRM overlay planes — complete
 
-- Promote eligible surfaces to overlay planes without changing their color,
+- [x] Promote eligible surfaces to overlay planes without changing their color,
   alpha, transform, synchronization, or presentation semantics.
-- Include plane assignment and rejection reasons in renderer diagnostics.
+- [x] Include plane assignment and rejection reasons in renderer diagnostics.
 
 Acceptance: video and opaque surfaces use overlays when the complete atomic
 state is supported, composition remains the reliable fallback, and switching
