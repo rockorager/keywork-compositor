@@ -7705,6 +7705,220 @@ test "Vulkan renderer samples an ABGR GBM dmabuf without a CPU upload" {
     try std.testing.expect(renderer.textures.get(cache_id).?.imported);
 }
 
+fn syncTestDmaBuf(fd: std.posix.fd_t, flags: u64) bool {
+    while (true) {
+        var state: sync.dma_buf_sync = .{ .flags = flags };
+        const result = sync.ioctl(fd, sync.DMA_BUF_IOCTL_SYNC, &state);
+        if (result >= 0) return true;
+        switch (std.posix.errno(result)) {
+            .INTR, .AGAIN => continue,
+            else => return false,
+        }
+    }
+}
+
+fn fillTestVideoBuffer(
+    mapping: []u8,
+    format: render.DmabufFormat,
+    size: render.Size,
+    luma_stride: u32,
+    chroma_offset: u32,
+    chroma_stride: u32,
+) void {
+    switch (format) {
+        .nv12 => {
+            for (0..size.height) |y| {
+                @memset(mapping[y * luma_stride ..][0..size.width], 63);
+            }
+            for (0..size.height / 2) |y| {
+                const row = mapping[@as(usize, chroma_offset) + y * chroma_stride ..];
+                for (0..size.width / 2) |x| {
+                    row[x * 2] = 102;
+                    row[x * 2 + 1] = 240;
+                }
+            }
+        },
+        .p010 => {
+            const y_code: u16 = 252 << 6;
+            const cb_code: u16 = 408 << 6;
+            const cr_code: u16 = 960 << 6;
+            for (0..size.height) |y| {
+                const row = mapping[y * luma_stride ..];
+                for (0..size.width) |x| {
+                    std.mem.writeInt(u16, row[x * 2 ..][0..2], y_code, .little);
+                }
+            }
+            for (0..size.height / 2) |y| {
+                const row = mapping[@as(usize, chroma_offset) + y * chroma_stride ..];
+                for (0..size.width / 2) |x| {
+                    std.mem.writeInt(u16, row[x * 4 ..][0..2], cb_code, .little);
+                    std.mem.writeInt(u16, row[x * 4 + 2 ..][0..2], cr_code, .little);
+                }
+            }
+        },
+        .argb8888, .xrgb8888, .abgr8888, .xbgr8888, .xrgb2101010 => unreachable,
+    }
+}
+
+fn expectManualVideoImport(
+    format: render.DmabufFormat,
+    chroma_location: render.ChromaLocation,
+) !void {
+    const fd = std.c.open("/dev/dri/renderD128", std.c.O{
+        .ACCMODE = .RDWR,
+        .CLOEXEC = true,
+    });
+    if (fd < 0) return error.SkipZigTest;
+    defer _ = std.c.close(fd);
+
+    var renderer = Self.init(std.testing.allocator, .{ .major = 226, .minor = 128 }) catch |err| switch (err) {
+        error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+    const modifiers = switch (format) {
+        .nv12 => renderer.dmabuf_nv12_source_modifiers,
+        .p010 => renderer.dmabuf_p010_source_modifiers,
+        .argb8888, .xrgb8888, .abgr8888, .xbgr8888, .xrgb2101010 => unreachable,
+    };
+    if (std.mem.indexOfScalar(u64, modifiers, 0) == null) return error.SkipZigTest;
+
+    const Gbm = @import("../backend/gbm.zig");
+    var gbm = Gbm.init(fd) catch return error.SkipZigTest;
+    defer gbm.deinit();
+    const size: render.Size = .{ .width = 64, .height = 64 };
+    var storage = gbm.createBuffer(
+        size,
+        @intFromEnum(render.DmabufFormat.xrgb8888),
+        &.{0},
+    ) catch return error.SkipZigTest;
+    defer storage.deinit();
+    if (storage.modifier != 0) return error.SkipZigTest;
+
+    const bytes_per_sample: u32 = if (format == .p010) 2 else 1;
+    const luma_stride = size.width * bytes_per_sample;
+    const chroma_stride = size.width * bytes_per_sample;
+    const chroma_offset = luma_stride * size.height;
+    const required_bytes: usize = chroma_offset + chroma_stride * (size.height / 2);
+    var file_stat: sync.struct_stat = undefined;
+    if (sync.fstat(storage.fd, &file_stat) != 0 or file_stat.st_size < required_bytes) {
+        return error.SkipZigTest;
+    }
+    const mapping = std.posix.mmap(
+        null,
+        @intCast(file_stat.st_size),
+        .{ .READ = true, .WRITE = true },
+        .{ .TYPE = .SHARED },
+        storage.fd,
+        0,
+    ) catch return error.SkipZigTest;
+    defer std.posix.munmap(mapping);
+    if (!syncTestDmaBuf(storage.fd, sync.DMA_BUF_SYNC_WRITE)) return error.SkipZigTest;
+    var write_pending = true;
+    defer if (write_pending) {
+        _ = syncTestDmaBuf(
+            storage.fd,
+            sync.DMA_BUF_SYNC_WRITE | sync.DMA_BUF_SYNC_END,
+        );
+    };
+    fillTestVideoBuffer(
+        mapping,
+        format,
+        size,
+        luma_stride,
+        chroma_offset,
+        chroma_stride,
+    );
+    if (!syncTestDmaBuf(
+        storage.fd,
+        sync.DMA_BUF_SYNC_WRITE | sync.DMA_BUF_SYNC_END,
+    )) return error.SkipZigTest;
+    write_pending = false;
+
+    const chroma_fd = std.c.dup(storage.fd);
+    if (chroma_fd < 0) return error.SkipZigTest;
+    defer _ = std.c.close(chroma_fd);
+    const NoopSync = struct {
+        fn retain(_: *anyopaque) void {}
+        fn release(_: *anyopaque) void {}
+        fn begin(_: *anyopaque) bool {
+            return true;
+        }
+        fn end(_: *anyopaque) bool {
+            return true;
+        }
+        fn exportFence(_: *anyopaque, _: u8) ?std.posix.fd_t {
+            return null;
+        }
+    };
+    const cache_id = render.allocateSourceCacheId();
+    var target_pixels = [_]u32{0} ** (64 * 64);
+    const completion = try renderer.renderFrameWithCompletion(.{
+        .size = size,
+        .commands = &.{.{ .image = .{
+            .x = 0,
+            .y = 0,
+            .size = size,
+            .buffer = .{
+                .size = size,
+                .stride_pixels = size.width,
+                .dmabuf = .{
+                    .context = &storage,
+                    .format = @intFromEnum(format),
+                    .modifier = 0,
+                    .planes = .{
+                        .{
+                            .fd = storage.fd,
+                            .stride = luma_stride,
+                            .offset = 0,
+                            .required_bytes = chroma_offset,
+                        },
+                        .{
+                            .fd = chroma_fd,
+                            .stride = chroma_stride,
+                            .offset = chroma_offset,
+                            .required_bytes = required_bytes,
+                        },
+                        .{},
+                        .{},
+                    },
+                    .plane_count = 2,
+                    .y_inverted = false,
+                    .force_opaque = true,
+                    .retain = NoopSync.retain,
+                    .release = NoopSync.release,
+                    .begin_cpu_read = NoopSync.begin,
+                    .end_cpu_read = NoopSync.end,
+                    .export_read_fence = NoopSync.exportFence,
+                },
+                .source_cache = .{ .id = cache_id, .version = 1 },
+                .color_representation = .{
+                    .coefficients = .bt709,
+                    .range = .limited,
+                    .chroma_location = chroma_location,
+                },
+            },
+        } }},
+    }, .{ .pixels = .{
+        .size = size,
+        .stride_pixels = size.width,
+        .pixels = &target_pixels,
+    } }, .wait, null);
+
+    try std.testing.expectEqual(@as(u32, 0), completion.cpu_uploads);
+    try std.testing.expectEqual(@as(u32, 1), completion.dmabuf_imports);
+    try std.testing.expect(renderer.textures.get(cache_id).?.manual_ycbcr != null);
+    try expectArgbNear(0xffff0000, target_pixels[32 * 64 + 32], 2);
+}
+
+test "Vulkan manually reconstructs known NV12 pixels" {
+    try expectManualVideoImport(.nv12, .type_4);
+}
+
+test "Vulkan manually reconstructs known P010 pixels" {
+    try expectManualVideoImport(.p010, .type_5);
+}
+
 test "Vulkan renderer blends premultiplied alpha in linear light" {
     var renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
         error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
