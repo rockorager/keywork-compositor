@@ -10,6 +10,7 @@ const shaders = @import("vulkan_shaders.zig");
 const sync = @cImport({
     @cInclude("linux/dma-buf.h");
     @cInclude("sys/ioctl.h");
+    @cInclude("sys/stat.h");
 });
 const log = std.log.scoped(.vulkan);
 
@@ -887,6 +888,130 @@ fn dmabufTargetVkFormat(fourcc: u32) ?vk.Format {
         .xrgb2101010 => .a2r10g10b10_unorm_pack32,
         .argb8888, .abgr8888, .xbgr8888, .nv12, .p010 => null,
     };
+}
+
+const YcbcrConversion = struct {
+    model: vk.SamplerYcbcrModelConversion,
+    range: vk.SamplerYcbcrRange,
+    x_chroma_offset: vk.ChromaLocation,
+    y_chroma_offset: vk.ChromaLocation,
+};
+
+fn ycbcrConversion(representation: render.ColorRepresentation) ?YcbcrConversion {
+    const model: vk.SamplerYcbcrModelConversion = switch (representation.coefficients) {
+        .identity => return null,
+        .bt601 => .ycbcr_601,
+        .bt709 => .ycbcr_709,
+        .bt2020 => .ycbcr_2020,
+    };
+    const range: vk.SamplerYcbcrRange = switch (representation.range) {
+        .full => .itu_full,
+        .limited => .itu_narrow,
+    };
+    const location = representation.chroma_location orelse return null;
+    const offsets: struct { vk.ChromaLocation, vk.ChromaLocation } = switch (location) {
+        .type_0 => .{ .cosited_even, .midpoint },
+        .type_1 => .{ .midpoint, .midpoint },
+        .type_2 => .{ .cosited_even, .cosited_even },
+        .type_3 => .{ .midpoint, .cosited_even },
+        // Vulkan's basic conversion cannot express a vertical offset of one.
+        .type_4, .type_5 => return null,
+    };
+    return .{
+        .model = model,
+        .range = range,
+        .x_chroma_offset = offsets[0],
+        .y_chroma_offset = offsets[1],
+    };
+}
+
+test "color representation maps to Vulkan YCbCr conversion" {
+    const conversion = ycbcrConversion(.{
+        .coefficients = .bt2020,
+        .range = .limited,
+        .chroma_location = .type_3,
+    }).?;
+    try std.testing.expectEqual(vk.SamplerYcbcrModelConversion.ycbcr_2020, conversion.model);
+    try std.testing.expectEqual(vk.SamplerYcbcrRange.itu_narrow, conversion.range);
+    try std.testing.expectEqual(vk.ChromaLocation.midpoint, conversion.x_chroma_offset);
+    try std.testing.expectEqual(vk.ChromaLocation.cosited_even, conversion.y_chroma_offset);
+
+    const expected_offsets = [_][2]vk.ChromaLocation{
+        .{ .cosited_even, .midpoint },
+        .{ .midpoint, .midpoint },
+        .{ .cosited_even, .cosited_even },
+        .{ .midpoint, .cosited_even },
+    };
+    for (expected_offsets, 0..) |expected, index| {
+        const location: render.ChromaLocation = @enumFromInt(index);
+        const mapped = ycbcrConversion(.{
+            .coefficients = .bt709,
+            .range = .full,
+            .chroma_location = location,
+        }).?;
+        try std.testing.expectEqual(expected[0], mapped.x_chroma_offset);
+        try std.testing.expectEqual(expected[1], mapped.y_chroma_offset);
+    }
+}
+
+test "unsupported YCbCr conversion metadata is rejected" {
+    try std.testing.expect(ycbcrConversion(.{
+        .coefficients = .identity,
+        .range = .full,
+        .chroma_location = .type_0,
+    }) == null);
+    try std.testing.expect(ycbcrConversion(.{
+        .coefficients = .bt709,
+        .range = .limited,
+        .chroma_location = null,
+    }) == null);
+    inline for (.{ render.ChromaLocation.type_4, render.ChromaLocation.type_5 }) |location| {
+        try std.testing.expect(ycbcrConversion(.{
+            .coefficients = .bt709,
+            .range = .limited,
+            .chroma_location = location,
+        }) == null);
+    }
+}
+
+fn dmabufPlanesShareAllocation(planes: []const render.DmabufPlane) bool {
+    if (planes.len == 0) return false;
+    var first: sync.struct_stat = undefined;
+    if (sync.fstat(planes[0].fd, &first) != 0) return false;
+    for (planes[1..]) |plane| {
+        var current: sync.struct_stat = undefined;
+        if (sync.fstat(plane.fd, &current) != 0 or
+            current.st_dev != first.st_dev or current.st_ino != first.st_ino)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+test "DMA-BUF plane allocation identity follows the underlying file" {
+    var first_pipe: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe2(&first_pipe, .{ .CLOEXEC = true }));
+    defer {
+        for (first_pipe) |fd| _ = std.c.close(fd);
+    }
+    var second_pipe: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe2(&second_pipe, .{ .CLOEXEC = true }));
+    defer {
+        for (second_pipe) |fd| _ = std.c.close(fd);
+    }
+    const duplicate = std.c.dup(first_pipe[0]);
+    try std.testing.expect(duplicate >= 0);
+    defer _ = std.c.close(duplicate);
+
+    try std.testing.expect(dmabufPlanesShareAllocation(&.{
+        .{ .fd = first_pipe[0] },
+        .{ .fd = duplicate },
+    }));
+    try std.testing.expect(!dmabufPlanesShareAllocation(&.{
+        .{ .fd = first_pipe[0] },
+        .{ .fd = second_pipe[0] },
+    }));
 }
 
 fn dmabufSourceModifierImportable(
