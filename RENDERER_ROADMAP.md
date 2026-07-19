@@ -83,11 +83,12 @@ Acceptance: matrix/TRC and LUT-based reference profiles match the conformance
 corpus within its published tolerance, and profile changes take effect without
 mixing old and new color state in one frame.
 
-## 5. Native video buffers
+## 5. Native video buffers — complete
 
-- Import and sample multi-planar NV12 and P010 DMA-BUFs without CPU conversion.
-- Apply explicit YCbCr matrix, range, chroma siting, and transfer metadata.
-- Preserve P010 precision through HDR composition and scanout.
+- [x] Import and sample multi-planar NV12 and P010 DMA-BUFs without CPU
+  conversion.
+- [x] Apply explicit YCbCr matrix, range, chroma siting, and transfer metadata.
+- [x] Preserve P010 precision through HDR composition and scanout.
 
 Acceptance: supported video buffers incur no CPU upload, limited/full range and
 chroma siting are correct, and P010 remains greater than 8-bit through the
