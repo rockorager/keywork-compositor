@@ -182,8 +182,13 @@ void main() {
 #ifdef KEYWORK_MANUAL_YCBCR
     vec4 color=sampleSource(coordinate);
 #else
+#ifdef KEYWORK_NEAREST
+    ivec2 texel=clamp(ivec2(floor(coordinate)),ivec2(0),textureSize(tex,0)-ivec2(1));
+    vec4 color=texelFetch(tex,texel,0);
+#else
     vec2 uv=coordinate/pc.texture_size;
     vec4 color=texture(tex,uv);
+#endif
     if (pc.swap_rb>0.5) color=color.bgra;
 #endif
     vec3 straight=color.a>0.0 ? color.rgb/color.a : vec3(0.0);

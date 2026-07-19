@@ -46,6 +46,7 @@ pipeline_layout: vk.PipelineLayout,
 replace_pipeline: vk.Pipeline,
 blend_pipeline: vk.Pipeline,
 image_pipeline: vk.Pipeline,
+nearest_image_pipeline: vk.Pipeline,
 shadow_pipeline: vk.Pipeline,
 downsample_pipeline: vk.Pipeline,
 blur_horizontal_pipeline: vk.Pipeline,
@@ -374,6 +375,7 @@ const Graphics = struct {
     replace_pipeline: vk.Pipeline,
     blend_pipeline: vk.Pipeline,
     image_pipeline: vk.Pipeline,
+    nearest_image_pipeline: vk.Pipeline,
     shadow_pipeline: vk.Pipeline,
     downsample_pipeline: vk.Pipeline,
     blur_horizontal_pipeline: vk.Pipeline,
@@ -538,6 +540,11 @@ fn initGraphics(
         .p_code = &shaders.image_alpha_instanced,
     }, null);
     defer wrapper.destroyShaderModule(device, image_shader, null);
+    const nearest_image_shader = try wrapper.createShaderModule(device, &.{
+        .code_size = @sizeOf(@TypeOf(shaders.image_nearest_instanced)),
+        .p_code = &shaders.image_nearest_instanced,
+    }, null);
+    defer wrapper.destroyShaderModule(device, nearest_image_shader, null);
     const shadow_shader = try wrapper.createShaderModule(device, &.{
         .code_size = @sizeOf(@TypeOf(shaders.shadow_instanced)),
         .p_code = &shaders.shadow_instanced,
@@ -602,6 +609,19 @@ fn initGraphics(
         return err;
     };
     errdefer wrapper.destroyPipeline(device, image_pipeline, null);
+    const nearest_image_pipeline = createPipeline(
+        wrapper,
+        device,
+        render_pass,
+        pipeline_layout,
+        vertex_shader,
+        nearest_image_shader,
+        true,
+    ) catch |err| {
+        log.err("failed to create Vulkan nearest image pipeline: {t}", .{err});
+        return err;
+    };
+    errdefer wrapper.destroyPipeline(device, nearest_image_pipeline, null);
     const shadow_pipeline = createPipeline(
         wrapper,
         device,
@@ -690,6 +710,7 @@ fn initGraphics(
         .replace_pipeline = replace_pipeline,
         .blend_pipeline = blend_pipeline,
         .image_pipeline = image_pipeline,
+        .nearest_image_pipeline = nearest_image_pipeline,
         .shadow_pipeline = shadow_pipeline,
         .downsample_pipeline = downsample_pipeline,
         .blur_horizontal_pipeline = blur_horizontal_pipeline,
@@ -829,6 +850,7 @@ fn destroyGraphics(wrapper: vk.DeviceWrapper, device: vk.Device, graphics: Graph
     wrapper.destroyPipeline(device, graphics.blur_horizontal_pipeline, null);
     wrapper.destroyPipeline(device, graphics.downsample_pipeline, null);
     wrapper.destroyPipeline(device, graphics.shadow_pipeline, null);
+    wrapper.destroyPipeline(device, graphics.nearest_image_pipeline, null);
     wrapper.destroyPipeline(device, graphics.image_pipeline, null);
     wrapper.destroyPipeline(device, graphics.blend_pipeline, null);
     wrapper.destroyPipeline(device, graphics.replace_pipeline, null);
@@ -2057,6 +2079,7 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
         .replace_pipeline = graphics.replace_pipeline,
         .blend_pipeline = graphics.blend_pipeline,
         .image_pipeline = graphics.image_pipeline,
+        .nearest_image_pipeline = graphics.nearest_image_pipeline,
         .shadow_pipeline = graphics.shadow_pipeline,
         .downsample_pipeline = graphics.downsample_pipeline,
         .blur_horizontal_pipeline = graphics.blur_horizontal_pipeline,
@@ -2146,6 +2169,7 @@ pub fn deinit(self: *Self) void {
         .replace_pipeline = self.replace_pipeline,
         .blend_pipeline = self.blend_pipeline,
         .image_pipeline = self.image_pipeline,
+        .nearest_image_pipeline = self.nearest_image_pipeline,
         .shadow_pipeline = self.shadow_pipeline,
         .downsample_pipeline = self.downsample_pipeline,
         .blur_horizontal_pipeline = self.blur_horizontal_pipeline,
@@ -5450,11 +5474,17 @@ fn compileDrawRuns(
             };
             const radius = @min(rounded.radius, @min(rounded.rect.width, rounded.rect.height) / 2);
             const dmabuf = image.buffer.dmabuf;
+            const image_pipeline = if (prepared.texture.pipeline != .null_handle)
+                prepared.texture.pipeline
+            else if (image.samplingFilter() == .nearest)
+                self.nearest_image_pipeline
+            else
+                .null_handle;
             try self.emitDamaged(
                 frame,
                 clipped,
                 .image,
-                prepared.texture.pipeline,
+                image_pipeline,
                 prepared.texture.pipeline_layout,
                 prepared.texture.descriptor_set,
                 image.buffer.size,

@@ -174,6 +174,13 @@ pub fn build(b: *std.Build) void {
     addVulkanShaderVariant(
         b,
         compositor,
+        "vulkan-image-nearest",
+        "src/compositor/render/shaders/image.frag",
+        "KEYWORK_NEAREST",
+    );
+    addVulkanShaderVariant(
+        b,
+        compositor,
         "vulkan-video-manual",
         "src/compositor/render/shaders/image.frag",
         "KEYWORK_MANUAL_YCBCR",
