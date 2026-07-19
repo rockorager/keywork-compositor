@@ -888,6 +888,17 @@ fn dmabufSourceVkFormat(fourcc: u32) ?vk.Format {
     };
 }
 
+fn videoPlaneViewFormats(format: vk.Format) ?[2]vk.Format {
+    return switch (format) {
+        .g8_b8r8_2plane_420_unorm => .{ .r8_unorm, .r8g8_unorm },
+        .g10x6_b10x6r10x6_2plane_420_unorm_3pack16 => .{
+            .r10x6_unorm_pack16,
+            .r10x6g10x6_unorm_2pack16,
+        },
+        else => null,
+    };
+}
+
 fn dmabufTargetVkFormat(fourcc: u32) ?vk.Format {
     return switch (render.DmabufFormat.fromFourcc(fourcc) orelse return null) {
         .xrgb8888 => .b8g8r8a8_unorm,
@@ -906,6 +917,20 @@ test "Vulkan source extents respect chroma subsampling" {
     try std.testing.expect(!dmabufSourceExtentValid(.nv12, .{ .width = 1919, .height = 1080 }));
     try std.testing.expect(!dmabufSourceExtentValid(.p010, .{ .width = 1920, .height = 1079 }));
     try std.testing.expect(dmabufSourceExtentValid(.argb8888, .{ .width = 1919, .height = 1079 }));
+}
+
+test "video plane views preserve native sample precision" {
+    try std.testing.expectEqualSlices(
+        vk.Format,
+        &.{ .r8_unorm, .r8g8_unorm },
+        &videoPlaneViewFormats(.g8_b8r8_2plane_420_unorm).?,
+    );
+    try std.testing.expectEqualSlices(
+        vk.Format,
+        &.{ .r10x6_unorm_pack16, .r10x6g10x6_unorm_2pack16 },
+        &videoPlaneViewFormats(.g10x6_b10x6r10x6_2plane_420_unorm_3pack16).?,
+    );
+    try std.testing.expect(videoPlaneViewFormats(.r8g8b8a8_unorm) == null);
 }
 
 const YcbcrConversion = struct {
@@ -1219,8 +1244,14 @@ fn dmabufSourceModifierImportable(
         .drm_format_modifier = modifier,
         .sharing_mode = .exclusive,
     };
+    var plane_view_formats = videoPlaneViewFormats(format);
+    var format_list: vk.ImageFormatListCreateInfo = .{ .p_next = &modifier_info };
+    if (plane_view_formats) |*formats| {
+        format_list.view_format_count = formats.len;
+        format_list.p_view_formats = formats;
+    }
     const external_info: vk.PhysicalDeviceExternalImageFormatInfo = .{
-        .p_next = &modifier_info,
+        .p_next = if (plane_view_formats != null) &format_list else &modifier_info,
         .handle_type = .{ .dma_buf_bit_ext = true },
     };
     const format_info: vk.PhysicalDeviceImageFormatInfo2 = .{
@@ -1229,6 +1260,7 @@ fn dmabufSourceModifierImportable(
         .type = .@"2d",
         .tiling = .drm_format_modifier_ext,
         .usage = .{ .sampled_bit = true },
+        .flags = .{ .mutable_format_bit = plane_view_formats != null },
     };
     var external_properties: vk.ExternalImageFormatProperties = .{
         .external_memory_properties = undefined,
@@ -1249,7 +1281,10 @@ fn dmabufSourceModifierImportable(
     if (!external_properties.external_memory_properties.external_memory_features.importable_bit) {
         return null;
     }
-    return @max(ycbcr_properties.combined_image_sampler_descriptor_count, 1);
+    return @max(
+        ycbcr_properties.combined_image_sampler_descriptor_count,
+        @as(u32, if (plane_view_formats != null) 2 else 1),
+    );
 }
 
 test "DMA-BUF source FourCC selects the matching Vulkan format" {
