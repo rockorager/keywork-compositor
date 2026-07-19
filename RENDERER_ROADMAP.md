@@ -48,7 +48,7 @@ Acceptance: every presented frame is attributable to direct scanout or
 composition; every composition fallback has a reason; and a repeatable capture
 can compare p50, p95, p99, and worst-case frame costs before and after a change.
 
-## 2. 10-bit KMS and true HDR output
+## 2. 10-bit KMS and true HDR output — complete
 
 - [x] Allocate and prefer 10-bit scanout buffers where the plane supports them.
 - [x] Own connector colorspace, HDR output metadata, maximum-bpc, and KMS color
@@ -60,7 +60,7 @@ Acceptance: HDR test patterns reach a capable display through a 10-bit path
 with the intended primaries, transfer function, luminance metadata, and no
 8-bit truncation; unsupported displays remain color-correct SDR.
 
-## 3. Perceptual tone mapping and gamut mapping
+## 3. Perceptual tone mapping and gamut mapping — complete
 
 - [x] Replace channel-wise clipping with hue-preserving luminance tone mapping.
 - [x] Add luminance-preserving soft gamut compression for wide-gamut content on
@@ -71,7 +71,7 @@ Acceptance: reference ramps remain monotonic, neutral colors remain neutral,
 out-of-gamut colors approach the target boundary without hard channel clips,
 and HDR highlights retain detail under SDR conversion.
 
-## 4. ICC profiles and calibration
+## 4. ICC profiles and calibration — complete
 
 - [x] Load per-output power-law matrix ICC profiles and apply them to SDR output
   descriptions.
