@@ -20,6 +20,27 @@ pub const Profile = struct {
     }
 };
 
+pub const calibration_lut_edge_length = 33;
+
+/// A complete linear-light output transform, including any VCGT calibration,
+/// sampled for direct upload to a three-dimensional GPU texture.
+pub const CalibrationLut = struct {
+    values: [][4]f16,
+    identity: u64,
+
+    pub fn deinit(self: *CalibrationLut, allocator: std.mem.Allocator) void {
+        allocator.free(self.values);
+        self.* = undefined;
+    }
+
+    pub fn value(self: CalibrationLut, red: usize, green: usize, blue: usize) [4]f16 {
+        std.debug.assert(red < calibration_lut_edge_length);
+        std.debug.assert(green < calibration_lut_edge_length);
+        std.debug.assert(blue < calibration_lut_edge_length);
+        return self.values[lutIndex(red, green, blue)];
+    }
+};
+
 pub fn load(allocator: std.mem.Allocator, path: []const u8) !Profile {
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
@@ -27,6 +48,132 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !Profile {
         return error.InvalidIccProfile;
     defer _ = c.cmsCloseProfile(profile);
     return parse(profile);
+}
+
+pub fn loadCalibrationLut(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    linear_primaries: render.Chromaticities,
+) !CalibrationLut {
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    const profile = c.cmsOpenProfileFromFile(path_z.ptr, "r") orelse
+        return error.InvalidIccProfile;
+    defer _ = c.cmsCloseProfile(profile);
+    return compileCalibrationLut(allocator, profile, linear_primaries);
+}
+
+fn compileCalibrationLut(
+    allocator: std.mem.Allocator,
+    profile: c.cmsHPROFILE,
+    linear_primaries: render.Chromaticities,
+) !CalibrationLut {
+    if (c.cmsGetDeviceClass(profile) != c.cmsSigDisplayClass or
+        c.cmsGetColorSpace(profile) != c.cmsSigRgbData or
+        (c.cmsGetPCS(profile) != c.cmsSigXYZData and c.cmsGetPCS(profile) != c.cmsSigLabData) or
+        c.cmsIsIntentSupported(
+            profile,
+            c.INTENT_RELATIVE_COLORIMETRIC,
+            c.LCMS_USED_AS_OUTPUT,
+        ) == 0)
+    {
+        return error.UnsupportedIccProfile;
+    }
+
+    const linear_profile = try createLinearProfile(linear_primaries);
+    defer _ = c.cmsCloseProfile(linear_profile);
+    const transform = c.cmsCreateTransform(
+        linear_profile,
+        c.TYPE_RGB_FLT,
+        profile,
+        c.TYPE_RGB_FLT,
+        c.INTENT_RELATIVE_COLORIMETRIC,
+        c.cmsFLAGS_HIGHRESPRECALC | c.cmsFLAGS_NOCACHE,
+    ) orelse return error.InvalidIccProfile;
+    defer c.cmsDeleteTransform(transform);
+
+    const value_count = calibration_lut_edge_length *
+        calibration_lut_edge_length * calibration_lut_edge_length;
+    const values = try allocator.alloc([4]f16, value_count);
+    errdefer allocator.free(values);
+    const vcgt = try readVcgt(profile);
+    var input: [calibration_lut_edge_length][3]f32 = undefined;
+    var output: [calibration_lut_edge_length][3]f32 = undefined;
+    const denominator: f32 = @floatFromInt(calibration_lut_edge_length - 1);
+    for (0..calibration_lut_edge_length) |blue| {
+        for (0..calibration_lut_edge_length) |green| {
+            for (0..calibration_lut_edge_length) |red| input[red] = .{
+                @as(f32, @floatFromInt(red)) / denominator,
+                @as(f32, @floatFromInt(green)) / denominator,
+                @as(f32, @floatFromInt(blue)) / denominator,
+            };
+            c.cmsDoTransform(transform, &input, &output, calibration_lut_edge_length);
+            for (output, 0..) |transformed, red| {
+                for (transformed) |component| {
+                    if (!std.math.isFinite(component)) return error.InvalidIccProfile;
+                }
+                var calibrated = transformed;
+                if (vcgt) |curves| {
+                    for (&calibrated, 0..) |*component, channel| {
+                        component.* = c.cmsEvalToneCurveFloat(
+                            curves[channel],
+                            std.math.clamp(component.*, 0, 1),
+                        );
+                    }
+                }
+                for (calibrated) |component| {
+                    if (!std.math.isFinite(component)) return error.InvalidIccProfile;
+                }
+                values[lutIndex(red, green, blue)] = .{
+                    @floatCast(std.math.clamp(calibrated[0], 0, 1)),
+                    @floatCast(std.math.clamp(calibrated[1], 0, 1)),
+                    @floatCast(std.math.clamp(calibrated[2], 0, 1)),
+                    1,
+                };
+            }
+        }
+    }
+    return .{
+        .values = values,
+        .identity = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(values)),
+    };
+}
+
+fn createLinearProfile(primaries: render.Chromaticities) !c.cmsHPROFILE {
+    const white = try xyY(primaries.white_x, primaries.white_y);
+    const rgb: c.cmsCIExyYTRIPLE = .{
+        .Red = try xyY(primaries.red_x, primaries.red_y),
+        .Green = try xyY(primaries.green_x, primaries.green_y),
+        .Blue = try xyY(primaries.blue_x, primaries.blue_y),
+    };
+    const curve = c.cmsBuildGamma(null, 1) orelse return error.OutOfMemory;
+    defer c.cmsFreeToneCurve(curve);
+    var curves = [_]*c.cmsToneCurve{ curve, curve, curve };
+    return c.cmsCreateRGBProfile(&white, &rgb, &curves) orelse error.InvalidIccProfile;
+}
+
+fn xyY(x_fixed: i32, y_fixed: i32) !c.cmsCIExyY {
+    const x = @as(f64, @floatFromInt(x_fixed)) / 1_000_000.0;
+    const y = @as(f64, @floatFromInt(y_fixed)) / 1_000_000.0;
+    if (!std.math.isFinite(x) or !std.math.isFinite(y) or
+        x < 0 or y <= 0 or x > 1 or y > 1 or x + y > 1)
+    {
+        return error.InvalidIccProfile;
+    }
+    return .{ .x = x, .y = y, .Y = 1 };
+}
+
+fn readVcgt(profile: c.cmsHPROFILE) !?[*]const *c.cmsToneCurve {
+    if (c.cmsIsTag(profile, c.cmsSigVcgtTag) == 0) return null;
+    const value = c.cmsReadTag(profile, c.cmsSigVcgtTag) orelse
+        return error.InvalidIccProfile;
+    return @ptrCast(@alignCast(value));
+}
+
+fn lutIndex(red: usize, green: usize, blue: usize) usize {
+    // Vulkan uploads this contiguous dimension as texture X, so shaders sample
+    // the three-dimensional image with coordinates (red, green, blue).
+    return (blue * calibration_lut_edge_length + green) * calibration_lut_edge_length + red;
 }
 
 fn parse(profile: c.cmsHPROFILE) !Profile {
@@ -227,6 +374,170 @@ test "ICC matrix profiles expose primaries and a shared transfer curve" {
     try expectNear(60000, parsed.primaries.blue_y, 100);
     try expectNear(312700, parsed.primaries.white_x, 100);
     try expectNear(329000, parsed.primaries.white_y, 100);
+}
+
+test "ICC output transforms compile into stable linear-light LUTs" {
+    const linear = try createLinearProfile(render.srgb_chromaticities);
+    defer _ = c.cmsCloseProfile(linear);
+    var first = try compileCalibrationLut(
+        std.testing.allocator,
+        linear,
+        render.srgb_chromaticities,
+    );
+    defer first.deinit(std.testing.allocator);
+    var second = try compileCalibrationLut(
+        std.testing.allocator,
+        linear,
+        render.srgb_chromaticities,
+    );
+    defer second.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(first.identity, second.identity);
+    try expectLutValue(first, 0, 0, 0, .{ 0, 0, 0 }, 0.0001);
+    try expectLutValue(first, 16, 16, 16, .{ 0.5, 0.5, 0.5 }, 0.001);
+    try expectLutValue(first, 32, 32, 32, .{ 1, 1, 1 }, 0.0001);
+    try expectLutValue(first, 32, 0, 0, .{ 1, 0, 0 }, 0.001);
+}
+
+test "ICC output LUT includes transfer and VCGT calibration curves" {
+    const white: c.cmsCIExyY = .{ .x = 0.3127, .y = 0.3290, .Y = 1 };
+    const primaries: c.cmsCIExyYTRIPLE = .{
+        .Red = .{ .x = 0.68, .y = 0.32, .Y = 1 },
+        .Green = .{ .x = 0.265, .y = 0.69, .Y = 1 },
+        .Blue = .{ .x = 0.15, .y = 0.06, .Y = 1 },
+    };
+    const output_curve = c.cmsBuildGamma(null, 2) orelse return error.OutOfMemory;
+    defer c.cmsFreeToneCurve(output_curve);
+    var output_curves = [_]*c.cmsToneCurve{ output_curve, output_curve, output_curve };
+    const profile = c.cmsCreateRGBProfile(&white, &primaries, &output_curves) orelse
+        return error.OutOfMemory;
+    defer _ = c.cmsCloseProfile(profile);
+    var uncalibrated = try compileCalibrationLut(
+        std.testing.allocator,
+        profile,
+        render.srgb_chromaticities,
+    );
+    defer uncalibrated.deinit(std.testing.allocator);
+    const calibration_curve = c.cmsBuildGamma(null, 2) orelse return error.OutOfMemory;
+    defer c.cmsFreeToneCurve(calibration_curve);
+    var calibration_curves = [_]*c.cmsToneCurve{
+        calibration_curve,
+        calibration_curve,
+        calibration_curve,
+    };
+    try std.testing.expect(c.cmsWriteTag(profile, c.cmsSigVcgtTag, &calibration_curves) != 0);
+
+    var calibrated = try compileCalibrationLut(
+        std.testing.allocator,
+        profile,
+        render.srgb_chromaticities,
+    );
+    defer calibrated.deinit(std.testing.allocator);
+
+    const before = uncalibrated.value(24, 8, 16);
+    const after = calibrated.value(24, 8, 16);
+    var changed = false;
+    for (before[0..3], after[0..3]) |input, actual| {
+        const expected = c.cmsEvalToneCurveFloat(calibration_curve, @floatCast(input));
+        try std.testing.expectApproxEqAbs(expected, @as(f32, @floatCast(actual)), 0.002);
+        changed = changed or @abs(@as(f32, @floatCast(input)) - @as(f32, @floatCast(actual))) >
+            0.01;
+    }
+    try std.testing.expect(changed);
+}
+
+test "ICC output LUT rejects malformed VCGT calibration" {
+    const profile = try createLinearProfile(render.srgb_chromaticities);
+    defer _ = c.cmsCloseProfile(profile);
+    const invalid_vcgt = [_]u8{ 'v', 'c', 'g', 't', 0, 0, 0, 0 };
+    try std.testing.expect(c.cmsWriteRawTag(
+        profile,
+        c.cmsSigVcgtTag,
+        &invalid_vcgt,
+        invalid_vcgt.len,
+    ) != 0);
+    try std.testing.expectError(
+        error.InvalidIccProfile,
+        compileCalibrationLut(std.testing.allocator, profile, render.srgb_chromaticities),
+    );
+}
+
+test "ICC CLUT display profiles compile into output LUTs" {
+    const profile = try createTestClutProfile();
+    defer _ = c.cmsCloseProfile(profile);
+    try std.testing.expect(c.cmsIsCLUT(
+        profile,
+        c.INTENT_RELATIVE_COLORIMETRIC,
+        c.LCMS_USED_AS_OUTPUT,
+    ) != 0);
+
+    var lut = try compileCalibrationLut(
+        std.testing.allocator,
+        profile,
+        render.srgb_chromaticities,
+    );
+    defer lut.deinit(std.testing.allocator);
+    try expectLutValue(lut, 16, 16, 16, .{ 0.5, 0.5, 0.5 }, 0.01);
+    try expectLutValue(lut, 32, 0, 0, .{ 1, 0, 0 }, 0.01);
+}
+
+fn createTestClutProfile() !c.cmsHPROFILE {
+    const linear = try createLinearProfile(render.srgb_chromaticities);
+    defer _ = c.cmsCloseProfile(linear);
+    const xyz = c.cmsCreateXYZProfile() orelse return error.OutOfMemory;
+    defer _ = c.cmsCloseProfile(xyz);
+    const flags = c.cmsFLAGS_FORCE_CLUT | c.cmsFLAGS_HIGHRESPRECALC;
+    const forward = c.cmsCreateTransform(
+        linear,
+        c.TYPE_RGB_FLT,
+        xyz,
+        c.TYPE_XYZ_FLT,
+        c.INTENT_RELATIVE_COLORIMETRIC,
+        flags,
+    ) orelse return error.InvalidIccProfile;
+    defer c.cmsDeleteTransform(forward);
+    const reverse = c.cmsCreateTransform(
+        xyz,
+        c.TYPE_XYZ_FLT,
+        linear,
+        c.TYPE_RGB_FLT,
+        c.INTENT_RELATIVE_COLORIMETRIC,
+        flags,
+    ) orelse return error.InvalidIccProfile;
+    defer c.cmsDeleteTransform(reverse);
+
+    const profile = c.cmsCreateProfilePlaceholder(null) orelse return error.OutOfMemory;
+    errdefer _ = c.cmsCloseProfile(profile);
+    c.cmsSetProfileVersion(profile, 4.3);
+    c.cmsSetDeviceClass(profile, c.cmsSigDisplayClass);
+    c.cmsSetColorSpace(profile, c.cmsSigRgbData);
+    c.cmsSetPCS(profile, c.cmsSigXYZData);
+    c.cmsSetHeaderRenderingIntent(profile, c.INTENT_RELATIVE_COLORIMETRIC);
+    if (c.cmsWriteTag(profile, c.cmsSigMediaWhitePointTag, c.cmsD50_XYZ()) == 0 or
+        c.cmsWriteTag(profile, c.cmsSigAToB1Tag, c.cmsGetTransformPipeline(forward)) == 0 or
+        c.cmsWriteTag(profile, c.cmsSigBToA1Tag, c.cmsGetTransformPipeline(reverse)) == 0)
+    {
+        return error.InvalidIccProfile;
+    }
+    return profile;
+}
+
+fn expectLutValue(
+    lut: CalibrationLut,
+    red: usize,
+    green: usize,
+    blue: usize,
+    expected: [3]f32,
+    tolerance: f32,
+) !void {
+    const actual = lut.value(red, green, blue);
+    for (expected, actual[0..3]) |expected_component, actual_component| {
+        try std.testing.expectApproxEqAbs(
+            expected_component,
+            @as(f32, @floatCast(actual_component)),
+            tolerance,
+        );
+    }
 }
 
 fn expectNear(expected: i32, actual: i32, tolerance: i32) !void {
