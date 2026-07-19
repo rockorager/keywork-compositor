@@ -80,6 +80,11 @@ fallback: CpuRenderer,
 const max_cached_textures = 4096;
 const descriptor_set_capacity = max_cached_textures + 512;
 const stale_frame_count = 120;
+const timestamp_query_count = 4;
+const timestamp_frame_start = 0;
+const timestamp_composition_end = 1;
+const timestamp_output_encode_end = 2;
+const timestamp_frame_end = 3;
 
 const TargetKey = union(enum) {
     pixels: struct {
@@ -316,7 +321,9 @@ pub const Error = CpuRenderer.Error || error{
 
 pub const GpuTiming = struct {
     tag: u64,
-    nanoseconds: u64,
+    total_nanoseconds: u64,
+    composition_nanoseconds: u64,
+    output_encode_nanoseconds: u64,
 };
 
 const Graphics = struct {
@@ -1016,7 +1023,7 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
     else
         device_wrapper.createQueryPool(device, &.{
             .query_type = .timestamp,
-            .query_count = 2,
+            .query_count = timestamp_query_count,
         }, null) catch |err| pool: {
             log.warn("failed to create Vulkan timestamp query pool: {t}", .{err});
             break :pool vk.QueryPool.null_handle;
@@ -1676,7 +1683,7 @@ fn finishPendingGpuTiming(self: *Self) void {
     const tag = self.pending_gpu_sample_tag orelse return;
     self.pending_gpu_sample_tag = null;
     std.debug.assert(self.timestamp_query_pool != .null_handle);
-    var timestamps: [2]u64 = undefined;
+    var timestamps: [timestamp_query_count]u64 = undefined;
     const result = self.device_wrapper.getQueryPoolResults(
         self.device,
         self.timestamp_query_pool,
@@ -1694,15 +1701,16 @@ fn finishPendingGpuTiming(self: *Self) void {
         log.warn("Vulkan timestamp queries were unavailable after fence completion", .{});
         return;
     }
-    const ticks = timestampTickDelta(timestamps[0], timestamps[1], self.timestamp_valid_bits);
     if (self.completed_gpu_timing_count == self.completed_gpu_timings.len) {
         log.warn("dropping Vulkan GPU timestamp because the completion queue is full", .{});
         return;
     }
-    self.completed_gpu_timings[self.completed_gpu_timing_count] = .{
-        .tag = tag,
-        .nanoseconds = timestampNanoseconds(ticks, self.timestamp_period),
-    };
+    self.completed_gpu_timings[self.completed_gpu_timing_count] = gpuTimingFromTimestamps(
+        tag,
+        timestamps,
+        self.timestamp_valid_bits,
+        self.timestamp_period,
+    );
     self.completed_gpu_timing_count += 1;
 }
 
@@ -1732,6 +1740,32 @@ fn timestampNanoseconds(ticks: u64, period: f32) u64 {
     if (!(period > 0)) return 0;
     const nanoseconds = @as(f64, @floatFromInt(ticks)) * @as(f64, period);
     return std.math.lossyCast(u64, nanoseconds);
+}
+
+fn gpuTimingFromTimestamps(
+    tag: u64,
+    timestamps: [timestamp_query_count]u64,
+    valid_bits: u32,
+    period: f32,
+) GpuTiming {
+    return .{
+        .tag = tag,
+        .total_nanoseconds = timestampNanoseconds(timestampTickDelta(
+            timestamps[timestamp_frame_start],
+            timestamps[timestamp_frame_end],
+            valid_bits,
+        ), period),
+        .composition_nanoseconds = timestampNanoseconds(timestampTickDelta(
+            timestamps[timestamp_frame_start],
+            timestamps[timestamp_composition_end],
+            valid_bits,
+        ), period),
+        .output_encode_nanoseconds = timestampNanoseconds(timestampTickDelta(
+            timestamps[timestamp_composition_end],
+            timestamps[timestamp_output_encode_end],
+            valid_bits,
+        ), period),
+    };
 }
 
 fn releasePendingResources(self: *Self) void {
@@ -1928,12 +1962,17 @@ fn renderFrameWithCompletion(
             .flags = if (reusable) .{} else .{ .one_time_submit_bit = true },
         }) catch return error.VulkanFailure;
         if (self.timestamp_query_pool != .null_handle) {
-            self.device_wrapper.cmdResetQueryPool(command_buffer, self.timestamp_query_pool, 0, 2);
+            self.device_wrapper.cmdResetQueryPool(
+                command_buffer,
+                self.timestamp_query_pool,
+                0,
+                timestamp_query_count,
+            );
             self.device_wrapper.cmdWriteTimestamp(
                 command_buffer,
                 .{ .top_of_pipe_bit = true },
                 self.timestamp_query_pool,
-                0,
+                timestamp_frame_start,
             );
         }
 
@@ -2221,6 +2260,14 @@ fn renderFrameWithCompletion(
         self.device_wrapper.cmdEndRenderPass(command_buffer);
 
         self.transitionImage(command_buffer, output.linear.image, .color_attachment_optimal, .shader_read_only_optimal, .{ .color_attachment_write_bit = true }, .{ .shader_read_bit = true }, .{ .color_attachment_output_bit = true }, .{ .fragment_shader_bit = true });
+        if (self.timestamp_query_pool != .null_handle) {
+            self.device_wrapper.cmdWriteTimestamp(
+                command_buffer,
+                .{ .bottom_of_pipe_bit = true },
+                self.timestamp_query_pool,
+                timestamp_composition_end,
+            );
+        }
         if (output.kind == .dmabuf) {
             self.transitionExternalToRender(command_buffer, output.*);
         } else if (!output.initialized) {
@@ -2254,6 +2301,14 @@ fn renderFrameWithCompletion(
         self.device_wrapper.cmdPushConstants(command_buffer, self.pipeline_layout, .{ .vertex_bit = true, .fragment_bit = true }, 0, @sizeOf(FramePush), &output_push);
         self.device_wrapper.cmdDraw(command_buffer, 4, 1, 0, encode_instance);
         self.device_wrapper.cmdEndRenderPass(command_buffer);
+        if (self.timestamp_query_pool != .null_handle) {
+            self.device_wrapper.cmdWriteTimestamp(
+                command_buffer,
+                .{ .bottom_of_pipe_bit = true },
+                self.timestamp_query_pool,
+                timestamp_output_encode_end,
+            );
+        }
 
         for (self.prepared_images.items, 0..) |prepared, index| {
             if (!prepared.texture.imported or
@@ -2295,7 +2350,7 @@ fn renderFrameWithCompletion(
                 command_buffer,
                 .{ .bottom_of_pipe_bit = true },
                 self.timestamp_query_pool,
-                1,
+                timestamp_frame_end,
             );
         }
         self.device_wrapper.endCommandBuffer(command_buffer) catch return error.VulkanFailure;
@@ -6224,4 +6279,10 @@ test "timestamp durations handle device counter wraparound" {
         timestampTickDelta(std.math.maxInt(u64) - 4, 5, 64),
     );
     try std.testing.expectEqual(@as(u64, 16), timestampNanoseconds(11, 1.5));
+
+    const timing = gpuTimingFromTimestamps(7, .{ 250, 2, 5, 9 }, 8, 2);
+    try std.testing.expectEqual(@as(u64, 7), timing.tag);
+    try std.testing.expectEqual(@as(u64, 30), timing.total_nanoseconds);
+    try std.testing.expectEqual(@as(u64, 16), timing.composition_nanoseconds);
+    try std.testing.expectEqual(@as(u64, 6), timing.output_encode_nanoseconds);
 }

@@ -179,7 +179,9 @@ fn writeStatistics(writer: *std.Io.Writer, outputs: []const control.OutputStatis
             output.acquire_retries,
             output.frames_over_budget,
         });
-        try writeLatency(writer, "GPU execution", output.gpu_execution);
+        try writeLatency(writer, "GPU total", output.gpu_execution);
+        try writeLatency(writer, "GPU composition/effects", output.gpu_composition);
+        try writeLatency(writer, "GPU output encode", output.gpu_output_encode);
         try writeLatency(writer, "request -> presentation", output.request_to_presentation);
         try writeLatency(writer, "request -> render", output.request_to_render);
         try writeLatency(writer, "render -> commit", output.render_to_commit);
@@ -338,7 +340,7 @@ test "configuration reload errors expose their message" {
 
 test "performance statistics decode and render human-readable output" {
     var reply = try std.json.parseFromSlice(varlink.Reply, std.testing.allocator,
-        \\{"parameters":{"outputs":[{"name":"eDP-1","width":2880,"height":1800,"refresh_millihertz":120000,"frames_requested":10,"frames_started":9,"frames_presented":8,"frames_discarded":1,"acquire_retries":2,"composited_frames":7,"direct_scanout_candidates":3,"direct_scanout_frames":1,"frames_over_budget":2,"gpu_execution":{"samples":7,"p50_microseconds":2100,"p95_microseconds":4400,"p99_microseconds":6100,"maximum_microseconds":7200},"request_to_presentation":{"samples":8,"p50_microseconds":8200,"p95_microseconds":9100,"p99_microseconds":16700,"maximum_microseconds":25000},"request_to_render":{"samples":8,"p50_microseconds":1000,"p95_microseconds":1200,"p99_microseconds":1400,"maximum_microseconds":1600},"render_to_commit":{"samples":8,"p50_microseconds":1100,"p95_microseconds":2800,"p99_microseconds":5600,"maximum_microseconds":7000},"commit_to_presentation":{"samples":8,"p50_microseconds":6800,"p95_microseconds":8000,"p99_microseconds":14900,"maximum_microseconds":18000}}]}}
+        \\{"parameters":{"outputs":[{"name":"eDP-1","width":2880,"height":1800,"refresh_millihertz":120000,"frames_requested":10,"frames_started":9,"frames_presented":8,"frames_discarded":1,"acquire_retries":2,"composited_frames":7,"direct_scanout_candidates":3,"direct_scanout_frames":1,"frames_over_budget":2,"gpu_execution":{"samples":7,"p50_microseconds":2100,"p95_microseconds":4400,"p99_microseconds":6100,"maximum_microseconds":7200},"gpu_composition":{"samples":7,"p50_microseconds":1500,"p95_microseconds":3300,"p99_microseconds":4700,"maximum_microseconds":5400},"gpu_output_encode":{"samples":7,"p50_microseconds":400,"p95_microseconds":700,"p99_microseconds":900,"maximum_microseconds":1100},"request_to_presentation":{"samples":8,"p50_microseconds":8200,"p95_microseconds":9100,"p99_microseconds":16700,"maximum_microseconds":25000},"request_to_render":{"samples":8,"p50_microseconds":1000,"p95_microseconds":1200,"p99_microseconds":1400,"maximum_microseconds":1600},"render_to_commit":{"samples":8,"p50_microseconds":1100,"p95_microseconds":2800,"p99_microseconds":5600,"maximum_microseconds":7000},"commit_to_presentation":{"samples":8,"p50_microseconds":6800,"p95_microseconds":8000,"p99_microseconds":14900,"maximum_microseconds":18000}}]}}
     , .{});
     defer reply.deinit();
     const parsed = try parseStatisticsParameters(std.testing.allocator, reply.value.parameters);
@@ -351,7 +353,9 @@ test "performance statistics decode and render human-readable output" {
         \\  frames: requested 10, started 9, presented 8, discarded 1
         \\  paths: composited 7, direct scanout 1/3 candidates
         \\  acquire retries: 2, frames over budget: 2
-        \\  GPU execution: p50 2100us, p95 4400us, p99 6100us, max 7200us (7 samples)
+        \\  GPU total: p50 2100us, p95 4400us, p99 6100us, max 7200us (7 samples)
+        \\  GPU composition/effects: p50 1500us, p95 3300us, p99 4700us, max 5400us (7 samples)
+        \\  GPU output encode: p50 400us, p95 700us, p99 900us, max 1100us (7 samples)
         \\  request -> presentation: p50 8200us, p95 9100us, p99 16700us, max 25000us (8 samples)
         \\  request -> render: p50 1000us, p95 1200us, p99 1400us, max 1600us (8 samples)
         \\  render -> commit: p50 1100us, p95 2800us, p99 5600us, max 7000us (8 samples)

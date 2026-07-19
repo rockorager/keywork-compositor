@@ -31,6 +31,8 @@ pub const OutputStatistics = struct {
     direct_scanout_frames: i64,
     frames_over_budget: i64,
     gpu_execution: LatencyStatistics,
+    gpu_composition: LatencyStatistics,
+    gpu_output_encode: LatencyStatistics,
     request_to_presentation: LatencyStatistics,
     request_to_render: LatencyStatistics,
     render_to_commit: LatencyStatistics,

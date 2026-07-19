@@ -35,6 +35,8 @@ type OutputStatistics (
     direct_scanout_frames: int,
     frames_over_budget: int,
     gpu_execution: LatencyStatistics,
+    gpu_composition: LatencyStatistics,
+    gpu_output_encode: LatencyStatistics,
     request_to_presentation: LatencyStatistics,
     request_to_render: LatencyStatistics,
     render_to_commit: LatencyStatistics,

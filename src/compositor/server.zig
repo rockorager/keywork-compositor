@@ -316,6 +316,14 @@ const LatencyKind = enum {
     commit_to_presentation,
 };
 
+const GpuExecution = struct {
+    total_microseconds: u64,
+    composition_microseconds: u64,
+    output_encode_microseconds: u64,
+};
+
+const GpuExecutionKind = enum { total, composition, output_encode };
+
 const FrameStatistics = struct {
     frames_requested: u64 = 0,
     frames_started: u64 = 0,
@@ -329,7 +337,7 @@ const FrameStatistics = struct {
     latency_samples: [frame_latency_capacity]FrameLatency = undefined,
     latency_count: usize = 0,
     latency_next: usize = 0,
-    gpu_execution_samples: [frame_latency_capacity]u64 = undefined,
+    gpu_execution_samples: [frame_latency_capacity]GpuExecution = undefined,
     gpu_execution_count: usize = 0,
     gpu_execution_next: usize = 0,
 
@@ -371,8 +379,15 @@ const FrameStatistics = struct {
         self.latency_count = @min(self.latency_count + 1, frame_latency_capacity);
     }
 
-    fn addGpuExecution(self: *FrameStatistics, nanoseconds: u64) void {
-        self.gpu_execution_samples[self.gpu_execution_next] = nanosecondsToMicroseconds(nanoseconds);
+    fn addGpuExecution(
+        self: *FrameStatistics,
+        timing: renderer_types.Renderer.GpuTiming,
+    ) void {
+        self.gpu_execution_samples[self.gpu_execution_next] = .{
+            .total_microseconds = nanosecondsToMicroseconds(timing.total_nanoseconds),
+            .composition_microseconds = nanosecondsToMicroseconds(timing.composition_nanoseconds),
+            .output_encode_microseconds = nanosecondsToMicroseconds(timing.output_encode_nanoseconds),
+        };
         self.gpu_execution_next = (self.gpu_execution_next + 1) % frame_latency_capacity;
         self.gpu_execution_count = @min(self.gpu_execution_count + 1, frame_latency_capacity);
     }
@@ -397,7 +412,9 @@ const FrameStatistics = struct {
             .direct_scanout_candidates = wireInteger(self.direct_scanout_candidates),
             .direct_scanout_frames = wireInteger(self.direct_scanout_frames),
             .frames_over_budget = wireInteger(self.frames_over_budget),
-            .gpu_execution = self.gpuExecutionSummary(),
+            .gpu_execution = self.gpuExecutionSummary(.total),
+            .gpu_composition = self.gpuExecutionSummary(.composition),
+            .gpu_output_encode = self.gpuExecutionSummary(.output_encode),
             .request_to_presentation = self.latencySummary(.request_to_presentation),
             .request_to_render = self.latencySummary(.request_to_render),
             .render_to_commit = self.latencySummary(.render_to_commit),
@@ -436,7 +453,10 @@ const FrameStatistics = struct {
         };
     }
 
-    fn gpuExecutionSummary(self: *const FrameStatistics) ControlProtocol.LatencyStatistics {
+    fn gpuExecutionSummary(
+        self: *const FrameStatistics,
+        comptime kind: GpuExecutionKind,
+    ) ControlProtocol.LatencyStatistics {
         if (self.gpu_execution_count == 0) return .{
             .samples = 0,
             .p50_microseconds = 0,
@@ -445,10 +465,13 @@ const FrameStatistics = struct {
             .maximum_microseconds = 0,
         };
         var values: [frame_latency_capacity]u64 = undefined;
-        @memcpy(
-            values[0..self.gpu_execution_count],
-            self.gpu_execution_samples[0..self.gpu_execution_count],
-        );
+        for (self.gpu_execution_samples[0..self.gpu_execution_count], 0..) |sample, index| {
+            values[index] = switch (kind) {
+                .total => sample.total_microseconds,
+                .composition => sample.composition_microseconds,
+                .output_encode => sample.output_encode_microseconds,
+            };
+        }
         const sorted = values[0..self.gpu_execution_count];
         std.mem.sort(u64, sorted, {}, std.sort.asc(u64));
         return .{
@@ -532,14 +555,37 @@ test "frame statistics summarize rolling latency and classify over-budget frames
     try std.testing.expectEqual(@as(i64, 400), summary.p99_microseconds);
     try std.testing.expectEqual(@as(i64, 400), summary.maximum_microseconds);
 
-    statistics.addGpuExecution(1_100 * std.time.ns_per_us);
-    statistics.addGpuExecution(2_200 * std.time.ns_per_us);
-    statistics.addGpuExecution(3_300 * std.time.ns_per_us);
-    const gpu_summary = statistics.gpuExecutionSummary();
+    statistics.addGpuExecution(.{
+        .tag = 0,
+        .total_nanoseconds = 1_100 * std.time.ns_per_us,
+        .composition_nanoseconds = 700 * std.time.ns_per_us,
+        .output_encode_nanoseconds = 300 * std.time.ns_per_us,
+    });
+    statistics.addGpuExecution(.{
+        .tag = 0,
+        .total_nanoseconds = 2_200 * std.time.ns_per_us,
+        .composition_nanoseconds = 1_400 * std.time.ns_per_us,
+        .output_encode_nanoseconds = 600 * std.time.ns_per_us,
+    });
+    statistics.addGpuExecution(.{
+        .tag = 0,
+        .total_nanoseconds = 3_300 * std.time.ns_per_us,
+        .composition_nanoseconds = 2_100 * std.time.ns_per_us,
+        .output_encode_nanoseconds = 900 * std.time.ns_per_us,
+    });
+    const gpu_summary = statistics.gpuExecutionSummary(.total);
     try std.testing.expectEqual(@as(i64, 3), gpu_summary.samples);
     try std.testing.expectEqual(@as(i64, 2_200), gpu_summary.p50_microseconds);
     try std.testing.expectEqual(@as(i64, 3_300), gpu_summary.p95_microseconds);
     try std.testing.expectEqual(@as(i64, 3_300), gpu_summary.maximum_microseconds);
+    try std.testing.expectEqual(
+        @as(i64, 1_400),
+        statistics.gpuExecutionSummary(.composition).p50_microseconds,
+    );
+    try std.testing.expectEqual(
+        @as(i64, 600),
+        statistics.gpuExecutionSummary(.output_encode).p50_microseconds,
+    );
 
     statistics.recordPresentation(.{
         .request_nanoseconds = 0,
@@ -2496,7 +2542,7 @@ fn collectGpuTimings(self: *Self) void {
         const render_output = self.findProtocolRenderOutput(
             outputStatisticsId(timing.tag),
         ) orelse continue;
-        render_output.frame_statistics.addGpuExecution(timing.nanoseconds);
+        render_output.frame_statistics.addGpuExecution(timing);
     }
 }
 
