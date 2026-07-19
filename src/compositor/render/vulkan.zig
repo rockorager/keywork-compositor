@@ -66,6 +66,7 @@ pending_textures: std.ArrayList(Texture) = .empty,
 dmabuf_modifiers: []u64,
 dmabuf_sampled_modifiers: []u64,
 dmabuf_source_modifiers: []u64,
+dmabuf_rgba_source_modifiers: []u64,
 dmabuf_device_id: ?render.DrmDeviceId,
 outputs: std.AutoHashMapUnmanaged(TargetKey, Output) = .empty,
 textures: std.AutoHashMapUnmanaged(u64, Texture) = .empty,
@@ -76,8 +77,6 @@ fallback: CpuRenderer,
 const max_cached_textures = 4096;
 const descriptor_set_capacity = max_cached_textures + 512;
 const stale_frame_count = 120;
-const drm_format_argb8888: u32 = 0x34325241;
-const drm_format_xrgb8888: u32 = 0x34325258;
 
 const TargetKey = union(enum) {
     pixels: struct {
@@ -701,6 +700,73 @@ fn hasExtension(properties: []const vk.ExtensionProperties, name: []const u8) bo
     return false;
 }
 
+fn dmabufSourceVkFormat(fourcc: u32) ?vk.Format {
+    return switch (render.DmabufFormat.fromFourcc(fourcc) orelse return null) {
+        .argb8888, .xrgb8888 => .b8g8r8a8_unorm,
+        .abgr8888, .xbgr8888 => .r8g8b8a8_unorm,
+    };
+}
+
+test "DMA-BUF source FourCC selects the matching Vulkan format" {
+    try std.testing.expectEqual(
+        vk.Format.b8g8r8a8_unorm,
+        dmabufSourceVkFormat(@intFromEnum(render.DmabufFormat.argb8888)).?,
+    );
+    try std.testing.expectEqual(
+        vk.Format.b8g8r8a8_unorm,
+        dmabufSourceVkFormat(@intFromEnum(render.DmabufFormat.xrgb8888)).?,
+    );
+    try std.testing.expectEqual(
+        vk.Format.r8g8b8a8_unorm,
+        dmabufSourceVkFormat(@intFromEnum(render.DmabufFormat.abgr8888)).?,
+    );
+    try std.testing.expectEqual(
+        vk.Format.r8g8b8a8_unorm,
+        dmabufSourceVkFormat(@intFromEnum(render.DmabufFormat.xbgr8888)).?,
+    );
+    try std.testing.expect(dmabufSourceVkFormat(0) == null);
+}
+
+fn queryDmabufSourceModifiers(
+    allocator: std.mem.Allocator,
+    instance_wrapper: vk.InstanceWrapper,
+    physical_device: vk.PhysicalDevice,
+    format: vk.Format,
+) error{OutOfMemory}![]u64 {
+    var modifier_list: vk.DrmFormatModifierPropertiesListEXT = .{};
+    var format_properties: vk.FormatProperties2 = .{ .format_properties = undefined };
+    format_properties.p_next = &modifier_list;
+    instance_wrapper.getPhysicalDeviceFormatProperties2KHR(
+        physical_device,
+        format,
+        &format_properties,
+    );
+    const properties = allocator.alloc(
+        vk.DrmFormatModifierPropertiesEXT,
+        modifier_list.drm_format_modifier_count,
+    ) catch return error.OutOfMemory;
+    defer allocator.free(properties);
+    modifier_list.p_drm_format_modifier_properties = properties.ptr;
+    instance_wrapper.getPhysicalDeviceFormatProperties2KHR(
+        physical_device,
+        format,
+        &format_properties,
+    );
+
+    var modifiers: std.ArrayList(u64) = .empty;
+    defer modifiers.deinit(allocator);
+    for (properties) |property| {
+        const features = property.drm_format_modifier_tiling_features;
+        if (property.drm_format_modifier_plane_count == 1 and
+            features.sampled_image_bit and features.sampled_image_filter_linear_bit)
+        {
+            modifiers.append(allocator, property.drm_format_modifier) catch
+                return error.OutOfMemory;
+        }
+    }
+    return modifiers.toOwnedSlice(allocator) catch return error.OutOfMemory;
+}
+
 pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) InitError!Self {
     var loader = std.DynLib.open("libvulkan.so.1") catch return error.VulkanUnavailable;
     errdefer loader.close();
@@ -905,6 +971,7 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
     var dmabuf_modifiers: []u64 = &.{};
     var dmabuf_sampled_modifiers: []u64 = &.{};
     var dmabuf_source_modifiers: []u64 = &.{};
+    var dmabuf_rgba_source_modifiers: []u64 = &.{};
     if (dmabuf_capable) {
         var modifier_list: vk.DrmFormatModifierPropertiesListEXT = .{};
         var format_properties: vk.FormatProperties2 = .{ .format_properties = undefined };
@@ -965,10 +1032,20 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
         errdefer if (dmabuf_sampled_modifiers.len != 0) allocator.free(dmabuf_sampled_modifiers);
         dmabuf_source_modifiers = source_modifiers.toOwnedSlice(allocator) catch
             return error.OutOfMemory;
+        errdefer if (dmabuf_source_modifiers.len != 0) allocator.free(dmabuf_source_modifiers);
+        dmabuf_rgba_source_modifiers = try queryDmabufSourceModifiers(
+            allocator,
+            instance_wrapper,
+            physical_device,
+            .r8g8b8a8_unorm,
+        );
     }
     errdefer if (dmabuf_modifiers.len != 0) allocator.free(dmabuf_modifiers);
     errdefer if (dmabuf_sampled_modifiers.len != 0) allocator.free(dmabuf_sampled_modifiers);
     errdefer if (dmabuf_source_modifiers.len != 0) allocator.free(dmabuf_source_modifiers);
+    errdefer if (dmabuf_rgba_source_modifiers.len != 0) {
+        allocator.free(dmabuf_rgba_source_modifiers);
+    };
     const graphics = initGraphics(device_wrapper, device, format) catch |err| {
         log.err("failed to initialize Vulkan graphics pipelines: {t}", .{err});
         return error.VulkanUnavailable;
@@ -1023,6 +1100,10 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
         .dmabuf_modifiers = if (dmabuf_capable) dmabuf_modifiers else &.{},
         .dmabuf_sampled_modifiers = if (dmabuf_capable) dmabuf_sampled_modifiers else &.{},
         .dmabuf_source_modifiers = if (dmabuf_capable) dmabuf_source_modifiers else &.{},
+        .dmabuf_rgba_source_modifiers = if (dmabuf_capable)
+            dmabuf_rgba_source_modifiers
+        else
+            &.{},
         .dmabuf_device_id = dmabuf_device_id,
         .frame_number = 0,
         .resource_epoch = 1,
@@ -1040,6 +1121,9 @@ pub fn deinit(self: *Self) void {
     if (self.dmabuf_modifiers.len != 0) self.allocator.free(self.dmabuf_modifiers);
     if (self.dmabuf_sampled_modifiers.len != 0) self.allocator.free(self.dmabuf_sampled_modifiers);
     if (self.dmabuf_source_modifiers.len != 0) self.allocator.free(self.dmabuf_source_modifiers);
+    if (self.dmabuf_rgba_source_modifiers.len != 0) {
+        self.allocator.free(self.dmabuf_rgba_source_modifiers);
+    }
     self.instances.deinit(self.allocator);
     self.draw_runs.deinit(self.allocator);
     self.blur_ops.deinit(self.allocator);
@@ -1090,7 +1174,8 @@ pub fn dmabufAccess(self: *Self) ?render.DmabufRenderer {
 }
 
 pub fn dmabufDeviceId(self: *const Self) ?render.DrmDeviceId {
-    if (self.dmabuf_source_modifiers.len == 0) return null;
+    if (self.dmabuf_source_modifiers.len == 0 and
+        self.dmabuf_rgba_source_modifiers.len == 0) return null;
     return self.dmabuf_device_id;
 }
 
@@ -1312,12 +1397,14 @@ fn dmabufTargetUsage(sampleable: bool) vk.ImageUsageFlags {
 }
 
 fn supportsDmabufSource(self: *Self, size: render.Size, source: render.DmabufSource) bool {
-    if (size.width == 0 or size.height == 0 or
-        (source.format != drm_format_argb8888 and source.format != drm_format_xrgb8888) or
-        std.mem.indexOfScalar(u64, self.dmabuf_source_modifiers, source.modifier) == null)
-    {
-        return false;
-    }
+    if (size.width == 0 or size.height == 0) return false;
+    const source_format = dmabufSourceVkFormat(source.format) orelse return false;
+    const modifiers = switch (source_format) {
+        .b8g8r8a8_unorm => self.dmabuf_source_modifiers,
+        .r8g8b8a8_unorm => self.dmabuf_rgba_source_modifiers,
+        else => unreachable,
+    };
+    if (std.mem.indexOfScalar(u64, modifiers, source.modifier) == null) return false;
 
     const modifier_info: vk.PhysicalDeviceImageDrmFormatModifierInfoEXT = .{
         .drm_format_modifier = source.modifier,
@@ -1329,7 +1416,7 @@ fn supportsDmabufSource(self: *Self, size: render.Size, source: render.DmabufSou
     };
     const format_info: vk.PhysicalDeviceImageFormatInfo2 = .{
         .p_next = &external_info,
-        .format = .b8g8r8a8_unorm,
+        .format = source_format,
         .type = .@"2d",
         .tiling = .drm_format_modifier_ext,
         .usage = .{ .sampled_bit = true },
@@ -2998,6 +3085,7 @@ fn createImportedTexture(
     source: render.DmabufSource,
 ) Error!Texture {
     if (!self.supportsDmabufSource(size, source)) return error.InvalidTarget;
+    const source_format = dmabufSourceVkFormat(source.format) orelse return error.InvalidTarget;
     const duplicate_fd = std.c.dup(source.fd);
     if (duplicate_fd < 0) return error.VulkanFailure;
     var fd_owned = true;
@@ -3023,7 +3111,7 @@ fn createImportedTexture(
     const image = self.device_wrapper.createImage(self.device, &.{
         .p_next = &external_info,
         .image_type = .@"2d",
-        .format = .b8g8r8a8_unorm,
+        .format = source_format,
         .extent = extent(size),
         .mip_levels = 1,
         .array_layers = 1,
@@ -3063,7 +3151,7 @@ fn createImportedTexture(
     const view = self.device_wrapper.createImageView(self.device, &.{
         .image = image,
         .view_type = .@"2d",
-        .format = .b8g8r8a8_unorm,
+        .format = source_format,
         .components = .{
             .r = .identity,
             .g = .identity,
@@ -4220,17 +4308,23 @@ fn copyDmabufRectToMapped(
     const x_bytes = @as(usize, @intCast(rect.x)) * @sizeOf(u32);
     const copy_bytes = @as(usize, rect.width) * @sizeOf(u32);
     const stride_bytes = @as(usize, buffer.stride_pixels) * @sizeOf(u32);
+    const format = render.DmabufFormat.fromFourcc(dmabuf.format);
     for (0..rect.height) |row| {
         const row_offset = (@as(usize, @intCast(rect.y)) + row) * stride_bytes + x_bytes;
         @memcpy(
             mapped[base_offset + row_offset ..][0..copy_bytes],
             mapping[@as(usize, dmabuf.offset) + row_offset ..][0..copy_bytes],
         );
-        if (dmabuf.force_opaque) {
+        if ((format != null and format.?.redBlueSwapped()) or dmabuf.force_opaque) {
             const row_pixels: [*]u32 = @ptrCast(@alignCast(
                 mapped + base_offset + row_offset,
             ));
-            for (row_pixels[0..rect.width]) |*pixel| pixel.* |= 0xff00_0000;
+            for (row_pixels[0..rect.width]) |*pixel| {
+                if (format) |source_format| {
+                    pixel.* = source_format.toArgb8888(pixel.*);
+                }
+                if (dmabuf.force_opaque) pixel.* |= 0xff00_0000;
+            }
         }
     }
 }
@@ -5162,7 +5256,7 @@ test "Vulkan renderer imports and renders directly to a GBM dmabuf" {
     }, .{ .dmabuf = .{ .id = id, .size = size } });
 }
 
-test "Vulkan renderer samples a GBM dmabuf without a CPU upload" {
+test "Vulkan renderer samples an ABGR GBM dmabuf without a CPU upload" {
     const fd = std.c.open("/dev/dri/renderD128", std.c.O{
         .ACCMODE = .RDWR,
         .CLOEXEC = true,
@@ -5175,7 +5269,7 @@ test "Vulkan renderer samples a GBM dmabuf without a CPU upload" {
         else => return err,
     };
     defer renderer.deinit();
-    if (std.mem.indexOfScalar(u64, renderer.dmabuf_source_modifiers, 0) == null) {
+    if (std.mem.indexOfScalar(u64, renderer.dmabuf_rgba_source_modifiers, 0) == null) {
         return error.SkipZigTest;
     }
     const Gbm = @import("../backend/gbm.zig");
@@ -5183,7 +5277,8 @@ test "Vulkan renderer samples a GBM dmabuf without a CPU upload" {
     defer gbm.deinit();
 
     const size: render.Size = .{ .width = 64, .height = 64 };
-    var source_buffer = gbm.createBuffer(size, drm_format_argb8888, &.{0}) catch
+    const source_format: u32 = @intFromEnum(render.DmabufFormat.abgr8888);
+    var source_buffer = gbm.createBuffer(size, source_format, &.{0}) catch
         return error.SkipZigTest;
     defer source_buffer.deinit();
 
@@ -5218,7 +5313,7 @@ test "Vulkan renderer samples a GBM dmabuf without a CPU upload" {
                 .dmabuf = .{
                     .context = &source_buffer,
                     .fd = source_buffer.fd,
-                    .format = drm_format_argb8888,
+                    .format = source_format,
                     .modifier = source_buffer.modifier,
                     .stride = source_buffer.stride,
                     .offset = source_buffer.offset,

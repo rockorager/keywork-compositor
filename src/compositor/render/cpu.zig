@@ -85,10 +85,14 @@ fn createDestination(
     if (frame.size.width == 0 or frame.size.height == 0) return error.InvalidTarget;
     if (!std.meta.eql(frame.size, target.size)) return error.InvalidTarget;
     if (target.dmabuf != null) return error.InvalidTarget;
-    return createImage(target, false);
+    return createImage(target, false, false);
 }
 
-fn createImage(buffer: render_types.PixelBuffer, force_opaque: bool) Error!*pixman.pixman_image_t {
+fn createImage(
+    buffer: render_types.PixelBuffer,
+    force_opaque: bool,
+    red_blue_swapped: bool,
+) Error!*pixman.pixman_image_t {
     if (buffer.size.width == 0 or buffer.size.height == 0) return error.InvalidTarget;
     if (buffer.stride_pixels < buffer.size.width) return error.InvalidTarget;
 
@@ -108,7 +112,12 @@ fn createImage(buffer: render_types.PixelBuffer, force_opaque: bool) Error!*pixm
     if (buffer.pixels.len < required_pixels) return error.InvalidTarget;
 
     return pixman.pixman_image_create_bits(
-        if (force_opaque) pixman.PIXMAN_x8r8g8b8 else pixman.PIXMAN_a8r8g8b8,
+        if (red_blue_swapped)
+            if (force_opaque) pixman.PIXMAN_x8b8g8r8 else pixman.PIXMAN_a8b8g8r8
+        else if (force_opaque)
+            pixman.PIXMAN_x8r8g8b8
+        else
+            pixman.PIXMAN_a8r8g8b8,
         @intCast(buffer.size.width),
         @intCast(buffer.size.height),
         buffer.pixels.ptr,
@@ -571,7 +580,9 @@ fn composite(
     image: render_types.Image,
 ) Error!void {
     const dmabuf = image.buffer.dmabuf orelse
-        return compositePixels(destination, destination_size, image, false, false);
+        return compositePixels(destination, destination_size, image, false, false, false);
+    const format = render_types.DmabufFormat.fromFourcc(dmabuf.format) orelse
+        return error.InvalidTarget;
     if (dmabuf.offset % @alignOf(u32) != 0 or dmabuf.stride % @sizeOf(u32) != 0) {
         return error.InvalidTarget;
     }
@@ -597,6 +608,7 @@ fn composite(
         mapped_image,
         dmabuf.y_inverted,
         dmabuf.force_opaque,
+        format.redBlueSwapped(),
     );
 }
 
@@ -606,8 +618,9 @@ fn compositePixels(
     image: render_types.Image,
     y_inverted: bool,
     force_opaque: bool,
+    red_blue_swapped: bool,
 ) Error!void {
-    const source = try createImage(image.buffer, force_opaque);
+    const source = try createImage(image.buffer, force_opaque, red_blue_swapped);
     defer _ = pixman.pixman_image_unref(source);
     if (image.size.width == 0 or image.size.height == 0) return error.InvalidTarget;
     const transformed_size = image.transform.applyToSize(image.buffer.size);

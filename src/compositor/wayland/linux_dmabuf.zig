@@ -24,6 +24,16 @@ const invalid_modifier: u64 = 0x00ff_ffff_ffff_ffff;
 const linear_modifier: u64 = 0;
 const argb8888: u32 = linux.DRM_FORMAT_ARGB8888;
 const xrgb8888: u32 = linux.DRM_FORMAT_XRGB8888;
+const abgr8888: u32 = linux.DRM_FORMAT_ABGR8888;
+const xbgr8888: u32 = linux.DRM_FORMAT_XBGR8888;
+const import_formats = [_]u32{ argb8888, xrgb8888, abgr8888, xbgr8888 };
+
+comptime {
+    std.debug.assert(argb8888 == @intFromEnum(render.DmabufFormat.argb8888));
+    std.debug.assert(xrgb8888 == @intFromEnum(render.DmabufFormat.xrgb8888));
+    std.debug.assert(abgr8888 == @intFromEnum(render.DmabufFormat.abgr8888));
+    std.debug.assert(xbgr8888 == @intFromEnum(render.DmabufFormat.xbgr8888));
+}
 
 pub const Device = linux.dev_t;
 
@@ -102,11 +112,11 @@ fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
     if (version >= zwp.LinuxDmabufV1.Request.get_default_feedback_since_version) {
         return;
     } else if (version >= zwp.LinuxDmabufV1.modifier_since_version) {
-        resource.sendModifier(argb8888, 0, @intCast(linear_modifier));
-        resource.sendModifier(xrgb8888, 0, @intCast(linear_modifier));
+        for (import_formats) |format| {
+            resource.sendModifier(format, 0, @intCast(linear_modifier));
+        }
     } else {
-        resource.sendFormat(argb8888);
-        resource.sendFormat(xrgb8888);
+        for (import_formats) |format| resource.sendFormat(format);
     }
 }
 
@@ -155,6 +165,8 @@ const FeedbackState = struct {
         const entries = [_]FormatTableEntry{
             .{ .format = argb8888, .padding = 0, .modifier = linear_modifier },
             .{ .format = xrgb8888, .padding = 0, .modifier = linear_modifier },
+            .{ .format = abgr8888, .padding = 0, .modifier = linear_modifier },
+            .{ .format = xbgr8888, .padding = 0, .modifier = linear_modifier },
         };
         comptime std.debug.assert(@sizeOf(FormatTableEntry) == 16);
 
@@ -227,13 +239,22 @@ const Feedback = struct {
             .alloc = @sizeOf(linux.dev_t),
             .data = @ptrCast(&device),
         };
-        var indices: [2]u16 align(4) = .{ 0, 1 };
+        var scanout_indices: [2]u16 align(4) = .{ 0, 1 };
+        var scanout_indices_array: wl.Array = .{
+            .size = @sizeOf(@TypeOf(scanout_indices)),
+            .alloc = @sizeOf(@TypeOf(scanout_indices)),
+            .data = @ptrCast(&scanout_indices),
+        };
+        var indices: [import_formats.len]u16 align(4) = .{ 0, 1, 2, 3 };
         var indices_array: wl.Array = .{
             .size = @sizeOf(@TypeOf(indices)),
             .alloc = @sizeOf(@TypeOf(indices)),
             .data = @ptrCast(&indices),
         };
-        resource.sendFormatTable(state.file.handle, 2 * @sizeOf(FormatTableEntry));
+        resource.sendFormatTable(
+            state.file.handle,
+            import_formats.len * @sizeOf(FormatTableEntry),
+        );
         if (resource.getVersion() < 6) resource.sendMainDevice(&device_array);
         if (state.scanout_device) |scanout_device| {
             var scanout_device_value = scanout_device;
@@ -244,7 +265,7 @@ const Feedback = struct {
             };
             resource.sendTrancheTargetDevice(&scanout_device_array);
             resource.sendTrancheFlags(.{ .scanout = true });
-            resource.sendTrancheFormats(&indices_array);
+            resource.sendTrancheFormats(&scanout_indices_array);
             resource.sendTrancheDone();
         }
         resource.sendTrancheTargetDevice(&device_array);
@@ -501,7 +522,7 @@ fn validateDescriptor(
     if (planes[0] == null) return error.Incomplete;
     for (planes[1..]) |plane| if (plane != null) return error.Incomplete;
     if (width <= 0 or height <= 0) return error.InvalidDimensions;
-    if (format != argb8888 and format != xrgb8888) return error.InvalidFormat;
+    if (render.DmabufFormat.fromFourcc(format) == null) return error.InvalidFormat;
 
     const plane = planes[0].?;
     if (plane.modifier != linear_modifier and
@@ -670,6 +691,7 @@ pub const Buffer = struct {
 
     pub fn renderSource(self: *Buffer) render.DmabufSource {
         const descriptor = self.descriptor;
+        const format_info = render.DmabufFormat.fromFourcc(descriptor.format).?;
         return .{
             .context = self,
             .fd = descriptor.plane.fd,
@@ -682,7 +704,7 @@ pub const Buffer = struct {
             .offset = descriptor.plane.offset,
             .required_bytes = descriptor.required_bytes,
             .y_inverted = descriptor.y_inverted,
-            .force_opaque = descriptor.format == xrgb8888,
+            .force_opaque = !format_info.hasAlpha(),
             .retain = retainSourceCallback,
             .release = releaseSourceCallback,
             .begin_cpu_read = beginCpuReadCallback,
@@ -696,6 +718,7 @@ pub const Buffer = struct {
         allocator: std.mem.Allocator,
     ) CopyError![]u32 {
         const descriptor = self.descriptor;
+        const format_info = render.DmabufFormat.fromFourcc(descriptor.format).?;
         const pixels = allocator.alloc(
             u32,
             descriptor.size.pixelCount() catch return error.ImportFailed,
@@ -737,8 +760,8 @@ pub const Buffer = struct {
                 mapping[source_offset..][0..row_bytes],
             );
         }
-        if (descriptor.format == xrgb8888) {
-            for (pixels) |*pixel| pixel.* |= 0xff00_0000;
+        if (format_info.redBlueSwapped() or !format_info.hasAlpha()) {
+            for (pixels) |*pixel| pixel.* = format_info.toArgb8888(pixel.*);
         }
         return pixels;
     }
@@ -748,6 +771,7 @@ pub const Buffer = struct {
         source: render.PixelBuffer,
     ) CopyError!void {
         const descriptor = self.descriptor;
+        const format_info = render.DmabufFormat.fromFourcc(descriptor.format).?;
         if (!std.meta.eql(source.size, descriptor.size) or
             source.stride_pixels < source.size.width) return error.ImportFailed;
         const source_row_offset = std.math.mul(
@@ -775,7 +799,6 @@ pub const Buffer = struct {
         if (!syncDmaBuf(descriptor.plane.fd, linux.DMA_BUF_SYNC_WRITE)) {
             return error.ImportFailed;
         }
-        const source_bytes = std.mem.sliceAsBytes(source.pixels);
         const row_bytes = @as(usize, descriptor.size.width) * @sizeOf(u32);
         for (0..descriptor.size.height) |source_y| {
             const destination_y = if (descriptor.y_inverted)
@@ -785,10 +808,26 @@ pub const Buffer = struct {
             const source_offset = source_y * source.stride_pixels * @sizeOf(u32);
             const destination_offset = @as(usize, descriptor.plane.offset) +
                 destination_y * descriptor.plane.stride;
-            @memcpy(
-                mapping[destination_offset..][0..row_bytes],
-                source_bytes[source_offset..][0..row_bytes],
-            );
+            if (!format_info.redBlueSwapped()) {
+                const source_bytes = std.mem.sliceAsBytes(source.pixels);
+                @memcpy(
+                    mapping[destination_offset..][0..row_bytes],
+                    source_bytes[source_offset..][0..row_bytes],
+                );
+            } else {
+                const destination_bytes = mapping[destination_offset..][0..row_bytes];
+                const destination_pixels: []u32 = @alignCast(std.mem.bytesAsSlice(
+                    u32,
+                    destination_bytes,
+                ));
+                const source_pixel_offset = source_y * source.stride_pixels;
+                for (
+                    destination_pixels,
+                    source.pixels[source_pixel_offset..][0..descriptor.size.width],
+                ) |*destination, pixel| {
+                    destination.* = format_info.fromArgb8888(pixel);
+                }
+            }
         }
         if (!syncDmaBuf(
             descriptor.plane.fd,

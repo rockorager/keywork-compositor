@@ -260,6 +260,48 @@ pub const Frame = struct {
     origin: Position = .{},
 };
 
+pub const DmabufFormat = enum(u32) {
+    argb8888 = 0x34325241,
+    xrgb8888 = 0x34325258,
+    abgr8888 = 0x34324241,
+    xbgr8888 = 0x34324258,
+
+    pub fn fromFourcc(fourcc: u32) ?DmabufFormat {
+        return switch (fourcc) {
+            @intFromEnum(DmabufFormat.argb8888) => .argb8888,
+            @intFromEnum(DmabufFormat.xrgb8888) => .xrgb8888,
+            @intFromEnum(DmabufFormat.abgr8888) => .abgr8888,
+            @intFromEnum(DmabufFormat.xbgr8888) => .xbgr8888,
+            else => null,
+        };
+    }
+
+    pub fn hasAlpha(self: DmabufFormat) bool {
+        return self == .argb8888 or self == .abgr8888;
+    }
+
+    pub fn redBlueSwapped(self: DmabufFormat) bool {
+        return self == .abgr8888 or self == .xbgr8888;
+    }
+
+    pub fn toArgb8888(self: DmabufFormat, pixel: u32) u32 {
+        var converted = if (self.redBlueSwapped()) swapRedBlue(pixel) else pixel;
+        if (!self.hasAlpha()) converted |= 0xff00_0000;
+        return converted;
+    }
+
+    pub fn fromArgb8888(self: DmabufFormat, pixel: u32) u32 {
+        const converted = if (self.hasAlpha()) pixel else pixel | 0xff00_0000;
+        return if (self.redBlueSwapped()) swapRedBlue(converted) else converted;
+    }
+
+    fn swapRedBlue(pixel: u32) u32 {
+        return pixel & 0xff00_ff00 |
+            (pixel & 0x00ff_0000) >> 16 |
+            (pixel & 0x0000_00ff) << 16;
+    }
+};
+
 /// A CPU-addressable ARGB8888 target or a retained DMA-BUF image source.
 /// Render targets are always CPU-addressable. Image sources may instead set
 /// `dmabuf` and leave `pixels` empty so GPU renderers can sample them directly.
@@ -364,6 +406,26 @@ test "color conversion premultiplies alpha" {
     try std.testing.expectEqual(@as(u8, 0), color.blue);
     try std.testing.expectEqual(@as(u8, 128), color.alpha);
     try std.testing.expectEqual(@as(u32, 0x80804000), color.argb8888());
+}
+
+test "DMA-BUF formats normalize red-blue order and opacity" {
+    try std.testing.expectEqual(
+        DmabufFormat.abgr8888,
+        DmabufFormat.fromFourcc(0x34324241).?,
+    );
+    try std.testing.expect(DmabufFormat.fromFourcc(0) == null);
+    try std.testing.expectEqual(
+        @as(u32, 0x80332211),
+        DmabufFormat.abgr8888.toArgb8888(0x80112233),
+    );
+    try std.testing.expectEqual(
+        @as(u32, 0xff332211),
+        DmabufFormat.xbgr8888.toArgb8888(0x00112233),
+    );
+    try std.testing.expectEqual(
+        @as(u32, 0x80112233),
+        DmabufFormat.abgr8888.fromArgb8888(0x80332211),
+    );
 }
 
 test "fractional scale rounds physical dimensions halfway up" {
