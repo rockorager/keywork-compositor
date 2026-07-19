@@ -31,8 +31,8 @@ Keywork already has:
 - EDID-derived output descriptions and color-aware direct-scanout decisions.
 
 The native KMS path prefers 10-bit scanout when KMS, GBM, and Vulkan share a
-supported format-modifier pair. Connector colorspace and HDR metadata are not
-yet configured, so it cannot yet drive a display in an HDR mode.
+supported format-modifier pair. It atomically coordinates the scanout plane,
+connector colorspace, HDR metadata, and maximum-bpc state when driving HDR.
 
 ## 1. Rendering observability — complete
 
@@ -51,9 +51,9 @@ can compare p50, p95, p99, and worst-case frame costs before and after a change.
 ## 2. 10-bit KMS and true HDR output
 
 - [x] Allocate and prefer 10-bit scanout buffers where the plane supports them.
-- [ ] Own connector colorspace, HDR output metadata, maximum-bpc, and KMS color
+- [x] Own connector colorspace, HDR output metadata, maximum-bpc, and KMS color
   state as one atomic output configuration.
-- [ ] Select SDR or HDR output mode from display capability and rendered content,
+- [x] Select SDR or HDR output mode from display capability and rendered content,
   with a predictable SDR fallback.
 
 Acceptance: HDR test patterns reach a capable display through a 10-bit path

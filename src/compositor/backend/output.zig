@@ -117,6 +117,16 @@ pub fn hdrOutputDescription(
     };
 }
 
+pub fn selectOutputTransfer(
+    self: *Self,
+    transfer: ?render.TransferFunction,
+) bool {
+    return switch (self.backend) {
+        .drm => |output| output.selectOutputTransfer(transfer),
+        .headless, .nested => false,
+    };
+}
+
 pub fn make(self: *const Self, fallback: []const u8) []const u8 {
     return switch (self.backend) {
         .drm => |output| output.make() orelse fallback,

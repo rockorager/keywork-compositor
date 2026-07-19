@@ -62,7 +62,15 @@ make_value: [*c]u8,
 model_value: [*c]u8,
 serial_value: [*c]u8,
 color_description: render.ColorDescription,
+sdr_color_description: render.ColorDescription,
 hdr_capabilities: HdrCapabilities,
+output_color_mode: OutputColorMode,
+output_color_dirty: bool,
+rejected_output_color_mode: ?OutputColorMode,
+hdr_failed: bool,
+color_fallback_pending: bool,
+hdr_metadata_blob: u32,
+hdr_metadata_blob_mode: ?OutputColorMode,
 description_value: [description_capacity]u8,
 description_length: usize,
 logical_x: i32,
@@ -197,6 +205,20 @@ const HdrCapabilities = struct {
     }
 };
 
+const OutputColorMode = enum {
+    sdr,
+    pq,
+    hlg,
+
+    fn transfer(self: OutputColorMode) ?render.TransferFunction {
+        return switch (self) {
+            .sdr => null,
+            .pq => .st2084_pq,
+            .hlg => .hlg,
+        };
+    }
+};
+
 pub const DirectScanoutResult = union(enum) {
     accepted,
     rejected: render.DirectScanoutRejection,
@@ -295,7 +317,15 @@ pub fn init(
         .model_value = null,
         .serial_value = null,
         .color_description = .{},
+        .sdr_color_description = .{},
         .hdr_capabilities = .{},
+        .output_color_mode = .sdr,
+        .output_color_dirty = false,
+        .rejected_output_color_mode = null,
+        .hdr_failed = false,
+        .color_fallback_pending = false,
+        .hdr_metadata_blob = 0,
+        .hdr_metadata_blob_mode = null,
         .description_value = undefined,
         .description_length = 0,
         .logical_x = 0,
@@ -321,6 +351,7 @@ pub fn init(
 pub fn deinit(self: *Self) void {
     std.debug.assert(self.listener == null);
     std.debug.assert(self.old_crtc == null);
+    std.debug.assert(self.hdr_metadata_blob == 0);
     std.debug.assert(self.shadow_pixels.len == 0);
     std.debug.assert(self.direct_pending == null and self.direct_displayed == null);
     std.debug.assert(self.direct_framebuffers.count() == 0);
@@ -396,11 +427,43 @@ pub fn colorDescription(self: *const Self) render.ColorDescription {
     return self.color_description;
 }
 
+pub fn selectOutputTransfer(self: *Self, transfer: ?render.TransferFunction) bool {
+    const selected_description = if (transfer) |requested|
+        self.hdrOutputDescription(requested)
+    else
+        null;
+    const mode: OutputColorMode = if (selected_description) |selected|
+        switch (selected.transfer_function) {
+            .st2084_pq => .pq,
+            .hlg => .hlg,
+            .bt1886, .gamma22, .srgb, .power => unreachable,
+        }
+    else
+        .sdr;
+    if (mode == self.output_color_mode) return false;
+    if (self.rejected_output_color_mode == mode) return false;
+    const fd = self.device_access.fd(self.device_access.context) orelse return false;
+    if (!self.testOutputColorState(
+        fd,
+        mode,
+        selected_description orelse self.sdr_color_description,
+    )) {
+        self.rejected_output_color_mode = mode;
+        if (mode != .sdr) self.hdr_failed = true;
+        return false;
+    }
+    self.output_color_mode = mode;
+    self.output_color_dirty = true;
+    self.rejected_output_color_mode = null;
+    self.color_description = selected_description orelse self.sdr_color_description;
+    return true;
+}
+
 pub fn hdrOutputDescription(
     self: *const Self,
     transfer: render.TransferFunction,
 ) ?render.ColorDescription {
-    if (!self.hdr_capabilities.supports(transfer) or
+    if (self.hdr_failed or !self.hdr_capabilities.supports(transfer) or
         self.compositedScanoutFormat() != .xrgb2101010 or self.atomic_plane == null)
     {
         return null;
@@ -412,20 +475,7 @@ pub fn hdrOutputDescription(
     {
         return null;
     }
-    const maximum = self.hdr_capabilities.max_luminance orelse 1000;
-    return .{
-        .primaries = render.bt2020_chromaticities,
-        .named_primaries = .bt2020,
-        .transfer_function = transfer,
-        .min_luminance = self.hdr_capabilities.min_luminance orelse 50,
-        .max_luminance = maximum,
-        .reference_luminance = 203,
-        .mastering_primaries = self.color_description.primaries,
-        .mastering_min_luminance = self.hdr_capabilities.min_luminance,
-        .mastering_max_luminance = self.hdr_capabilities.max_luminance,
-        .max_cll = maximum,
-        .max_fall = self.hdr_capabilities.max_frame_average_luminance,
-    };
+    return hdrDescription(self.sdr_color_description, self.hdr_capabilities, transfer);
 }
 
 pub fn refreshMillihertz(self: *const Self) i32 {
@@ -533,6 +583,14 @@ pub fn present(
             &self.mode,
         ) != 0) return error.ModeSetFailed;
         self.mode_set = true;
+        if (self.output_color_dirty and !self.commitOutputColorState(fd)) {
+            self.rejectOutputColorState();
+            self.displayed = index;
+            self.acquired = null;
+            self.setDirectScanoutActive(false);
+            self.color_fallback_pending = false;
+            return error.OutputColorFallback;
+        }
         self.applyDesiredGamma(fd) catch |err| {
             log.warn("failed to restore gamma ramps on {s}: {t}", .{ self.name(), err });
         };
@@ -553,7 +611,14 @@ pub fn present(
         self.size,
         null,
         allow_tearing,
-    ) orelse return error.PageFlipFailed;
+    ) orelse {
+        if (self.color_fallback_pending) {
+            self.acquired = null;
+            self.color_fallback_pending = false;
+            return error.OutputColorFallback;
+        }
+        return error.PageFlipFailed;
+    };
     self.pending = index;
     self.pending_page_flip = page_flip;
     self.acquired = null;
@@ -602,6 +667,7 @@ pub fn tryDirectScanout(
     const source = buffer.dmabuf orelse return .{ .rejected = .non_dmabuf };
     const source_cache = buffer.source_cache orelse
         return .{ .rejected = .missing_buffer_identity };
+    if (self.output_color_dirty) return .{ .rejected = .color_conversion };
     if (!self.mode_set) return .{ .rejected = .output_unavailable };
     if (self.acquired == null or self.pending != null or self.direct_pending != null) {
         return .{ .rejected = .output_busy };
@@ -765,6 +831,8 @@ pub fn activate(self: *Self, fd: std.posix.fd_t, selection: Selection, device_pa
 
 fn readIdentity(self: *Self, fd: std.posix.fd_t) void {
     self.clearIdentity();
+    self.hdr_failed = false;
+    self.rejected_output_color_mode = null;
     const properties = c.drmModeObjectGetProperties(
         fd,
         self.connector_id,
@@ -788,8 +856,17 @@ fn readIdentity(self: *Self, fd: std.posix.fd_t) void {
         self.make_value = c.di_info_get_make(info);
         self.model_value = c.di_info_get_model(info);
         self.serial_value = c.di_info_get_serial(info);
-        self.color_description = colorDescriptionFromInfo(info);
+        self.sdr_color_description = colorDescriptionFromInfo(info);
         self.hdr_capabilities = hdrCapabilitiesFromInfo(info);
+        self.destroyHdrMetadataBlob(fd);
+        self.color_description = if (self.output_color_mode.transfer()) |transfer|
+            hdrDescription(self.sdr_color_description, self.hdr_capabilities, transfer) orelse
+                self.sdr_color_description
+        else
+            self.sdr_color_description;
+        if (self.output_color_mode != .sdr) {
+            self.output_color_dirty = true;
+        }
         return;
     }
 }
@@ -808,7 +885,30 @@ fn clearIdentity(self: *Self) void {
     self.model_value = null;
     self.serial_value = null;
     self.color_description = .{};
+    self.sdr_color_description = .{};
     self.hdr_capabilities = .{};
+}
+
+fn hdrDescription(
+    sdr_description: render.ColorDescription,
+    capabilities: HdrCapabilities,
+    transfer: render.TransferFunction,
+) ?render.ColorDescription {
+    if (!capabilities.supports(transfer)) return null;
+    const maximum = capabilities.max_luminance orelse 1000;
+    return .{
+        .primaries = render.bt2020_chromaticities,
+        .named_primaries = .bt2020,
+        .transfer_function = transfer,
+        .min_luminance = capabilities.min_luminance orelse 50,
+        .max_luminance = maximum,
+        .reference_luminance = 203,
+        .mastering_primaries = sdr_description.primaries,
+        .mastering_min_luminance = capabilities.min_luminance,
+        .mastering_max_luminance = capabilities.max_luminance,
+        .max_cll = maximum,
+        .max_fall = capabilities.max_frame_average_luminance,
+    };
 }
 
 fn hdrCapabilitiesFromInfo(info: *const c.di_info) HdrCapabilities {
@@ -944,6 +1044,9 @@ pub fn deactivate(self: *Self, fd: std.posix.fd_t) void {
     if (self.gamma_lut.len != 0) self.applyIdentityGamma(fd) catch |err| {
         log.warn("failed to restore gamma ramps before releasing {s}: {t}", .{ self.name(), err });
     };
+    if (!self.restoreOutputColorState(fd)) {
+        log.warn("failed to restore SDR connector state before releasing {s}", .{self.name()});
+    }
     if (self.old_crtc) |old_crtc| restoreCrtc(fd, self.connector_id, old_crtc);
     self.release(fd);
 }
@@ -958,6 +1061,14 @@ pub fn disconnect(self: *Self, fd: std.posix.fd_t) void {
 }
 
 fn release(self: *Self, fd: std.posix.fd_t) void {
+    const restore_color_state = self.output_color_mode != .sdr or self.output_color_dirty;
+    self.destroyHdrMetadataBlob(fd);
+    self.output_color_mode = .sdr;
+    self.output_color_dirty = restore_color_state;
+    self.rejected_output_color_mode = null;
+    self.hdr_failed = false;
+    self.color_fallback_pending = false;
+    self.color_description = self.sdr_color_description;
     self.mode_set = false;
     self.atomic_plane = null;
     self.atomic_color = null;
@@ -1572,6 +1683,16 @@ test "EDID HDR capabilities preserve supported transfers and luminance" {
     try std.testing.expect(!missing_colorimetry.supports(.st2084_pq));
     try std.testing.expect(scaledLuminance(std.math.nan(f32), 1) == null);
     try std.testing.expect(scaledLuminance(0, 1) == null);
+
+    const output_description = hdrDescription(.{}, capabilities, .st2084_pq).?;
+    const metadata = hdrOutputMetadata(.pq, output_description);
+    const info = metadata.unnamed_0.hdmi_metadata_type1;
+    try std.testing.expectEqual(@as(u8, 2), info.eotf);
+    try std.testing.expectEqual(@as(u16, 32000), info.display_primaries[0].x);
+    try std.testing.expectEqual(@as(u16, 16450), info.white_point.y);
+    try std.testing.expectEqual(@as(u16, 1000), info.max_display_mastering_luminance);
+    try std.testing.expectEqual(@as(u16, 50), info.min_display_mastering_luminance);
+    try std.testing.expectEqual(@as(u16, 400), info.max_fall);
 }
 
 fn findOutput(outputs: []const *Self, connector_id: u32) ?*Self {
@@ -1842,7 +1963,8 @@ fn queuePageFlip(
     source: ?render.DmabufSource,
     allow_tearing: bool,
 ) ?PageFlipMode {
-    const preferred_mode: PageFlipMode = if (allow_tearing and self.async_page_flip_supported)
+    const preferred_mode: PageFlipMode = if (!self.output_color_dirty and
+        allow_tearing and self.async_page_flip_supported)
         .async
     else
         .vsync;
@@ -1893,18 +2015,51 @@ fn queuePageFlip(
             return null;
         }
     }
+    const color_dirty = self.output_color_dirty;
+    if (color_dirty or self.output_color_mode != .sdr) {
+        const color_added = self.addOutputColorState(
+            fd,
+            request,
+            self.output_color_mode,
+            self.color_description,
+        ) catch {
+            if (color_dirty and self.output_color_mode != .sdr) {
+                self.rejectOutputColorState();
+            }
+            return null;
+        };
+        if (!color_added) {
+            if (self.output_color_mode == .sdr) {
+                self.output_color_dirty = false;
+            } else {
+                if (color_dirty) self.rejectOutputColorState();
+                return null;
+            }
+        }
+    }
+    const atomic_flags: c_uint = if (color_dirty)
+        @intCast(c.DRM_MODE_ATOMIC_ALLOW_MODESET)
+    else
+        @intCast(c.DRM_MODE_ATOMIC_NONBLOCK);
     if (c.drmModeAtomicCommit(
         fd,
         request,
-        @as(c_uint, @intCast(c.DRM_MODE_ATOMIC_NONBLOCK)) | pageFlipFlags(preferred_mode),
+        atomic_flags | pageFlipFlags(preferred_mode),
         self,
-    ) == 0) return preferred_mode;
+    ) == 0) {
+        self.output_color_dirty = false;
+        return preferred_mode;
+    }
     if (preferred_mode == .async and c.drmModeAtomicCommit(
         fd,
         request,
-        @as(c_uint, @intCast(c.DRM_MODE_ATOMIC_NONBLOCK)) | pageFlipFlags(.vsync),
+        atomic_flags | pageFlipFlags(.vsync),
         self,
-    ) == 0) return .vsync;
+    ) == 0) {
+        self.output_color_dirty = false;
+        return .vsync;
+    }
+    if (color_dirty and self.output_color_mode != .sdr) self.rejectOutputColorState();
     return null;
 }
 
@@ -1998,6 +2153,217 @@ fn addAtomicProperty(
     value: u64,
 ) bool {
     return c.drmModeAtomicAddProperty(request, object_id, property_id, value) >= 0;
+}
+
+fn testOutputColorState(
+    self: *Self,
+    fd: std.posix.fd_t,
+    mode: OutputColorMode,
+    output_description: render.ColorDescription,
+) bool {
+    const request = c.drmModeAtomicAlloc() orelse return false;
+    defer c.drmModeAtomicFree(request);
+    const added = self.addOutputColorState(fd, request, mode, output_description) catch |err| {
+        log.warn("failed to prepare {t} output color state on {s}: {t}", .{
+            mode,
+            self.name(),
+            err,
+        });
+        return false;
+    };
+    if (!added) return mode == .sdr;
+    const flags = @as(c_uint, @intCast(c.DRM_MODE_ATOMIC_TEST_ONLY)) |
+        @as(c_uint, @intCast(c.DRM_MODE_ATOMIC_ALLOW_MODESET));
+    if (c.drmModeAtomicCommit(fd, request, flags, null) == 0) return true;
+    log.warn("{t} output color state is unsupported on {s}", .{ mode, self.name() });
+    return false;
+}
+
+fn commitOutputColorState(self: *Self, fd: std.posix.fd_t) bool {
+    const request = c.drmModeAtomicAlloc() orelse return false;
+    defer c.drmModeAtomicFree(request);
+    const added = self.addOutputColorState(
+        fd,
+        request,
+        self.output_color_mode,
+        self.color_description,
+    ) catch return false;
+    if (!added) {
+        if (self.output_color_mode != .sdr) return false;
+        self.output_color_dirty = false;
+        return true;
+    }
+    const flags = @as(c_uint, @intCast(c.DRM_MODE_ATOMIC_ALLOW_MODESET));
+    if (c.drmModeAtomicCommit(fd, request, flags, null) != 0) return false;
+    self.output_color_dirty = false;
+    return true;
+}
+
+fn rejectOutputColorState(self: *Self) void {
+    log.warn("{t} output color commit failed on {s}; falling back to SDR", .{
+        self.output_color_mode,
+        self.name(),
+    });
+    self.output_color_mode = .sdr;
+    self.output_color_dirty = true;
+    self.rejected_output_color_mode = null;
+    self.hdr_failed = true;
+    self.color_fallback_pending = true;
+    self.color_description = self.sdr_color_description;
+}
+
+fn restoreOutputColorState(self: *Self, fd: std.posix.fd_t) bool {
+    if (self.output_color_mode == .sdr and !self.output_color_dirty) return true;
+    const properties = (self.atomic_color orelse return false).connector;
+    const request = c.drmModeAtomicAlloc() orelse return false;
+    defer c.drmModeAtomicFree(request);
+    var added = false;
+    if (properties.colorspace != 0) {
+        const value = properties.default_colorspace orelse return false;
+        if (!addAtomicProperty(request, self.connector_id, properties.colorspace, value)) {
+            return false;
+        }
+        added = true;
+    }
+    if (properties.hdr_output_metadata != 0) {
+        if (!addAtomicProperty(request, self.connector_id, properties.hdr_output_metadata, 0)) {
+            return false;
+        }
+        added = true;
+    }
+    if (properties.max_bpc != 0) {
+        if (!addAtomicProperty(
+            request,
+            self.connector_id,
+            properties.max_bpc,
+            properties.current_max_bpc,
+        )) return false;
+        added = true;
+    }
+    if (added) {
+        const flags = @as(c_uint, @intCast(c.DRM_MODE_ATOMIC_ALLOW_MODESET));
+        if (c.drmModeAtomicCommit(fd, request, flags, null) != 0) return false;
+    }
+    self.output_color_mode = .sdr;
+    self.output_color_dirty = false;
+    self.color_description = self.sdr_color_description;
+    return true;
+}
+
+fn addOutputColorState(
+    self: *Self,
+    fd: std.posix.fd_t,
+    request: *c.drmModeAtomicReq,
+    mode: OutputColorMode,
+    output_description: render.ColorDescription,
+) !bool {
+    const properties = (self.atomic_color orelse return false).connector;
+    var added = false;
+    if (properties.colorspace != 0) {
+        const value = switch (mode) {
+            .sdr => properties.default_colorspace orelse return false,
+            .pq, .hlg => properties.bt2020_rgb orelse return false,
+        };
+        if (!addAtomicProperty(request, self.connector_id, properties.colorspace, value)) {
+            return error.AddAtomicPropertyFailed;
+        }
+        added = true;
+    }
+    if (properties.hdr_output_metadata != 0) {
+        const blob = try self.outputMetadataBlob(fd, mode, output_description);
+        if (!addAtomicProperty(
+            request,
+            self.connector_id,
+            properties.hdr_output_metadata,
+            blob,
+        )) return error.AddAtomicPropertyFailed;
+        added = true;
+    }
+    if (properties.max_bpc != 0 and properties.max_bpc_limit >= properties.min_bpc) {
+        const target: u64 = if (self.compositedScanoutFormat() == .xrgb2101010) 10 else 8;
+        const value = @max(properties.min_bpc, @min(target, properties.max_bpc_limit));
+        if (!addAtomicProperty(request, self.connector_id, properties.max_bpc, value)) {
+            return error.AddAtomicPropertyFailed;
+        }
+        added = true;
+    }
+    return added;
+}
+
+fn outputMetadataBlob(
+    self: *Self,
+    fd: std.posix.fd_t,
+    mode: OutputColorMode,
+    output_description: render.ColorDescription,
+) !u32 {
+    if (mode == .sdr) return 0;
+    if (self.hdr_metadata_blob != 0 and self.hdr_metadata_blob_mode == mode) {
+        return self.hdr_metadata_blob;
+    }
+    self.destroyHdrMetadataBlob(fd);
+    var metadata = hdrOutputMetadata(mode, output_description);
+    var blob_id: u32 = 0;
+    if (c.drmModeCreatePropertyBlob(fd, &metadata, @sizeOf(@TypeOf(metadata)), &blob_id) != 0 or
+        blob_id == 0)
+    {
+        return error.CreatePropertyBlobFailed;
+    }
+    self.hdr_metadata_blob = blob_id;
+    self.hdr_metadata_blob_mode = mode;
+    return blob_id;
+}
+
+fn destroyHdrMetadataBlob(self: *Self, fd: std.posix.fd_t) void {
+    if (self.hdr_metadata_blob != 0) {
+        _ = c.drmModeDestroyPropertyBlob(fd, self.hdr_metadata_blob);
+        self.hdr_metadata_blob = 0;
+        self.hdr_metadata_blob_mode = null;
+    }
+}
+
+fn hdrOutputMetadata(
+    mode: OutputColorMode,
+    output_description: render.ColorDescription,
+) c.hdr_output_metadata {
+    std.debug.assert(mode != .sdr);
+    var metadata = std.mem.zeroes(c.hdr_output_metadata);
+    metadata.metadata_type = 0;
+    const info = &metadata.unnamed_0.hdmi_metadata_type1;
+    info.eotf = switch (mode) {
+        .sdr => unreachable,
+        .pq => 2,
+        .hlg => 3,
+    };
+    info.metadata_type = 0;
+    const primaries = output_description.mastering_primaries orelse output_description.primaries;
+    info.display_primaries[0].x = hdrChromaticity(primaries.red_x);
+    info.display_primaries[0].y = hdrChromaticity(primaries.red_y);
+    info.display_primaries[1].x = hdrChromaticity(primaries.green_x);
+    info.display_primaries[1].y = hdrChromaticity(primaries.green_y);
+    info.display_primaries[2].x = hdrChromaticity(primaries.blue_x);
+    info.display_primaries[2].y = hdrChromaticity(primaries.blue_y);
+    info.white_point.x = hdrChromaticity(primaries.white_x);
+    info.white_point.y = hdrChromaticity(primaries.white_y);
+    info.max_display_mastering_luminance = boundedU16(
+        output_description.mastering_max_luminance orelse output_description.max_luminance,
+    );
+    info.min_display_mastering_luminance = boundedU16(
+        output_description.mastering_min_luminance orelse output_description.min_luminance,
+    );
+    info.max_cll = boundedU16(
+        output_description.max_cll orelse output_description.max_luminance,
+    );
+    info.max_fall = boundedU16(output_description.max_fall orelse 0);
+    return metadata;
+}
+
+fn hdrChromaticity(value: i32) u16 {
+    const clamped: u32 = @intCast(std.math.clamp(value, 0, 1_000_000));
+    return @intCast((clamped + 10) / 20);
+}
+
+fn boundedU16(value: u32) u16 {
+    return @intCast(@min(value, std.math.maxInt(u16)));
 }
 
 fn loadAtomicPlaneProperties(fd: std.posix.fd_t, plane_id: u32) ?AtomicPlaneProperties {

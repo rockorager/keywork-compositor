@@ -6452,6 +6452,7 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
     try self.renderCommands(&frame, &clear_command);
     if (self.session_lock.isLocked()) {
         try self.renderSessionLockContents(&frame, true);
+        try self.selectFrameOutputColorDescription(render_output, null);
         renderer_frame_active = false;
         const completion = try self.renderer.finishFrameScanout(
             outputStatisticsTag(render_output.protocol_id),
@@ -6466,6 +6467,10 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
     }
 
     const top_fullscreen = try self.renderDesktopContents(&frame, true);
+    try self.selectFrameOutputColorDescription(
+        render_output,
+        self.renderer.preferredOutputTransfer(),
+    );
     const fifo_barrier = Surface.hasFifoBarrierForOutput(
         self.compositor.surfaceStore(),
         output,
@@ -6515,8 +6520,16 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
             &frame_damage,
             render_fence_fd,
             allow_tearing,
-        ) catch
-            return error.InvalidTarget;
+        ) catch |err| switch (err) {
+            error.OutputColorFallback => {
+                render_output.discardFrame();
+                output.cancelFrame();
+                try self.refreshRenderOutputColorDescription(render_output);
+                self.damageFullOutput(render_output);
+                return;
+            },
+            else => return error.InvalidTarget,
+        };
         render_output.commitFrame(
             .composited,
             &frame_damage,
@@ -6562,6 +6575,16 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
     self.finishRepaintIfIdle();
     if (presented) |info| outputPresented(render_output, info);
     self.refreshKeyboardFocus();
+}
+
+fn selectFrameOutputColorDescription(
+    self: *Self,
+    render_output: *RenderOutput,
+    transfer: ?render.TransferFunction,
+) !void {
+    _ = render_output.backend.selectOutputTransfer(transfer);
+    try self.refreshRenderOutputColorDescription(render_output);
+    self.renderer.setOutputColorDescription(render_output.color_description);
 }
 
 fn renderDesktopContents(
@@ -6667,8 +6690,16 @@ fn presentSessionLockFrame(
         frame.presentation_damage.?,
         render_fence_fd,
         false,
-    ) catch
-        return error.InvalidTarget;
+    ) catch |err| switch (err) {
+        error.OutputColorFallback => {
+            frame.render_output.discardFrame();
+            frame.output.cancelFrame();
+            try self.refreshRenderOutputColorDescription(frame.render_output);
+            self.damageFullOutput(frame.render_output);
+            return;
+        },
+        else => return error.InvalidTarget,
+    };
     frame.render_output.commitFrame(
         .composited,
         frame.presentation_damage.?,
