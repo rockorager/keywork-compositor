@@ -293,7 +293,8 @@ pub fn build(b: *std.Build) void {
         "renderer-conformance",
         "Run renderer reference-vector conformance tests",
     );
-    renderer_conformance_step.dependOn(&b.addRunArtifact(renderer_conformance_tests).step);
+    const renderer_conformance_run = b.addRunArtifact(renderer_conformance_tests);
+    renderer_conformance_step.dependOn(&renderer_conformance_run.step);
 
     const renderer_scene_tests = b.addTest(.{
         .root_module = compositor,
@@ -303,7 +304,15 @@ pub fn build(b: *std.Build) void {
         "renderer-scenes",
         "Run reproducible renderer scene tests",
     );
-    renderer_scene_step.dependOn(&b.addRunArtifact(renderer_scene_tests).step);
+    const renderer_scene_run = b.addRunArtifact(renderer_scene_tests);
+    renderer_scene_step.dependOn(&renderer_scene_run.step);
+
+    const renderer_check_step = b.step(
+        "renderer-check",
+        "Run renderer conformance and reproducible scene tests",
+    );
+    renderer_check_step.dependOn(&renderer_conformance_run.step);
+    renderer_check_step.dependOn(&renderer_scene_run.step);
 
     const fmt_step = b.step("fmt", "Check code formatting");
     const fmt_check = b.addFmt(.{ .paths = &.{ "src", "build.zig", "build.zig.zon" }, .check = true });

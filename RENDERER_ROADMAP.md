@@ -115,10 +115,12 @@ Acceptance: video and opaque surfaces use overlays when the complete atomic
 state is supported, composition remains the reliable fallback, and switching
 between paths does not produce a visible color or timing discontinuity.
 
-## 8. Conformance and benchmark suite
+## 8. Conformance and benchmark suite — complete
 
 Current commands:
 
+- `zig build renderer-check --summary all` runs all deterministic correctness
+  vectors and reproducible scenes.
 - `zig build renderer-conformance --summary all` runs the deterministic renderer
   reference-vector corpus independently from the broader unit suite.
 - `zig build renderer-scenes --summary all` runs reproducible direct-scanout,
@@ -131,7 +133,7 @@ Current commands:
   tone mapping, gamut mapping, scaling, and YCbCr conversion.
 - [x] Add reproducible scenes for direct scanout, mixed windows, damage, blur,
   video, SDR, and HDR.
-- Track CPU time, GPU pass time, memory bandwidth proxies, copies, imports,
+- [x] Track CPU time, GPU pass time, memory bandwidth proxies, copies, imports,
   missed frame budgets, and presentation latency.
 
 Acceptance: renderer changes can be evaluated with one documented command,
