@@ -584,21 +584,23 @@ fn composite(
     if (dmabuf.modifier != 0) return error.InvalidTarget;
     const format = render_types.DmabufFormat.fromFourcc(dmabuf.format) orelse
         return error.InvalidTarget;
-    if (dmabuf.offset % @alignOf(u32) != 0 or dmabuf.stride % @sizeOf(u32) != 0) {
+    if (!format.isPackedRgb() or dmabuf.plane_count != 1) return error.InvalidTarget;
+    const plane = dmabuf.planes[0];
+    if (plane.offset % @alignOf(u32) != 0 or plane.stride % @sizeOf(u32) != 0) {
         return error.InvalidTarget;
     }
     const mapping = std.posix.mmap(
         null,
-        dmabuf.required_bytes,
+        plane.required_bytes,
         .{ .READ = true },
         .{ .TYPE = .SHARED },
-        dmabuf.fd,
+        plane.fd,
         0,
     ) catch return error.InvalidTarget;
     defer std.posix.munmap(mapping);
     if (!(dmabuf.begin_cpu_read)(dmabuf.context)) return error.InvalidTarget;
     defer _ = (dmabuf.end_cpu_read)(dmabuf.context);
-    const source_bytes = mapping[dmabuf.offset..];
+    const source_bytes = mapping[plane.offset..];
     const source_pixels: [*]u32 = @ptrCast(@alignCast(source_bytes.ptr));
     var mapped_image = image;
     mapped_image.buffer.pixels = source_pixels[0 .. source_bytes.len / @sizeOf(u32)];

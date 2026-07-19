@@ -19,13 +19,15 @@ const linux = @cImport({
     @cInclude("sys/sysmacros.h");
 });
 
-const max_planes = 4;
+const max_planes = render.max_dmabuf_planes;
 const invalid_modifier: u64 = 0x00ff_ffff_ffff_ffff;
 const linear_modifier: u64 = 0;
 const argb8888: u32 = linux.DRM_FORMAT_ARGB8888;
 const xrgb8888: u32 = linux.DRM_FORMAT_XRGB8888;
 const abgr8888: u32 = linux.DRM_FORMAT_ABGR8888;
 const xbgr8888: u32 = linux.DRM_FORMAT_XBGR8888;
+const nv12: u32 = linux.DRM_FORMAT_NV12;
+const p010: u32 = linux.DRM_FORMAT_P010;
 const fallback_formats = [_]render.DmabufFormatModifier{
     .{ .format = argb8888, .modifier = linear_modifier },
     .{ .format = xrgb8888, .modifier = linear_modifier },
@@ -38,6 +40,8 @@ comptime {
     std.debug.assert(xrgb8888 == @intFromEnum(render.DmabufFormat.xrgb8888));
     std.debug.assert(abgr8888 == @intFromEnum(render.DmabufFormat.abgr8888));
     std.debug.assert(xbgr8888 == @intFromEnum(render.DmabufFormat.xbgr8888));
+    std.debug.assert(nv12 == @intFromEnum(render.DmabufFormat.nv12));
+    std.debug.assert(p010 == @intFromEnum(render.DmabufFormat.p010));
 }
 
 pub const Device = linux.dev_t;
@@ -487,7 +491,7 @@ const Params = struct {
             switch (err) {
                 error.Incomplete => self.resource.postError(
                     .incomplete,
-                    "DMA-BUF requires exactly one plane",
+                    "DMA-BUF does not have the planes required by its format",
                 ),
                 error.InvalidFormat => self.resource.postError(
                     .invalid_format,
@@ -514,9 +518,7 @@ const Params = struct {
                 return;
             }
         }
-        if (descriptor.plane.modifier != linear_modifier and
-            descriptor.plane.modifier != invalid_modifier)
-        {
+        if (descriptor.modifier != linear_modifier) {
             const validator = self.manager.source_validator orelse {
                 self.importFailed(immediate_id);
                 return;
@@ -524,18 +526,17 @@ const Params = struct {
             const format_info = render.DmabufFormat.fromFourcc(descriptor.format).?;
             validator.validate(validator.context, .{
                 .size = descriptor.size,
-                .fd = descriptor.plane.fd,
                 .format = descriptor.format,
-                .modifier = descriptor.plane.modifier,
-                .stride = descriptor.plane.stride,
-                .offset = descriptor.plane.offset,
+                .modifier = descriptor.modifier,
+                .planes = descriptor.renderPlanes(),
+                .plane_count = descriptor.plane_count,
                 .force_opaque = !format_info.hasAlpha(),
             }) catch {
                 self.importFailed(immediate_id);
                 return;
             };
         }
-        if (descriptor.plane.modifier == invalid_modifier) {
+        if (descriptor.implicit_modifier) {
             log.warn("assuming a legacy implicit DMA-BUF has linear layout", .{});
         }
 
@@ -548,7 +549,7 @@ const Params = struct {
             self.resource.postNoMemory();
             return;
         };
-        self.planes[0] = null;
+        for (self.planes[0..descriptor.plane_count]) |*plane| plane.* = null;
         if (immediate_id == null) self.resource.sendCreated(buffer.resource.?);
     }
 
@@ -576,12 +577,37 @@ fn deviceFromArray(array: *const wl.Array) error{InvalidSize}!linux.dev_t {
     return device;
 }
 
-const Descriptor = struct {
+const DescriptorPlane = struct {
     plane: Plane,
+    required_bytes: usize,
+};
+
+const Descriptor = struct {
+    planes: [max_planes]DescriptorPlane,
+    plane_count: u8,
     size: render.Size,
     format: u32,
+    modifier: u64,
+    implicit_modifier: bool,
     y_inverted: bool,
-    required_bytes: usize,
+
+    fn renderPlanes(self: Descriptor) [max_planes]render.DmabufPlane {
+        var planes: [max_planes]render.DmabufPlane = @splat(.{
+            .fd = -1,
+            .stride = 0,
+            .offset = 0,
+            .required_bytes = 0,
+        });
+        for (self.planes[0..self.plane_count], planes[0..self.plane_count]) |source, *destination| {
+            destination.* = .{
+                .fd = source.plane.fd,
+                .stride = source.plane.stride,
+                .offset = source.plane.offset,
+                .required_bytes = source.required_bytes,
+            };
+        }
+        return planes;
+    }
 };
 
 const DescriptorError = error{
@@ -601,16 +627,21 @@ fn validateDescriptor(
     allow_implicit_modifier: bool,
     supported_pairs: []const render.DmabufFormatModifier,
 ) DescriptorError!Descriptor {
-    if (planes[0] == null) return error.Incomplete;
-    for (planes[1..]) |plane| if (plane != null) return error.Incomplete;
     if (width <= 0 or height <= 0) return error.InvalidDimensions;
-    if (render.DmabufFormat.fromFourcc(format) == null) return error.InvalidFormat;
+    const format_info = render.DmabufFormat.fromFourcc(format) orelse return error.InvalidFormat;
+    const plane_count = format_info.planeCount();
+    for (planes[0..plane_count]) |plane| if (plane == null) return error.Incomplete;
+    for (planes[plane_count..]) |plane| if (plane != null) return error.Incomplete;
 
-    const plane = planes[0].?;
-    const effective_modifier = if (allow_implicit_modifier and plane.modifier == invalid_modifier)
+    const first_plane = planes[0].?;
+    for (planes[1..plane_count]) |plane| {
+        if (plane.?.modifier != first_plane.modifier) return error.InvalidFormat;
+    }
+    const implicit_modifier = allow_implicit_modifier and first_plane.modifier == invalid_modifier;
+    const effective_modifier = if (implicit_modifier)
         linear_modifier
     else
-        plane.modifier;
+        first_plane.modifier;
     if (!render.DmabufFormatModifier.contains(supported_pairs, format, effective_modifier)) return error.InvalidFormat;
     const flag_bits: u32 = @bitCast(flags);
     if (flag_bits & ~@as(u32, 7) != 0 or flags.interlaced or flags.bottom_first) {
@@ -621,57 +652,68 @@ fn validateDescriptor(
         .width = @intCast(width),
         .height = @intCast(height),
     };
-    if (effective_modifier != linear_modifier) {
-        const fd_size = std.c.lseek(plane.fd, 0, std.c.SEEK.END);
-        if (fd_size <= 0) return error.ImportFailed;
-        if (@as(u64, @intCast(fd_size)) > std.math.maxInt(usize)) return error.OutOfBounds;
-        return .{
-            .plane = plane,
-            .size = size,
-            .format = format,
-            .y_inverted = flags.y_invert,
-            .required_bytes = @intCast(fd_size),
+    var validated_planes: [max_planes]DescriptorPlane = @splat(.{
+        .plane = .{ .fd = -1, .offset = 0, .stride = 0, .modifier = 0 },
+        .required_bytes = 0,
+    });
+    for (planes[0..plane_count], 0..) |optional_plane, index| {
+        const plane = optional_plane.?;
+        const required_bytes = if (effective_modifier == linear_modifier) required: {
+            const plane_index: u8 = @intCast(index);
+            const row_bytes = format_info.planeRowBytes(plane_index, size.width).?;
+            const plane_height = format_info.planeHeight(plane_index, size.height).?;
+            const alignment = format_info.planeAlignment();
+            if (plane.stride < row_bytes or plane.stride % alignment != 0 or
+                plane.offset % alignment != 0) return error.OutOfBounds;
+            const row_offset = std.math.mul(u64, plane_height - 1, plane.stride) catch
+                return error.OutOfBounds;
+            const required_offset = std.math.add(u64, plane.offset, row_offset) catch
+                return error.OutOfBounds;
+            const required_end = std.math.add(u64, required_offset, row_bytes) catch
+                return error.OutOfBounds;
+            if (required_end == 0 or required_end > std.math.maxInt(usize)) {
+                return error.OutOfBounds;
+            }
+            const fd_size = std.c.lseek(plane.fd, 0, std.c.SEEK.END);
+            if (fd_size < 0) return error.ImportFailed;
+            if (required_end > @as(u64, @intCast(fd_size))) return error.OutOfBounds;
+
+            if (!syncDmaBuf(plane.fd, linux.DMA_BUF_SYNC_READ)) return error.ImportFailed;
+            const mapping = std.posix.mmap(
+                null,
+                @intCast(required_end),
+                .{ .READ = true },
+                .{ .TYPE = .SHARED },
+                plane.fd,
+                0,
+            ) catch {
+                _ = syncDmaBuf(plane.fd, linux.DMA_BUF_SYNC_READ | linux.DMA_BUF_SYNC_END);
+                return error.ImportFailed;
+            };
+            std.posix.munmap(mapping);
+            if (!syncDmaBuf(plane.fd, linux.DMA_BUF_SYNC_READ | linux.DMA_BUF_SYNC_END)) {
+                return error.ImportFailed;
+            }
+            break :required @as(usize, @intCast(required_end));
+        } else non_linear: {
+            const fd_size = std.c.lseek(plane.fd, 0, std.c.SEEK.END);
+            if (fd_size <= 0) return error.ImportFailed;
+            if (@as(u64, @intCast(fd_size)) > std.math.maxInt(usize)) {
+                return error.OutOfBounds;
+            }
+            break :non_linear @as(usize, @intCast(fd_size));
         };
-    }
-    const row_bytes = std.math.mul(u64, size.width, @sizeOf(u32)) catch
-        return error.OutOfBounds;
-    if (plane.stride < row_bytes or plane.stride % @sizeOf(u32) != 0 or
-        plane.offset % @alignOf(u32) != 0) return error.OutOfBounds;
-    const row_offset = std.math.mul(u64, size.height - 1, plane.stride) catch
-        return error.OutOfBounds;
-    const required_bytes_u64 = std.math.add(u64, plane.offset, row_offset) catch
-        return error.OutOfBounds;
-    const required_end = std.math.add(u64, required_bytes_u64, row_bytes) catch
-        return error.OutOfBounds;
-    if (required_end == 0 or required_end > std.math.maxInt(usize)) return error.OutOfBounds;
-
-    const fd_size = std.c.lseek(plane.fd, 0, std.c.SEEK.END);
-    if (fd_size < 0) return error.ImportFailed;
-    if (required_end > @as(u64, @intCast(fd_size))) return error.OutOfBounds;
-
-    if (!syncDmaBuf(plane.fd, linux.DMA_BUF_SYNC_READ)) return error.ImportFailed;
-    const mapping = std.posix.mmap(
-        null,
-        @intCast(required_end),
-        .{ .READ = true },
-        .{ .TYPE = .SHARED },
-        plane.fd,
-        0,
-    ) catch {
-        _ = syncDmaBuf(plane.fd, linux.DMA_BUF_SYNC_READ | linux.DMA_BUF_SYNC_END);
-        return error.ImportFailed;
-    };
-    std.posix.munmap(mapping);
-    if (!syncDmaBuf(plane.fd, linux.DMA_BUF_SYNC_READ | linux.DMA_BUF_SYNC_END)) {
-        return error.ImportFailed;
+        validated_planes[index] = .{ .plane = plane, .required_bytes = required_bytes };
     }
 
     return .{
-        .plane = plane,
+        .planes = validated_planes,
+        .plane_count = plane_count,
         .size = size,
         .format = format,
+        .modifier = effective_modifier,
+        .implicit_modifier = implicit_modifier,
         .y_inverted = flags.y_invert,
-        .required_bytes = @intCast(required_end),
     };
 }
 
@@ -753,7 +795,7 @@ pub const Buffer = struct {
         std.debug.assert(self.reference_count > 0);
         self.reference_count -= 1;
         if (self.reference_count != 0) return;
-        self.descriptor.plane.close();
+        for (self.descriptor.planes[0..self.descriptor.plane_count]) |plane| plane.plane.close();
         self.manager.buffer_count -= 1;
         self.manager.allocator.destroy(self);
     }
@@ -788,15 +830,10 @@ pub const Buffer = struct {
         const format_info = render.DmabufFormat.fromFourcc(descriptor.format).?;
         return .{
             .context = self,
-            .fd = descriptor.plane.fd,
             .format = descriptor.format,
-            .modifier = if (descriptor.plane.modifier == invalid_modifier)
-                linear_modifier
-            else
-                descriptor.plane.modifier,
-            .stride = descriptor.plane.stride,
-            .offset = descriptor.plane.offset,
-            .required_bytes = descriptor.required_bytes,
+            .modifier = descriptor.modifier,
+            .planes = descriptor.renderPlanes(),
+            .plane_count = descriptor.plane_count,
             .y_inverted = descriptor.y_inverted,
             .force_opaque = !format_info.hasAlpha(),
             .retain = retainSourceCallback,
@@ -812,9 +849,10 @@ pub const Buffer = struct {
         allocator: std.mem.Allocator,
     ) CopyError![]u32 {
         const descriptor = self.descriptor;
-        if (descriptor.plane.modifier != linear_modifier and
-            descriptor.plane.modifier != invalid_modifier) return error.ImportFailed;
         const format_info = render.DmabufFormat.fromFourcc(descriptor.format).?;
+        if (descriptor.modifier != linear_modifier or !format_info.isPackedRgb() or
+            descriptor.plane_count != 1) return error.ImportFailed;
+        const plane = descriptor.planes[0];
         const pixels = allocator.alloc(
             u32,
             descriptor.size.pixelCount() catch return error.ImportFailed,
@@ -823,20 +861,20 @@ pub const Buffer = struct {
 
         const mapping = std.posix.mmap(
             null,
-            descriptor.required_bytes,
+            plane.required_bytes,
             .{ .READ = true },
             .{ .TYPE = .SHARED },
-            descriptor.plane.fd,
+            plane.plane.fd,
             0,
         ) catch return error.ImportFailed;
         defer std.posix.munmap(mapping);
 
-        if (!syncDmaBuf(descriptor.plane.fd, linux.DMA_BUF_SYNC_READ)) {
+        if (!syncDmaBuf(plane.plane.fd, linux.DMA_BUF_SYNC_READ)) {
             return error.ImportFailed;
         }
         defer {
             _ = syncDmaBuf(
-                descriptor.plane.fd,
+                plane.plane.fd,
                 linux.DMA_BUF_SYNC_READ | linux.DMA_BUF_SYNC_END,
             );
         }
@@ -848,8 +886,8 @@ pub const Buffer = struct {
                 descriptor.size.height - destination_y - 1
             else
                 destination_y;
-            const source_offset = @as(usize, descriptor.plane.offset) +
-                source_y * descriptor.plane.stride;
+            const source_offset = @as(usize, plane.plane.offset) +
+                source_y * plane.plane.stride;
             const destination_offset = destination_y * row_bytes;
             @memcpy(
                 destination[destination_offset..][0..row_bytes],
@@ -867,9 +905,10 @@ pub const Buffer = struct {
         source: render.PixelBuffer,
     ) CopyError!void {
         const descriptor = self.descriptor;
-        if (descriptor.plane.modifier != linear_modifier and
-            descriptor.plane.modifier != invalid_modifier) return error.ImportFailed;
         const format_info = render.DmabufFormat.fromFourcc(descriptor.format).?;
+        if (descriptor.modifier != linear_modifier or !format_info.isPackedRgb() or
+            descriptor.plane_count != 1) return error.ImportFailed;
+        const plane = descriptor.planes[0];
         if (!std.meta.eql(source.size, descriptor.size) or
             source.stride_pixels < source.size.width) return error.ImportFailed;
         const source_row_offset = std.math.mul(
@@ -886,15 +925,15 @@ pub const Buffer = struct {
 
         const mapping = std.posix.mmap(
             null,
-            descriptor.required_bytes,
+            plane.required_bytes,
             .{ .READ = true, .WRITE = true },
             .{ .TYPE = .SHARED },
-            descriptor.plane.fd,
+            plane.plane.fd,
             0,
         ) catch return error.ImportFailed;
         defer std.posix.munmap(mapping);
 
-        if (!syncDmaBuf(descriptor.plane.fd, linux.DMA_BUF_SYNC_WRITE)) {
+        if (!syncDmaBuf(plane.plane.fd, linux.DMA_BUF_SYNC_WRITE)) {
             return error.ImportFailed;
         }
         const row_bytes = @as(usize, descriptor.size.width) * @sizeOf(u32);
@@ -904,8 +943,8 @@ pub const Buffer = struct {
             else
                 source_y;
             const source_offset = source_y * source.stride_pixels * @sizeOf(u32);
-            const destination_offset = @as(usize, descriptor.plane.offset) +
-                destination_y * descriptor.plane.stride;
+            const destination_offset = @as(usize, plane.plane.offset) +
+                destination_y * plane.plane.stride;
             if (!format_info.redBlueSwapped()) {
                 const source_bytes = std.mem.sliceAsBytes(source.pixels);
                 @memcpy(
@@ -928,7 +967,7 @@ pub const Buffer = struct {
             }
         }
         if (!syncDmaBuf(
-            descriptor.plane.fd,
+            plane.plane.fd,
             linux.DMA_BUF_SYNC_WRITE | linux.DMA_BUF_SYNC_END,
         )) return error.ImportFailed;
     }
@@ -955,7 +994,14 @@ pub const Buffer = struct {
 
     fn beginCpuReadCallback(context: *anyopaque) bool {
         const self: *Buffer = @ptrCast(@alignCast(context));
-        return syncDmaBuf(self.descriptor.plane.fd, linux.DMA_BUF_SYNC_READ);
+        for (self.descriptor.planes[0..self.descriptor.plane_count], 0..) |plane, index| {
+            if (syncDmaBuf(plane.plane.fd, linux.DMA_BUF_SYNC_READ)) continue;
+            for (self.descriptor.planes[0..index]) |started| {
+                _ = syncDmaBuf(started.plane.fd, linux.DMA_BUF_SYNC_READ | linux.DMA_BUF_SYNC_END);
+            }
+            return false;
+        }
+        return true;
     }
 
     fn retainSourceCallback(context: *anyopaque) void {
@@ -970,21 +1016,26 @@ pub const Buffer = struct {
 
     fn endCpuReadCallback(context: *anyopaque) bool {
         const self: *Buffer = @ptrCast(@alignCast(context));
-        return syncDmaBuf(
-            self.descriptor.plane.fd,
-            linux.DMA_BUF_SYNC_READ | linux.DMA_BUF_SYNC_END,
-        );
+        var succeeded = true;
+        for (self.descriptor.planes[0..self.descriptor.plane_count]) |plane| {
+            succeeded = syncDmaBuf(
+                plane.plane.fd,
+                linux.DMA_BUF_SYNC_READ | linux.DMA_BUF_SYNC_END,
+            ) and succeeded;
+        }
+        return succeeded;
     }
 
-    fn exportReadFenceCallback(context: *anyopaque) ?std.posix.fd_t {
+    fn exportReadFenceCallback(context: *anyopaque, plane_index: u8) ?std.posix.fd_t {
         const self: *Buffer = @ptrCast(@alignCast(context));
+        if (plane_index >= self.descriptor.plane_count) return null;
         var export_sync_file: linux.dma_buf_export_sync_file = .{
             .flags = linux.DMA_BUF_SYNC_READ,
             .fd = -1,
         };
         while (true) {
             const result = linux.ioctl(
-                self.descriptor.plane.fd,
+                self.descriptor.planes[plane_index].plane.fd,
                 linux.DMA_BUF_IOCTL_EXPORT_SYNC_FILE,
                 &export_sync_file,
             );
@@ -1089,9 +1140,58 @@ test "DMA-BUF descriptor accepts only advertised non-linear pairs without mappin
         false,
         &supported,
     );
-    try std.testing.expectEqual(@as(u64, 42), descriptor.plane.modifier);
+    try std.testing.expectEqual(@as(u64, 42), descriptor.modifier);
     try std.testing.expectError(
         error.InvalidFormat,
         validateDescriptor(planes, 2, 2, xrgb8888, no_flags, false, &supported),
+    );
+}
+
+test "DMA-BUF descriptor retains every plane required by video formats" {
+    const no_flags: zwp.LinuxBufferParamsV1.Flags = @bitCast(@as(u32, 0));
+    const luma_fd = try std.posix.memfd_create("keywork-nv12-luma-test", 0);
+    defer _ = std.c.close(luma_fd);
+    const chroma_fd = try std.posix.memfd_create("keywork-nv12-chroma-test", 0);
+    defer _ = std.c.close(chroma_fd);
+    if (std.c.ftruncate(luma_fd, 64) != 0 or std.c.ftruncate(chroma_fd, 64) != 0) {
+        return error.Unexpected;
+    }
+
+    const supported = [_]render.DmabufFormatModifier{
+        .{ .format = nv12, .modifier = 42 },
+    };
+    var planes: [max_planes]?Plane = @splat(null);
+    planes[0] = .{ .fd = luma_fd, .offset = 3, .stride = 5, .modifier = 42 };
+    try std.testing.expectError(
+        error.Incomplete,
+        validateDescriptor(planes, 5, 3, nv12, no_flags, false, &supported),
+    );
+
+    planes[1] = .{ .fd = chroma_fd, .offset = 7, .stride = 6, .modifier = 42 };
+    const descriptor = try validateDescriptor(
+        planes,
+        5,
+        3,
+        nv12,
+        no_flags,
+        false,
+        &supported,
+    );
+    try std.testing.expectEqual(@as(u8, 2), descriptor.plane_count);
+    try std.testing.expectEqual(luma_fd, descriptor.planes[0].plane.fd);
+    try std.testing.expectEqual(chroma_fd, descriptor.planes[1].plane.fd);
+    try std.testing.expectEqual(@as(usize, 64), descriptor.planes[0].required_bytes);
+    try std.testing.expectEqual(@as(usize, 64), descriptor.planes[1].required_bytes);
+
+    planes[1].?.modifier = 43;
+    try std.testing.expectError(
+        error.InvalidFormat,
+        validateDescriptor(planes, 5, 3, nv12, no_flags, false, &supported),
+    );
+    planes[1].?.modifier = 42;
+    planes[2] = planes[1];
+    try std.testing.expectError(
+        error.Incomplete,
+        validateDescriptor(planes, 5, 3, nv12, no_flags, false, &supported),
     );
 }

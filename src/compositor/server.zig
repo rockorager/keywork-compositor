@@ -627,6 +627,7 @@ fn controlScanoutFormat(format: ?render.DmabufFormat) ControlProtocol.BufferForm
         .abgr8888 => .abgr8888,
         .xbgr8888 => .xbgr8888,
         .xrgb2101010 => .xrgb2101010,
+        .nv12, .p010 => .none,
     } else .none;
 }
 

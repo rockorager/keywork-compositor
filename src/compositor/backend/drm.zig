@@ -722,6 +722,7 @@ pub fn tryDirectScanout(
     if (!self.device_access.active(self.device_access.context)) {
         return .{ .rejected = .device_inactive };
     }
+    if (source.plane_count != 1) return .{ .rejected = .unsupported_layout };
     const framebuffer = self.directFramebuffer(fd, buffer) catch |err| return .{
         .rejected = if (err == error.UnsupportedModifier)
             .unsupported_format_or_modifier
@@ -1893,13 +1894,15 @@ fn directFramebuffer(
     buffer: render.PixelBuffer,
 ) !*DirectFramebuffer {
     const source = buffer.dmabuf orelse return error.InvalidBuffer;
+    if (source.plane_count != 1) return error.InvalidBuffer;
+    const plane = source.planes[0];
     const cache_id = buffer.source_cache.?.id;
     self.direct_frame_number +%= 1;
     if (self.direct_frame_number == 0) self.direct_frame_number = 1;
     if (self.direct_framebuffers.getPtr(cache_id)) |framebuffer| {
         if (!std.meta.eql(framebuffer.size, buffer.size) or
             framebuffer.format != source.format or framebuffer.modifier != source.modifier or
-            framebuffer.stride != source.stride or framebuffer.offset != source.offset)
+            framebuffer.stride != plane.stride or framebuffer.offset != plane.offset)
         {
             return error.CacheIdentityMismatch;
         }
@@ -1922,13 +1925,13 @@ fn directFramebuffer(
         source.modifier == drm_format_mod_linear)) return error.UnsupportedModifier;
 
     var handle: u32 = 0;
-    if (c.drmPrimeFDToHandle(fd, source.fd, &handle) != 0) return error.ImportHandleFailed;
+    if (c.drmPrimeFDToHandle(fd, plane.fd, &handle) != 0) return error.ImportHandleFailed;
     defer if (c.drmCloseBufferHandle(fd, handle) != 0) {
         log.err("failed to close imported DRM buffer handle {d}", .{handle});
     };
     var handles = [_]u32{ handle, 0, 0, 0 };
-    var pitches = [_]u32{ source.stride, 0, 0, 0 };
-    var offsets = [_]u32{ source.offset, 0, 0, 0 };
+    var pitches = [_]u32{ plane.stride, 0, 0, 0 };
+    var offsets = [_]u32{ plane.offset, 0, 0, 0 };
     var framebuffer_id: u32 = 0;
     var add_result: c_int = -1;
     if (modifier_supported) {
@@ -1967,8 +1970,8 @@ fn directFramebuffer(
         .size = buffer.size,
         .format = source.format,
         .modifier = source.modifier,
-        .stride = source.stride,
-        .offset = source.offset,
+        .stride = plane.stride,
+        .offset = plane.offset,
         .last_used = self.direct_frame_number,
     });
     return self.direct_framebuffers.getPtr(cache_id).?;
@@ -1976,6 +1979,8 @@ fn directFramebuffer(
 
 fn legacyFramebufferLayoutMatches(self: *const Self, buffer: render.PixelBuffer) bool {
     const source = buffer.dmabuf orelse return false;
+    if (source.plane_count != 1) return false;
+    const plane = source.planes[0];
     const compositor_format = if (self.buffers[0].gbm) |gbm_buffer|
         gbm_buffer.format
     else
@@ -1986,8 +1991,8 @@ fn legacyFramebufferLayoutMatches(self: *const Self, buffer: render.PixelBuffer)
         return current.format == source.format and
             std.meta.eql(current.size, buffer.size) and
             current.modifier == source.modifier and
-            current.stride == source.stride and
-            current.offset == source.offset;
+            current.stride == plane.stride and
+            current.offset == plane.offset;
     }
 
     const index = self.displayed orelse return false;
@@ -1996,8 +2001,8 @@ fn legacyFramebufferLayoutMatches(self: *const Self, buffer: render.PixelBuffer)
     // with identical layouts. Enforcing this here also guarantees that the
     // compositor-owned framebuffer can be restored after direct scan-out.
     return current.modifier == source.modifier and
-        current.stride == source.stride and
-        current.offset == source.offset;
+        current.stride == plane.stride and
+        current.offset == plane.offset;
 }
 
 fn queuePageFlip(
@@ -2049,7 +2054,7 @@ fn queuePageFlip(
     }
 
     const fence_fd = if (properties.in_fence_fd != 0 and source != null)
-        source.?.export_read_fence(source.?.context)
+        source.?.export_read_fence(source.?.context, 0)
     else
         null;
     defer {

@@ -2190,7 +2190,7 @@ const DmabufUse = struct {
         if (self.synchronization) |*synchronization| {
             const release_succeeded = if (self.gpu_accessed) completed: {
                 const source = self.buffer.renderSource();
-                const sync_file_fd = source.export_read_fence(source.context) orelse
+                const sync_file_fd = source.export_read_fence(source.context, 0) orelse
                     break :completed false;
                 defer _ = std.c.close(sync_file_fd);
                 break :completed synchronization.release.importSyncFile(sync_file_fd);
@@ -2241,7 +2241,7 @@ const DmabufUse = struct {
         return source.end_cpu_read(source.context);
     }
 
-    fn exportReadFenceCallback(context: *anyopaque) ?std.posix.fd_t {
+    fn exportReadFenceCallback(context: *anyopaque, plane_index: u8) ?std.posix.fd_t {
         const self: *DmabufUse = @ptrCast(@alignCast(context));
         if (self.synchronization) |synchronization| {
             if (!self.isReady()) return null;
@@ -2249,7 +2249,7 @@ const DmabufUse = struct {
             return synchronization.acquire.exportSyncFile();
         }
         const source = self.buffer.renderSource();
-        return source.export_read_fence(source.context);
+        return source.export_read_fence(source.context, plane_index);
     }
 };
 
@@ -2457,14 +2457,18 @@ pub const BufferSnapshot = struct {
     }
 
     pub fn pixelBuffer(self: *BufferSnapshot) render_types.PixelBuffer {
+        const dmabuf_source = if (self.dmabuf) |dmabuf| dmabuf.renderSource() else null;
         return .{
             .size = self.buffer_size,
-            .stride_pixels = if (self.dmabuf) |dmabuf|
-                dmabuf.renderSource().stride / @sizeOf(u32)
+            .stride_pixels = if (dmabuf_source) |dmabuf|
+                if (render_types.DmabufFormat.fromFourcc(dmabuf.format).?.isPackedRgb())
+                    dmabuf.planes[0].stride / @sizeOf(u32)
+                else
+                    self.buffer_size.width
             else
                 self.buffer_size.width,
             .pixels = self.pixels,
-            .dmabuf = if (self.dmabuf) |dmabuf| dmabuf.renderSource() else null,
+            .dmabuf = dmabuf_source,
             .color_description = self.color_description,
             .source_cache = self.source_cache,
             .source_damage = self.source_damage,

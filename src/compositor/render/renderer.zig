@@ -641,7 +641,7 @@ test "direct scanout candidate requires a final exact opaque DMA-BUF image" {
         fn end(_: *anyopaque) bool {
             return true;
         }
-        fn exportFence(_: *anyopaque) ?std.posix.fd_t {
+        fn exportFence(_: *anyopaque, _: u8) ?std.posix.fd_t {
             return null;
         }
     };
@@ -654,12 +654,20 @@ test "direct scanout candidate requires a final exact opaque DMA-BUF image" {
         .stride_pixels = size.width,
         .dmabuf = .{
             .context = &source_context,
-            .fd = -1,
-            .format = 0,
+            .format = @intFromEnum(render_types.DmabufFormat.xrgb8888),
             .modifier = 0,
-            .stride = size.width * @sizeOf(u32),
-            .offset = 0,
-            .required_bytes = target_pixels.len * @sizeOf(u32),
+            .planes = .{
+                .{
+                    .fd = -1,
+                    .stride = size.width * @sizeOf(u32),
+                    .offset = 0,
+                    .required_bytes = target_pixels.len * @sizeOf(u32),
+                },
+                .{},
+                .{},
+                .{},
+            },
+            .plane_count = 1,
             .y_inverted = false,
             .force_opaque = true,
             .retain = NoopSource.retain,

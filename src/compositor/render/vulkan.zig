@@ -871,7 +871,7 @@ fn dmabufSourceVkFormat(fourcc: u32) ?vk.Format {
     return switch (render.DmabufFormat.fromFourcc(fourcc) orelse return null) {
         .argb8888, .xrgb8888 => .b8g8r8a8_unorm,
         .abgr8888, .xbgr8888 => .r8g8b8a8_unorm,
-        .xrgb2101010 => null,
+        .xrgb2101010, .nv12, .p010 => null,
     };
 }
 
@@ -879,7 +879,7 @@ fn dmabufTargetVkFormat(fourcc: u32) ?vk.Format {
     return switch (render.DmabufFormat.fromFourcc(fourcc) orelse return null) {
         .xrgb8888 => .b8g8r8a8_unorm,
         .xrgb2101010 => .a2r10g10b10_unorm_pack32,
-        .argb8888, .abgr8888, .xbgr8888 => null,
+        .argb8888, .abgr8888, .xbgr8888, .nv12, .p010 => null,
     };
 }
 
@@ -1601,19 +1601,17 @@ fn validateSourceCallback(
         fn sync(_: *anyopaque) bool {
             return true;
         }
-        fn exportFence(_: *anyopaque) ?std.posix.fd_t {
+        fn exportFence(_: *anyopaque, _: u8) ?std.posix.fd_t {
             return null;
         }
     };
     var source_context: u8 = 0;
     const texture = try self.createImportedTexture(descriptor.size, .{
         .context = &source_context,
-        .fd = descriptor.fd,
         .format = descriptor.format,
         .modifier = descriptor.modifier,
-        .stride = descriptor.stride,
-        .offset = descriptor.offset,
-        .required_bytes = 0,
+        .planes = descriptor.planes,
+        .plane_count = descriptor.plane_count,
         .y_inverted = false,
         .force_opaque = descriptor.force_opaque,
         .retain = Noop.retain,
@@ -1848,7 +1846,7 @@ fn dmabufTargetSampleable(self: *const Self, format: u32, modifier: u64) bool {
     const modifiers = switch (render.DmabufFormat.fromFourcc(format) orelse return false) {
         .xrgb8888 => self.dmabuf_sampled_modifiers,
         .xrgb2101010 => self.dmabuf_10bit_sampled_modifiers,
-        .argb8888, .abgr8888, .xbgr8888 => return false,
+        .argb8888, .abgr8888, .xbgr8888, .nv12, .p010 => return false,
     };
     return std.mem.indexOfScalar(u64, modifiers, modifier) != null;
 }
@@ -1861,7 +1859,7 @@ fn dmabufTargetUsage(sampleable: bool) vk.ImageUsageFlags {
 }
 
 fn supportsDmabufSource(self: *Self, size: render.Size, source: render.DmabufSource) bool {
-    if (size.width == 0 or size.height == 0) return false;
+    if (size.width == 0 or size.height == 0 or source.plane_count != 1) return false;
     const source_format = dmabufSourceVkFormat(source.format) orelse return false;
     const modifiers = switch (source_format) {
         .b8g8r8a8_unorm => self.dmabuf_source_modifiers,
@@ -2739,11 +2737,16 @@ fn renderFrameWithCompletion(
 
     var wait_stages: std.ArrayList(vk.PipelineStageFlags) = .empty;
     defer wait_stages.deinit(self.allocator);
+    const maximum_waits = std.math.mul(
+        usize,
+        self.prepared_images.items.len,
+        render.max_dmabuf_planes,
+    ) catch return error.OutOfMemory;
     self.pending_wait_semaphores.ensureTotalCapacity(
         self.allocator,
-        self.prepared_images.items.len,
+        maximum_waits,
     ) catch return error.OutOfMemory;
-    wait_stages.ensureTotalCapacity(self.allocator, self.prepared_images.items.len) catch
+    wait_stages.ensureTotalCapacity(self.allocator, maximum_waits) catch
         return error.OutOfMemory;
     var temporary_texture_count: usize = 0;
     for (self.prepared_images.items) |prepared| {
@@ -2755,31 +2758,33 @@ fn renderFrameWithCompletion(
         if (!prepared.texture.imported or
             !isFirstImportedTexture(self.prepared_images.items, index)) continue;
         const source = prepared.buffer.dmabuf.?;
-        const sync_fd = (source.export_read_fence)(source.context) orelse {
-            if (!(source.begin_cpu_read)(source.context)) return error.VulkanFailure;
-            if (!(source.end_cpu_read)(source.context)) return error.VulkanFailure;
-            continue;
-        };
-        const semaphore = self.device_wrapper.createSemaphore(self.device, &.{}, null) catch {
-            _ = std.c.close(sync_fd);
-            if (!(source.begin_cpu_read)(source.context)) return error.VulkanFailure;
-            if (!(source.end_cpu_read)(source.context)) return error.VulkanFailure;
-            continue;
-        };
-        self.device_wrapper.importSemaphoreFdKHR(self.device, &.{
-            .semaphore = semaphore,
-            .flags = .{ .temporary_bit = true },
-            .handle_type = .{ .sync_fd_bit = true },
-            .fd = sync_fd,
-        }) catch {
-            _ = std.c.close(sync_fd);
-            self.device_wrapper.destroySemaphore(self.device, semaphore, null);
-            if (!(source.begin_cpu_read)(source.context)) return error.VulkanFailure;
-            if (!(source.end_cpu_read)(source.context)) return error.VulkanFailure;
-            continue;
-        };
-        self.pending_wait_semaphores.appendAssumeCapacity(semaphore);
-        wait_stages.appendAssumeCapacity(.{ .all_commands_bit = true });
+        plane_waits: for (source.planeSlice(), 0..) |_, plane_index| {
+            const sync_fd = (source.export_read_fence)(source.context, @intCast(plane_index)) orelse {
+                if (!(source.begin_cpu_read)(source.context)) return error.VulkanFailure;
+                if (!(source.end_cpu_read)(source.context)) return error.VulkanFailure;
+                break :plane_waits;
+            };
+            const semaphore = self.device_wrapper.createSemaphore(self.device, &.{}, null) catch {
+                _ = std.c.close(sync_fd);
+                if (!(source.begin_cpu_read)(source.context)) return error.VulkanFailure;
+                if (!(source.end_cpu_read)(source.context)) return error.VulkanFailure;
+                break :plane_waits;
+            };
+            self.device_wrapper.importSemaphoreFdKHR(self.device, &.{
+                .semaphore = semaphore,
+                .flags = .{ .temporary_bit = true },
+                .handle_type = .{ .sync_fd_bit = true },
+                .fd = sync_fd,
+            }) catch {
+                _ = std.c.close(sync_fd);
+                self.device_wrapper.destroySemaphore(self.device, semaphore, null);
+                if (!(source.begin_cpu_read)(source.context)) return error.VulkanFailure;
+                if (!(source.end_cpu_read)(source.context)) return error.VulkanFailure;
+                break :plane_waits;
+            };
+            self.pending_wait_semaphores.appendAssumeCapacity(semaphore);
+            wait_stages.appendAssumeCapacity(.{ .all_commands_bit = true });
+        }
     }
 
     const async_submission = completion_mode == .sync_fd and
@@ -2854,16 +2859,18 @@ fn renderFrameWithCompletion(
         for (self.prepared_images.items, 0..) |prepared, index| {
             if (!prepared.texture.imported or
                 !isFirstImportedTexture(self.prepared_images.items, index)) continue;
-            if (!importDmaBufSyncFile(
-                prepared.buffer.dmabuf.?.fd,
-                completion_fd,
-                sync.DMA_BUF_SYNC_READ,
-            )) {
-                try self.drainPending();
-                self.disableScanoutSemaphore();
-                log.warn("DMA-BUF sync-file import failed; using blocking scanout", .{});
-                frame_succeeded = true;
-                return completion;
+            for (prepared.buffer.dmabuf.?.planeSlice()) |plane| {
+                if (!importDmaBufSyncFile(
+                    plane.fd,
+                    completion_fd,
+                    sync.DMA_BUF_SYNC_READ,
+                )) {
+                    try self.drainPending();
+                    self.disableScanoutSemaphore();
+                    log.warn("DMA-BUF sync-file import failed; using blocking scanout", .{});
+                    frame_succeeded = true;
+                    return completion;
+                }
             }
         }
         frame_succeeded = true;
@@ -3090,9 +3097,13 @@ fn validateImage(image: render.Image) Error!void {
 
 fn requiredBufferPixels(buffer: render.PixelBuffer) Error!usize {
     if (buffer.size.width == 0 or buffer.size.height == 0) return error.InvalidTarget;
-    if (buffer.dmabuf) |dmabuf| if (dmabuf.modifier != 0) {
-        return buffer.size.pixelCount() catch return error.InvalidTarget;
-    };
+    if (buffer.dmabuf) |dmabuf| {
+        const format = render.DmabufFormat.fromFourcc(dmabuf.format) orelse
+            return error.InvalidTarget;
+        if (dmabuf.modifier != 0 or !format.isPackedRgb() or dmabuf.plane_count != 1) {
+            return buffer.size.pixelCount() catch return error.InvalidTarget;
+        }
+    }
     if (buffer.stride_pixels < buffer.size.width) return error.InvalidTarget;
     const last_row = std.math.mul(
         usize,
@@ -3102,17 +3113,18 @@ fn requiredBufferPixels(buffer: render.PixelBuffer) Error!usize {
     const required = std.math.add(usize, last_row, buffer.size.width) catch
         return error.InvalidTarget;
     if (buffer.dmabuf) |dmabuf| {
+        const plane = dmabuf.planes[0];
         const stride_bytes = std.math.mul(u64, buffer.stride_pixels, @sizeOf(u32)) catch
             return error.InvalidTarget;
         const last_row_bytes = std.math.mul(u64, buffer.size.height - 1, stride_bytes) catch
             return error.InvalidTarget;
         const required_bytes = std.math.add(
             u64,
-            std.math.add(u64, dmabuf.offset, last_row_bytes) catch return error.InvalidTarget,
+            std.math.add(u64, plane.offset, last_row_bytes) catch return error.InvalidTarget,
             @as(u64, buffer.size.width) * @sizeOf(u32),
         ) catch return error.InvalidTarget;
-        if (dmabuf.stride != stride_bytes or required_bytes > dmabuf.required_bytes or
-            dmabuf.offset % @alignOf(u32) != 0)
+        if (plane.stride != stride_bytes or required_bytes > plane.required_bytes or
+            plane.offset % @alignOf(u32) != 0)
         {
             return error.InvalidTarget;
         }
@@ -3587,7 +3599,7 @@ fn prepareTexture(
             };
             if (imported) |prepared| return prepared;
         }
-        if (dmabuf.modifier != 0) return error.InvalidTarget;
+        if (dmabuf.modifier != 0 or dmabuf.plane_count != 1) return error.InvalidTarget;
     }
     if (buffer.source_cache) |source| {
         for (previously_prepared) |prepared| {
@@ -3922,16 +3934,17 @@ fn createImportedTexture(
 ) Error!Texture {
     if (!self.supportsDmabufSource(size, source)) return error.InvalidTarget;
     const source_format = dmabufSourceVkFormat(source.format) orelse return error.InvalidTarget;
-    const duplicate_fd = std.c.dup(source.fd);
+    const source_plane = source.planes[0];
+    const duplicate_fd = std.c.dup(source_plane.fd);
     if (duplicate_fd < 0) return error.VulkanFailure;
     var fd_owned = true;
     defer if (fd_owned) {
         _ = std.c.close(duplicate_fd);
     };
     const plane: vk.SubresourceLayout = .{
-        .offset = source.offset,
+        .offset = source_plane.offset,
         .size = 0,
-        .row_pitch = source.stride,
+        .row_pitch = source_plane.stride,
         .array_pitch = 0,
         .depth_pitch = 0,
     };
@@ -4359,8 +4372,11 @@ fn hashRenderCommand(hasher: *std.hash.Wyhash, command: render.Command) bool {
                 hashScalar(hasher, @as(u8, 1));
                 hashScalar(hasher, dmabuf.format);
                 hashScalar(hasher, dmabuf.modifier);
-                hashScalar(hasher, dmabuf.stride);
-                hashScalar(hasher, dmabuf.offset);
+                hashScalar(hasher, dmabuf.plane_count);
+                for (dmabuf.planeSlice()) |plane| {
+                    hashScalar(hasher, plane.stride);
+                    hashScalar(hasher, plane.offset);
+                }
                 hashScalar(hasher, @intFromBool(dmabuf.y_inverted));
                 hashScalar(hasher, @intFromBool(dmabuf.force_opaque));
             } else {
@@ -5366,12 +5382,14 @@ fn copySourceToMapped(
         copyPixelsToMapped(mapped, base_offset, buffer, damage);
         return;
     };
+    if (dmabuf.plane_count != 1) return error.InvalidTarget;
+    const plane = dmabuf.planes[0];
     const mapping = std.posix.mmap(
         null,
-        dmabuf.required_bytes,
+        plane.required_bytes,
         .{ .READ = true },
         .{ .TYPE = .SHARED },
-        dmabuf.fd,
+        plane.fd,
         0,
     ) catch return error.VulkanFailure;
     defer std.posix.munmap(mapping);
@@ -5414,7 +5432,7 @@ fn copyDmabufRectToMapped(
         const row_offset = (@as(usize, @intCast(rect.y)) + row) * stride_bytes + x_bytes;
         @memcpy(
             mapped[base_offset + row_offset ..][0..copy_bytes],
-            mapping[@as(usize, dmabuf.offset) + row_offset ..][0..copy_bytes],
+            mapping[@as(usize, dmabuf.planes[0].offset) + row_offset ..][0..copy_bytes],
         );
         if ((format != null and format.?.redBlueSwapped()) or dmabuf.force_opaque) {
             const row_pixels: [*]u32 = @ptrCast(@alignCast(
@@ -6810,7 +6828,7 @@ test "Vulkan renderer samples an ABGR GBM dmabuf without a CPU upload" {
             return true;
         }
 
-        fn exportFence(_: *anyopaque) ?std.posix.fd_t {
+        fn exportFence(_: *anyopaque, _: u8) ?std.posix.fd_t {
             return null;
         }
     };
@@ -6827,14 +6845,22 @@ test "Vulkan renderer samples an ABGR GBM dmabuf without a CPU upload" {
                 .stride_pixels = source_buffer.stride / @sizeOf(u32),
                 .dmabuf = .{
                     .context = &source_buffer,
-                    .fd = source_buffer.fd,
                     .format = source_format,
                     .modifier = source_buffer.modifier,
-                    .stride = source_buffer.stride,
-                    .offset = source_buffer.offset,
-                    .required_bytes = @intCast(
-                        source_buffer.offset + source_buffer.stride * size.height,
-                    ),
+                    .planes = .{
+                        .{
+                            .fd = source_buffer.fd,
+                            .stride = source_buffer.stride,
+                            .offset = source_buffer.offset,
+                            .required_bytes = @intCast(
+                                source_buffer.offset + source_buffer.stride * size.height,
+                            ),
+                        },
+                        .{},
+                        .{},
+                        .{},
+                    },
+                    .plane_count = 1,
                     .y_inverted = false,
                     .force_opaque = false,
                     .retain = NoopSync.retain,

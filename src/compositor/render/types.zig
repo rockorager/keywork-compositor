@@ -358,6 +358,7 @@ pub const Command = union(enum) {
 };
 
 pub const output_calibration_edge_length = 33;
+pub const max_dmabuf_planes = 4;
 
 pub const OutputCalibration = struct {
     identity: u64,
@@ -383,6 +384,8 @@ pub const DmabufFormat = enum(u32) {
     abgr8888 = 0x34324241,
     xbgr8888 = 0x34324258,
     xrgb2101010 = 0x30335258,
+    nv12 = 0x3231564e,
+    p010 = 0x30313050,
 
     pub fn fromFourcc(fourcc: u32) ?DmabufFormat {
         return switch (fourcc) {
@@ -391,6 +394,8 @@ pub const DmabufFormat = enum(u32) {
             @intFromEnum(DmabufFormat.abgr8888) => .abgr8888,
             @intFromEnum(DmabufFormat.xbgr8888) => .xbgr8888,
             @intFromEnum(DmabufFormat.xrgb2101010) => .xrgb2101010,
+            @intFromEnum(DmabufFormat.nv12) => .nv12,
+            @intFromEnum(DmabufFormat.p010) => .p010,
             else => null,
         };
     }
@@ -399,11 +404,56 @@ pub const DmabufFormat = enum(u32) {
         return self == .argb8888 or self == .abgr8888;
     }
 
+    pub fn isPackedRgb(self: DmabufFormat) bool {
+        return switch (self) {
+            .argb8888, .xrgb8888, .abgr8888, .xbgr8888, .xrgb2101010 => true,
+            .nv12, .p010 => false,
+        };
+    }
+
+    pub fn planeCount(self: DmabufFormat) u8 {
+        return switch (self) {
+            .argb8888, .xrgb8888, .abgr8888, .xbgr8888, .xrgb2101010 => 1,
+            .nv12, .p010 => 2,
+        };
+    }
+
+    pub fn planeRowBytes(self: DmabufFormat, plane_index: u8, width: u32) ?u64 {
+        if (plane_index >= self.planeCount()) return null;
+        return switch (self) {
+            .argb8888, .xrgb8888, .abgr8888, .xbgr8888, .xrgb2101010 => @as(u64, width) * @sizeOf(u32),
+            .nv12 => if (plane_index == 0)
+                width
+            else
+                @as(u64, (width + 1) / 2) * 2,
+            .p010 => if (plane_index == 0)
+                @as(u64, width) * 2
+            else
+                @as(u64, (width + 1) / 2) * 4,
+        };
+    }
+
+    pub fn planeHeight(self: DmabufFormat, plane_index: u8, height: u32) ?u32 {
+        if (plane_index >= self.planeCount()) return null;
+        return switch (self) {
+            .argb8888, .xrgb8888, .abgr8888, .xbgr8888, .xrgb2101010 => height,
+            .nv12, .p010 => if (plane_index == 0) height else (height + 1) / 2,
+        };
+    }
+
+    pub fn planeAlignment(self: DmabufFormat) u32 {
+        return switch (self) {
+            .argb8888, .xrgb8888, .abgr8888, .xbgr8888, .xrgb2101010 => @alignOf(u32),
+            .nv12 => 1,
+            .p010 => @alignOf(u16),
+        };
+    }
+
     pub fn opaqueFormat(self: DmabufFormat) DmabufFormat {
         return switch (self) {
             .argb8888 => .xrgb8888,
             .abgr8888 => .xbgr8888,
-            .xrgb8888, .xbgr8888, .xrgb2101010 => self,
+            .xrgb8888, .xbgr8888, .xrgb2101010, .nv12, .p010 => self,
         };
     }
 
@@ -412,6 +462,7 @@ pub const DmabufFormat = enum(u32) {
     }
 
     pub fn toArgb8888(self: DmabufFormat, pixel: u32) u32 {
+        std.debug.assert(self.isPackedRgb());
         if (self == .xrgb2101010) return 0xff00_0000 |
             tenToEight((pixel >> 20) & 0x3ff) << 16 |
             tenToEight((pixel >> 10) & 0x3ff) << 8 |
@@ -422,6 +473,7 @@ pub const DmabufFormat = enum(u32) {
     }
 
     pub fn fromArgb8888(self: DmabufFormat, pixel: u32) u32 {
+        std.debug.assert(self.isPackedRgb());
         if (self == .xrgb2101010) return 0xc000_0000 |
             eightToTen((pixel >> 16) & 0xff) << 20 |
             eightToTen((pixel >> 8) & 0xff) << 10 |
@@ -499,30 +551,39 @@ pub const DirectScanoutCandidate = union(enum) {
     rejected: DirectScanoutRejection,
 };
 
+pub const DmabufPlane = struct {
+    fd: std.posix.fd_t = -1,
+    stride: u32 = 0,
+    offset: u32 = 0,
+    required_bytes: usize = 0,
+};
+
 pub const DmabufSource = struct {
     context: *anyopaque,
-    fd: std.posix.fd_t,
     format: u32,
     modifier: u64,
-    stride: u32,
-    offset: u32,
-    required_bytes: usize,
+    planes: [max_dmabuf_planes]DmabufPlane,
+    plane_count: u8,
     y_inverted: bool,
     force_opaque: bool,
     retain: *const fn (*anyopaque) void,
     release: *const fn (*anyopaque) void,
     begin_cpu_read: *const fn (*anyopaque) bool,
     end_cpu_read: *const fn (*anyopaque) bool,
-    export_read_fence: *const fn (*anyopaque) ?std.posix.fd_t,
+    export_read_fence: *const fn (*anyopaque, u8) ?std.posix.fd_t,
+
+    pub fn planeSlice(self: *const DmabufSource) []const DmabufPlane {
+        std.debug.assert(self.plane_count > 0 and self.plane_count <= max_dmabuf_planes);
+        return self.planes[0..self.plane_count];
+    }
 };
 
 pub const DmabufSourceDescriptor = struct {
     size: Size,
-    fd: std.posix.fd_t,
     format: u32,
     modifier: u64,
-    stride: u32,
-    offset: u32,
+    planes: [max_dmabuf_planes]DmabufPlane,
+    plane_count: u8,
     force_opaque: bool,
 };
 
@@ -628,6 +689,13 @@ test "DMA-BUF formats normalize red-blue order and opacity" {
         @as(u32, 0x80332211),
         DmabufFormat.abgr8888.toArgb8888(0x80112233),
     );
+    try std.testing.expectEqual(@as(u8, 2), DmabufFormat.nv12.planeCount());
+    try std.testing.expectEqual(@as(u64, 5), DmabufFormat.nv12.planeRowBytes(0, 5).?);
+    try std.testing.expectEqual(@as(u64, 6), DmabufFormat.nv12.planeRowBytes(1, 5).?);
+    try std.testing.expectEqual(@as(u32, 3), DmabufFormat.nv12.planeHeight(1, 5).?);
+    try std.testing.expectEqual(@as(u64, 10), DmabufFormat.p010.planeRowBytes(0, 5).?);
+    try std.testing.expectEqual(@as(u64, 12), DmabufFormat.p010.planeRowBytes(1, 5).?);
+    try std.testing.expect(!DmabufFormat.p010.isPackedRgb());
     try std.testing.expectEqual(
         @as(u32, 0xff332211),
         DmabufFormat.xbgr8888.toArgb8888(0x00112233),
