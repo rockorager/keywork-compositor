@@ -153,6 +153,11 @@ const AtomicPlaneProperties = struct {
     }
 };
 
+const AtomicZpos = struct {
+    property_id: u32,
+    value: u64,
+};
+
 const AtomicPlaneDisableProperties = struct {
     fb_id: u32 = 0,
     crtc_id: u32 = 0,
@@ -2260,20 +2265,6 @@ fn queuePageFlip(
     defer c.drmModeAtomicFree(request);
 
     const plane_id = self.primary_plane_id orelse return null;
-    if (!addAtomicProperty(request, plane_id, properties.fb_id, framebuffer_id) or
-        !addAtomicProperty(request, plane_id, properties.crtc_id, self.crtc_id) or
-        !addAtomicProperty(request, plane_id, properties.src_x, 0) or
-        !addAtomicProperty(request, plane_id, properties.src_y, 0) or
-        !addAtomicProperty(request, plane_id, properties.src_w, @as(u64, source_size.width) << 16) or
-        !addAtomicProperty(request, plane_id, properties.src_h, @as(u64, source_size.height) << 16) or
-        !addAtomicProperty(request, plane_id, properties.crtc_x, 0) or
-        !addAtomicProperty(request, plane_id, properties.crtc_y, 0) or
-        !addAtomicProperty(request, plane_id, properties.crtc_w, self.size.width) or
-        !addAtomicProperty(request, plane_id, properties.crtc_h, self.size.height))
-    {
-        return null;
-    }
-
     const fence_fd = if (properties.in_fence_fd != 0 and source != null)
         source.?.export_read_fence(source.?.context, 0)
     else
@@ -2281,11 +2272,17 @@ fn queuePageFlip(
     defer {
         if (fence_fd) |value| _ = std.c.close(value);
     }
-    if (fence_fd) |value| {
-        if (!addAtomicProperty(request, plane_id, properties.in_fence_fd, @bitCast(@as(i64, value)))) {
-            return null;
-        }
-    }
+    if (!addAtomicPlaneState(
+        request,
+        plane_id,
+        properties,
+        framebuffer_id,
+        self.crtc_id,
+        source_size,
+        .{ .x = 0, .y = 0, .width = self.size.width, .height = self.size.height },
+        fence_fd,
+        null,
+    )) return null;
     const color_dirty = self.output_color_dirty;
     if (color_dirty or self.output_color_mode != .sdr) {
         const color_added = self.addOutputColorState(
@@ -2426,6 +2423,54 @@ fn addAtomicProperty(
     return c.drmModeAtomicAddProperty(request, object_id, property_id, value) >= 0;
 }
 
+fn addAtomicPlaneState(
+    request: *c.drmModeAtomicReq,
+    plane_id: u32,
+    properties: AtomicPlaneProperties,
+    framebuffer_id: u32,
+    crtc_id: u32,
+    source_size: render.Size,
+    destination: render.Rect,
+    in_fence_fd: ?std.posix.fd_t,
+    zpos: ?AtomicZpos,
+) bool {
+    std.debug.assert(framebuffer_id != 0 and crtc_id != 0);
+    std.debug.assert(source_size.width > 0 and source_size.height > 0);
+    std.debug.assert(destination.x >= 0 and destination.y >= 0);
+    std.debug.assert(destination.width > 0 and destination.height > 0);
+    if (!addAtomicProperty(request, plane_id, properties.fb_id, framebuffer_id) or
+        !addAtomicProperty(request, plane_id, properties.crtc_id, crtc_id) or
+        !addAtomicProperty(request, plane_id, properties.src_x, 0) or
+        !addAtomicProperty(request, plane_id, properties.src_y, 0) or
+        !addAtomicProperty(request, plane_id, properties.src_w, @as(u64, source_size.width) << 16) or
+        !addAtomicProperty(request, plane_id, properties.src_h, @as(u64, source_size.height) << 16) or
+        !addAtomicProperty(request, plane_id, properties.crtc_x, @intCast(destination.x)) or
+        !addAtomicProperty(request, plane_id, properties.crtc_y, @intCast(destination.y)) or
+        !addAtomicProperty(request, plane_id, properties.crtc_w, destination.width) or
+        !addAtomicProperty(request, plane_id, properties.crtc_h, destination.height))
+    {
+        return false;
+    }
+    if (in_fence_fd) |value| {
+        if (properties.in_fence_fd == 0 or !addAtomicProperty(
+            request,
+            plane_id,
+            properties.in_fence_fd,
+            @bitCast(@as(i64, value)),
+        )) return false;
+    }
+    if (zpos) |value| {
+        if (!addAtomicProperty(request, plane_id, value.property_id, value.value)) return false;
+    }
+    return true;
+}
+
+fn testAtomicRequest(fd: std.posix.fd_t, request: *c.drmModeAtomicReq, allow_modeset: bool) bool {
+    const flags = @as(c_uint, @intCast(c.DRM_MODE_ATOMIC_TEST_ONLY)) |
+        if (allow_modeset) @as(c_uint, @intCast(c.DRM_MODE_ATOMIC_ALLOW_MODESET)) else 0;
+    return c.drmModeAtomicCommit(fd, request, flags, null) == 0;
+}
+
 fn testOutputColorState(
     self: *Self,
     fd: std.posix.fd_t,
@@ -2443,9 +2488,7 @@ fn testOutputColorState(
         return false;
     };
     if (!added) return mode == .sdr;
-    const flags = @as(c_uint, @intCast(c.DRM_MODE_ATOMIC_TEST_ONLY)) |
-        @as(c_uint, @intCast(c.DRM_MODE_ATOMIC_ALLOW_MODESET));
-    if (c.drmModeAtomicCommit(fd, request, flags, null) == 0) return true;
+    if (testAtomicRequest(fd, request, true)) return true;
     log.warn("{t} output color state is unsupported on {s}", .{ mode, self.name() });
     return false;
 }
