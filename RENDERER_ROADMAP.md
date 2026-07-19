@@ -75,8 +75,8 @@ and HDR highlights retain detail under SDR conversion.
 
 - [x] Load per-output power-law matrix ICC profiles and apply them to SDR output
   descriptions.
-- [ ] Load per-output calibration data and LUT profiles.
-- [ ] Compile profile transforms into renderer-owned GPU resources.
+- [x] Load per-output calibration data and LUT profiles.
+- [x] Compile profile transforms into renderer-owned GPU resources.
 - [x] Invalidate retained images and scanout eligibility when profiles change.
 
 Acceptance: matrix/TRC and LUT-based reference profiles match the conformance

@@ -65,7 +65,7 @@ serial_value: [*c]u8,
 color_description: render.ColorDescription,
 native_color_description: render.ColorDescription,
 sdr_color_description: render.ColorDescription,
-icc_profile: ?Icc.Profile,
+icc_profile: ?Icc.OutputProfile,
 icc_profile_path: ?[]u8,
 hdr_capabilities: HdrCapabilities,
 output_color_mode: OutputColorMode,
@@ -364,6 +364,7 @@ pub fn deinit(self: *Self) void {
     std.debug.assert(self.direct_framebuffers.count() == 0);
     self.direct_framebuffers.deinit(self.allocator);
     self.clearIdentity();
+    if (self.icc_profile) |*profile| profile.deinit(self.allocator);
     if (self.icc_profile_path) |path| self.allocator.free(path);
     self.allocator.free(self.gamma_lut);
     self.allocator.free(self.modes);
@@ -435,16 +436,26 @@ pub fn colorDescription(self: *const Self) render.ColorDescription {
     return self.color_description;
 }
 
+pub fn nativeColorDescription(self: *const Self) render.ColorDescription {
+    return self.native_color_description;
+}
+
+pub fn outputCalibration(self: *const Self) ?render.OutputCalibration {
+    if (self.output_color_mode != .sdr) return null;
+    return if (self.icc_profile) |profile| profile.rendererCalibration() else null;
+}
+
 pub fn iccProfilePath(self: *const Self) ?[]const u8 {
     return self.icc_profile_path;
 }
 
 pub fn replaceIccProfile(
     self: *Self,
-    profile: ?Icc.Profile,
+    profile: ?Icc.OutputProfile,
     owned_path: ?[]u8,
 ) void {
     std.debug.assert((profile == null) == (owned_path == null));
+    if (self.icc_profile) |*old| old.deinit(self.allocator);
     if (self.icc_profile_path) |path| self.allocator.free(path);
     self.icc_profile = profile;
     self.icc_profile_path = owned_path;
@@ -3045,10 +3056,10 @@ test "ICC profiles override SDR colorimetry without replacing native display dat
     output.refreshSdrColorDescription();
     output.color_description = output.sdr_color_description;
     const path = try std.testing.allocator.dupe(u8, "/profiles/display.icc");
-    output.replaceIccProfile(.{
+    output.replaceIccProfile(.{ .matrix = .{
         .primaries = render.srgb_chromaticities,
         .transfer_function = .{ .power = 24000 },
-    }, path);
+    } }, path);
 
     try std.testing.expectEqualStrings("/profiles/display.icc", output.iccProfilePath().?);
     try std.testing.expectEqual(render.srgb_chromaticities, output.color_description.primaries);
@@ -3061,6 +3072,25 @@ test "ICC profiles override SDR colorimetry without replacing native display dat
         render.display_p3_chromaticities,
         output.native_color_description.primaries,
     );
+
+    const values = try std.testing.allocator.alloc(
+        [4]f16,
+        Icc.calibration_lut_edge_length * Icc.calibration_lut_edge_length *
+            Icc.calibration_lut_edge_length,
+    );
+    @memset(values, .{ 0, 0, 0, 1 });
+    const calibration_path = try std.testing.allocator.dupe(u8, "/profiles/calibration.icc");
+    output.replaceIccProfile(.{ .calibration = .{
+        .values = values,
+        .identity = 42,
+    } }, calibration_path);
+    try std.testing.expectEqual(
+        render.display_p3_chromaticities,
+        output.color_description.primaries,
+    );
+    try std.testing.expectEqual(@as(u64, 42), output.outputCalibration().?.identity);
+    output.replaceIccProfile(null, null);
+    try std.testing.expect(output.outputCalibration() == null);
 }
 
 test "DRM discovery only accepts primary nodes" {

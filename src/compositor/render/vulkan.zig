@@ -51,6 +51,7 @@ blur_horizontal_pipeline: vk.Pipeline,
 blur_vertical_pipeline: vk.Pipeline,
 blur_composite_pipeline: vk.Pipeline,
 encode_pipeline: vk.Pipeline,
+encode_calibrated_pipeline: vk.Pipeline,
 sampler: vk.Sampler,
 work_buffer: vk.Buffer,
 work_memory: vk.DeviceMemory,
@@ -77,6 +78,7 @@ dmabuf_source_formats: []render.DmabufFormatModifier,
 dmabuf_device_id: ?render.DrmDeviceId,
 outputs: std.AutoHashMapUnmanaged(TargetKey, Output) = .empty,
 textures: std.AutoHashMapUnmanaged(u64, Texture) = .empty,
+calibrations: std.AutoHashMapUnmanaged(u64, CalibrationTexture) = .empty,
 frame_number: u64,
 resource_epoch: u64,
 fallback: CpuRenderer,
@@ -116,6 +118,7 @@ const Output = struct {
     format: vk.Format,
     size: render.Size,
     color_description: render.ColorDescription = .{},
+    calibration_identity: ?u64 = null,
     kind: OutputKind = .pixels,
     initialized: bool = false,
     last_used: u64,
@@ -192,6 +195,21 @@ const PreparedImage = struct {
     cache_id: ?u64,
     desired_version: u64,
     newly_imported: bool = false,
+};
+
+const CalibrationTexture = struct {
+    image: vk.Image,
+    memory: vk.DeviceMemory,
+    view: vk.ImageView,
+    descriptor_set: vk.DescriptorSet,
+    initialized: bool = false,
+    last_used: u64,
+};
+
+const PreparedCalibration = struct {
+    identity: u64,
+    texture: CalibrationTexture,
+    upload_offset: ?usize,
 };
 
 const Instance = extern struct {
@@ -350,12 +368,14 @@ const Graphics = struct {
     blur_vertical_pipeline: vk.Pipeline,
     blur_composite_pipeline: vk.Pipeline,
     encode_pipeline: vk.Pipeline,
+    encode_calibrated_pipeline: vk.Pipeline,
     sampler: vk.Sampler,
 };
 
 const OutputGraphics = struct {
     render_pass: vk.RenderPass,
     encode_pipeline: vk.Pipeline,
+    encode_calibrated_pipeline: vk.Pipeline,
 };
 
 const working_format: vk.Format = .r16g16b16a16_sfloat;
@@ -418,8 +438,8 @@ fn initGraphics(
         .size = @sizeOf(FramePush),
     };
     const pipeline_layout = try wrapper.createPipelineLayout(device, &.{
-        .set_layout_count = 1,
-        .p_set_layouts = @ptrCast(&descriptor_set_layout),
+        .set_layout_count = 2,
+        .p_set_layouts = &.{ descriptor_set_layout, descriptor_set_layout },
         .push_constant_range_count = 1,
         .p_push_constant_ranges = @ptrCast(&push_range),
     }, null);
@@ -524,6 +544,11 @@ fn initGraphics(
         .p_code = &shaders.output_encode,
     }, null);
     defer wrapper.destroyShaderModule(device, encode_shader, null);
+    const encode_calibrated_shader = try wrapper.createShaderModule(device, &.{
+        .code_size = @sizeOf(@TypeOf(shaders.output_encode_calibrated)),
+        .p_code = &shaders.output_encode_calibrated,
+    }, null);
+    defer wrapper.destroyShaderModule(device, encode_calibrated_shader, null);
     const replace_pipeline = createPipeline(
         wrapper,
         device,
@@ -594,6 +619,16 @@ fn initGraphics(
         false,
     );
     errdefer wrapper.destroyPipeline(device, encode_pipeline, null);
+    const encode_calibrated_pipeline = try createPipeline(
+        wrapper,
+        device,
+        output_render_pass,
+        pipeline_layout,
+        vertex_shader,
+        encode_calibrated_shader,
+        false,
+    );
+    errdefer wrapper.destroyPipeline(device, encode_calibrated_pipeline, null);
     const output_10bit: ?OutputGraphics = if (enable_10bit_output) output: {
         var ten_bit_attachment = output_attachment;
         ten_bit_attachment.format = .a2r10g10b10_unorm_pack32;
@@ -613,9 +648,20 @@ fn initGraphics(
             encode_shader,
             false,
         );
+        errdefer wrapper.destroyPipeline(device, ten_bit_pipeline, null);
+        const ten_bit_calibrated_pipeline = try createPipeline(
+            wrapper,
+            device,
+            ten_bit_render_pass,
+            pipeline_layout,
+            vertex_shader,
+            encode_calibrated_shader,
+            false,
+        );
         break :output .{
             .render_pass = ten_bit_render_pass,
             .encode_pipeline = ten_bit_pipeline,
+            .encode_calibrated_pipeline = ten_bit_calibrated_pipeline,
         };
     } else null;
     errdefer if (output_10bit) |output| destroyOutputGraphics(wrapper, device, output);
@@ -636,6 +682,7 @@ fn initGraphics(
         .blur_vertical_pipeline = blur_vertical_pipeline,
         .blur_composite_pipeline = blur_composite_pipeline,
         .encode_pipeline = encode_pipeline,
+        .encode_calibrated_pipeline = encode_calibrated_pipeline,
         .sampler = sampler,
     };
 }
@@ -761,6 +808,7 @@ fn createPipeline(
 
 fn destroyGraphics(wrapper: vk.DeviceWrapper, device: vk.Device, graphics: Graphics) void {
     if (graphics.output_10bit) |output| destroyOutputGraphics(wrapper, device, output);
+    wrapper.destroyPipeline(device, graphics.encode_calibrated_pipeline, null);
     wrapper.destroyPipeline(device, graphics.encode_pipeline, null);
     wrapper.destroyPipeline(device, graphics.blur_composite_pipeline, null);
     wrapper.destroyPipeline(device, graphics.blur_vertical_pipeline, null);
@@ -784,6 +832,7 @@ fn destroyOutputGraphics(
     device: vk.Device,
     graphics: OutputGraphics,
 ) void {
+    wrapper.destroyPipeline(device, graphics.encode_calibrated_pipeline, null);
     wrapper.destroyPipeline(device, graphics.encode_pipeline, null);
     wrapper.destroyRenderPass(device, graphics.render_pass, null);
 }
@@ -1412,6 +1461,7 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
         .blur_vertical_pipeline = graphics.blur_vertical_pipeline,
         .blur_composite_pipeline = graphics.blur_composite_pipeline,
         .encode_pipeline = graphics.encode_pipeline,
+        .encode_calibrated_pipeline = graphics.encode_calibrated_pipeline,
         .sampler = graphics.sampler,
         .work_buffer = .null_handle,
         .work_memory = .null_handle,
@@ -1486,6 +1536,7 @@ pub fn deinit(self: *Self) void {
         .blur_vertical_pipeline = self.blur_vertical_pipeline,
         .blur_composite_pipeline = self.blur_composite_pipeline,
         .encode_pipeline = self.encode_pipeline,
+        .encode_calibrated_pipeline = self.encode_calibrated_pipeline,
         .sampler = self.sampler,
     });
     if (self.scanout_semaphore != .null_handle) {
@@ -1517,6 +1568,7 @@ fn outputGraphics(self: *const Self, format: vk.Format) OutputGraphics {
     if (format == self.format) return .{
         .render_pass = self.output_render_pass,
         .encode_pipeline = self.encode_pipeline,
+        .encode_calibrated_pipeline = self.encode_calibrated_pipeline,
     };
     if (format == .a2r10g10b10_unorm_pack32) return self.output_10bit orelse unreachable;
     unreachable;
@@ -2060,6 +2112,7 @@ fn renderFrameWithCompletion(
     }
 
     var frame_succeeded = false;
+    var new_calibration_identity: ?u64 = null;
     defer if (!frame_succeeded) {
         self.device_wrapper.deviceWaitIdle(self.device) catch {};
         self.fence_pending = false;
@@ -2068,6 +2121,11 @@ fn renderFrameWithCompletion(
         self.resetCommandBufferForTarget(target_key);
         self.invalidateOutput(target_key);
         self.invalidatePreparedTextures(self.prepared_images.items);
+        if (new_calibration_identity) |identity| {
+            if (self.calibrations.fetchRemove(identity)) |removed| {
+                self.destroyCalibrationTexture(removed.value);
+            }
+        }
     };
     var work_size = switch (target) {
         .pixels => std.math.mul(usize, required_pixels, @sizeOf(u32)) catch
@@ -2084,14 +2142,26 @@ fn renderFrameWithCompletion(
         },
         else => {},
     };
+    const prepared_calibration = try self.prepareCalibration(
+        frame.output_calibration,
+        &work_size,
+    );
+    if (prepared_calibration) |prepared| {
+        if (prepared.upload_offset != null) new_calibration_identity = prepared.identity;
+    }
 
     try self.ensureWorkBuffer(work_size);
     const output = try self.getOutput(target_key);
     if (!std.meta.eql(output.size, frame.size)) return error.InvalidTarget;
     output.last_used = self.frame_number;
     var compiled_frame = frame;
+    const calibration_identity = if (frame.output_calibration) |calibration|
+        calibration.identity
+    else
+        null;
     if (output.initialized and
-        !std.meta.eql(output.color_description, frame.output_color_description))
+        (!std.meta.eql(output.color_description, frame.output_color_description) or
+            output.calibration_identity != calibration_identity))
     {
         // The retained image is expressed in the output's linear RGB space.
         // Reusing any of it after the output description changes would mix
@@ -2104,6 +2174,7 @@ fn renderFrameWithCompletion(
         }
     }
     output.color_description = frame.output_color_description;
+    output.calibration_identity = calibration_identity;
     // The retained linear image, rather than the scanout image, is the source
     // of truth for partial redraws. Initialize all of it from the complete
     // scene before accepting damage-limited updates.
@@ -2158,6 +2229,12 @@ fn renderFrameWithCompletion(
         },
         else => {},
     };
+    if (prepared_calibration) |prepared| {
+        if (prepared.upload_offset) |offset| {
+            const bytes = std.mem.sliceAsBytes(frame.output_calibration.?.values);
+            @memcpy(self.work_mapped.?[offset..][0..bytes.len], bytes);
+        }
+    }
 
     std.debug.assert(!self.fence_pending);
     self.device_wrapper.resetFences(self.device, &.{self.fence}) catch
@@ -2190,6 +2267,50 @@ fn renderFrameWithCompletion(
                 self.timestamp_query_pool,
                 timestamp_frame_start,
             );
+        }
+
+        if (prepared_calibration) |prepared| {
+            if (prepared.upload_offset) |offset| {
+                self.transitionImage(
+                    command_buffer,
+                    prepared.texture.image,
+                    .undefined,
+                    .transfer_dst_optimal,
+                    .{},
+                    .{ .transfer_write_bit = true },
+                    .{ .top_of_pipe_bit = true },
+                    .{ .transfer_bit = true },
+                );
+                const upload: vk.BufferImageCopy = .{
+                    .buffer_offset = offset,
+                    .buffer_row_length = 0,
+                    .buffer_image_height = 0,
+                    .image_subresource = colorSubresourceLayers(),
+                    .image_offset = .{ .x = 0, .y = 0, .z = 0 },
+                    .image_extent = .{
+                        .width = render.output_calibration_edge_length,
+                        .height = render.output_calibration_edge_length,
+                        .depth = render.output_calibration_edge_length,
+                    },
+                };
+                self.device_wrapper.cmdCopyBufferToImage(
+                    command_buffer,
+                    self.work_buffer,
+                    prepared.texture.image,
+                    .transfer_dst_optimal,
+                    &.{upload},
+                );
+                self.transitionImage(
+                    command_buffer,
+                    prepared.texture.image,
+                    .transfer_dst_optimal,
+                    .shader_read_only_optimal,
+                    .{ .transfer_write_bit = true },
+                    .{ .shader_read_bit = true },
+                    .{ .transfer_bit = true },
+                    .{ .fragment_shader_bit = true },
+                );
+            }
         }
 
         if (!output.initialized and output.kind == .pixels) {
@@ -2501,12 +2622,34 @@ fn renderFrameWithCompletion(
         self.device_wrapper.cmdBeginRenderPass(command_buffer, &output_pass_info, .@"inline");
         self.setViewportAndScissor(command_buffer, frame.size);
         self.device_wrapper.cmdSetScissor(command_buffer, 0, &.{rect2D(frame_render_area)});
+        const output_graphics = self.outputGraphics(output.format);
         self.device_wrapper.cmdBindPipeline(
             command_buffer,
             .graphics,
-            self.outputGraphics(output.format).encode_pipeline,
+            if (prepared_calibration != null)
+                output_graphics.encode_calibrated_pipeline
+            else
+                output_graphics.encode_pipeline,
         );
-        self.device_wrapper.cmdBindDescriptorSets(command_buffer, .graphics, self.pipeline_layout, 0, &.{output.linear.descriptor_set}, null);
+        if (prepared_calibration) |prepared| {
+            self.device_wrapper.cmdBindDescriptorSets(
+                command_buffer,
+                .graphics,
+                self.pipeline_layout,
+                0,
+                &.{ output.linear.descriptor_set, prepared.texture.descriptor_set },
+                null,
+            );
+        } else {
+            self.device_wrapper.cmdBindDescriptorSets(
+                command_buffer,
+                .graphics,
+                self.pipeline_layout,
+                0,
+                &.{output.linear.descriptor_set},
+                null,
+            );
+        }
         const output_push: FramePush = .{
             .target_size = sizeFloats(frame.size),
             .texture_size = sizeFloats(frame.size),
@@ -2575,13 +2718,23 @@ fn renderFrameWithCompletion(
             );
         }
         self.device_wrapper.endCommandBuffer(command_buffer) catch return error.VulkanFailure;
-        if (reusable) try self.rememberRecordedFrame(
-            &output.recorded_frame,
-            output.initialized,
-            output.blur_initialized,
-            frame_render_area,
-            self.prepared_images.items,
-        );
+        if (reusable) {
+            const uploaded_calibration = if (prepared_calibration) |prepared|
+                prepared.upload_offset != null
+            else
+                false;
+            if (uploaded_calibration) {
+                // The staging offset belongs to this frame and cannot be
+                // replayed safely after the mapped work buffer is reused.
+                output.recorded_frame.valid = false;
+            } else try self.rememberRecordedFrame(
+                &output.recorded_frame,
+                output.initialized,
+                output.blur_initialized,
+                frame_render_area,
+                self.prepared_images.items,
+            );
+        }
     }
 
     var wait_stages: std.ArrayList(vk.PipelineStageFlags) = .empty;
@@ -2659,6 +2812,9 @@ fn renderFrameWithCompletion(
     }
     temporary_textures_pending = true;
     output.initialized = true;
+    if (new_calibration_identity) |identity| {
+        self.calibrations.getPtr(identity).?.initialized = true;
+    }
     if (self.blur_ops.items.len != 0) output.blur_initialized = blur_initialized;
     for (self.blur_ops.items) |blur_op| {
         if (blur_op.cache_hit) continue;
@@ -3316,6 +3472,61 @@ fn createImageForFormat(
     return .{ .image = image, .memory = memory, .view = view };
 }
 
+fn createCalibrationTexture(self: *Self, edge_length: u32) Error!CalibrationTexture {
+    const image = self.device_wrapper.createImage(self.device, &.{
+        .image_type = .@"3d",
+        .format = working_format,
+        .extent = .{ .width = edge_length, .height = edge_length, .depth = edge_length },
+        .mip_levels = 1,
+        .array_layers = 1,
+        .samples = .{ .@"1_bit" = true },
+        .tiling = .optimal,
+        .usage = .{ .transfer_dst_bit = true, .sampled_bit = true },
+        .sharing_mode = .exclusive,
+        .initial_layout = .undefined,
+    }, null) catch return error.VulkanFailure;
+    errdefer self.device_wrapper.destroyImage(self.device, image, null);
+    const requirements = self.device_wrapper.getImageMemoryRequirements(self.device, image);
+    const memory_type = self.deviceMemoryType(requirements.memory_type_bits) orelse
+        return error.VulkanFailure;
+    const memory = self.device_wrapper.allocateMemory(self.device, &.{
+        .allocation_size = requirements.size,
+        .memory_type_index = memory_type,
+    }, null) catch |err| switch (err) {
+        error.OutOfHostMemory => return error.OutOfMemory,
+        else => return error.VulkanFailure,
+    };
+    errdefer self.device_wrapper.freeMemory(self.device, memory, null);
+    self.device_wrapper.bindImageMemory(self.device, image, memory, 0) catch
+        return error.VulkanFailure;
+    const view = self.device_wrapper.createImageView(self.device, &.{
+        .image = image,
+        .view_type = .@"3d",
+        .format = working_format,
+        .components = .{ .r = .identity, .g = .identity, .b = .identity, .a = .identity },
+        .subresource_range = colorSubresourceRange(),
+    }, null) catch return error.VulkanFailure;
+    errdefer self.device_wrapper.destroyImageView(self.device, view, null);
+    const descriptor_set = try self.createImageDescriptor(view);
+    return .{
+        .image = image,
+        .memory = memory,
+        .view = view,
+        .descriptor_set = descriptor_set,
+        .last_used = self.frame_number,
+    };
+}
+
+fn destroyCalibrationTexture(self: *Self, texture: CalibrationTexture) void {
+    self.advanceResourceEpoch();
+    self.destroyImageDescriptor(texture.descriptor_set);
+    self.destroyImageAllocation(.{
+        .image = texture.image,
+        .memory = texture.memory,
+        .view = texture.view,
+    });
+}
+
 fn createWorkingTarget(self: *Self, size: render.Size) Error!WorkingImage {
     const allocation = try self.createWorkingImage(size, .{
         .color_attachment_bit = true,
@@ -3626,6 +3837,40 @@ fn reserveWork(work_size: *usize, byte_size: usize) Error!usize {
     return aligned;
 }
 
+fn prepareCalibration(
+    self: *Self,
+    calibration: ?render.OutputCalibration,
+    work_size: *usize,
+) Error!?PreparedCalibration {
+    const value = calibration orelse return null;
+    const edge = render.output_calibration_edge_length;
+    if (value.edge_length != edge or value.values.len != edge * edge * edge) {
+        return error.InvalidTarget;
+    }
+    if (self.calibrations.getPtr(value.identity)) |texture| {
+        std.debug.assert(texture.initialized);
+        texture.last_used = self.frame_number;
+        return .{
+            .identity = value.identity,
+            .texture = texture.*,
+            .upload_offset = null,
+        };
+    }
+
+    work_size.* = std.mem.alignForward(usize, work_size.*, @sizeOf([4]f16));
+    const upload_offset = try reserveWork(work_size, std.mem.sliceAsBytes(value.values).len);
+    const texture = try self.createCalibrationTexture(value.edge_length);
+    errdefer self.destroyCalibrationTexture(texture);
+    self.calibrations.put(self.allocator, value.identity, texture) catch
+        return error.OutOfMemory;
+    self.advanceResourceEpoch();
+    return .{
+        .identity = value.identity,
+        .texture = texture,
+        .upload_offset = upload_offset,
+    };
+}
+
 fn createTexture(self: *Self, size: render.Size) Error!Texture {
     const allocation = try self.createImage(size, .{
         .transfer_dst_bit = true,
@@ -3839,6 +4084,18 @@ fn reclaimStaleResources(self: *Self) void {
         self.destroyTexture(self.textures.fetchRemove(id).?.value);
     }
     while (true) {
+        var stale: ?u64 = null;
+        var iterator = self.calibrations.iterator();
+        while (iterator.next()) |entry| {
+            if (entry.value_ptr.last_used < oldest) {
+                stale = entry.key_ptr.*;
+                break;
+            }
+        }
+        const identity = stale orelse break;
+        self.destroyCalibrationTexture(self.calibrations.fetchRemove(identity).?.value);
+    }
+    while (true) {
         var stale: ?TargetKey = null;
         var iterator = self.outputs.iterator();
         while (iterator.next()) |entry| {
@@ -3859,6 +4116,11 @@ fn destroyCachedResources(self: *Self) void {
     var texture_iterator = self.textures.valueIterator();
     while (texture_iterator.next()) |texture| self.destroyTexture(texture.*);
     self.textures.deinit(self.allocator);
+    var calibration_iterator = self.calibrations.valueIterator();
+    while (calibration_iterator.next()) |calibration| {
+        self.destroyCalibrationTexture(calibration.*);
+    }
+    self.calibrations.deinit(self.allocator);
 }
 
 fn invalidatePreparedTextures(self: *Self, prepared_images: []const PreparedImage) void {
@@ -5784,6 +6046,57 @@ test "Vulkan renderer clears and clips solid rectangles" {
     try std.testing.expectEqual(@as(u32, 0xff141e28), pixels[6]);
     try std.testing.expectEqual(@as(u32, 0xff010203), pixels[7]);
     try std.testing.expectEqual(@as(u32, 0xff141e28), pixels[10]);
+}
+
+test "Vulkan renderer applies a three-dimensional output calibration LUT" {
+    var renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
+        error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+
+    var values: [33 * 33 * 33][4]f16 = undefined;
+    for (0..33) |blue| for (0..33) |green| for (0..33) |red| {
+        const scale: f32 = 1.0 / 32.0;
+        values[(blue * 33 + green) * 33 + red] = .{
+            @floatCast(@as(f32, @floatFromInt(blue)) * scale),
+            @floatCast(@as(f32, @floatFromInt(red)) * scale),
+            @floatCast(@as(f32, @floatFromInt(green)) * scale),
+            1,
+        };
+    };
+    var source = [_]u32{0xff800000};
+    var pixel = [_]u32{0};
+    const commands = [_]render.Command{.{ .image = .{
+        .x = 0,
+        .y = 0,
+        .size = .{ .width = 1, .height = 1 },
+        .buffer = .{
+            .size = .{ .width = 1, .height = 1 },
+            .stride_pixels = 1,
+            .pixels = &source,
+            .color_description = .{
+                .transfer_function = .{ .power = 10000 },
+                .min_luminance = 0,
+            },
+        },
+        .is_opaque = true,
+    } }};
+    try renderer.renderFrame(.{
+        .size = .{ .width = 1, .height = 1 },
+        .commands = &commands,
+        .output_calibration = .{
+            .identity = 42,
+            .edge_length = 33,
+            .values = &values,
+        },
+    }, .{ .pixels = .{
+        .size = .{ .width = 1, .height = 1 },
+        .stride_pixels = 1,
+        .pixels = &pixel,
+    } });
+
+    try expectArgbNear(0xff008000, pixel[0], 1);
 }
 
 test "Vulkan renderer applies ordered backdrop blurs on GPU" {

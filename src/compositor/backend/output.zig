@@ -107,6 +107,13 @@ pub fn colorDescription(self: *const Self) render.ColorDescription {
     };
 }
 
+pub fn outputCalibration(self: *const Self) ?render.OutputCalibration {
+    return switch (self.backend) {
+        .drm => |output| output.outputCalibration(),
+        .headless, .nested => null,
+    };
+}
+
 pub fn hdrOutputDescription(
     self: *const Self,
     transfer: render.TransferFunction,

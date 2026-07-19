@@ -357,6 +357,14 @@ pub const Command = union(enum) {
     image: Image,
 };
 
+pub const output_calibration_edge_length = 33;
+
+pub const OutputCalibration = struct {
+    identity: u64,
+    edge_length: u32,
+    values: []const [4]f16,
+};
+
 pub const Frame = struct {
     size: Size,
     commands: []const Command,
@@ -366,6 +374,7 @@ pub const Frame = struct {
     /// Global logical coordinate rendered at the target's top-left corner.
     origin: Position = .{},
     output_color_description: ColorDescription = .{},
+    output_calibration: ?OutputCalibration = null,
 };
 
 pub const DmabufFormat = enum(u32) {

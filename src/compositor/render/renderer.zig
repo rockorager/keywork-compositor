@@ -37,6 +37,7 @@ pub const Renderer = struct {
         scale: render_types.Scale,
         origin: render_types.Position,
         color_description: render_types.ColorDescription,
+        output_calibration: ?render_types.OutputCalibration = null,
     };
 
     pub fn init(allocator: std.mem.Allocator, kind: Kind) VulkanRenderer.InitError!Renderer {
@@ -191,6 +192,7 @@ pub const Renderer = struct {
             .commands = self.commands.items,
             .damage = active.damage,
             .output_color_description = active.color_description,
+            .output_calibration = active.output_calibration,
         }, active.target);
     }
 
@@ -209,6 +211,7 @@ pub const Renderer = struct {
             .commands = self.commands.items,
             .damage = active.damage,
             .output_color_description = active.color_description,
+            .output_calibration = active.output_calibration,
         };
         return switch (self.backend) {
             .cpu => |*renderer| switch (active.target) {
@@ -269,6 +272,7 @@ pub const Renderer = struct {
         if (!std.meta.eql(image.buffer.color_description, active.color_description)) {
             return .{ .rejected = .color_conversion };
         }
+        if (active.output_calibration != null) return .{ .rejected = .color_conversion };
         return .{ .candidate = image.buffer };
     }
 
@@ -292,6 +296,14 @@ pub const Renderer = struct {
     ) void {
         const active = if (self.active_frame) |*frame| frame else unreachable;
         active.color_description = description;
+    }
+
+    pub fn setOutputCalibration(
+        self: *Renderer,
+        calibration: ?render_types.OutputCalibration,
+    ) void {
+        const active = if (self.active_frame) |*frame| frame else unreachable;
+        active.output_calibration = calibration;
     }
 
     pub fn cancelFrame(self: *Renderer) void {
@@ -695,6 +707,16 @@ test "direct scanout candidate requires a final exact opaque DMA-BUF image" {
     try renderer.beginFrame(target, .{}, .{}, null, p3);
     try renderer.append(&matching_color_commands);
     try expectDirectScanoutCandidate(renderer.directScanoutCandidate());
+    renderer.cancelFrame();
+
+    try renderer.beginFrame(target, .{}, .{}, null, p3);
+    renderer.setOutputCalibration(.{
+        .identity = 1,
+        .edge_length = 33,
+        .values = &.{},
+    });
+    try renderer.append(&matching_color_commands);
+    try expectDirectScanoutRejection(.color_conversion, renderer.directScanoutCandidate());
     renderer.cancelFrame();
 
     const covered_commands = [_]render_types.Command{

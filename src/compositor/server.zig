@@ -220,6 +220,7 @@ const RenderOutput = struct {
     backend: OutputBackend,
     protocol_id: OutputLayout.Id,
     color_description: render.ColorDescription,
+    output_calibration: ?render.OutputCalibration,
     timer: ?*wl.EventSource,
     repaint_idle: ?*wl.EventSource,
     damage: Region,
@@ -821,7 +822,7 @@ const EffectiveOutputSettings = struct {
 
 const PreparedIccProfile = struct {
     output: *DrmOutput,
-    profile: ?Icc.Profile,
+    profile: ?Icc.OutputProfile,
     owned_path: ?[]u8,
 };
 
@@ -1782,6 +1783,7 @@ fn addRenderOutput(
         .backend = undefined,
         .protocol_id = undefined,
         .color_description = .{},
+        .output_calibration = null,
         .timer = null,
         .repaint_idle = null,
         .damage = Region.init(),
@@ -1810,6 +1812,7 @@ fn addRenderOutput(
     errdefer render_output.backend.deinit();
     if (self.renderer.supportsColorManagement()) {
         render_output.color_description = render_output.backend.colorDescription();
+        render_output.output_calibration = render_output.backend.outputCalibration();
     }
     const color_identity = try self.color_management.identityForDescription(
         render_output.color_description,
@@ -2486,7 +2489,8 @@ fn applyConfiguredOutputs(self: *Self, rules: []const Config.OutputRule, only: ?
     defer changes.deinit(self.allocator);
     var profiles: std.ArrayList(PreparedIccProfile) = .empty;
     defer {
-        for (profiles.items) |profile| {
+        for (profiles.items) |*profile| {
+            if (profile.profile) |*value| value.deinit(self.allocator);
             if (profile.owned_path) |path| self.allocator.free(path);
         }
         profiles.deinit(self.allocator);
@@ -2497,8 +2501,12 @@ fn applyConfiguredOutputs(self: *Self, rules: []const Config.OutputRule, only: ?
         const requested = configuredOutputIccProfile(output, rules) orelse continue;
         const path = requestedIccProfilePath(requested);
         if (path == null and output.iccProfilePath() == null) continue;
-        const profile = if (path) |value|
-            Icc.load(self.allocator, value) catch |err| {
+        var profile = if (path) |value|
+            Icc.loadOutputProfile(
+                self.allocator,
+                value,
+                output.nativeColorDescription().primaries,
+            ) catch |err| {
                 log.warn("failed to load ICC profile for {s} from {s}: {t}", .{
                     output.name(),
                     value,
@@ -2508,15 +2516,16 @@ fn applyConfiguredOutputs(self: *Self, rules: []const Config.OutputRule, only: ?
             }
         else
             null;
-        const owned_path = if (path) |value| try self.allocator.dupe(u8, value) else null;
-        profiles.append(self.allocator, .{
+        errdefer if (profile) |*value| value.deinit(self.allocator);
+        var owned_path = if (path) |value| try self.allocator.dupe(u8, value) else null;
+        errdefer if (owned_path) |value| self.allocator.free(value);
+        try profiles.append(self.allocator, .{
             .output = output,
             .profile = profile,
             .owned_path = owned_path,
-        }) catch |err| {
-            if (owned_path) |value| self.allocator.free(value);
-            return err;
-        };
+        });
+        profile = null;
+        owned_path = null;
     }
     if (changes.items.len != 0) {
         if (!self.applyOutputChanges(changes.items)) return error.OutputConfigurationFailed;
@@ -2528,6 +2537,7 @@ fn applyConfiguredOutputs(self: *Self, rules: []const Config.OutputRule, only: ?
         const path = prepared.owned_path;
         prepared.owned_path = null;
         prepared.output.replaceIccProfile(prepared.profile, path);
+        prepared.profile = null;
         if (self.findDrmRenderOutput(prepared.output)) |render_output| {
             try self.refreshRenderOutputColorDescription(render_output.output);
         }
@@ -2643,12 +2653,25 @@ fn refreshRenderOutputColorDescription(
 ) !void {
     if (!self.renderer.supportsColorManagement()) return;
     const description = render_output.backend.colorDescription();
-    if (std.meta.eql(description, render_output.color_description)) return;
-    const identity = try self.color_management.identityForDescription(description);
+    const calibration = render_output.backend.outputCalibration();
+    const description_changed = !std.meta.eql(description, render_output.color_description);
+    const calibration_changed = calibrationIdentity(calibration) !=
+        calibrationIdentity(render_output.output_calibration);
+    // A same-content profile reload preserves identity but replaces the
+    // backend-owned value storage referenced by this snapshot.
+    render_output.output_calibration = calibration;
+    if (!description_changed and !calibration_changed) return;
+    if (description_changed) {
+        const identity = try self.color_management.identityForDescription(description);
+        const output = self.outputs.get(render_output.protocol_id) orelse unreachable;
+        self.color_management.updateOutputColorDescription(output, description, identity);
+    }
     render_output.color_description = description;
-    const output = self.outputs.get(render_output.protocol_id) orelse unreachable;
-    self.color_management.updateOutputColorDescription(output, description, identity);
     self.damageFullOutput(render_output);
+}
+
+fn calibrationIdentity(calibration: ?render.OutputCalibration) ?u64 {
+    return if (calibration) |value| value.identity else null;
 }
 
 fn drmDeviceDeactivating(context: *anyopaque) void {
@@ -6650,6 +6673,7 @@ fn selectFrameOutputColorDescription(
     _ = render_output.backend.selectOutputTransfer(transfer);
     try self.refreshRenderOutputColorDescription(render_output);
     self.renderer.setOutputColorDescription(render_output.color_description);
+    self.renderer.setOutputCalibration(render_output.output_calibration);
 }
 
 fn renderDesktopContents(

@@ -20,7 +20,7 @@ pub const Profile = struct {
     }
 };
 
-pub const calibration_lut_edge_length = 33;
+pub const calibration_lut_edge_length = render.output_calibration_edge_length;
 
 /// A complete linear-light output transform, including any VCGT calibration,
 /// sampled for direct upload to a three-dimensional GPU texture.
@@ -39,6 +39,41 @@ pub const CalibrationLut = struct {
         std.debug.assert(blue < calibration_lut_edge_length);
         return self.values[lutIndex(red, green, blue)];
     }
+
+    pub fn rendererCalibration(self: CalibrationLut) render.OutputCalibration {
+        return .{
+            .identity = self.identity,
+            .edge_length = calibration_lut_edge_length,
+            .values = self.values,
+        };
+    }
+};
+
+pub const OutputProfile = union(enum) {
+    matrix: Profile,
+    calibration: CalibrationLut,
+
+    pub fn deinit(self: *OutputProfile, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .matrix => {},
+            .calibration => |*lut| lut.deinit(allocator),
+        }
+        self.* = undefined;
+    }
+
+    pub fn applyTo(self: OutputProfile, base: render.ColorDescription) render.ColorDescription {
+        return switch (self) {
+            .matrix => |profile| profile.applyTo(base),
+            .calibration => base,
+        };
+    }
+
+    pub fn rendererCalibration(self: OutputProfile) ?render.OutputCalibration {
+        return switch (self) {
+            .matrix => null,
+            .calibration => |lut| lut.rendererCalibration(),
+        };
+    }
 };
 
 pub fn load(allocator: std.mem.Allocator, path: []const u8) !Profile {
@@ -48,6 +83,33 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !Profile {
         return error.InvalidIccProfile;
     defer _ = c.cmsCloseProfile(profile);
     return parse(profile);
+}
+
+pub fn loadOutputProfile(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    linear_primaries: render.Chromaticities,
+) !OutputProfile {
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    const profile = c.cmsOpenProfileFromFile(path_z.ptr, "r") orelse
+        return error.InvalidIccProfile;
+    defer _ = c.cmsCloseProfile(profile);
+    return outputProfile(allocator, profile, linear_primaries);
+}
+
+fn outputProfile(
+    allocator: std.mem.Allocator,
+    profile: c.cmsHPROFILE,
+    linear_primaries: render.Chromaticities,
+) !OutputProfile {
+    const matrix = parse(profile) catch |err| switch (err) {
+        error.UnsupportedIccProfile => return .{
+            .calibration = try compileCalibrationLut(allocator, profile, linear_primaries),
+        },
+        else => return err,
+    };
+    return .{ .matrix = matrix };
 }
 
 pub fn loadCalibrationLut(
@@ -365,6 +427,13 @@ test "ICC matrix profiles expose primaries and a shared transfer curve" {
     defer _ = c.cmsCloseProfile(profile);
 
     const parsed = try parse(profile);
+    var selected = try outputProfile(
+        std.testing.allocator,
+        profile,
+        render.srgb_chromaticities,
+    );
+    defer selected.deinit(std.testing.allocator);
+    try std.testing.expect(selected == .matrix);
     try std.testing.expectEqual(render.TransferFunction{ .power = 24000 }, parsed.transfer_function);
     try expectNear(640000, parsed.primaries.red_x, 100);
     try expectNear(330000, parsed.primaries.red_y, 100);
@@ -427,12 +496,14 @@ test "ICC output LUT includes transfer and VCGT calibration curves" {
     };
     try std.testing.expect(c.cmsWriteTag(profile, c.cmsSigVcgtTag, &calibration_curves) != 0);
 
-    var calibrated = try compileCalibrationLut(
+    var selected = try outputProfile(
         std.testing.allocator,
         profile,
         render.srgb_chromaticities,
     );
-    defer calibrated.deinit(std.testing.allocator);
+    defer selected.deinit(std.testing.allocator);
+    try std.testing.expect(selected == .calibration);
+    const calibrated = selected.calibration;
 
     const before = uncalibrated.value(24, 8, 16);
     const after = calibrated.value(24, 8, 16);
@@ -471,12 +542,14 @@ test "ICC CLUT display profiles compile into output LUTs" {
         c.LCMS_USED_AS_OUTPUT,
     ) != 0);
 
-    var lut = try compileCalibrationLut(
+    var selected = try outputProfile(
         std.testing.allocator,
         profile,
         render.srgb_chromaticities,
     );
-    defer lut.deinit(std.testing.allocator);
+    defer selected.deinit(std.testing.allocator);
+    try std.testing.expect(selected == .calibration);
+    const lut = selected.calibration;
     try expectLutValue(lut, 16, 16, 16, .{ 0.5, 0.5, 0.5 }, 0.01);
     try expectLutValue(lut, 32, 0, 0, .{ 1, 0, 0 }, 0.01);
 }
