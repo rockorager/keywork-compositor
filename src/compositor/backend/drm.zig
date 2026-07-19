@@ -49,6 +49,7 @@ connector_id: u32,
 crtc_id: u32,
 primary_plane_id: ?u32,
 atomic_plane: ?AtomicPlaneProperties,
+atomic_color: ?AtomicColorProperties,
 gamma_size: u32,
 gamma_lut: []u16,
 scanout_formats: []render.DmabufFormatModifier,
@@ -147,6 +148,35 @@ const AtomicPlaneDisableProperties = struct {
     }
 };
 
+const AtomicConnectorColorProperties = struct {
+    colorspace: u32 = 0,
+    default_colorspace: ?u64 = null,
+    bt2020_rgb: ?u64 = null,
+    current_colorspace: u64 = 0,
+    hdr_output_metadata: u32 = 0,
+    current_hdr_output_metadata: u64 = 0,
+    max_bpc: u32 = 0,
+    min_bpc: u64 = 0,
+    max_bpc_limit: u64 = 0,
+    current_max_bpc: u64 = 0,
+};
+
+const AtomicCrtcColorProperties = struct {
+    degamma_lut: u32 = 0,
+    degamma_lut_size: u32 = 0,
+    current_degamma_lut: u64 = 0,
+    ctm: u32 = 0,
+    current_ctm: u64 = 0,
+    gamma_lut: u32 = 0,
+    gamma_lut_size: u32 = 0,
+    current_gamma_lut: u64 = 0,
+};
+
+const AtomicColorProperties = struct {
+    connector: AtomicConnectorColorProperties,
+    crtc: AtomicCrtcColorProperties,
+};
+
 pub const DirectScanoutResult = union(enum) {
     accepted,
     rejected: render.DirectScanoutRejection,
@@ -232,6 +262,7 @@ pub fn init(
         .crtc_id = 0,
         .primary_plane_id = null,
         .atomic_plane = null,
+        .atomic_color = null,
         .gamma_size = 0,
         .gamma_lut = &.{},
         .scanout_formats = &.{},
@@ -595,11 +626,16 @@ pub fn activate(self: *Self, fd: std.posix.fd_t, selection: Selection, device_pa
     self.connector_id = selection.connector_id;
     self.crtc_id = selection.crtc_id;
     self.primary_plane_id = selection.primary_plane_id;
-    self.atomic_plane = if (self.device_access.atomic(self.device_access.context))
+    const atomic = self.device_access.atomic(self.device_access.context);
+    self.atomic_plane = if (atomic)
         loadAtomicPlaneProperties(fd, self.primary_plane_id orelse 0)
     else
         null;
-    if (self.device_access.atomic(self.device_access.context) and self.atomic_plane == null) {
+    self.atomic_color = if (atomic)
+        loadAtomicColorProperties(fd, self.connector_id, self.crtc_id)
+    else
+        null;
+    if (atomic and self.atomic_plane == null) {
         log.warn("primary plane lacks required atomic properties; using legacy frame commits", .{});
     }
     self.async_page_flip_supported = supportsAsyncPageFlips(fd, self.atomic_plane != null);
@@ -823,6 +859,7 @@ pub fn disconnect(self: *Self, fd: std.posix.fd_t) void {
 fn release(self: *Self, fd: std.posix.fd_t) void {
     self.mode_set = false;
     self.atomic_plane = null;
+    self.atomic_color = null;
     self.async_page_flip_supported = false;
     self.acquired = null;
     self.pending = null;
@@ -1869,6 +1906,108 @@ fn loadAtomicPlaneProperties(fd: std.posix.fd_t, plane_id: u32) ?AtomicPlaneProp
         }
     }
     return if (result.complete()) result else null;
+}
+
+fn loadAtomicColorProperties(
+    fd: std.posix.fd_t,
+    connector_id: u32,
+    crtc_id: u32,
+) AtomicColorProperties {
+    return .{
+        .connector = loadAtomicConnectorColorProperties(fd, connector_id),
+        .crtc = loadAtomicCrtcColorProperties(fd, crtc_id),
+    };
+}
+
+fn loadAtomicConnectorColorProperties(
+    fd: std.posix.fd_t,
+    connector_id: u32,
+) AtomicConnectorColorProperties {
+    const properties = c.drmModeObjectGetProperties(
+        fd,
+        connector_id,
+        c.DRM_MODE_OBJECT_CONNECTOR,
+    ) orelse return .{};
+    defer c.drmModeFreeObjectProperties(properties);
+
+    var result: AtomicConnectorColorProperties = .{};
+    const property_count: usize = @intCast(properties.*.count_props);
+    for (0..property_count) |index| {
+        const property_id = properties.*.props[index];
+        const property = c.drmModeGetProperty(fd, property_id) orelse continue;
+        defer c.drmModeFreeProperty(property);
+        const property_name = std.mem.sliceTo(property.*.name[0..], 0);
+        const current_value = properties.*.prop_values[index];
+        if (std.mem.eql(u8, property_name, "Colorspace")) {
+            result.colorspace = property_id;
+            result.default_colorspace = propertyEnumValue(property, "Default");
+            result.bt2020_rgb = propertyEnumValue(property, "BT2020_RGB");
+            result.current_colorspace = current_value;
+        } else if (std.mem.eql(u8, property_name, "HDR_OUTPUT_METADATA")) {
+            result.hdr_output_metadata = property_id;
+            result.current_hdr_output_metadata = current_value;
+        } else if (std.mem.eql(u8, property_name, "max bpc")) {
+            result.max_bpc = property_id;
+            result.current_max_bpc = current_value;
+            if (property.*.count_values >= 2 and property.*.values != null) {
+                result.min_bpc = property.*.values[0];
+                result.max_bpc_limit = property.*.values[1];
+            }
+        }
+    }
+    return result;
+}
+
+fn loadAtomicCrtcColorProperties(
+    fd: std.posix.fd_t,
+    crtc_id: u32,
+) AtomicCrtcColorProperties {
+    const properties = c.drmModeObjectGetProperties(
+        fd,
+        crtc_id,
+        c.DRM_MODE_OBJECT_CRTC,
+    ) orelse return .{};
+    defer c.drmModeFreeObjectProperties(properties);
+
+    var result: AtomicCrtcColorProperties = .{};
+    const property_count: usize = @intCast(properties.*.count_props);
+    for (0..property_count) |index| {
+        const property_id = properties.*.props[index];
+        const property = c.drmModeGetProperty(fd, property_id) orelse continue;
+        defer c.drmModeFreeProperty(property);
+        const property_name = std.mem.sliceTo(property.*.name[0..], 0);
+        const current_value = properties.*.prop_values[index];
+        if (std.mem.eql(u8, property_name, "DEGAMMA_LUT")) {
+            result.degamma_lut = property_id;
+            result.current_degamma_lut = current_value;
+        } else if (std.mem.eql(u8, property_name, "DEGAMMA_LUT_SIZE")) {
+            result.degamma_lut_size = boundedU32(current_value);
+        } else if (std.mem.eql(u8, property_name, "CTM")) {
+            result.ctm = property_id;
+            result.current_ctm = current_value;
+        } else if (std.mem.eql(u8, property_name, "GAMMA_LUT")) {
+            result.gamma_lut = property_id;
+            result.current_gamma_lut = current_value;
+        } else if (std.mem.eql(u8, property_name, "GAMMA_LUT_SIZE")) {
+            result.gamma_lut_size = boundedU32(current_value);
+        }
+    }
+    return result;
+}
+
+fn propertyEnumValue(property: *const c.drmModePropertyRes, enum_name: []const u8) ?u64 {
+    const enum_count: usize = @intCast(@max(property.count_enums, 0));
+    if (enum_count == 0 or property.enums == null) return null;
+    for (property.enums[0..enum_count]) |candidate| {
+        if (std.mem.eql(u8, std.mem.sliceTo(candidate.name[0..], 0), enum_name)) {
+            return candidate.value;
+        }
+    }
+    return null;
+}
+
+fn boundedU32(value: u64) u32 {
+    return @intCast(@min(value, std.math.maxInt(u32)));
 }
 
 fn makeDirectFramebufferRoom(self: *Self, fd: std.posix.fd_t) !void {
