@@ -65,7 +65,7 @@ with the intended primaries, transfer function, luminance metadata, and no
 - [x] Replace channel-wise clipping with hue-preserving luminance tone mapping.
 - [x] Add luminance-preserving soft gamut compression for wide-gamut content on
   narrower outputs.
-- Keep source and output reference luminance explicit throughout the pipeline.
+- [x] Keep source and output reference luminance explicit throughout the pipeline.
 
 Acceptance: reference ramps remain monotonic, neutral colors remain neutral,
 out-of-gamut colors approach the target boundary without hard channel clips,

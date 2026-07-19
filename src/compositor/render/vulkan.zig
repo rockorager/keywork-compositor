@@ -6270,6 +6270,63 @@ test "Vulkan renderer preserves HDR hue above the output peak" {
     try std.testing.expect(@as(u16, red) > @as(u16, blue) + 40);
 }
 
+test "Vulkan renderer keeps source and output reference luminance distinct" {
+    var renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
+        error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+
+    const source_size: render.Size = .{ .width = 1, .height = 1 };
+    var source_pixels = [_]u32{0xffffffff};
+    var target_pixels = [_]u32{0} ** 2;
+    const commands = [_]render.Command{
+        .{ .image = .{
+            .x = 0,
+            .y = 0,
+            .size = source_size,
+            .buffer = .{
+                .size = source_size,
+                .stride_pixels = 1,
+                .pixels = &source_pixels,
+                .color_description = .{
+                    .max_luminance = 100,
+                    .reference_luminance = 100,
+                },
+            },
+        } },
+        .{ .image = .{
+            .x = 1,
+            .y = 0,
+            .size = source_size,
+            .buffer = .{
+                .size = source_size,
+                .stride_pixels = 1,
+                .pixels = &source_pixels,
+                .color_description = .{
+                    .max_luminance = 100,
+                    .reference_luminance = 50,
+                },
+            },
+        } },
+    };
+    try renderer.renderFrame(.{
+        .size = .{ .width = 2, .height = 1 },
+        .commands = &commands,
+        .output_color_description = .{
+            .max_luminance = 400,
+            .reference_luminance = 200,
+        },
+    }, .{ .pixels = .{
+        .size = .{ .width = 2, .height = 1 },
+        .stride_pixels = 2,
+        .pixels = &target_pixels,
+    } });
+
+    try expectArgbNear(0xffbababa, target_pixels[0], 2);
+    try expectArgbNear(0xffffffff, target_pixels[1], 1);
+}
+
 test "Vulkan renderer preserves image orientation and source rectangles" {
     var renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
         error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
