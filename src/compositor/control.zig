@@ -687,6 +687,8 @@ const Recorder = struct {
                 .framebuffer_import_failed = 0,
                 .page_flip_failed = 0,
             },
+            .cpu_uploads = 4,
+            .dmabuf_imports = 6,
             .frames_over_budget = 1,
             .gpu_execution = latency,
             .gpu_composition = latency,

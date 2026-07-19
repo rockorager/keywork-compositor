@@ -48,6 +48,8 @@ pub const OutputStatistics = struct {
     direct_scanout_candidates: i64,
     direct_scanout_frames: i64,
     direct_scanout_rejections: DirectScanoutRejections,
+    cpu_uploads: i64,
+    dmabuf_imports: i64,
     frames_over_budget: i64,
     gpu_execution: LatencyStatistics,
     gpu_composition: LatencyStatistics,

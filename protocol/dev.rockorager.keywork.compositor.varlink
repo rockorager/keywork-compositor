@@ -53,6 +53,8 @@ type OutputStatistics (
     direct_scanout_candidates: int,
     direct_scanout_frames: int,
     direct_scanout_rejections: DirectScanoutRejections,
+    cpu_uploads: int,
+    dmabuf_imports: int,
     frames_over_budget: int,
     gpu_execution: LatencyStatistics,
     gpu_composition: LatencyStatistics,

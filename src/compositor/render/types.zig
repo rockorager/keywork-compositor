@@ -511,6 +511,15 @@ pub const Target = union(enum) {
     }
 };
 
+pub const FrameCompletion = struct {
+    /// Owned by the caller when non-null.
+    sync_file_fd: ?std.posix.fd_t = null,
+    /// CPU-to-GPU texture upload operations performed for this frame.
+    cpu_uploads: u32 = 0,
+    /// New Vulkan DMA-BUF image imports created for this frame.
+    dmabuf_imports: u32 = 0,
+};
+
 pub const OffscreenTarget = struct {
     id: u64,
     size: Size,

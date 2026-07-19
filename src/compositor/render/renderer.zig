@@ -19,6 +19,7 @@ pub const Renderer = struct {
 
     pub const Error = CpuRenderer.Error || VulkanRenderer.Error;
     pub const GpuTiming = VulkanRenderer.GpuTiming;
+    pub const FrameCompletion = render_types.FrameCompletion;
 
     const Backend = union(enum) {
         cpu: CpuRenderer,
@@ -181,13 +182,13 @@ pub const Renderer = struct {
         }, active.target);
     }
 
-    /// Returns an owned sync-file descriptor when rendering can complete
-    /// asynchronously. The caller must close it after handing it to the
-    /// display backend.
+    /// Returns the frame's buffer-path statistics and an owned sync-file
+    /// descriptor when rendering can complete asynchronously. The caller must
+    /// close the descriptor after handing it to the display backend.
     pub fn finishFrameScanout(
         self: *Renderer,
         gpu_sample_tag: ?u64,
-    ) Error!?std.posix.fd_t {
+    ) Error!FrameCompletion {
         const active = self.active_frame orelse unreachable;
         self.active_frame = null;
         defer self.commands.clearRetainingCapacity();
@@ -201,7 +202,7 @@ pub const Renderer = struct {
             .cpu => |*renderer| switch (active.target) {
                 .pixels => |pixels| blk: {
                     try renderer.render(frame, pixels);
-                    break :blk null;
+                    break :blk .{};
                 },
                 .offscreen, .dmabuf => error.InvalidTarget,
             },

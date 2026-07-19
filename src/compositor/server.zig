@@ -335,6 +335,8 @@ const FrameStatistics = struct {
     direct_scanout_candidates: u64 = 0,
     direct_scanout_frames: u64 = 0,
     direct_scanout_rejections: [direct_scanout_rejection_count]u64 = @splat(0),
+    cpu_uploads: u64 = 0,
+    dmabuf_imports: u64 = 0,
     frames_over_budget: u64 = 0,
     latency_samples: [frame_latency_capacity]FrameLatency = undefined,
     latency_count: usize = 0,
@@ -401,6 +403,14 @@ const FrameStatistics = struct {
         increment(&self.direct_scanout_rejections[@intFromEnum(reason)]);
     }
 
+    fn addFrameCompletion(
+        self: *FrameStatistics,
+        completion: render.FrameCompletion,
+    ) void {
+        self.cpu_uploads +|= completion.cpu_uploads;
+        self.dmabuf_imports +|= completion.dmabuf_imports;
+    }
+
     fn snapshot(
         self: *const FrameStatistics,
         name: []const u8,
@@ -437,6 +447,8 @@ const FrameStatistics = struct {
                 .framebuffer_import_failed = self.directScanoutRejection(.framebuffer_import_failed),
                 .page_flip_failed = self.directScanoutRejection(.page_flip_failed),
             },
+            .cpu_uploads = wireInteger(self.cpu_uploads),
+            .dmabuf_imports = wireInteger(self.dmabuf_imports),
             .frames_over_budget = wireInteger(self.frames_over_budget),
             .gpu_execution = self.gpuExecutionSummary(.total),
             .gpu_composition = self.gpuExecutionSummary(.composition),
@@ -594,6 +606,11 @@ test "frame statistics summarize rolling latency and classify over-budget frames
     try std.testing.expectEqual(@as(i64, 2), statistics.directScanoutRejection(.color_conversion));
     try std.testing.expectEqual(@as(i64, 1), statistics.directScanoutRejection(.page_flip_failed));
 
+    statistics.addFrameCompletion(.{ .cpu_uploads = 3, .dmabuf_imports = 2 });
+    statistics.addFrameCompletion(.{ .cpu_uploads = 1, .dmabuf_imports = 4 });
+    try std.testing.expectEqual(@as(u64, 4), statistics.cpu_uploads);
+    try std.testing.expectEqual(@as(u64, 6), statistics.dmabuf_imports);
+
     statistics.addGpuExecution(.{
         .tag = 0,
         .total_nanoseconds = 1_100 * std.time.ns_per_us,
@@ -639,6 +656,8 @@ test "frame statistics summarize rolling latency and classify over-budget frames
     try std.testing.expectEqual(@as(usize, 0), statistics.gpu_execution_count);
     try std.testing.expectEqual(@as(u64, 0), statistics.frames_presented);
     try std.testing.expectEqual(@as(i64, 0), statistics.directScanoutRejection(.color_conversion));
+    try std.testing.expectEqual(@as(u64, 0), statistics.cpu_uploads);
+    try std.testing.expectEqual(@as(u64, 0), statistics.dmabuf_imports);
 
     for (0..frame_latency_capacity + 1) |value| statistics.addLatency(.{
         .request_to_presentation_microseconds = value,
@@ -6351,10 +6370,12 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
     if (self.session_lock.isLocked()) {
         try self.renderSessionLockContents(&frame, true);
         renderer_frame_active = false;
-        const render_fence_fd = try self.renderer.finishFrameScanout(
+        const completion = try self.renderer.finishFrameScanout(
             outputStatisticsTag(render_output.protocol_id),
         );
+        render_output.frame_statistics.addFrameCompletion(completion);
         self.collectGpuTimings();
+        const render_fence_fd = completion.sync_file_fd;
         defer if (render_fence_fd) |fd| {
             _ = std.c.close(fd);
         };
@@ -6395,10 +6416,12 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
     }
     if (!direct_scanout) {
         renderer_frame_active = false;
-        const render_fence_fd = try self.renderer.finishFrameScanout(
+        const completion = try self.renderer.finishFrameScanout(
             outputStatisticsTag(render_output.protocol_id),
         );
+        render_output.frame_statistics.addFrameCompletion(completion);
         self.collectGpuTimings();
+        const render_fence_fd = completion.sync_file_fd;
         defer if (render_fence_fd) |fd| {
             _ = std.c.close(fd);
         };

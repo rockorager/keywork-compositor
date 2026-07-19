@@ -186,6 +186,7 @@ const PreparedImage = struct {
     upload_damage: ?[]const render.Rect,
     cache_id: ?u64,
     desired_version: u64,
+    newly_imported: bool = false,
 };
 
 const Instance = extern struct {
@@ -1784,7 +1785,8 @@ fn disableScanoutSemaphore(self: *Self) void {
 }
 
 pub fn renderFrame(self: *Self, frame: render.Frame, target: render.Target) Error!void {
-    _ = try self.renderFrameWithCompletion(frame, target, .wait, null);
+    const completion = try self.renderFrameWithCompletion(frame, target, .wait, null);
+    std.debug.assert(completion.sync_file_fd == null);
 }
 
 pub fn renderFrameScanout(
@@ -1792,7 +1794,7 @@ pub fn renderFrameScanout(
     frame: render.Frame,
     target: render.Target,
     gpu_sample_tag: ?u64,
-) Error!?std.posix.fd_t {
+) Error!render.FrameCompletion {
     return self.renderFrameWithCompletion(frame, target, .sync_fd, gpu_sample_tag);
 }
 
@@ -1807,19 +1809,23 @@ fn renderFrameWithCompletion(
     target: render.Target,
     completion_mode: CompletionMode,
     gpu_sample_tag: ?u64,
-) Error!?std.posix.fd_t {
+) Error!render.FrameCompletion {
     try self.drainPending();
     const required_pixels = try validateTarget(frame, target);
     const target_key = targetKey(target);
     if (!supports(frame.commands)) {
+        var completion: render.FrameCompletion = .{};
         switch (target) {
             .pixels => |pixels| {
                 self.invalidateOutput(target_key);
                 try self.fallback.render(frame, pixels);
             },
-            .offscreen, .dmabuf => try self.renderGpuFallback(frame, target_key),
+            .offscreen, .dmabuf => {
+                try self.renderGpuFallback(frame, target_key);
+                completion.cpu_uploads = 1;
+            },
         }
-        return null;
+        return completion;
     }
 
     self.frame_number +%= 1;
@@ -2452,6 +2458,7 @@ fn renderFrameWithCompletion(
             texture.version = prepared.desired_version;
         }
     }
+    var completion = frameCompletion(self.prepared_images.items);
 
     if (async_submission) {
         const completion_fd = self.device_wrapper.getSemaphoreFdKHR(self.device, &.{
@@ -2462,12 +2469,12 @@ fn renderFrameWithCompletion(
             self.disableScanoutSemaphore();
             log.warn("Vulkan sync-file export failed; using blocking scanout", .{});
             frame_succeeded = true;
-            return null;
+            return completion;
         };
         if (completion_fd < 0) {
             try self.drainPending();
             frame_succeeded = true;
-            return null;
+            return completion;
         }
         var completion_fd_owned = true;
         defer if (completion_fd_owned) {
@@ -2485,18 +2492,28 @@ fn renderFrameWithCompletion(
                 self.disableScanoutSemaphore();
                 log.warn("DMA-BUF sync-file import failed; using blocking scanout", .{});
                 frame_succeeded = true;
-                return null;
+                return completion;
             }
         }
         frame_succeeded = true;
         completion_fd_owned = false;
-        return completion_fd;
+        completion.sync_file_fd = completion_fd;
+        return completion;
     }
 
     try self.drainPending();
     frame_succeeded = true;
     if (output.kind == .pixels) copyDamageToTarget(compiled_frame, target.pixels, self.work_mapped.?);
-    return null;
+    return completion;
+}
+
+fn frameCompletion(prepared_images: []const PreparedImage) render.FrameCompletion {
+    var result: render.FrameCompletion = .{};
+    for (prepared_images) |prepared| {
+        if (prepared.upload_offset != null) result.cpu_uploads +|= 1;
+        if (prepared.newly_imported) result.dmabuf_imports +|= 1;
+    }
+    return result;
 }
 
 fn importDmaBufSyncFile(
@@ -3261,6 +3278,7 @@ fn prepareImportedTexture(
         .upload_damage = null,
         .cache_id = source.id,
         .desired_version = source.version,
+        .newly_imported = true,
     };
 }
 
@@ -5447,6 +5465,15 @@ test "recorded Vulkan frames match only identical command topology" {
         .cache_id = 1,
         .desired_version = 2,
     }};
+    const upload_completion = frameCompletion(&prepared);
+    try std.testing.expectEqual(@as(u32, 1), upload_completion.cpu_uploads);
+    try std.testing.expectEqual(@as(u32, 0), upload_completion.dmabuf_imports);
+    var imported_prepared = prepared;
+    imported_prepared[0].newly_imported = true;
+    const import_completion = frameCompletion(&imported_prepared);
+    try std.testing.expectEqual(@as(u32, 1), import_completion.cpu_uploads);
+    try std.testing.expectEqual(@as(u32, 1), import_completion.dmabuf_imports);
+
     var recorded: RecordedFrame = .{};
     defer recorded.deinit(std.testing.allocator);
     const render_area: render.Rect = .{ .x = 0, .y = 0, .width = 2, .height = 1 };

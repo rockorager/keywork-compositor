@@ -2277,11 +2277,11 @@ test "GBM Vulkan target accepts asynchronous render completion" {
     defer _ = c.drmModeRmFB(fd, selected.?.framebuffer_id);
     defer access.release_target(access.context, selected.?.target_id);
 
-    const completion_fd = try renderer.renderFrameScanout(.{
+    const completion = try renderer.renderFrameScanout(.{
         .size = size,
         .commands = &.{.{ .clear = render.Color.rgba(12, 34, 56, 255) }},
     }, .{ .dmabuf = .{ .id = selected.?.target_id, .size = size } }, null);
-    if (completion_fd) |fence_fd| {
+    if (completion.sync_file_fd) |fence_fd| {
         defer _ = std.c.close(fence_fd);
         try std.testing.expect(importSyncFile(selected.?.buffer.fd, fence_fd));
         try waitSyncFile(fence_fd);
