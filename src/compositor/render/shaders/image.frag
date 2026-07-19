@@ -212,6 +212,45 @@ vec4 sampleCatmullRom(vec2 coordinate,vec2 lower,vec2 upper) {
 }
 #endif
 
+#ifdef KEYWORK_AREA
+void areaPairs(float start,float end,out vec4 positions,out vec4 weights) {
+    float base=floor(start);
+    for (int pair=0;pair<4;pair++) {
+        float first=base+2.0*float(pair);
+        float first_weight=clamp(min(end,first+1.0)-max(start,first),0.0,1.0);
+        float second_weight=clamp(min(end,first+2.0)-max(start,first+1.0),0.0,1.0);
+        float weight=first_weight+second_weight;
+        positions[pair]=first+0.5+(weight>0.0 ? second_weight/weight : 0.0);
+        weights[pair]=weight;
+    }
+}
+
+vec4 sampleArea(vec2 coordinate) {
+    vec2 footprint=abs(source.zw/dest.zw);
+    vec2 radius=clamp(footprint*0.5,vec2(0.5),vec2(3.5));
+    vec2 start=max(coordinate-radius,source.xy);
+    vec2 end=min(coordinate+radius,source.xy+source.zw);
+    vec4 x_positions;
+    vec4 x_weights;
+    vec4 y_positions;
+    vec4 y_weights;
+    areaPairs(start.x,end.x,x_positions,x_weights);
+    areaPairs(start.y,end.y,y_positions,y_weights);
+    vec4 color=vec4(0.0);
+    float total_weight=0.0;
+    for (int y=0;y<4;y++) {
+        for (int x=0;x<4;x++) {
+            float weight=x_weights[x]*y_weights[y];
+            if (weight<=0.0) continue;
+            vec2 sample_coordinate=mapToTexture(vec2(x_positions[x],y_positions[y]));
+            color+=texture(tex,sample_coordinate/pc.texture_size)*weight;
+            total_weight+=weight;
+        }
+    }
+    return color/max(total_weight,0.000001);
+}
+#endif
+
 void main() {
     vec2 q=(pixel-dest.xy)/dest.zw;
     vec2 transformed=source.xy+q*source.zw;
@@ -228,6 +267,8 @@ void main() {
     vec2 lower=min(first,last)+0.5;
     vec2 upper=max(max(first,last)-0.5,lower);
     vec4 color=sampleCatmullRom(coordinate,lower,upper);
+#elif defined(KEYWORK_AREA)
+    vec4 color=sampleArea(transformed);
 #else
     vec2 uv=coordinate/pc.texture_size;
     vec4 color=texture(tex,uv);

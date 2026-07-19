@@ -48,6 +48,7 @@ blend_pipeline: vk.Pipeline,
 image_pipeline: vk.Pipeline,
 nearest_image_pipeline: vk.Pipeline,
 reconstruction_image_pipeline: vk.Pipeline,
+area_image_pipeline: vk.Pipeline,
 shadow_pipeline: vk.Pipeline,
 downsample_pipeline: vk.Pipeline,
 blur_horizontal_pipeline: vk.Pipeline,
@@ -378,6 +379,7 @@ const Graphics = struct {
     image_pipeline: vk.Pipeline,
     nearest_image_pipeline: vk.Pipeline,
     reconstruction_image_pipeline: vk.Pipeline,
+    area_image_pipeline: vk.Pipeline,
     shadow_pipeline: vk.Pipeline,
     downsample_pipeline: vk.Pipeline,
     blur_horizontal_pipeline: vk.Pipeline,
@@ -552,6 +554,11 @@ fn initGraphics(
         .p_code = &shaders.image_catmull_rom_instanced,
     }, null);
     defer wrapper.destroyShaderModule(device, reconstruction_image_shader, null);
+    const area_image_shader = try wrapper.createShaderModule(device, &.{
+        .code_size = @sizeOf(@TypeOf(shaders.image_area_instanced)),
+        .p_code = &shaders.image_area_instanced,
+    }, null);
+    defer wrapper.destroyShaderModule(device, area_image_shader, null);
     const shadow_shader = try wrapper.createShaderModule(device, &.{
         .code_size = @sizeOf(@TypeOf(shaders.shadow_instanced)),
         .p_code = &shaders.shadow_instanced,
@@ -642,6 +649,19 @@ fn initGraphics(
         return err;
     };
     errdefer wrapper.destroyPipeline(device, reconstruction_image_pipeline, null);
+    const area_image_pipeline = createPipeline(
+        wrapper,
+        device,
+        render_pass,
+        pipeline_layout,
+        vertex_shader,
+        area_image_shader,
+        true,
+    ) catch |err| {
+        log.err("failed to create Vulkan area image pipeline: {t}", .{err});
+        return err;
+    };
+    errdefer wrapper.destroyPipeline(device, area_image_pipeline, null);
     const shadow_pipeline = createPipeline(
         wrapper,
         device,
@@ -732,6 +752,7 @@ fn initGraphics(
         .image_pipeline = image_pipeline,
         .nearest_image_pipeline = nearest_image_pipeline,
         .reconstruction_image_pipeline = reconstruction_image_pipeline,
+        .area_image_pipeline = area_image_pipeline,
         .shadow_pipeline = shadow_pipeline,
         .downsample_pipeline = downsample_pipeline,
         .blur_horizontal_pipeline = blur_horizontal_pipeline,
@@ -871,6 +892,7 @@ fn destroyGraphics(wrapper: vk.DeviceWrapper, device: vk.Device, graphics: Graph
     wrapper.destroyPipeline(device, graphics.blur_horizontal_pipeline, null);
     wrapper.destroyPipeline(device, graphics.downsample_pipeline, null);
     wrapper.destroyPipeline(device, graphics.shadow_pipeline, null);
+    wrapper.destroyPipeline(device, graphics.area_image_pipeline, null);
     wrapper.destroyPipeline(device, graphics.reconstruction_image_pipeline, null);
     wrapper.destroyPipeline(device, graphics.nearest_image_pipeline, null);
     wrapper.destroyPipeline(device, graphics.image_pipeline, null);
@@ -2103,6 +2125,7 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
         .image_pipeline = graphics.image_pipeline,
         .nearest_image_pipeline = graphics.nearest_image_pipeline,
         .reconstruction_image_pipeline = graphics.reconstruction_image_pipeline,
+        .area_image_pipeline = graphics.area_image_pipeline,
         .shadow_pipeline = graphics.shadow_pipeline,
         .downsample_pipeline = graphics.downsample_pipeline,
         .blur_horizontal_pipeline = graphics.blur_horizontal_pipeline,
@@ -2194,6 +2217,7 @@ pub fn deinit(self: *Self) void {
         .image_pipeline = self.image_pipeline,
         .nearest_image_pipeline = self.nearest_image_pipeline,
         .reconstruction_image_pipeline = self.reconstruction_image_pipeline,
+        .area_image_pipeline = self.area_image_pipeline,
         .shadow_pipeline = self.shadow_pipeline,
         .downsample_pipeline = self.downsample_pipeline,
         .blur_horizontal_pipeline = self.blur_horizontal_pipeline,
@@ -5502,8 +5526,8 @@ fn compileDrawRuns(
                 prepared.texture.pipeline
             else switch (image.samplingFilter()) {
                 .nearest => self.nearest_image_pipeline,
-                .linear => .null_handle,
                 .reconstruction => self.reconstruction_image_pipeline,
+                .area => self.area_image_pipeline,
             };
             try self.emitDamaged(
                 frame,
@@ -7346,6 +7370,155 @@ test "Vulkan reconstruction preserves premultiplied alpha" {
         try std.testing.expect(@as(u8, @truncate(pixel >> 8)) <= alpha);
         try std.testing.expect(@as(u8, @truncate(pixel)) <= alpha);
     }
+}
+
+test "Vulkan area minification integrates source texels" {
+    var renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
+        error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+
+    var constant_source = [_]u32{0xff808080} ** 64;
+    var constant_target = [_]u32{0} ** 9;
+    try renderer.renderFrame(.{
+        .size = .{ .width = 3, .height = 3 },
+        .commands = &.{.{ .image = .{
+            .x = 0,
+            .y = 0,
+            .size = .{ .width = 3, .height = 3 },
+            .buffer = .{
+                .size = .{ .width = 8, .height = 8 },
+                .stride_pixels = 8,
+                .pixels = &constant_source,
+            },
+        } }},
+    }, .{ .pixels = .{
+        .size = .{ .width = 3, .height = 3 },
+        .stride_pixels = 3,
+        .pixels = &constant_target,
+    } });
+    for (constant_target) |pixel| try expectArgbNear(0xff808080, pixel, 1);
+
+    var integer_source = [_]u32{ 0xffffffff, 0xffffffff, 0xff000000, 0xff000000 };
+    var integer_target = [_]u32{0};
+    try renderer.renderFrame(.{
+        .size = .{ .width = 1, .height = 1 },
+        .commands = &.{.{ .image = .{
+            .x = 0,
+            .y = 0,
+            .size = .{ .width = 1, .height = 1 },
+            .buffer = .{
+                .size = .{ .width = 4, .height = 1 },
+                .stride_pixels = 4,
+                .pixels = &integer_source,
+            },
+        } }},
+    }, .{ .pixels = .{
+        .size = .{ .width = 1, .height = 1 },
+        .stride_pixels = 1,
+        .pixels = &integer_target,
+    } });
+    try expectArgbNear(0xff808080, integer_target[0], 2);
+
+    var fractional_source = [_]u32{ 0xffffffff, 0xff000000, 0xff000000 };
+    var fractional_target = [_]u32{0};
+    try renderer.renderFrame(.{
+        .size = .{ .width = 1, .height = 1 },
+        .commands = &.{.{ .image = .{
+            .x = 0,
+            .y = 0,
+            .size = .{ .width = 1, .height = 1 },
+            .buffer = .{
+                .size = .{ .width = 3, .height = 1 },
+                .stride_pixels = 3,
+                .pixels = &fractional_source,
+            },
+        } }},
+    }, .{ .pixels = .{
+        .size = .{ .width = 1, .height = 1 },
+        .stride_pixels = 1,
+        .pixels = &fractional_target,
+    } });
+    try expectArgbNear(0xff555555, fractional_target[0], 2);
+
+    var cropped_source = [_]u32{0xffff0000} ++ [_]u32{0xff00ff00} ** 8 ++ [_]u32{0xffff0000};
+    var cropped_target = [_]u32{0} ** 2;
+    try renderer.renderFrame(.{
+        .size = .{ .width = 2, .height = 1 },
+        .commands = &.{.{ .image = .{
+            .x = 0,
+            .y = 0,
+            .size = .{ .width = 2, .height = 1 },
+            .buffer = .{
+                .size = .{ .width = 10, .height = 1 },
+                .stride_pixels = 10,
+                .pixels = &cropped_source,
+            },
+            .source = .{ .x = 1, .y = 0, .width = 8, .height = 1 },
+        } }},
+    }, .{ .pixels = .{
+        .size = .{ .width = 2, .height = 1 },
+        .stride_pixels = 2,
+        .pixels = &cropped_target,
+    } });
+    for (cropped_target) |pixel| try expectArgbNear(0xff00ff00, pixel, 1);
+}
+
+test "Vulkan area minification follows transforms and premultiplied alpha" {
+    var renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
+        error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+
+    var transformed_source: [16]u32 = undefined;
+    for (0..8) |y| {
+        const color: u32 = if (y % 2 == 0) 0xffffffff else 0xff000000;
+        transformed_source[y * 2] = color;
+        transformed_source[y * 2 + 1] = color;
+    }
+    var transformed_target = [_]u32{0} ** 4;
+    try renderer.renderFrame(.{
+        .size = .{ .width = 2, .height = 2 },
+        .commands = &.{.{ .image = .{
+            .x = 0,
+            .y = 0,
+            .size = .{ .width = 2, .height = 2 },
+            .buffer = .{
+                .size = .{ .width = 2, .height = 8 },
+                .stride_pixels = 2,
+                .pixels = &transformed_source,
+            },
+            .transform = .rotate_90,
+        } }},
+    }, .{ .pixels = .{
+        .size = .{ .width = 2, .height = 2 },
+        .stride_pixels = 2,
+        .pixels = &transformed_target,
+    } });
+    for (transformed_target) |pixel| try expectArgbNear(0xff808080, pixel, 2);
+
+    var alpha_source = [_]u32{ 0x00000000, 0x80800000, 0x00000000, 0x80800000 };
+    var alpha_target = [_]u32{0};
+    try renderer.renderFrame(.{
+        .size = .{ .width = 1, .height = 1 },
+        .commands = &.{.{ .image = .{
+            .x = 0,
+            .y = 0,
+            .size = .{ .width = 1, .height = 1 },
+            .buffer = .{
+                .size = .{ .width = 4, .height = 1 },
+                .stride_pixels = 4,
+                .pixels = &alpha_source,
+            },
+        } }},
+    }, .{ .pixels = .{
+        .size = .{ .width = 1, .height = 1 },
+        .stride_pixels = 1,
+        .pixels = &alpha_target,
+    } });
+    try expectArgbNear(0x40400000, alpha_target[0], 1);
 }
 
 test "Vulkan HDR tone mapping reserves SDR highlight headroom" {
