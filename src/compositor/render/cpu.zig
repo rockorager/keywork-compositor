@@ -581,6 +581,7 @@ fn composite(
 ) Error!void {
     const dmabuf = image.buffer.dmabuf orelse
         return compositePixels(destination, destination_size, image, false, false, false);
+    if (dmabuf.modifier != 0) return error.InvalidTarget;
     const format = render_types.DmabufFormat.fromFourcc(dmabuf.format) orelse
         return error.InvalidTarget;
     if (dmabuf.offset % @alignOf(u32) != 0 or dmabuf.stride % @sizeOf(u32) != 0) {

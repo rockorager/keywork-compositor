@@ -51,7 +51,7 @@ primary_plane_id: ?u32,
 atomic_plane: ?AtomicPlaneProperties,
 gamma_size: u32,
 gamma_lut: []u16,
-scanout_modifiers: []u64,
+scanout_formats: []render.DmabufFormatModifier,
 implicit_scanout: bool,
 sync_file_import_supported: bool,
 async_page_flip_supported: bool,
@@ -161,13 +161,13 @@ pub const Selection = struct {
     connector_type_id: u32,
     crtc_id: u32,
     primary_plane_id: ?u32,
-    scanout_modifiers: []u64,
+    scanout_formats: []render.DmabufFormatModifier,
     implicit_scanout: bool,
 };
 
 const PrimaryPlane = struct {
     id: ?u32 = null,
-    modifiers: []u64 = &.{},
+    formats: []render.DmabufFormatModifier = &.{},
     implicit: bool = true,
 };
 
@@ -232,7 +232,7 @@ pub fn init(
         .atomic_plane = null,
         .gamma_size = 0,
         .gamma_lut = &.{},
-        .scanout_modifiers = &.{},
+        .scanout_formats = &.{},
         .implicit_scanout = true,
         .sync_file_import_supported = true,
         .async_page_flip_supported = false,
@@ -273,7 +273,7 @@ pub fn deinit(self: *Self) void {
     self.clearIdentity();
     self.allocator.free(self.gamma_lut);
     self.allocator.free(self.modes);
-    self.allocator.free(self.scanout_modifiers);
+    self.allocator.free(self.scanout_formats);
     for (&self.buffer_damage) |*damage| damage.deinit();
     self.* = undefined;
 }
@@ -294,6 +294,10 @@ pub fn attach(self: *Self, listener: Listener, dmabuf_renderer: ?render.DmabufRe
         self.resetBufferDamage(self.size);
     }
     self.listener = listener;
+}
+
+pub fn scanoutFormats(self: *const Self) []const render.DmabufFormatModifier {
+    return self.scanout_formats;
 }
 
 pub fn detach(self: *Self) void {
@@ -500,7 +504,7 @@ pub fn tryDirectScanout(
     const source_cache = buffer.source_cache orelse return .{};
     if (!self.mode_set or self.acquired == null or self.pending != null or
         self.direct_pending != null or source.y_inverted or
-        (source.format != c.DRM_FORMAT_ARGB8888 and source.format != c.DRM_FORMAT_XRGB8888) or
+        render.DmabufFormat.fromFourcc(source.format) == null or
         (self.atomic_plane == null and (!std.meta.eql(buffer.size, self.size) or
             !self.legacyFramebufferLayoutMatches(buffer))))
     {
@@ -546,14 +550,14 @@ pub fn activate(self: *Self, fd: std.posix.fd_t, selection: Selection, device_pa
         return error.OutputChanged;
     }
     const modes = try self.allocator.dupe(Mode, selection.modes);
-    const scanout_modifiers = self.allocator.dupe(u64, selection.scanout_modifiers) catch |err| {
+    const scanout_formats = self.allocator.dupe(render.DmabufFormatModifier, selection.scanout_formats) catch |err| {
         self.allocator.free(modes);
         return err;
     };
     self.allocator.free(self.modes);
-    self.allocator.free(self.scanout_modifiers);
+    self.allocator.free(self.scanout_formats);
     self.modes = modes;
-    self.scanout_modifiers = scanout_modifiers;
+    self.scanout_formats = scanout_formats;
     self.implicit_scanout = selection.implicit_scanout;
     self.mode_index = selection.mode_index;
     self.mode = selected_mode.value;
@@ -979,7 +983,7 @@ pub fn selectOutputs(
     errdefer {
         for (selections.items) |selection| {
             allocator.free(selection.modes);
-            allocator.free(selection.scanout_modifiers);
+            allocator.free(selection.scanout_formats);
         }
         selections.deinit(allocator);
     }
@@ -1055,14 +1059,14 @@ pub fn selectOutputs(
         );
         if (primary_plane.id) |plane_id| {
             claimed_primary_planes.append(allocator, plane_id) catch |err| {
-                allocator.free(primary_plane.modifiers);
+                allocator.free(primary_plane.formats);
                 return err;
             };
         }
         const mode_count: usize = @intCast(connector.*.count_modes);
         const connector_modes = connector.*.modes[0..mode_count];
         const modes = allocator.alloc(Mode, mode_count) catch |err| {
-            allocator.free(primary_plane.modifiers);
+            allocator.free(primary_plane.formats);
             return err;
         };
         for (connector_modes, modes) |mode, *stored| stored.* = .{
@@ -1085,11 +1089,11 @@ pub fn selectOutputs(
             .connector_type_id = connector.*.connector_type_id,
             .crtc_id = crtc_id,
             .primary_plane_id = primary_plane.id,
-            .scanout_modifiers = primary_plane.modifiers,
+            .scanout_formats = primary_plane.formats,
             .implicit_scanout = primary_plane.implicit,
         }) catch |err| {
             allocator.free(modes);
-            allocator.free(primary_plane.modifiers);
+            allocator.free(primary_plane.formats);
             return err;
         };
     }
@@ -1099,7 +1103,7 @@ pub fn selectOutputs(
 pub fn deinitSelections(allocator: std.mem.Allocator, selections: []Selection) void {
     for (selections) |selection| {
         allocator.free(selection.modes);
-        allocator.free(selection.scanout_modifiers);
+        allocator.free(selection.scanout_formats);
     }
     allocator.free(selections);
 }
@@ -1116,7 +1120,7 @@ fn primaryPlane(
     const resources = c.drmModeGetPlaneResources(fd) orelse return .{};
     defer c.drmModeFreePlaneResources(resources);
     var selected: PrimaryPlane = .{};
-    errdefer allocator.free(selected.modifiers);
+    errdefer allocator.free(selected.formats);
     var selected_score: u8 = 0;
     const plane_count: usize = @intCast(resources.*.count_planes);
     for (resources.*.planes[0..plane_count]) |plane_id| {
@@ -1172,28 +1176,82 @@ fn primaryPlane(
                 break;
             }
         }
-        var modifiers: std.ArrayList(u64) = .empty;
-        defer modifiers.deinit(allocator);
+        var formats: std.ArrayList(render.DmabufFormatModifier) = .empty;
+        defer formats.deinit(allocator);
         if (formats_blob_id) |blob_id| if (c.drmModeGetPropertyBlob(fd, blob_id)) |blob| {
             defer c.drmModeFreePropertyBlob(blob);
             var iterator = std.mem.zeroes(c.drmModeFormatModifierIterator);
             while (c.drmModeFormatModifierBlobIterNext(blob, &iterator)) {
-                if (iterator.fmt != c.DRM_FORMAT_XRGB8888 or
-                    std.mem.indexOfScalar(u64, modifiers.items, iterator.mod) != null) continue;
-                try modifiers.append(allocator, iterator.mod);
+                if (render.DmabufFormat.fromFourcc(iterator.fmt) == null or
+                    render.DmabufFormatModifier.contains(formats.items, iterator.fmt, iterator.mod)) continue;
+                try formats.append(allocator, .{ .format = iterator.fmt, .modifier = iterator.mod });
             }
         };
-        const owned_modifiers = try modifiers.toOwnedSlice(allocator);
-        allocator.free(selected.modifiers);
+        if (formats_blob_id == null) {
+            for (plane.*.formats[0..format_count]) |format| if (render.DmabufFormat.fromFourcc(format) != null and
+                !render.DmabufFormatModifier.contains(formats.items, format, drm_format_mod_linear))
+                try formats.append(allocator, .{ .format = format, .modifier = drm_format_mod_linear });
+        }
+        for ([_]render.DmabufFormat{ .argb8888, .abgr8888 }) |alpha| {
+            const opaque_format = alpha.opaqueFormat();
+            const initial_len = formats.items.len;
+            var format_index: usize = 0;
+            while (format_index < initial_len) : (format_index += 1) {
+                const pair = formats.items[format_index];
+                if (pair.format == @intFromEnum(opaque_format) and
+                    !render.DmabufFormatModifier.contains(formats.items, @intFromEnum(alpha), pair.modifier))
+                {
+                    try formats.append(allocator, .{
+                        .format = @intFromEnum(alpha),
+                        .modifier = pair.modifier,
+                    });
+                }
+            }
+        }
+        const owned_formats = try formats.toOwnedSlice(allocator);
+        allocator.free(selected.formats);
         selected = .{
             .id = plane_id,
-            .modifiers = owned_modifiers,
+            .formats = owned_formats,
             .implicit = implicit,
         };
         selected_score = score;
         if (score == 3) break;
     }
     return selected;
+}
+
+fn scanoutFramebufferFormat(
+    formats: []const render.DmabufFormatModifier,
+    source_format: u32,
+    modifier: u64,
+) ?u32 {
+    const format = render.DmabufFormat.fromFourcc(source_format) orelse return null;
+    const opaque_format = @intFromEnum(format.opaqueFormat());
+    if (render.DmabufFormatModifier.contains(formats, opaque_format, modifier)) {
+        return opaque_format;
+    }
+    if (render.DmabufFormatModifier.contains(formats, source_format, modifier)) {
+        return source_format;
+    }
+    return null;
+}
+
+test "scanout framebuffer prefers an opaque format with the same memory layout" {
+    const formats = [_]render.DmabufFormatModifier{
+        .{ .format = c.DRM_FORMAT_ARGB8888, .modifier = 7 },
+        .{ .format = c.DRM_FORMAT_XRGB8888, .modifier = 7 },
+        .{ .format = c.DRM_FORMAT_ABGR8888, .modifier = 9 },
+    };
+    try std.testing.expectEqual(
+        c.DRM_FORMAT_XRGB8888,
+        scanoutFramebufferFormat(&formats, c.DRM_FORMAT_ARGB8888, 7).?,
+    );
+    try std.testing.expectEqual(
+        c.DRM_FORMAT_ABGR8888,
+        scanoutFramebufferFormat(&formats, c.DRM_FORMAT_ABGR8888, 9).?,
+    );
+    try std.testing.expect(scanoutFramebufferFormat(&formats, c.DRM_FORMAT_XBGR8888, 9) == null);
 }
 
 fn findOutput(outputs: []const *Self, connector_id: u32) ?*Self {
@@ -1364,11 +1422,16 @@ fn directFramebuffer(
     }
     try self.makeDirectFramebufferRoom(fd);
 
-    const modifier_supported = std.mem.indexOfScalar(
-        u64,
-        self.scanout_modifiers,
+    const framebuffer_format = scanoutFramebufferFormat(
+        self.scanout_formats,
+        source.format,
         source.modifier,
-    ) != null;
+    ) orelse return error.UnsupportedModifier;
+    const modifier_supported = render.DmabufFormatModifier.contains(
+        self.scanout_formats,
+        framebuffer_format,
+        source.modifier,
+    );
     if (!modifier_supported and !(self.implicit_scanout and
         source.modifier == drm_format_mod_linear)) return error.UnsupportedModifier;
 
@@ -1380,10 +1443,6 @@ fn directFramebuffer(
     var handles = [_]u32{ handle, 0, 0, 0 };
     var pitches = [_]u32{ source.stride, 0, 0, 0 };
     var offsets = [_]u32{ source.offset, 0, 0, 0 };
-    const framebuffer_format = if (source.format == c.DRM_FORMAT_ARGB8888)
-        c.DRM_FORMAT_XRGB8888
-    else
-        source.format;
     var framebuffer_id: u32 = 0;
     var add_result: c_int = -1;
     if (modifier_supported) {
@@ -1727,7 +1786,9 @@ fn allocateGpuPair(self: *Self, fd: std.posix.fd_t, size: render.Size) !BufferPa
     const gbm = self.device_access.gbm(self.device_access.context) orelse return error.NoGbmDevice;
     var compatible_modifiers: std.ArrayList(u64) = .empty;
     defer compatible_modifiers.deinit(self.allocator);
-    for (self.scanout_modifiers) |modifier| {
+    for (self.scanout_formats) |pair| {
+        if (pair.format != c.DRM_FORMAT_XRGB8888) continue;
+        const modifier = pair.modifier;
         if (std.mem.indexOfScalar(u64, renderer.modifiers, modifier) != null and
             renderer.supports_target(renderer.context, size, modifier))
         {

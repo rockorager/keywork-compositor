@@ -1,4 +1,4 @@
-//! Linux DMA-BUF wl_buffer import for CPU-addressable linear images.
+//! Linux DMA-BUF wl_buffer import and format-modifier feedback.
 
 const Self = @This();
 
@@ -26,7 +26,12 @@ const argb8888: u32 = linux.DRM_FORMAT_ARGB8888;
 const xrgb8888: u32 = linux.DRM_FORMAT_XRGB8888;
 const abgr8888: u32 = linux.DRM_FORMAT_ABGR8888;
 const xbgr8888: u32 = linux.DRM_FORMAT_XBGR8888;
-const import_formats = [_]u32{ argb8888, xrgb8888, abgr8888, xbgr8888 };
+const fallback_formats = [_]render.DmabufFormatModifier{
+    .{ .format = argb8888, .modifier = linear_modifier },
+    .{ .format = xrgb8888, .modifier = linear_modifier },
+    .{ .format = abgr8888, .modifier = linear_modifier },
+    .{ .format = xbgr8888, .modifier = linear_modifier },
+};
 
 comptime {
     std.debug.assert(argb8888 == @intFromEnum(render.DmabufFormat.argb8888));
@@ -54,6 +59,8 @@ feedback_state: ?FeedbackState,
 params_count: usize,
 buffer_count: usize,
 feedback_count: usize,
+supported_pairs: []const render.DmabufFormatModifier,
+source_validator: ?render.DmabufSourceValidator,
 
 pub fn init(
     self: *Self,
@@ -62,16 +69,23 @@ pub fn init(
     display: *wl.Server,
     renderer_device_id: ?render.DrmDeviceId,
     scanout_device_id: ?render.DrmDeviceId,
+    sampled_pairs: []const render.DmabufFormatModifier,
+    scanout_pairs: []const render.DmabufFormatModifier,
+    source_validator: ?render.DmabufSourceValidator,
 ) !void {
-    const feedback_state = FeedbackState.init(
+    const supported_pairs = if (sampled_pairs.len != 0) sampled_pairs else &fallback_formats;
+    var feedback_state = FeedbackState.init(
         io,
         renderer_device_id,
         scanout_device_id,
+        allocator,
+        supported_pairs,
+        scanout_pairs,
     ) catch |err| unavailable: {
         log.info("DMA-BUF feedback unavailable: {t}", .{err});
         break :unavailable null;
     };
-    errdefer if (feedback_state) |state| state.file.close(io);
+    errdefer if (feedback_state) |*state| state.deinit(allocator, io);
     self.* = .{
         .allocator = allocator,
         .io = io,
@@ -87,6 +101,8 @@ pub fn init(
         .params_count = 0,
         .buffer_count = 0,
         .feedback_count = 0,
+        .supported_pairs = supported_pairs,
+        .source_validator = source_validator,
     };
 }
 
@@ -95,7 +111,7 @@ pub fn deinit(self: *Self) void {
     std.debug.assert(self.buffer_count == 0);
     std.debug.assert(self.feedback_count == 0);
     self.global.destroy();
-    if (self.feedback_state) |state| state.file.close(self.io);
+    if (self.feedback_state) |*state| state.deinit(self.allocator, self.io);
     self.* = undefined;
 }
 
@@ -112,11 +128,16 @@ fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
     if (version >= zwp.LinuxDmabufV1.Request.get_default_feedback_since_version) {
         return;
     } else if (version >= zwp.LinuxDmabufV1.modifier_since_version) {
-        for (import_formats) |format| {
-            resource.sendModifier(format, 0, @intCast(linear_modifier));
+        for (self.supported_pairs) |pair| {
+            resource.sendModifier(pair.format, @intCast(pair.modifier >> 32), @intCast(pair.modifier));
         }
     } else {
-        for (import_formats) |format| resource.sendFormat(format);
+        for (self.supported_pairs, 0..) |pair, index| {
+            if (pair.modifier != linear_modifier) continue;
+            for (self.supported_pairs[0..index]) |previous| {
+                if (previous.modifier == linear_modifier and previous.format == pair.format) break;
+            } else resource.sendFormat(pair.format);
+        }
     }
 }
 
@@ -148,12 +169,21 @@ const FeedbackState = struct {
     device: linux.dev_t,
     scanout_device: ?linux.dev_t,
     file: std.Io.File,
+    pairs: []render.DmabufFormatModifier,
+    sampling_indices: []align(4) u16,
+    scanout_indices: []align(4) u16,
 
     fn init(
         io: std.Io,
         renderer_device_id: ?render.DrmDeviceId,
         scanout_device_id: ?render.DrmDeviceId,
+        allocator: std.mem.Allocator,
+        sampled_pairs: []const render.DmabufFormatModifier,
+        scanout_pairs: []const render.DmabufFormatModifier,
     ) !FeedbackState {
+        if (sampled_pairs.len == 0 or sampled_pairs.len > std.math.maxInt(u16) + 1 or
+            sampled_pairs.len > std.math.maxInt(u32) / @sizeOf(FormatTableEntry))
+            return error.InvalidFormatTable;
         const device = if (renderer_device_id) |id|
             linux.makedev(id.major, id.minor)
         else
@@ -162,13 +192,34 @@ const FeedbackState = struct {
             linux.makedev(id.major, id.minor)
         else
             null;
-        const entries = [_]FormatTableEntry{
-            .{ .format = argb8888, .padding = 0, .modifier = linear_modifier },
-            .{ .format = xrgb8888, .padding = 0, .modifier = linear_modifier },
-            .{ .format = abgr8888, .padding = 0, .modifier = linear_modifier },
-            .{ .format = xbgr8888, .padding = 0, .modifier = linear_modifier },
-        };
         comptime std.debug.assert(@sizeOf(FormatTableEntry) == 16);
+        const pairs = try allocator.dupe(render.DmabufFormatModifier, sampled_pairs);
+        errdefer allocator.free(pairs);
+        const sampling_indices = try allocator.alignedAlloc(u16, .fromByteUnits(4), pairs.len);
+        errdefer allocator.free(sampling_indices);
+        var scanout_count: usize = 0;
+        for (pairs, 0..) |pair, index| {
+            sampling_indices[index] = @intCast(index);
+            if (render.DmabufFormatModifier.contains(scanout_pairs, pair.format, pair.modifier)) scanout_count += 1;
+        }
+        const scanout_indices = try allocator.alignedAlloc(u16, .fromByteUnits(4), scanout_count);
+        errdefer allocator.free(scanout_indices);
+        var scanout_index: usize = 0;
+        for (pairs, 0..) |pair, index| if (render.DmabufFormatModifier.contains(
+            scanout_pairs,
+            pair.format,
+            pair.modifier,
+        )) {
+            scanout_indices[scanout_index] = @intCast(index);
+            scanout_index += 1;
+        };
+        const entries = try allocator.alloc(FormatTableEntry, pairs.len);
+        defer allocator.free(entries);
+        for (pairs, entries) |pair, *entry| entry.* = .{
+            .format = pair.format,
+            .padding = 0,
+            .modifier = pair.modifier,
+        };
 
         const fd = try std.posix.memfd_create(
             "keywork-dmabuf-formats",
@@ -179,7 +230,7 @@ const FeedbackState = struct {
             .flags = .{ .nonblocking = false },
         };
         errdefer file.close(io);
-        const bytes = std.mem.asBytes(&entries);
+        const bytes = std.mem.sliceAsBytes(entries);
         try file.setLength(io, bytes.len);
         try file.writePositionalAll(io, bytes, 0);
         const seals = std.os.linux.F.SEAL_SHRINK | std.os.linux.F.SEAL_GROW |
@@ -190,7 +241,17 @@ const FeedbackState = struct {
             .device = device,
             .scanout_device = scanout_device,
             .file = file,
+            .pairs = pairs,
+            .sampling_indices = sampling_indices,
+            .scanout_indices = scanout_indices,
         };
+    }
+
+    fn deinit(self: *FeedbackState, allocator: std.mem.Allocator, io: std.Io) void {
+        self.file.close(io);
+        allocator.free(self.pairs);
+        allocator.free(self.sampling_indices);
+        allocator.free(self.scanout_indices);
     }
 };
 
@@ -239,24 +300,22 @@ const Feedback = struct {
             .alloc = @sizeOf(linux.dev_t),
             .data = @ptrCast(&device),
         };
-        var scanout_indices: [2]u16 align(4) = .{ 0, 1 };
         var scanout_indices_array: wl.Array = .{
-            .size = @sizeOf(@TypeOf(scanout_indices)),
-            .alloc = @sizeOf(@TypeOf(scanout_indices)),
-            .data = @ptrCast(&scanout_indices),
+            .size = state.scanout_indices.len * @sizeOf(u16),
+            .alloc = state.scanout_indices.len * @sizeOf(u16),
+            .data = state.scanout_indices.ptr,
         };
-        var indices: [import_formats.len]u16 align(4) = .{ 0, 1, 2, 3 };
         var indices_array: wl.Array = .{
-            .size = @sizeOf(@TypeOf(indices)),
-            .alloc = @sizeOf(@TypeOf(indices)),
-            .data = @ptrCast(&indices),
+            .size = state.sampling_indices.len * @sizeOf(u16),
+            .alloc = state.sampling_indices.len * @sizeOf(u16),
+            .data = state.sampling_indices.ptr,
         };
         resource.sendFormatTable(
             state.file.handle,
-            import_formats.len * @sizeOf(FormatTableEntry),
+            @intCast(state.pairs.len * @sizeOf(FormatTableEntry)),
         );
         if (resource.getVersion() < 6) resource.sendMainDevice(&device_array);
-        if (state.scanout_device) |scanout_device| {
+        if (state.scanout_device) |scanout_device| if (state.scanout_indices.len != 0) {
             var scanout_device_value = scanout_device;
             var scanout_device_array: wl.Array = .{
                 .size = @sizeOf(linux.dev_t),
@@ -267,7 +326,7 @@ const Feedback = struct {
             resource.sendTrancheFlags(.{ .scanout = true });
             resource.sendTrancheFormats(&scanout_indices_array);
             resource.sendTrancheDone();
-        }
+        };
         resource.sendTrancheTargetDevice(&device_array);
         resource.sendTrancheFlags(if (resource.getVersion() >= 6)
             .{ .sampling = true }
@@ -423,6 +482,7 @@ const Params = struct {
             format,
             flags,
             self.resource.getVersion() < 3,
+            self.manager.supported_pairs,
         ) catch |err| {
             switch (err) {
                 error.Incomplete => self.resource.postError(
@@ -453,6 +513,27 @@ const Params = struct {
                 self.importFailed(immediate_id);
                 return;
             }
+        }
+        if (descriptor.plane.modifier != linear_modifier and
+            descriptor.plane.modifier != invalid_modifier)
+        {
+            const validator = self.manager.source_validator orelse {
+                self.importFailed(immediate_id);
+                return;
+            };
+            const format_info = render.DmabufFormat.fromFourcc(descriptor.format).?;
+            validator.validate(validator.context, .{
+                .size = descriptor.size,
+                .fd = descriptor.plane.fd,
+                .format = descriptor.format,
+                .modifier = descriptor.plane.modifier,
+                .stride = descriptor.plane.stride,
+                .offset = descriptor.plane.offset,
+                .force_opaque = !format_info.hasAlpha(),
+            }) catch {
+                self.importFailed(immediate_id);
+                return;
+            };
         }
         if (descriptor.plane.modifier == invalid_modifier) {
             log.warn("assuming a legacy implicit DMA-BUF has linear layout", .{});
@@ -518,6 +599,7 @@ fn validateDescriptor(
     format: u32,
     flags: zwp.LinuxBufferParamsV1.Flags,
     allow_implicit_modifier: bool,
+    supported_pairs: []const render.DmabufFormatModifier,
 ) DescriptorError!Descriptor {
     if (planes[0] == null) return error.Incomplete;
     for (planes[1..]) |plane| if (plane != null) return error.Incomplete;
@@ -525,11 +607,11 @@ fn validateDescriptor(
     if (render.DmabufFormat.fromFourcc(format) == null) return error.InvalidFormat;
 
     const plane = planes[0].?;
-    if (plane.modifier != linear_modifier and
-        !(allow_implicit_modifier and plane.modifier == invalid_modifier))
-    {
-        return error.InvalidFormat;
-    }
+    const effective_modifier = if (allow_implicit_modifier and plane.modifier == invalid_modifier)
+        linear_modifier
+    else
+        plane.modifier;
+    if (!render.DmabufFormatModifier.contains(supported_pairs, format, effective_modifier)) return error.InvalidFormat;
     const flag_bits: u32 = @bitCast(flags);
     if (flag_bits & ~@as(u32, 7) != 0 or flags.interlaced or flags.bottom_first) {
         return error.ImportFailed;
@@ -539,6 +621,18 @@ fn validateDescriptor(
         .width = @intCast(width),
         .height = @intCast(height),
     };
+    if (effective_modifier != linear_modifier) {
+        const fd_size = std.c.lseek(plane.fd, 0, std.c.SEEK.END);
+        if (fd_size <= 0) return error.ImportFailed;
+        if (@as(u64, @intCast(fd_size)) > std.math.maxInt(usize)) return error.OutOfBounds;
+        return .{
+            .plane = plane,
+            .size = size,
+            .format = format,
+            .y_inverted = flags.y_invert,
+            .required_bytes = @intCast(fd_size),
+        };
+    }
     const row_bytes = std.math.mul(u64, size.width, @sizeOf(u32)) catch
         return error.OutOfBounds;
     if (plane.stride < row_bytes or plane.stride % @sizeOf(u32) != 0 or
@@ -718,6 +812,8 @@ pub const Buffer = struct {
         allocator: std.mem.Allocator,
     ) CopyError![]u32 {
         const descriptor = self.descriptor;
+        if (descriptor.plane.modifier != linear_modifier and
+            descriptor.plane.modifier != invalid_modifier) return error.ImportFailed;
         const format_info = render.DmabufFormat.fromFourcc(descriptor.format).?;
         const pixels = allocator.alloc(
             u32,
@@ -771,6 +867,8 @@ pub const Buffer = struct {
         source: render.PixelBuffer,
     ) CopyError!void {
         const descriptor = self.descriptor;
+        if (descriptor.plane.modifier != linear_modifier and
+            descriptor.plane.modifier != invalid_modifier) return error.ImportFailed;
         const format_info = render.DmabufFormat.fromFourcc(descriptor.format).?;
         if (!std.meta.eql(source.size, descriptor.size) or
             source.stride_pixels < source.size.width) return error.ImportFailed;
@@ -929,31 +1027,31 @@ test "DMA-BUF descriptor rejects malformed and unsupported layouts before import
 
     try std.testing.expectError(
         error.Incomplete,
-        validateDescriptor(planes, 2, 2, argb8888, no_flags, false),
+        validateDescriptor(planes, 2, 2, argb8888, no_flags, false, &fallback_formats),
     );
     planes[0] = linear_plane;
     try std.testing.expectError(
         error.InvalidDimensions,
-        validateDescriptor(planes, 0, 2, argb8888, no_flags, false),
+        validateDescriptor(planes, 0, 2, argb8888, no_flags, false, &fallback_formats),
     );
 
     planes[0].?.stride = 4;
     try std.testing.expectError(
         error.OutOfBounds,
-        validateDescriptor(planes, 2, 2, argb8888, no_flags, false),
+        validateDescriptor(planes, 2, 2, argb8888, no_flags, false, &fallback_formats),
     );
     planes[0].?.stride = 8;
     planes[0].?.modifier = 1;
     try std.testing.expectError(
         error.InvalidFormat,
-        validateDescriptor(planes, 2, 2, argb8888, no_flags, false),
+        validateDescriptor(planes, 2, 2, argb8888, no_flags, false, &fallback_formats),
     );
 
     planes[0].?.modifier = linear_modifier;
     const interlaced: zwp.LinuxBufferParamsV1.Flags = @bitCast(@as(u32, 2));
     try std.testing.expectError(
         error.ImportFailed,
-        validateDescriptor(planes, 2, 2, argb8888, interlaced, false),
+        validateDescriptor(planes, 2, 2, argb8888, interlaced, false, &fallback_formats),
     );
 }
 
@@ -968,4 +1066,32 @@ test "DMA-BUF sampling device arrays use native dev_t representation" {
 
     array.size -= 1;
     try std.testing.expectError(error.InvalidSize, deviceFromArray(&array));
+}
+
+test "DMA-BUF descriptor accepts only advertised non-linear pairs without mapping" {
+    const no_flags: zwp.LinuxBufferParamsV1.Flags = @bitCast(@as(u32, 0));
+    const fd = try std.posix.memfd_create("keywork-dmabuf-test", 0);
+    defer _ = std.c.close(fd);
+    if (std.c.ftruncate(fd, 16) != 0) return error.Unexpected;
+    var planes: [max_planes]?Plane = @splat(null);
+    // Modifier-specific plane layout values are opaque to the compositor; only
+    // Vulkan may interpret them.
+    planes[0] = .{ .fd = fd, .offset = 3, .stride = 1, .modifier = 42 };
+    const supported = [_]render.DmabufFormatModifier{
+        .{ .format = argb8888, .modifier = 42 },
+    };
+    const descriptor = try validateDescriptor(
+        planes,
+        2,
+        2,
+        argb8888,
+        no_flags,
+        false,
+        &supported,
+    );
+    try std.testing.expectEqual(@as(u64, 42), descriptor.plane.modifier);
+    try std.testing.expectError(
+        error.InvalidFormat,
+        validateDescriptor(planes, 2, 2, xrgb8888, no_flags, false, &supported),
+    );
 }

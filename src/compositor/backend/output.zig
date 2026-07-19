@@ -71,6 +71,13 @@ pub fn drmOutput(self: *const Self) ?*DrmOutput {
     };
 }
 
+pub fn scanoutFormats(self: *const Self) []const render.DmabufFormatModifier {
+    return switch (self.backend) {
+        .drm => |output| output.scanoutFormats(),
+        else => &.{},
+    };
+}
+
 pub fn name(self: *const Self, fallback: []const u8) []const u8 {
     return switch (self.backend) {
         .drm => |output| output.name(),

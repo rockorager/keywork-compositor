@@ -115,6 +115,25 @@ pub const Renderer = struct {
         };
     }
 
+    pub fn dmabufSourceFormats(self: *const Renderer) []const render_types.DmabufFormatModifier {
+        return switch (self.backend) {
+            .cpu => &.{
+                .{ .format = @intFromEnum(render_types.DmabufFormat.argb8888), .modifier = 0 },
+                .{ .format = @intFromEnum(render_types.DmabufFormat.xrgb8888), .modifier = 0 },
+                .{ .format = @intFromEnum(render_types.DmabufFormat.abgr8888), .modifier = 0 },
+                .{ .format = @intFromEnum(render_types.DmabufFormat.xbgr8888), .modifier = 0 },
+            },
+            .vulkan => |*renderer| renderer.dmabufSourceFormats(),
+        };
+    }
+
+    pub fn dmabufSourceValidator(self: *Renderer) ?render_types.DmabufSourceValidator {
+        return switch (self.backend) {
+            .cpu => null,
+            .vulkan => |*renderer| renderer.dmabufSourceValidator(),
+        };
+    }
+
     pub fn offscreenAccess(self: *Renderer) ?render_types.OffscreenRenderer {
         return switch (self.backend) {
             .cpu => null,

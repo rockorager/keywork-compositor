@@ -1038,6 +1038,9 @@ pub fn createWithVirtualOutput(
         display,
         self.renderer.dmabufDeviceId(),
         if (output_kind == .drm) self.drm_device.deviceId() else null,
+        self.renderer.dmabufSourceFormats(),
+        render_output.backend.scanoutFormats(),
+        self.renderer.dmabufSourceValidator(),
     );
     errdefer self.linux_dmabuf.deinit();
     try self.linux_drm_syncobj.init(

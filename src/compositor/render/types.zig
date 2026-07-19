@@ -280,6 +280,14 @@ pub const DmabufFormat = enum(u32) {
         return self == .argb8888 or self == .abgr8888;
     }
 
+    pub fn opaqueFormat(self: DmabufFormat) DmabufFormat {
+        return switch (self) {
+            .argb8888 => .xrgb8888,
+            .abgr8888 => .xbgr8888,
+            .xrgb8888, .xbgr8888 => self,
+        };
+    }
+
     pub fn redBlueSwapped(self: DmabufFormat) bool {
         return self == .abgr8888 or self == .xbgr8888;
     }
@@ -299,6 +307,20 @@ pub const DmabufFormat = enum(u32) {
         return pixel & 0xff00_ff00 |
             (pixel & 0x00ff_0000) >> 16 |
             (pixel & 0x0000_00ff) << 16;
+    }
+};
+
+pub const DmabufFormatModifier = struct {
+    format: u32,
+    modifier: u64,
+
+    pub fn matches(self: DmabufFormatModifier, format: u32, modifier: u64) bool {
+        return self.format == format and self.modifier == modifier;
+    }
+
+    pub fn contains(pairs: []const DmabufFormatModifier, format: u32, modifier: u64) bool {
+        for (pairs) |pair| if (pair.matches(format, modifier)) return true;
+        return false;
     }
 };
 
@@ -333,6 +355,21 @@ pub const DmabufSource = struct {
     begin_cpu_read: *const fn (*anyopaque) bool,
     end_cpu_read: *const fn (*anyopaque) bool,
     export_read_fence: *const fn (*anyopaque) ?std.posix.fd_t,
+};
+
+pub const DmabufSourceDescriptor = struct {
+    size: Size,
+    fd: std.posix.fd_t,
+    format: u32,
+    modifier: u64,
+    stride: u32,
+    offset: u32,
+    force_opaque: bool,
+};
+
+pub const DmabufSourceValidator = struct {
+    context: *anyopaque,
+    validate: *const fn (*anyopaque, DmabufSourceDescriptor) anyerror!void,
 };
 
 pub const Target = union(enum) {
@@ -409,6 +446,11 @@ test "color conversion premultiplies alpha" {
 }
 
 test "DMA-BUF formats normalize red-blue order and opacity" {
+    try std.testing.expectEqual(DmabufFormat.xrgb8888, DmabufFormat.argb8888.opaqueFormat());
+    try std.testing.expectEqual(DmabufFormat.xbgr8888, DmabufFormat.abgr8888.opaqueFormat());
+    const pairs = [_]DmabufFormatModifier{.{ .format = 7, .modifier = 11 }};
+    try std.testing.expect(DmabufFormatModifier.contains(&pairs, 7, 11));
+    try std.testing.expect(!DmabufFormatModifier.contains(&pairs, 7, 12));
     try std.testing.expectEqual(
         DmabufFormat.abgr8888,
         DmabufFormat.fromFourcc(0x34324241).?,
