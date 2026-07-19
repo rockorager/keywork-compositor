@@ -74,6 +74,8 @@ dmabuf_10bit_sampled_modifiers: []u64,
 dmabuf_target_formats: []render.DmabufFormatModifier,
 dmabuf_source_modifiers: []u64,
 dmabuf_rgba_source_modifiers: []u64,
+dmabuf_nv12_source_modifiers: []u64,
+dmabuf_p010_source_modifiers: []u64,
 dmabuf_source_formats: []render.DmabufFormatModifier,
 dmabuf_device_id: ?render.DrmDeviceId,
 outputs: std.AutoHashMapUnmanaged(TargetKey, Output) = .empty,
@@ -871,7 +873,9 @@ fn dmabufSourceVkFormat(fourcc: u32) ?vk.Format {
     return switch (render.DmabufFormat.fromFourcc(fourcc) orelse return null) {
         .argb8888, .xrgb8888 => .b8g8r8a8_unorm,
         .abgr8888, .xbgr8888 => .r8g8b8a8_unorm,
-        .xrgb2101010, .nv12, .p010 => null,
+        .nv12 => .g8_b8r8_2plane_420_unorm,
+        .p010 => .g10x6_b10x6r10x6_2plane_420_unorm_3pack16,
+        .xrgb2101010 => null,
     };
 }
 
@@ -935,6 +939,14 @@ test "DMA-BUF source FourCC selects the matching Vulkan format" {
     try std.testing.expectEqual(
         vk.Format.r8g8b8a8_unorm,
         dmabufSourceVkFormat(@intFromEnum(render.DmabufFormat.xbgr8888)).?,
+    );
+    try std.testing.expectEqual(
+        vk.Format.g8_b8r8_2plane_420_unorm,
+        dmabufSourceVkFormat(@intFromEnum(render.DmabufFormat.nv12)).?,
+    );
+    try std.testing.expectEqual(
+        vk.Format.g10x6_b10x6r10x6_2plane_420_unorm_3pack16,
+        dmabufSourceVkFormat(@intFromEnum(render.DmabufFormat.p010)).?,
     );
     try std.testing.expect(
         dmabufSourceVkFormat(@intFromEnum(render.DmabufFormat.xrgb2101010)) == null,
@@ -1021,6 +1033,8 @@ fn queryDmabufSourceModifiers(
     instance_wrapper: vk.InstanceWrapper,
     physical_device: vk.PhysicalDevice,
     format: vk.Format,
+    plane_count: u32,
+    require_ycbcr: bool,
 ) error{OutOfMemory}![]u64 {
     var modifier_list: vk.DrmFormatModifierPropertiesListEXT = .{};
     var format_properties: vk.FormatProperties2 = .{ .format_properties = undefined };
@@ -1046,8 +1060,12 @@ fn queryDmabufSourceModifiers(
     defer modifiers.deinit(allocator);
     for (properties) |property| {
         const features = property.drm_format_modifier_tiling_features;
-        if (property.drm_format_modifier_plane_count == 1 and
+        if (property.drm_format_modifier_plane_count == plane_count and
             features.sampled_image_bit and features.sampled_image_filter_linear_bit and
+            (!require_ycbcr or
+                (features.cosited_chroma_samples_bit and
+                    features.midpoint_chroma_samples_bit and
+                    features.sampled_image_ycbcr_conversion_linear_filter_bit)) and
             dmabufSourceModifierImportable(
                 instance_wrapper,
                 physical_device,
@@ -1185,7 +1203,18 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
         &dmabuf_device_extensions
     else
         &.{};
+    var supported_ycbcr: vk.PhysicalDeviceSamplerYcbcrConversionFeatures = .{};
+    var physical_features: vk.PhysicalDeviceFeatures2 = .{ .features = undefined };
+    if (dmabuf_capable) {
+        physical_features.p_next = &supported_ycbcr;
+        instance_wrapper.getPhysicalDeviceFeatures2KHR(physical_device, &physical_features);
+    }
+    const ycbcr_capable = dmabuf_capable and supported_ycbcr.sampler_ycbcr_conversion == .true;
+    var enabled_ycbcr: vk.PhysicalDeviceSamplerYcbcrConversionFeatures = .{
+        .sampler_ycbcr_conversion = .true,
+    };
     const device = instance_wrapper.createDevice(physical_device, &.{
+        .p_next = if (ycbcr_capable) &enabled_ycbcr else null,
         .queue_create_info_count = 1,
         .p_queue_create_infos = @ptrCast(&queue_create_info),
         .enabled_extension_count = @intCast(enabled_device_extensions.len),
@@ -1281,6 +1310,8 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
     var dmabuf_target_formats: []render.DmabufFormatModifier = &.{};
     var dmabuf_source_modifiers: []u64 = &.{};
     var dmabuf_rgba_source_modifiers: []u64 = &.{};
+    var dmabuf_nv12_source_modifiers: []u64 = &.{};
+    var dmabuf_p010_source_modifiers: []u64 = &.{};
     var dmabuf_source_formats: []render.DmabufFormatModifier = &.{};
     if (dmabuf_capable) {
         var modifier_list: vk.DrmFormatModifierPropertiesListEXT = .{};
@@ -1379,10 +1410,36 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
             instance_wrapper,
             physical_device,
             .r8g8b8a8_unorm,
+            1,
+            false,
         );
         errdefer if (dmabuf_rgba_source_modifiers.len != 0) {
             allocator.free(dmabuf_rgba_source_modifiers);
         };
+        if (ycbcr_capable) {
+            dmabuf_nv12_source_modifiers = try queryDmabufSourceModifiers(
+                allocator,
+                instance_wrapper,
+                physical_device,
+                .g8_b8r8_2plane_420_unorm,
+                2,
+                true,
+            );
+            errdefer if (dmabuf_nv12_source_modifiers.len != 0) {
+                allocator.free(dmabuf_nv12_source_modifiers);
+            };
+            dmabuf_p010_source_modifiers = try queryDmabufSourceModifiers(
+                allocator,
+                instance_wrapper,
+                physical_device,
+                .g10x6_b10x6r10x6_2plane_420_unorm_3pack16,
+                2,
+                true,
+            );
+            errdefer if (dmabuf_p010_source_modifiers.len != 0) {
+                allocator.free(dmabuf_p010_source_modifiers);
+            };
+        }
         var pairs: std.ArrayList(render.DmabufFormatModifier) = .empty;
         defer pairs.deinit(allocator);
         for (dmabuf_source_modifiers) |modifier| for ([_]render.DmabufFormat{
@@ -1409,6 +1466,12 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
     errdefer if (dmabuf_source_modifiers.len != 0) allocator.free(dmabuf_source_modifiers);
     errdefer if (dmabuf_rgba_source_modifiers.len != 0) {
         allocator.free(dmabuf_rgba_source_modifiers);
+    };
+    errdefer if (dmabuf_nv12_source_modifiers.len != 0) {
+        allocator.free(dmabuf_nv12_source_modifiers);
+    };
+    errdefer if (dmabuf_p010_source_modifiers.len != 0) {
+        allocator.free(dmabuf_p010_source_modifiers);
     };
     errdefer if (dmabuf_source_formats.len != 0) allocator.free(dmabuf_source_formats);
     const graphics = initGraphics(
@@ -1484,6 +1547,14 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
             dmabuf_rgba_source_modifiers
         else
             &.{},
+        .dmabuf_nv12_source_modifiers = if (dmabuf_capable)
+            dmabuf_nv12_source_modifiers
+        else
+            &.{},
+        .dmabuf_p010_source_modifiers = if (dmabuf_capable)
+            dmabuf_p010_source_modifiers
+        else
+            &.{},
         .dmabuf_source_formats = if (dmabuf_capable) dmabuf_source_formats else &.{},
         .dmabuf_device_id = dmabuf_device_id,
         .frame_number = 0,
@@ -1509,6 +1580,12 @@ pub fn deinit(self: *Self) void {
     if (self.dmabuf_source_modifiers.len != 0) self.allocator.free(self.dmabuf_source_modifiers);
     if (self.dmabuf_rgba_source_modifiers.len != 0) {
         self.allocator.free(self.dmabuf_rgba_source_modifiers);
+    }
+    if (self.dmabuf_nv12_source_modifiers.len != 0) {
+        self.allocator.free(self.dmabuf_nv12_source_modifiers);
+    }
+    if (self.dmabuf_p010_source_modifiers.len != 0) {
+        self.allocator.free(self.dmabuf_p010_source_modifiers);
     }
     if (self.dmabuf_source_formats.len != 0) self.allocator.free(self.dmabuf_source_formats);
     self.instances.deinit(self.allocator);
