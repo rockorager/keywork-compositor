@@ -359,6 +359,9 @@ pub const Image = struct {
             source.width != @as(f64, @floatFromInt(self.size.width)) or
             source.height != @as(f64, @floatFromInt(self.size.height)))
         {
+            const horizontal_scale = @as(f64, @floatFromInt(self.size.width)) / source.width;
+            const vertical_scale = @as(f64, @floatFromInt(self.size.height)) / source.height;
+            if (horizontal_scale < 0.5 or vertical_scale < 0.5) return .linear;
             return .reconstruction;
         }
         return .nearest;
@@ -367,6 +370,7 @@ pub const Image = struct {
 
 pub const SamplingFilter = enum {
     nearest,
+    linear,
     reconstruction,
 };
 
@@ -814,6 +818,8 @@ test "image sampling preserves exact texel alignment" {
 
     image.size = .{ .width = 6, .height = 4 };
     try std.testing.expectEqual(SamplingFilter.reconstruction, image.samplingFilter());
+    image.size = .{ .width = 1, .height = 1 };
+    try std.testing.expectEqual(SamplingFilter.linear, image.samplingFilter());
 
     image.size = .{ .width = 2, .height = 2 };
     image.source = .{ .x = 1, .y = 0, .width = 2, .height = 2 };
