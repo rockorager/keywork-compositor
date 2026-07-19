@@ -73,9 +73,11 @@ and HDR highlights retain detail under SDR conversion.
 
 ## 4. ICC profiles and calibration
 
-- Load per-output ICC profiles and calibration data.
-- Compile profile transforms into renderer-owned GPU resources.
-- Invalidate retained images and scanout eligibility when calibration changes.
+- [x] Load per-output power-law matrix ICC profiles and apply them to SDR output
+  descriptions.
+- [ ] Load per-output calibration data and LUT profiles.
+- [ ] Compile profile transforms into renderer-owned GPU resources.
+- [x] Invalidate retained images and scanout eligibility when profiles change.
 
 Acceptance: matrix/TRC and LUT-based reference profiles match the conformance
 corpus within its published tolerance, and profile changes take effect without

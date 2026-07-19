@@ -160,11 +160,17 @@ pub const OutputMode = struct {
 
 pub const OutputPosition = struct { x: i32, y: i32 };
 
+pub const OutputIccProfile = union(enum) {
+    none,
+    path: []const u8,
+};
+
 pub const OutputSettings = struct {
     enable: ?bool = null,
     mode: ?OutputMode = null,
     position: ?OutputPosition = null,
     scale_v120_numerator: ?u32 = null,
+    icc_profile: ?OutputIccProfile = null,
 };
 
 pub const OutputRule = struct {
@@ -524,7 +530,13 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !ParseResult {
                     .problem = problemForInputSettingError(err),
                 } };
             },
-            .output => |index| parseOutputSetting(&output_rules.items[index].settings, name, value) catch |err| {
+            .output => |index| parseOutputSetting(
+                arena_allocator,
+                &output_rules.items[index].settings,
+                name,
+                value,
+            ) catch |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
                 arena.deinit();
                 return .{ .diagnostic = .{ .line = line_number, .problem = problemForOutputSettingError(err) } };
             },
@@ -716,7 +728,12 @@ const OutputSettingError = error{
     DuplicateOutputSetting,
 };
 
-fn parseOutputSetting(settings: *OutputSettings, name: []const u8, value: []const u8) OutputSettingError!void {
+fn parseOutputSetting(
+    allocator: std.mem.Allocator,
+    settings: *OutputSettings,
+    name: []const u8,
+    value: []const u8,
+) (OutputSettingError || error{OutOfMemory})!void {
     if (std.mem.eql(u8, name, "enable")) {
         if (settings.enable != null) return error.DuplicateOutputSetting;
         if (std.mem.eql(u8, value, "enabled")) {
@@ -738,6 +755,14 @@ fn parseOutputSetting(settings: *OutputSettings, name: []const u8, value: []cons
         const numerator: u32 = @intFromFloat(@round(scale * 120.0));
         if (numerator == 0) return error.InvalidOutputSetting;
         settings.scale_v120_numerator = numerator;
+    } else if (std.mem.eql(u8, name, "icc-profile")) {
+        if (settings.icc_profile != null) return error.DuplicateOutputSetting;
+        if (std.mem.eql(u8, value, "none")) {
+            settings.icc_profile = .none;
+        } else {
+            if (value.len == 0) return error.InvalidOutputSetting;
+            settings.icc_profile = .{ .path = try allocator.dupe(u8, value) };
+        }
     } else return error.UnknownOutputSetting;
 }
 
@@ -1221,6 +1246,7 @@ test "output rules parse in order and match output identity" {
         \\enable=disabled
         \\mode=3840x2160@59.94Hz
         \\position=-1920,40
+        \\icc-profile=/home/user/.local/share/color/icc/display.icc
     );
     var snapshot = switch (result) {
         .snapshot => |snapshot| snapshot,
@@ -1241,6 +1267,10 @@ test "output rules parse in order and match output identity" {
     try std.testing.expectEqual(false, rule.settings.enable.?);
     try std.testing.expectEqual(@as(i32, 59940), rule.settings.mode.?.refresh_millihertz.?);
     try std.testing.expectEqual(OutputPosition{ .x = -1920, .y = 40 }, rule.settings.position.?);
+    try std.testing.expectEqualStrings(
+        "/home/user/.local/share/color/icc/display.icc",
+        rule.settings.icc_profile.?.path,
+    );
 }
 
 test "output rules reject invalid matchers and settings" {
@@ -1256,6 +1286,8 @@ test "output rules reject invalid matchers and settings" {
         .{ .source = "[output]\nmode=1920-1080\n", .problem = .invalid_output_setting },
         .{ .source = "[output]\nmode=1920x1080@0Hz\n", .problem = .invalid_output_setting },
         .{ .source = "[output]\nposition=1:2\n", .problem = .invalid_output_setting },
+        .{ .source = "[output]\nicc-profile=\n", .problem = .invalid_output_setting },
+        .{ .source = "[output]\nicc-profile=a.icc\nicc-profile=b.icc\n", .problem = .duplicate_output_setting },
         .{ .source = "[outputs]\n", .problem = .unknown_section },
     };
     for (cases) |case| {

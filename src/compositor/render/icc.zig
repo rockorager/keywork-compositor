@@ -10,6 +10,14 @@ const c = @cImport({
 pub const Profile = struct {
     primaries: render.Chromaticities,
     transfer_function: render.TransferFunction,
+
+    pub fn applyTo(self: Profile, base: render.ColorDescription) render.ColorDescription {
+        var description = base;
+        description.primaries = self.primaries;
+        description.named_primaries = null;
+        description.transfer_function = self.transfer_function;
+        return description;
+    }
 };
 
 pub fn load(allocator: std.mem.Allocator, path: []const u8) !Profile {
@@ -29,20 +37,29 @@ fn parse(profile: c.cmsHPROFILE) !Profile {
     {
         return error.UnsupportedIccProfile;
     }
+    for (0..4) |intent| {
+        if (c.cmsIsCLUT(profile, @intCast(intent), c.LCMS_USED_AS_INPUT) != 0 or
+            c.cmsIsCLUT(profile, @intCast(intent), c.LCMS_USED_AS_OUTPUT) != 0)
+        {
+            return error.UnsupportedIccProfile;
+        }
+    }
+    if (c.cmsIsTag(profile, c.cmsSigVcgtTag) != 0) return error.UnsupportedIccProfile;
 
-    const red = readTag(c.cmsCIEXYZ, profile, c.cmsSigRedColorantTag) orelse
+    const red_tag = readTag(c.cmsCIEXYZ, profile, c.cmsSigRedColorantTag) orelse
         return error.InvalidIccProfile;
-    const green = readTag(c.cmsCIEXYZ, profile, c.cmsSigGreenColorantTag) orelse
+    const green_tag = readTag(c.cmsCIEXYZ, profile, c.cmsSigGreenColorantTag) orelse
         return error.InvalidIccProfile;
-    const blue = readTag(c.cmsCIEXYZ, profile, c.cmsSigBlueColorantTag) orelse
+    const blue_tag = readTag(c.cmsCIEXYZ, profile, c.cmsSigBlueColorantTag) orelse
         return error.InvalidIccProfile;
-    const red_xy = try xyzChromaticity(red.*);
-    const green_xy = try xyzChromaticity(green.*);
-    const blue_xy = try xyzChromaticity(blue.*);
+    const colorants = try nativeColorants(profile, .{ red_tag.*, green_tag.*, blue_tag.* });
+    const red_xy = try xyzChromaticity(colorants[0]);
+    const green_xy = try xyzChromaticity(colorants[1]);
+    const blue_xy = try xyzChromaticity(colorants[2]);
     const white_xy = try xyzChromaticity(.{
-        .X = red.X + green.X + blue.X,
-        .Y = red.Y + green.Y + blue.Y,
-        .Z = red.Z + green.Z + blue.Z,
+        .X = colorants[0].X + colorants[1].X + colorants[2].X,
+        .Y = colorants[0].Y + colorants[1].Y + colorants[2].Y,
+        .Z = colorants[0].Z + colorants[1].Z + colorants[2].Z,
     });
 
     const red_trc = readTag(c.cmsToneCurve, profile, c.cmsSigRedTRCTag) orelse
@@ -78,6 +95,86 @@ fn parse(profile: c.cmsHPROFILE) !Profile {
         .transfer_function = .{
             .power = @intFromFloat(@round(gamma[0] * 10000.0)),
         },
+    };
+}
+
+const Matrix3 = [3][3]f64;
+
+fn nativeColorants(
+    profile: c.cmsHPROFILE,
+    pcs_colorants: [3]c.cmsCIEXYZ,
+) ![3]c.cmsCIEXYZ {
+    if (try readChromaticAdaptation(profile)) |adaptation| {
+        const inverse = invertMatrix3(adaptation) orelse return error.InvalidIccProfile;
+        var result: [3]c.cmsCIEXYZ = undefined;
+        for (pcs_colorants, &result) |colorant, *native| native.* = multiplyXyz(inverse, colorant);
+        return result;
+    }
+
+    const media_white = readTag(c.cmsCIEXYZ, profile, c.cmsSigMediaWhitePointTag) orelse
+        return error.UnsupportedIccProfile;
+    var result: [3]c.cmsCIEXYZ = undefined;
+    for (pcs_colorants, &result) |colorant, *native| {
+        if (c.cmsAdaptToIlluminant(native, c.cmsD50_XYZ(), media_white, &colorant) == 0) {
+            return error.InvalidIccProfile;
+        }
+    }
+    return result;
+}
+
+fn readChromaticAdaptation(profile: c.cmsHPROFILE) !?Matrix3 {
+    const size = c.cmsReadRawTag(profile, c.cmsSigChromaticAdaptationTag, null, 0);
+    if (size == 0) return null;
+    if (size != 44) return error.InvalidIccProfile;
+    var bytes: [44]u8 = undefined;
+    if (c.cmsReadRawTag(profile, c.cmsSigChromaticAdaptationTag, &bytes, bytes.len) != bytes.len or
+        !std.mem.eql(u8, bytes[0..4], "sf32") or !std.mem.allEqual(u8, bytes[4..8], 0))
+    {
+        return error.InvalidIccProfile;
+    }
+    var matrix: Matrix3 = undefined;
+    for (0..3) |row| {
+        for (0..3) |column| {
+            const offset = 8 + (row * 3 + column) * 4;
+            const fixed = std.mem.readInt(i32, bytes[offset..][0..4], .big);
+            matrix[row][column] = @as(f64, @floatFromInt(fixed)) / 65536.0;
+        }
+    }
+    return matrix;
+}
+
+fn invertMatrix3(matrix: Matrix3) ?Matrix3 {
+    const determinant =
+        matrix[0][0] * (matrix[1][1] * matrix[2][2] - matrix[1][2] * matrix[2][1]) -
+        matrix[0][1] * (matrix[1][0] * matrix[2][2] - matrix[1][2] * matrix[2][0]) +
+        matrix[0][2] * (matrix[1][0] * matrix[2][1] - matrix[1][1] * matrix[2][0]);
+    if (!std.math.isFinite(determinant) or @abs(determinant) < 0.000000001) return null;
+    const inverse_determinant = 1.0 / determinant;
+    return .{
+        .{
+            (matrix[1][1] * matrix[2][2] - matrix[1][2] * matrix[2][1]) * inverse_determinant,
+            (matrix[0][2] * matrix[2][1] - matrix[0][1] * matrix[2][2]) * inverse_determinant,
+            (matrix[0][1] * matrix[1][2] - matrix[0][2] * matrix[1][1]) * inverse_determinant,
+        },
+        .{
+            (matrix[1][2] * matrix[2][0] - matrix[1][0] * matrix[2][2]) * inverse_determinant,
+            (matrix[0][0] * matrix[2][2] - matrix[0][2] * matrix[2][0]) * inverse_determinant,
+            (matrix[0][2] * matrix[1][0] - matrix[0][0] * matrix[1][2]) * inverse_determinant,
+        },
+        .{
+            (matrix[1][0] * matrix[2][1] - matrix[1][1] * matrix[2][0]) * inverse_determinant,
+            (matrix[0][1] * matrix[2][0] - matrix[0][0] * matrix[2][1]) * inverse_determinant,
+            (matrix[0][0] * matrix[1][1] - matrix[0][1] * matrix[1][0]) * inverse_determinant,
+        },
+    };
+}
+
+fn multiplyXyz(matrix: Matrix3, value: c.cmsCIEXYZ) c.cmsCIEXYZ {
+    const vector = [_]f64{ value.X, value.Y, value.Z };
+    return .{
+        .X = matrix[0][0] * vector[0] + matrix[0][1] * vector[1] + matrix[0][2] * vector[2],
+        .Y = matrix[1][0] * vector[0] + matrix[1][1] * vector[1] + matrix[1][2] * vector[2],
+        .Z = matrix[2][0] * vector[0] + matrix[2][1] * vector[1] + matrix[2][2] * vector[2],
     };
 }
 
@@ -122,10 +219,18 @@ test "ICC matrix profiles expose primaries and a shared transfer curve" {
 
     const parsed = try parse(profile);
     try std.testing.expectEqual(render.TransferFunction{ .power = 24000 }, parsed.transfer_function);
-    try std.testing.expect(parsed.primaries.red_y > 0);
-    try std.testing.expect(parsed.primaries.green_y > 0);
-    try std.testing.expect(parsed.primaries.blue_y > 0);
-    try std.testing.expect(parsed.primaries.white_y > 0);
+    try expectNear(640000, parsed.primaries.red_x, 100);
+    try expectNear(330000, parsed.primaries.red_y, 100);
+    try expectNear(300000, parsed.primaries.green_x, 100);
+    try expectNear(600000, parsed.primaries.green_y, 100);
+    try expectNear(150000, parsed.primaries.blue_x, 100);
+    try expectNear(60000, parsed.primaries.blue_y, 100);
+    try expectNear(312700, parsed.primaries.white_x, 100);
+    try expectNear(329000, parsed.primaries.white_y, 100);
+}
+
+fn expectNear(expected: i32, actual: i32, tolerance: i32) !void {
+    try std.testing.expect(@abs(expected - actual) <= tolerance);
 }
 
 test "ICC LUT profiles are rejected by the matrix profile path" {

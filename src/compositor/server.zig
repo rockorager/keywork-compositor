@@ -74,6 +74,7 @@ const DrmDevice = @import("backend/drm_device.zig");
 const DrmOutput = @import("backend/drm.zig");
 const NativeInput = @import("backend/native_input.zig");
 const Session = @import("backend/session.zig");
+const Icc = @import("render/icc.zig");
 const renderer_types = @import("render/renderer.zig");
 const render = @import("render/types.zig");
 const Region = @import("region.zig");
@@ -816,6 +817,12 @@ const EffectiveOutputSettings = struct {
     x: i32,
     y: i32,
     scale: render.Scale,
+};
+
+const PreparedIccProfile = struct {
+    output: *DrmOutput,
+    profile: ?Icc.Profile,
+    owned_path: ?[]u8,
 };
 
 pub const VirtualOutputConfig = struct {
@@ -2453,18 +2460,76 @@ fn configuredOutputChange(output: *DrmOutput, rules: []const Config.OutputRule) 
     };
 }
 
+fn configuredOutputIccProfile(
+    output: *const DrmOutput,
+    rules: []const Config.OutputRule,
+) ?Config.OutputIccProfile {
+    var configured: ?Config.OutputIccProfile = null;
+    const device = outputDeviceMatch(output);
+    for (rules) |rule| {
+        if (!rule.matcher.matches(device)) continue;
+        if (rule.settings.icc_profile) |profile| configured = profile;
+    }
+    return configured;
+}
+
+fn requestedIccProfilePath(profile: Config.OutputIccProfile) ?[]const u8 {
+    return switch (profile) {
+        .none => null,
+        .path => |path| path,
+    };
+}
+
 fn applyConfiguredOutputs(self: *Self, rules: []const Config.OutputRule, only: ?*DrmOutput) !void {
     if (!self.drm_device_initialized) return;
     var changes: std.ArrayList(OutputManagement.Change) = .empty;
     defer changes.deinit(self.allocator);
+    var profiles: std.ArrayList(PreparedIccProfile) = .empty;
+    defer {
+        for (profiles.items) |profile| {
+            if (profile.owned_path) |path| self.allocator.free(path);
+        }
+        profiles.deinit(self.allocator);
+    }
     for (self.drm_device.outputs()) |output| {
         if (only != null and only.? != output) continue;
         if (try configuredOutputChange(output, rules)) |change| try changes.append(self.allocator, change);
+        const requested = configuredOutputIccProfile(output, rules) orelse continue;
+        const path = requestedIccProfilePath(requested);
+        if (path == null and output.iccProfilePath() == null) continue;
+        const profile = if (path) |value|
+            Icc.load(self.allocator, value) catch |err| {
+                log.warn("failed to load ICC profile for {s} from {s}: {t}", .{
+                    output.name(),
+                    value,
+                    err,
+                });
+                return err;
+            }
+        else
+            null;
+        const owned_path = if (path) |value| try self.allocator.dupe(u8, value) else null;
+        profiles.append(self.allocator, .{
+            .output = output,
+            .profile = profile,
+            .owned_path = owned_path,
+        }) catch |err| {
+            if (owned_path) |value| self.allocator.free(value);
+            return err;
+        };
     }
     if (changes.items.len != 0) {
         if (!self.applyOutputChanges(changes.items)) return error.OutputConfigurationFailed;
         if (self.output_management_initialized) {
             for (changes.items) |change| self.output_management.syncHead(change.output);
+        }
+    }
+    for (profiles.items) |*prepared| {
+        const path = prepared.owned_path;
+        prepared.owned_path = null;
+        prepared.output.replaceIccProfile(prepared.profile, path);
+        if (self.findDrmRenderOutput(prepared.output)) |render_output| {
+            try self.refreshRenderOutputColorDescription(render_output.output);
         }
     }
 }

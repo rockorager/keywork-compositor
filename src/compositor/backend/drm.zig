@@ -7,6 +7,7 @@ const Gbm = @import("gbm.zig");
 const NestedOutput = @import("nested_wayland.zig");
 const presentation = @import("../presentation.zig");
 const Region = @import("../region.zig");
+const Icc = @import("../render/icc.zig");
 const render = @import("../render/types.zig");
 
 const c = @cImport({
@@ -62,7 +63,10 @@ make_value: [*c]u8,
 model_value: [*c]u8,
 serial_value: [*c]u8,
 color_description: render.ColorDescription,
+native_color_description: render.ColorDescription,
 sdr_color_description: render.ColorDescription,
+icc_profile: ?Icc.Profile,
+icc_profile_path: ?[]u8,
 hdr_capabilities: HdrCapabilities,
 output_color_mode: OutputColorMode,
 output_color_dirty: bool,
@@ -317,7 +321,10 @@ pub fn init(
         .model_value = null,
         .serial_value = null,
         .color_description = .{},
+        .native_color_description = .{},
         .sdr_color_description = .{},
+        .icc_profile = null,
+        .icc_profile_path = null,
         .hdr_capabilities = .{},
         .output_color_mode = .sdr,
         .output_color_dirty = false,
@@ -357,6 +364,7 @@ pub fn deinit(self: *Self) void {
     std.debug.assert(self.direct_framebuffers.count() == 0);
     self.direct_framebuffers.deinit(self.allocator);
     self.clearIdentity();
+    if (self.icc_profile_path) |path| self.allocator.free(path);
     self.allocator.free(self.gamma_lut);
     self.allocator.free(self.modes);
     self.allocator.free(self.scanout_formats);
@@ -427,6 +435,23 @@ pub fn colorDescription(self: *const Self) render.ColorDescription {
     return self.color_description;
 }
 
+pub fn iccProfilePath(self: *const Self) ?[]const u8 {
+    return self.icc_profile_path;
+}
+
+pub fn replaceIccProfile(
+    self: *Self,
+    profile: ?Icc.Profile,
+    owned_path: ?[]u8,
+) void {
+    std.debug.assert((profile == null) == (owned_path == null));
+    if (self.icc_profile_path) |path| self.allocator.free(path);
+    self.icc_profile = profile;
+    self.icc_profile_path = owned_path;
+    self.refreshSdrColorDescription();
+    if (self.output_color_mode == .sdr) self.color_description = self.sdr_color_description;
+}
+
 pub fn selectOutputTransfer(self: *Self, transfer: ?render.TransferFunction) bool {
     const selected_description = if (transfer) |requested|
         self.hdrOutputDescription(requested)
@@ -475,7 +500,7 @@ pub fn hdrOutputDescription(
     {
         return null;
     }
-    return hdrDescription(self.sdr_color_description, self.hdr_capabilities, transfer);
+    return hdrDescription(self.native_color_description, self.hdr_capabilities, transfer);
 }
 
 pub fn refreshMillihertz(self: *const Self) i32 {
@@ -856,11 +881,12 @@ fn readIdentity(self: *Self, fd: std.posix.fd_t) void {
         self.make_value = c.di_info_get_make(info);
         self.model_value = c.di_info_get_model(info);
         self.serial_value = c.di_info_get_serial(info);
-        self.sdr_color_description = colorDescriptionFromInfo(info);
+        self.native_color_description = colorDescriptionFromInfo(info);
+        self.refreshSdrColorDescription();
         self.hdr_capabilities = hdrCapabilitiesFromInfo(info);
         self.destroyHdrMetadataBlob(fd);
         self.color_description = if (self.output_color_mode.transfer()) |transfer|
-            hdrDescription(self.sdr_color_description, self.hdr_capabilities, transfer) orelse
+            hdrDescription(self.native_color_description, self.hdr_capabilities, transfer) orelse
                 self.sdr_color_description
         else
             self.sdr_color_description;
@@ -884,9 +910,17 @@ fn clearIdentity(self: *Self) void {
     self.make_value = null;
     self.model_value = null;
     self.serial_value = null;
-    self.color_description = .{};
-    self.sdr_color_description = .{};
+    self.native_color_description = .{};
+    self.refreshSdrColorDescription();
+    self.color_description = self.sdr_color_description;
     self.hdr_capabilities = .{};
+}
+
+fn refreshSdrColorDescription(self: *Self) void {
+    self.sdr_color_description = if (self.icc_profile) |profile|
+        profile.applyTo(self.native_color_description)
+    else
+        self.native_color_description;
 }
 
 fn hdrDescription(
@@ -2988,6 +3022,45 @@ test "DRM scale preserves mode pixels and derives logical size" {
         output.logicalSize(),
     );
     try std.testing.expectEqual(render.Size{ .width = 3840, .height = 2160 }, output.size);
+}
+
+test "ICC profiles override SDR colorimetry without replacing native display data" {
+    var context: u8 = 0;
+    var output: Self = undefined;
+    output.init(std.testing.allocator, std.testing.io, .{
+        .context = &context,
+        .fd = testDeviceFd,
+        .gbm = testDeviceGbm,
+        .active = testDeviceActive,
+        .fail = testDeviceFail,
+    });
+    defer output.deinit();
+
+    output.native_color_description = .{
+        .primaries = render.display_p3_chromaticities,
+        .named_primaries = .display_p3,
+        .max_luminance = 120,
+        .reference_luminance = 100,
+    };
+    output.refreshSdrColorDescription();
+    output.color_description = output.sdr_color_description;
+    const path = try std.testing.allocator.dupe(u8, "/profiles/display.icc");
+    output.replaceIccProfile(.{
+        .primaries = render.srgb_chromaticities,
+        .transfer_function = .{ .power = 24000 },
+    }, path);
+
+    try std.testing.expectEqualStrings("/profiles/display.icc", output.iccProfilePath().?);
+    try std.testing.expectEqual(render.srgb_chromaticities, output.color_description.primaries);
+    try std.testing.expectEqual(
+        render.TransferFunction{ .power = 24000 },
+        output.color_description.transfer_function,
+    );
+    try std.testing.expectEqual(@as(u32, 120), output.color_description.max_luminance);
+    try std.testing.expectEqual(
+        render.display_p3_chromaticities,
+        output.native_color_description.primaries,
+    );
 }
 
 test "DRM discovery only accepts primary nodes" {
