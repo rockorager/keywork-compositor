@@ -47,6 +47,7 @@ replace_pipeline: vk.Pipeline,
 blend_pipeline: vk.Pipeline,
 image_pipeline: vk.Pipeline,
 nearest_image_pipeline: vk.Pipeline,
+nearest_gamma22_image_pipeline: vk.Pipeline,
 reconstruction_image_pipeline: vk.Pipeline,
 area_image_pipeline: vk.Pipeline,
 shadow_pipeline: vk.Pipeline,
@@ -373,6 +374,7 @@ const Graphics = struct {
     blend_pipeline: vk.Pipeline,
     image_pipeline: vk.Pipeline,
     nearest_image_pipeline: vk.Pipeline,
+    nearest_gamma22_image_pipeline: vk.Pipeline,
     reconstruction_image_pipeline: vk.Pipeline,
     area_image_pipeline: vk.Pipeline,
     shadow_pipeline: vk.Pipeline,
@@ -544,6 +546,11 @@ fn initGraphics(
         .p_code = &shaders.image_nearest_instanced,
     }, null);
     defer wrapper.destroyShaderModule(device, nearest_image_shader, null);
+    const nearest_gamma22_image_shader = try wrapper.createShaderModule(device, &.{
+        .code_size = @sizeOf(@TypeOf(shaders.image_nearest_gamma22_instanced)),
+        .p_code = &shaders.image_nearest_gamma22_instanced,
+    }, null);
+    defer wrapper.destroyShaderModule(device, nearest_gamma22_image_shader, null);
     const reconstruction_image_shader = try wrapper.createShaderModule(device, &.{
         .code_size = @sizeOf(@TypeOf(shaders.image_catmull_rom_instanced)),
         .p_code = &shaders.image_catmull_rom_instanced,
@@ -631,6 +638,19 @@ fn initGraphics(
         return err;
     };
     errdefer wrapper.destroyPipeline(device, nearest_image_pipeline, null);
+    const nearest_gamma22_image_pipeline = createPipeline(
+        wrapper,
+        device,
+        render_pass,
+        pipeline_layout,
+        vertex_shader,
+        nearest_gamma22_image_shader,
+        true,
+    ) catch |err| {
+        log.err("failed to create Vulkan nearest gamma 2.2 image pipeline: {t}", .{err});
+        return err;
+    };
+    errdefer wrapper.destroyPipeline(device, nearest_gamma22_image_pipeline, null);
     const reconstruction_image_pipeline = createPipeline(
         wrapper,
         device,
@@ -746,6 +766,7 @@ fn initGraphics(
         .blend_pipeline = blend_pipeline,
         .image_pipeline = image_pipeline,
         .nearest_image_pipeline = nearest_image_pipeline,
+        .nearest_gamma22_image_pipeline = nearest_gamma22_image_pipeline,
         .reconstruction_image_pipeline = reconstruction_image_pipeline,
         .area_image_pipeline = area_image_pipeline,
         .shadow_pipeline = shadow_pipeline,
@@ -889,6 +910,7 @@ fn destroyGraphics(wrapper: vk.DeviceWrapper, device: vk.Device, graphics: Graph
     wrapper.destroyPipeline(device, graphics.shadow_pipeline, null);
     wrapper.destroyPipeline(device, graphics.area_image_pipeline, null);
     wrapper.destroyPipeline(device, graphics.reconstruction_image_pipeline, null);
+    wrapper.destroyPipeline(device, graphics.nearest_gamma22_image_pipeline, null);
     wrapper.destroyPipeline(device, graphics.nearest_image_pipeline, null);
     wrapper.destroyPipeline(device, graphics.image_pipeline, null);
     wrapper.destroyPipeline(device, graphics.blend_pipeline, null);
@@ -2119,6 +2141,7 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
         .blend_pipeline = graphics.blend_pipeline,
         .image_pipeline = graphics.image_pipeline,
         .nearest_image_pipeline = graphics.nearest_image_pipeline,
+        .nearest_gamma22_image_pipeline = graphics.nearest_gamma22_image_pipeline,
         .reconstruction_image_pipeline = graphics.reconstruction_image_pipeline,
         .area_image_pipeline = graphics.area_image_pipeline,
         .shadow_pipeline = graphics.shadow_pipeline,
@@ -2211,6 +2234,7 @@ pub fn deinit(self: *Self) void {
         .blend_pipeline = self.blend_pipeline,
         .image_pipeline = self.image_pipeline,
         .nearest_image_pipeline = self.nearest_image_pipeline,
+        .nearest_gamma22_image_pipeline = self.nearest_gamma22_image_pipeline,
         .reconstruction_image_pipeline = self.reconstruction_image_pipeline,
         .area_image_pipeline = self.area_image_pipeline,
         .shadow_pipeline = self.shadow_pipeline,
@@ -5508,7 +5532,10 @@ fn compileDrawRuns(
             const image_pipeline = if (prepared.texture.pipeline != .null_handle)
                 prepared.texture.pipeline
             else switch (image.samplingFilter()) {
-                .nearest => self.nearest_image_pipeline,
+                .nearest => if (image.buffer.color_description.transfer_function == .gamma22)
+                    self.nearest_gamma22_image_pipeline
+                else
+                    self.nearest_image_pipeline,
                 .reconstruction => self.reconstruction_image_pipeline,
                 .area => self.area_image_pipeline,
             };

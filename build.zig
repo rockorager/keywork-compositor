@@ -176,28 +176,35 @@ pub fn build(b: *std.Build) void {
         compositor,
         "vulkan-image-nearest",
         "src/compositor/render/shaders/image.frag",
-        "KEYWORK_NEAREST",
+        &.{"KEYWORK_NEAREST"},
+    );
+    addVulkanShaderVariant(
+        b,
+        compositor,
+        "vulkan-image-nearest-gamma22",
+        "src/compositor/render/shaders/image.frag",
+        &.{ "KEYWORK_NEAREST", "KEYWORK_TRANSFER_GAMMA22" },
     );
     addVulkanShaderVariant(
         b,
         compositor,
         "vulkan-image-catmull-rom",
         "src/compositor/render/shaders/image.frag",
-        "KEYWORK_CATMULL_ROM",
+        &.{"KEYWORK_CATMULL_ROM"},
     );
     addVulkanShaderVariant(
         b,
         compositor,
         "vulkan-image-area",
         "src/compositor/render/shaders/image.frag",
-        "KEYWORK_AREA",
+        &.{"KEYWORK_AREA"},
     );
     addVulkanShaderVariant(
         b,
         compositor,
         "vulkan-video-manual",
         "src/compositor/render/shaders/image.frag",
-        "KEYWORK_MANUAL_YCBCR",
+        &.{"KEYWORK_MANUAL_YCBCR"},
     );
     addVulkanShader(b, compositor, "vulkan-shadow", "src/compositor/render/shaders/shadow.frag");
     addVulkanShader(b, compositor, "vulkan-blur-downsample", "src/compositor/render/shaders/blur_downsample.frag");
@@ -326,7 +333,7 @@ fn addVulkanShader(
     name: []const u8,
     source_path: []const u8,
 ) void {
-    addVulkanShaderVariant(b, module, name, source_path, null);
+    addVulkanShaderVariant(b, module, name, source_path, &.{});
 }
 
 fn addVulkanShaderVariant(
@@ -334,10 +341,10 @@ fn addVulkanShaderVariant(
     module: *std.Build.Module,
     name: []const u8,
     source_path: []const u8,
-    define: ?[]const u8,
+    defines: []const []const u8,
 ) void {
     const compile = b.addSystemCommand(&.{ "glslc", "-O" });
-    if (define) |value| compile.addArg(b.fmt("-D{s}", .{value}));
+    for (defines) |value| compile.addArg(b.fmt("-D{s}", .{value}));
     compile.addFileArg(b.path(source_path));
     compile.addArg("-o");
     const spirv = compile.addOutputFileArg(b.fmt("{s}.spv", .{name}));

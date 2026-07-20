@@ -26,6 +26,9 @@ layout(location=5) flat in vec4 parameters;
 layout(location=0) out vec4 out_color;
 
 float decodeComponent(float value) {
+#ifdef KEYWORK_TRANSFER_GAMMA22
+    return pow(max(value,0.0),2.2);
+#else
     int transfer=int(pc.transfer.x+0.5);
     if (transfer==0) return value;
     if (transfer==1) return pow(max(value,0.0),2.2);
@@ -57,6 +60,7 @@ float decodeComponent(float value) {
         return scene;
     }
     return value;
+#endif
 }
 
 vec3 toneMapHdr(vec3 nits) {
@@ -83,7 +87,9 @@ vec3 toneMapHdr(vec3 nits) {
 
 vec3 compressGamut(vec3 color) {
     if (pc.color_matrix_0.w<=0.0) return color;
+#ifndef KEYWORK_TRANSFER_GAMMA22
     if (int(pc.transfer.x+0.5)>=5 && int(pc.output_transfer.x+0.5)>=5) return color;
+#endif
     vec3 luminance_weights=vec3(
         pc.color_matrix_0.w,
         pc.color_matrix_1.w,
@@ -113,6 +119,9 @@ vec3 decodeColor(vec3 electrical) {
         decodeComponent(electrical.g),
         decodeComponent(electrical.b)
     );
+#ifdef KEYWORK_TRANSFER_GAMMA22
+    optical=((pc.transfer.w-pc.transfer_aux.x)*optical+pc.transfer_aux.x)/pc.transfer.z;
+#else
     int transfer=int(pc.transfer.x+0.5);
     if (transfer==0) {}
     else if (transfer==5) {
@@ -127,6 +136,7 @@ vec3 decodeColor(vec3 electrical) {
     }
     else if (transfer==3) optical/=pc.transfer.z;
     else optical=((pc.transfer.w-pc.transfer_aux.x)*optical+pc.transfer_aux.x)/pc.transfer.z;
+#endif
     return compressGamut(vec3(
         dot(pc.color_matrix_0.xyz,optical),
         dot(pc.color_matrix_1.xyz,optical),
