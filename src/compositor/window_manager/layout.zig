@@ -13,6 +13,10 @@ pub const Layout = union(enum) {
     tiled: Tiled,
     scrolling: Scrolling,
 
+    pub const Resize = union(enum) {
+        dwindle: Dwindle.Resize,
+    };
+
     pub fn init(kind: Kind) Layout {
         return switch (kind) {
             .master_stack => .{ .tiled = .{ .master_stack = .{} } },
@@ -98,6 +102,47 @@ pub const Layout = union(enum) {
             .tiled => |*layout| layout.swapWindows(first, second),
             .scrolling => {},
         }
+    }
+
+    pub fn beginResize(
+        self: *const Layout,
+        id: types.WindowId,
+        pointer_x: f64,
+        pointer_y: f64,
+        edge_threshold: f64,
+    ) ?Resize {
+        return switch (self.*) {
+            .tiled => |layout| switch (layout) {
+                .master_stack => null,
+                .dwindle => |policy| if (policy.beginResize(
+                    id,
+                    pointer_x,
+                    pointer_y,
+                    edge_threshold,
+                )) |resize|
+                    .{ .dwindle = resize }
+                else
+                    null,
+            },
+            .scrolling => null,
+        };
+    }
+
+    pub fn updateResize(
+        self: *Layout,
+        resize: Resize,
+        pointer_x: f64,
+        pointer_y: f64,
+    ) bool {
+        return switch (self.*) {
+            .tiled => |*layout| switch (layout.*) {
+                .master_stack => false,
+                .dwindle => |*policy| switch (resize) {
+                    .dwindle => |value| policy.updateResize(value, pointer_x, pointer_y),
+                },
+            },
+            .scrolling => false,
+        };
     }
 
     pub fn arrange(
@@ -273,8 +318,18 @@ pub const Dwindle = struct {
     outer_gap: u32 = 16,
     inner_gap: u32 = 16,
 
-    const NodeIndex = u32;
-    const Axis = enum { horizontal, vertical };
+    pub const NodeIndex = u32;
+    pub const Axis = enum { horizontal, vertical };
+    pub const Resize = struct {
+        window: types.WindowId,
+        split_index: NodeIndex,
+        first: NodeIndex,
+        second: NodeIndex,
+        axis: Axis,
+        initial_ratio_percent: u8,
+        initial_pointer: f64,
+        available_length: u32,
+    };
     const Split = struct {
         axis: Axis,
         ratio_percent: u8,
@@ -413,6 +468,129 @@ pub const Dwindle = struct {
         const second_index = self.findLeaf(second) orelse unreachable;
         self.nodes.items[first_index].content.leaf = second;
         self.nodes.items[second_index].content.leaf = first;
+    }
+
+    fn beginResize(
+        self: *const Dwindle,
+        id: types.WindowId,
+        pointer_x: f64,
+        pointer_y: f64,
+        edge_threshold: f64,
+    ) ?Resize {
+        std.debug.assert(edge_threshold >= 0);
+        const leaf_index = self.findLeaf(id) orelse return null;
+        const leaf_rect = self.nodes.items[leaf_index].rect orelse return null;
+        var child_index = leaf_index;
+        var best: ?Resize = null;
+        var best_distance = std.math.inf(f64);
+        while (self.nodes.items[child_index].parent) |parent_index| {
+            const parent = self.nodes.items[parent_index];
+            const split = switch (parent.content) {
+                .leaf => unreachable,
+                .split => |value| value,
+            };
+            const division = divide(
+                parent.rect orelse break,
+                split.axis,
+                split.ratio_percent,
+                self.inner_gap,
+            ) orelse {
+                child_index = parent_index;
+                continue;
+            };
+            const first_end = if (split.axis == .horizontal)
+                @as(i64, division.first.x) + division.first.size.width
+            else
+                @as(i64, division.first.y) + division.first.size.height;
+            const second_start = if (split.axis == .horizontal)
+                @as(i64, division.second.x)
+            else
+                @as(i64, division.second.y);
+            const leaf_start = if (split.axis == .horizontal)
+                @as(i64, leaf_rect.x)
+            else
+                @as(i64, leaf_rect.y);
+            const leaf_end = leaf_start + if (split.axis == .horizontal)
+                leaf_rect.size.width
+            else
+                leaf_rect.size.height;
+            const touches_boundary = if (split.first == child_index)
+                leaf_end == first_end
+            else blk: {
+                std.debug.assert(split.second == child_index);
+                break :blk leaf_start == second_start;
+            };
+            const cross_pointer = if (split.axis == .horizontal) pointer_y else pointer_x;
+            const cross_start = if (split.axis == .horizontal)
+                @as(i64, leaf_rect.y)
+            else
+                @as(i64, leaf_rect.x);
+            const cross_end = cross_start + if (split.axis == .horizontal)
+                leaf_rect.size.height
+            else
+                leaf_rect.size.width;
+            const within_leaf = cross_pointer >= @as(f64, @floatFromInt(cross_start)) and
+                cross_pointer < @as(f64, @floatFromInt(cross_end));
+            if (touches_boundary and within_leaf) {
+                const pointer = if (split.axis == .horizontal) pointer_x else pointer_y;
+                const first_boundary: f64 = @floatFromInt(first_end);
+                const second_boundary: f64 = @floatFromInt(second_start);
+                const distance = if (pointer < first_boundary)
+                    first_boundary - pointer
+                else if (pointer > second_boundary)
+                    pointer - second_boundary
+                else
+                    0;
+                if (distance < best_distance) {
+                    best_distance = distance;
+                    best = .{
+                        .window = id,
+                        .split_index = parent_index,
+                        .first = split.first,
+                        .second = split.second,
+                        .axis = split.axis,
+                        .initial_ratio_percent = split.ratio_percent,
+                        .initial_pointer = pointer,
+                        .available_length = if (split.axis == .horizontal)
+                            division.first.size.width + division.second.size.width
+                        else
+                            division.first.size.height + division.second.size.height,
+                    };
+                }
+            }
+            child_index = parent_index;
+        }
+        return if (best_distance <= edge_threshold) best else null;
+    }
+
+    fn updateResize(
+        self: *Dwindle,
+        resize: Resize,
+        pointer_x: f64,
+        pointer_y: f64,
+    ) bool {
+        var node_index = self.findLeaf(resize.window) orelse return false;
+        while (node_index != resize.split_index) {
+            node_index = self.nodes.items[node_index].parent orelse return false;
+        }
+        const node = &self.nodes.items[resize.split_index];
+        const split = switch (node.content) {
+            .leaf => return false,
+            .split => &node.content.split,
+        };
+        if (split.first != resize.first or split.second != resize.second or
+            split.axis != resize.axis) return false;
+        const pointer = if (resize.axis == .horizontal) pointer_x else pointer_y;
+        const ratio = resizedRatio(
+            resize.initial_ratio_percent,
+            resize.initial_pointer,
+            pointer,
+            resize.available_length,
+        );
+        if (ratio == split.ratio_percent) return false;
+        split.ratio_percent = ratio;
+        self.refreshRects();
+        return true;
     }
 
     fn arrange(
@@ -716,6 +894,18 @@ fn divide(
     };
 }
 
+fn resizedRatio(initial: u8, initial_pointer: f64, pointer: f64, available: u32) u8 {
+    std.debug.assert(available > 0);
+    const delta_percent = (pointer - initial_pointer) * 100 /
+        @as(f64, @floatFromInt(available));
+    const ratio = std.math.clamp(
+        @as(f64, @floatFromInt(initial)) + delta_percent,
+        10,
+        90,
+    );
+    return @intFromFloat(@round(ratio));
+}
+
 fn input(index: u32, width: u32) types.WindowInput {
     return .{ .id = types.id(index), .current = types.Size.init(width, 40) };
 }
@@ -871,6 +1061,88 @@ test "dwindle tree traversal swaps leaves and collapses removed branches" {
     }, first.id);
     defer plans.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 3), plans.items.len);
+}
+
+test "dwindle pointer resize adjusts the nearest bordering split" {
+    const first = input(0, 10);
+    const second = input(1, 10);
+    const third = input(2, 10);
+    var layout: Layout = .{ .tiled = .{ .dwindle = .{ .outer_gap = 0, .inner_gap = 0 } } };
+    defer layout.deinit(std.testing.allocator);
+    try layout.windowAdded(std.testing.allocator, first.id, null);
+    try layout.windowAdded(std.testing.allocator, second.id, first.id);
+    var plans = try layout.arrange(std.testing.allocator, &.{ first, second }, .{
+        .x = 0,
+        .y = 0,
+        .size = types.Size.init(120, 80),
+    }, second.id);
+    plans.deinit(std.testing.allocator);
+    try layout.windowAdded(std.testing.allocator, third.id, second.id);
+
+    plans = try layout.arrange(std.testing.allocator, &.{ first, second, third }, .{
+        .x = 0,
+        .y = 0,
+        .size = types.Size.init(120, 80),
+    }, third.id);
+    plans.deinit(std.testing.allocator);
+
+    const resize = layout.beginResize(second.id, 100, 35, 8).?;
+    try std.testing.expect(layout.updateResize(resize, 100, 55));
+    try std.testing.expect(!layout.updateResize(resize, 100, 55));
+    plans = try layout.arrange(std.testing.allocator, &.{ first, second, third }, .{
+        .x = 0,
+        .y = 0,
+        .size = types.Size.init(120, 80),
+    }, third.id);
+    defer plans.deinit(std.testing.allocator);
+    try std.testing.expectEqual(types.Rect{
+        .x = 60,
+        .y = 0,
+        .size = types.Size.init(60, 60),
+    }, plans.items[1].rect);
+    try std.testing.expectEqual(types.Rect{
+        .x = 60,
+        .y = 60,
+        .size = types.Size.init(60, 20),
+    }, plans.items[2].rect);
+    try std.testing.expect(layout.beginResize(second.id, 100, 20, 8) == null);
+}
+
+test "dwindle pointer resize rejects a split removed during the grab" {
+    const first = input(0, 10);
+    const second = input(1, 10);
+    var layout: Layout = .{ .tiled = .{ .dwindle = .{ .outer_gap = 0, .inner_gap = 0 } } };
+    defer layout.deinit(std.testing.allocator);
+    try layout.windowAdded(std.testing.allocator, first.id, null);
+    try layout.windowAdded(std.testing.allocator, second.id, first.id);
+    var plans = try layout.arrange(std.testing.allocator, &.{ first, second }, .{
+        .x = 0,
+        .y = 0,
+        .size = types.Size.init(100, 100),
+    }, second.id);
+    plans.deinit(std.testing.allocator);
+
+    const resize = layout.beginResize(first.id, 45, 50, 8).?;
+    layout.windowRemoved(second.id);
+    try std.testing.expect(!layout.updateResize(resize, 60, 50));
+}
+
+test "dwindle pointer resize accepts a window edge across a wide gap" {
+    const first = input(0, 10);
+    const second = input(1, 10);
+    var layout: Layout = .{ .tiled = .{ .dwindle = .{ .outer_gap = 0, .inner_gap = 20 } } };
+    defer layout.deinit(std.testing.allocator);
+    try layout.windowAdded(std.testing.allocator, first.id, null);
+    try layout.windowAdded(std.testing.allocator, second.id, first.id);
+    var plans = try layout.arrange(std.testing.allocator, &.{ first, second }, .{
+        .x = 0,
+        .y = 0,
+        .size = types.Size.init(100, 100),
+    }, second.id);
+    plans.deinit(std.testing.allocator);
+
+    try std.testing.expect(layout.beginResize(first.id, 39, 50, 8) != null);
+    try std.testing.expect(layout.beginResize(first.id, 25, 50, 8) == null);
 }
 
 test "scrolling keeps focus visible and clips viewport edges" {

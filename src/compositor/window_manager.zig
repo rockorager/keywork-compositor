@@ -23,6 +23,7 @@ const Direction = command_mod.Direction;
 
 const wl = wayland.server.wl;
 const workspace_count = 10;
+const resize_edge_threshold: f64 = 8;
 
 allocator: std.mem.Allocator,
 outputs: *OutputLayout,
@@ -46,6 +47,7 @@ focused_window_effects: Scene.Effects = Scene.default_effects,
 focused_window_border: ?Scene.Borders = null,
 tiling_drag: ?TilingDrag = null,
 toplevel_drag: ?ToplevelDrag = null,
+interactive_resize: ?InteractiveResize = null,
 session_listener: ?SessionListener = null,
 pending_session_restores: std.AutoHashMapUnmanaged(XdgShell.WindowId, SessionState) = .empty,
 
@@ -79,6 +81,33 @@ const ToplevelDrag = struct {
     window: WindowId,
     grab_x: f64,
     grab_y: f64,
+    modifier: bool = false,
+};
+
+const InteractiveResize = union(enum) {
+    floating: FloatingResize,
+    tiled: TiledResize,
+};
+
+const FloatingResize = struct {
+    window: WindowId,
+    initial_rect: types.Rect,
+    initial_pointer_x: f64,
+    initial_pointer_y: f64,
+    edges: ResizeEdges,
+    constraints: types.SizeConstraints,
+};
+
+const TiledResize = struct {
+    workspace: usize,
+    resize: layout_mod.Layout.Resize,
+};
+
+const ResizeEdges = packed struct(u4) {
+    top: bool = false,
+    right: bool = false,
+    bottom: bool = false,
+    left: bool = false,
 };
 
 const KnownXwaylandWindow = struct {
@@ -741,7 +770,7 @@ fn focusWindow(self: *Self, id: WindowId) bool {
 /// Starts a compositor-owned Super+pointer tiling drag. The server owns the
 /// physical button grab; this object owns only policy and drop state.
 pub fn beginTilingDrag(self: *Self, root: ?Surface.Id) bool {
-    if (self.tiling_drag != null or self.layer_focus == .exclusive) return false;
+    if (self.pointerInteractionActive() or self.layer_focus == .exclusive) return false;
     const id = self.windowForSurface(root orelse return false) orelse return false;
     const window = self.windows.get(id) orelse return false;
     if (!self.isDraggableTiledWindow(window)) return false;
@@ -809,6 +838,133 @@ pub fn endTilingDrag(self: *Self, commit: bool) bool {
     return true;
 }
 
+pub fn beginModifierMove(
+    self: *Self,
+    root: ?Surface.Id,
+    pointer_x: f64,
+    pointer_y: f64,
+) bool {
+    if (self.beginTilingDrag(root)) return true;
+    const id = self.windowForSurface(root orelse return false) orelse return false;
+    const window = self.windows.get(id) orelse return false;
+    if (!self.isFloating(window)) return false;
+    return self.beginWindowMove(id, pointer_x, pointer_y, 0, 0, false, true, false);
+}
+
+pub fn beginInteractiveResize(
+    self: *Self,
+    root: ?Surface.Id,
+    pointer_x: f64,
+    pointer_y: f64,
+) bool {
+    if (self.pointerInteractionActive() or self.layer_focus == .exclusive) return false;
+    if (root) |surface_id| {
+        const id = self.windowForSurface(surface_id) orelse return false;
+        return self.beginInteractiveResizeWindow(id, pointer_x, pointer_y);
+    }
+    for (self.workspaces.items) |workspace| {
+        if (!workspace.active) continue;
+        for (workspace.workspace.members.items) |member| {
+            const id = internal(member);
+            const window = self.windows.get(id) orelse continue;
+            if (self.isFloating(window)) continue;
+            if (self.beginInteractiveResizeWindow(id, pointer_x, pointer_y)) return true;
+        }
+    }
+    return false;
+}
+
+fn beginInteractiveResizeWindow(
+    self: *Self,
+    id: WindowId,
+    pointer_x: f64,
+    pointer_y: f64,
+) bool {
+    const window = self.windows.get(id) orelse return false;
+    if (!window.mapped or window.minimized or window.fullscreen_output != null) return false;
+    const workspace = &self.workspaces.items[window.workspace];
+    if (!workspace.active) return false;
+    if (self.isFloating(window)) {
+        const rect = (window.placement orelse return false).rect;
+        const edges = resizeEdgesAt(
+            rect,
+            pointer_x,
+            pointer_y,
+            resize_edge_threshold,
+        ) orelse return false;
+        self.interactive_resize = .{ .floating = .{
+            .window = id,
+            .initial_rect = rect,
+            .initial_pointer_x = pointer_x,
+            .initial_pointer_y = pointer_y,
+            .edges = edges,
+            .constraints = self.windowSizeConstraints(window),
+        } };
+        _ = workspace.workspace.raise(neutral(id));
+        self.scene.placeTop(window.scene_id);
+    } else {
+        if (!self.isDraggableTiledWindow(window)) return false;
+        const resize = workspace.workspace.layout.beginResize(
+            neutral(id),
+            pointer_x,
+            pointer_y,
+            resize_edge_threshold,
+        ) orelse return false;
+        self.interactive_resize = .{ .tiled = .{
+            .workspace = window.workspace,
+            .resize = resize,
+        } };
+    }
+    _ = workspace.workspace.focus(neutral(id));
+    self.default_output = workspace.output;
+    self.relayout();
+    return true;
+}
+
+pub fn compositorPointerGrabActive(self: *const Self) bool {
+    return self.tiling_drag != null or self.interactive_resize != null or
+        if (self.toplevel_drag) |drag| drag.modifier else false;
+}
+
+pub fn updateCompositorPointerGrab(self: *Self, pointer_x: f64, pointer_y: f64) bool {
+    if (self.tiling_drag != null) return self.updateTilingDrag(pointer_x, pointer_y);
+    if (self.toplevel_drag) |drag| {
+        if (drag.modifier) {
+            self.updateToplevelDrag(pointer_x, pointer_y);
+            return true;
+        }
+    }
+    const resize = self.interactive_resize orelse return false;
+    return switch (resize) {
+        .floating => |value| self.updateFloatingResize(value, pointer_x, pointer_y),
+        .tiled => |value| update: {
+            if (value.workspace >= self.workspaces.items.len) break :update false;
+            const changed = self.workspaces.items[value.workspace].workspace.layout.updateResize(
+                value.resize,
+                pointer_x,
+                pointer_y,
+            );
+            if (changed) self.relayout();
+            break :update changed;
+        },
+    };
+}
+
+pub fn endCompositorPointerGrab(self: *Self, commit: bool) bool {
+    if (self.tiling_drag != null) return self.endTilingDrag(commit);
+    if (self.toplevel_drag) |drag| {
+        if (drag.modifier) {
+            self.toplevel_drag = null;
+            self.relayout();
+            return true;
+        }
+    }
+    if (self.interactive_resize == null) return false;
+    self.interactive_resize = null;
+    self.relayout();
+    return true;
+}
+
 pub fn beginToplevelDrag(
     self: *Self,
     xdg_id: XdgShell.WindowId,
@@ -818,10 +974,34 @@ pub fn beginToplevelDrag(
     y_offset: i32,
     use_offset_hint: bool,
 ) bool {
-    if (self.toplevel_drag != null or self.layer_focus == .exclusive) return false;
     const id = self.findXdg(xdg_id) orelse return false;
+    return self.beginWindowMove(
+        id,
+        pointer_x,
+        pointer_y,
+        x_offset,
+        y_offset,
+        use_offset_hint,
+        false,
+        true,
+    );
+}
+
+fn beginWindowMove(
+    self: *Self,
+    id: WindowId,
+    pointer_x: f64,
+    pointer_y: f64,
+    x_offset: i32,
+    y_offset: i32,
+    use_offset_hint: bool,
+    modifier: bool,
+    allow_tiled: bool,
+) bool {
+    if (self.pointerInteractionActive() or self.layer_focus == .exclusive) return false;
     const window = self.windows.get(id) orelse return false;
     if (!window.mapped or window.minimized or window.fullscreen_output != null) return false;
+    if (!allow_tiled and !self.isFloating(window)) return false;
     const current = self.scene.windowPosition(window.scene_id) orelse return false;
     const grab_x = if (use_offset_hint)
         @as(f64, @floatFromInt(x_offset))
@@ -845,9 +1025,14 @@ pub fn beginToplevelDrag(
     _ = workspace.workspace.focus(neutral(id));
     _ = workspace.workspace.raise(neutral(id));
     self.default_output = workspace.output;
-    self.toplevel_drag = .{ .window = id, .grab_x = grab_x, .grab_y = grab_y };
+    self.toplevel_drag = .{
+        .window = id,
+        .grab_x = grab_x,
+        .grab_y = grab_y,
+        .modifier = modifier,
+    };
     self.relayout();
-    self.xdg_shell.setWindowPosition(xdg_id, position);
+    self.setWindowPositionImmediate(window, position);
     self.scene.placeTop(window.scene_id);
     return true;
 }
@@ -858,24 +1043,134 @@ pub fn updateToplevelDrag(self: *Self, pointer_x: f64, pointer_y: f64) void {
         self.toplevel_drag = null;
         return;
     };
-    const xdg_id = switch (window.backend) {
-        .xdg => |id| id,
-        .xwayland => unreachable,
-    };
     const position = toplevelDragPosition(pointer_x, pointer_y, drag.grab_x, drag.grab_y);
     window.floating_position = position;
     if (window.placement) |*placement| {
         placement.rect.x = position.x;
         placement.rect.y = position.y;
     }
-    self.xdg_shell.setWindowPosition(xdg_id, position);
+    self.setWindowPositionImmediate(window, position);
     self.scene.placeTop(window.scene_id);
 }
 
 pub fn endToplevelDrag(self: *Self) void {
-    if (self.toplevel_drag == null) return;
+    const drag = self.toplevel_drag orelse return;
+    if (drag.modifier) return;
     self.toplevel_drag = null;
     self.relayout();
+}
+
+fn pointerInteractionActive(self: *const Self) bool {
+    return self.tiling_drag != null or self.toplevel_drag != null or
+        self.interactive_resize != null;
+}
+
+fn updateFloatingResize(
+    self: *Self,
+    resize: FloatingResize,
+    pointer_x: f64,
+    pointer_y: f64,
+) bool {
+    const window = self.windows.get(resize.window) orelse {
+        self.interactive_resize = null;
+        return false;
+    };
+    if (!window.mapped or window.minimized or window.fullscreen_output != null or
+        !self.isFloating(window))
+    {
+        self.interactive_resize = null;
+        return false;
+    }
+    const rect = resizedFloatingRect(
+        resize.initial_rect,
+        resize.initial_pointer_x,
+        resize.initial_pointer_y,
+        resize.edges,
+        resize.constraints,
+        pointer_x,
+        pointer_y,
+    );
+    if (window.placement) |placement| {
+        if (std.meta.eql(placement.rect, rect)) return false;
+    }
+    window.floating_position = .{ .x = rect.x, .y = rect.y };
+    window.floating_restore_size = rect.size;
+    if (window.placement) |*placement| placement.rect = rect;
+    self.setWindowPositionImmediate(window, .{ .x = rect.x, .y = rect.y });
+    self.scene.placeTop(window.scene_id);
+    self.relayout();
+    return true;
+}
+
+fn setWindowPositionImmediate(
+    self: *Self,
+    window: *const Window,
+    position: Scene.Position,
+) void {
+    switch (window.backend) {
+        .xdg => |id| self.xdg_shell.setWindowPosition(id, position),
+        .xwayland => |id| {
+            self.scene.setPosition(window.scene_id, position);
+            _ = self.xwayland.move(
+                self.xwayland.context,
+                id,
+                clampI16(position.x),
+                clampI16(position.y),
+            );
+        },
+    }
+}
+
+fn windowSizeConstraints(self: *Self, window: *const Window) types.SizeConstraints {
+    return switch (window.backend) {
+        .xdg => |id| constraints: {
+            const info = self.xdg_shell.windowInfo(id) orelse break :constraints .{};
+            const min_width: u32 = @intCast(@max(1, info.min_size.width));
+            const min_height: u32 = @intCast(@max(1, info.min_size.height));
+            break :constraints .{
+                .min_width = min_width,
+                .min_height = min_height,
+                .max_width = @intCast(@max(
+                    @as(i32, @intCast(min_width)),
+                    if (info.max_size.width > 0) info.max_size.width else std.math.maxInt(i32),
+                )),
+                .max_height = @intCast(@max(
+                    @as(i32, @intCast(min_height)),
+                    if (info.max_size.height > 0) info.max_size.height else std.math.maxInt(i32),
+                )),
+            };
+        },
+        .xwayland => |id| constraints: {
+            const info = self.xwayland.window_info(self.xwayland.context, id) orelse
+                break :constraints .{};
+            const min_width: u32 = @intCast(@min(
+                @max(1, info.min_size.width),
+                std.math.maxInt(u16),
+            ));
+            const min_height: u32 = @intCast(@min(
+                @max(1, info.min_size.height),
+                std.math.maxInt(u16),
+            ));
+            break :constraints .{
+                .min_width = min_width,
+                .min_height = min_height,
+                .max_width = @intCast(@min(
+                    @max(
+                        @as(i32, @intCast(min_width)),
+                        if (info.max_size.width > 0) info.max_size.width else std.math.maxInt(i32),
+                    ),
+                    std.math.maxInt(u16),
+                )),
+                .max_height = @intCast(@min(
+                    @max(
+                        @as(i32, @intCast(min_height)),
+                        if (info.max_size.height > 0) info.max_size.height else std.math.maxInt(i32),
+                    ),
+                    std.math.maxInt(u16),
+                )),
+            };
+        },
+    };
 }
 
 fn isDraggableTiledWindow(self: *Self, window: *const Window) bool {
@@ -1280,6 +1575,7 @@ fn relayout(self: *Self) void {
                     const configuration: XdgShell.ToplevelConfigure = .{
                         .activated = !window.minimized and entry.workspace.focused != null and
                             member.eql(entry.workspace.focused.?),
+                        .resizing = self.interactivelyResizing(internal(member)),
                         .maximized = window.maximized,
                         .fullscreen = window.fullscreen_output != null,
                         .tiled = tiled,
@@ -1316,6 +1612,17 @@ fn relayout(self: *Self) void {
     } else {
         self.configure_timer.timerUpdate(100) catch self.handleOutOfMemory();
     }
+}
+
+fn interactivelyResizing(self: *const Self, id: WindowId) bool {
+    const resize = self.interactive_resize orelse return false;
+    const target = switch (resize) {
+        .floating => |value| value.window,
+        .tiled => |value| switch (value.resize) {
+            .dwindle => |dwindle| internal(dwindle.window),
+        },
+    };
+    return std.meta.eql(target, id);
 }
 
 fn normalizeFocus(self: *Self, entry: *OutputWorkspace) void {
@@ -1461,6 +1768,106 @@ fn toplevelDragPosition(x: f64, y: f64, grab_x: f64, grab_y: f64) Scene.Position
 
 fn dragCoordinate(value: f64) i32 {
     return @intFromFloat(@floor(std.math.clamp(
+        value,
+        @as(f64, @floatFromInt(std.math.minInt(i32))),
+        @as(f64, @floatFromInt(std.math.maxInt(i32))),
+    )));
+}
+
+fn resizeEdgesAt(
+    rect: types.Rect,
+    pointer_x: f64,
+    pointer_y: f64,
+    threshold: f64,
+) ?ResizeEdges {
+    std.debug.assert(threshold >= 0);
+    const left: f64 = @floatFromInt(rect.x);
+    const top: f64 = @floatFromInt(rect.y);
+    const right: f64 = @floatFromInt(@as(i64, rect.x) + rect.size.width);
+    const bottom: f64 = @floatFromInt(@as(i64, rect.y) + rect.size.height);
+    if (pointer_x < left or pointer_x >= right or pointer_y < top or pointer_y >= bottom) {
+        return null;
+    }
+    const left_distance = pointer_x - left;
+    const right_distance = right - pointer_x;
+    const top_distance = pointer_y - top;
+    const bottom_distance = bottom - pointer_y;
+    var edges: ResizeEdges = .{};
+    if (@min(left_distance, right_distance) <= threshold) {
+        if (left_distance <= right_distance) edges.left = true else edges.right = true;
+    }
+    if (@min(top_distance, bottom_distance) <= threshold) {
+        if (top_distance <= bottom_distance) edges.top = true else edges.bottom = true;
+    }
+    return if (@as(u4, @bitCast(edges)) == 0) null else edges;
+}
+
+fn resizedFloatingRect(
+    initial: types.Rect,
+    initial_pointer_x: f64,
+    initial_pointer_y: f64,
+    edges: ResizeEdges,
+    constraints: types.SizeConstraints,
+    pointer_x: f64,
+    pointer_y: f64,
+) types.Rect {
+    const horizontal = edges.left or edges.right;
+    const vertical = edges.top or edges.bottom;
+    std.debug.assert((horizontal or vertical) and !(edges.left and edges.right) and
+        !(edges.top and edges.bottom));
+    const width = if (horizontal)
+        resizedLength(
+            initial.size.width,
+            pointerDelta(pointer_x - initial_pointer_x),
+            edges.left,
+            constraints.min_width,
+            constraints.max_width orelse std.math.maxInt(i32),
+        )
+    else
+        initial.size.width;
+    const height = if (vertical)
+        resizedLength(
+            initial.size.height,
+            pointerDelta(pointer_y - initial_pointer_y),
+            edges.top,
+            constraints.min_height,
+            constraints.max_height orelse std.math.maxInt(i32),
+        )
+    else
+        initial.size.height;
+    const x = if (edges.left)
+        @as(i64, initial.x) + initial.size.width - width
+    else
+        initial.x;
+    const y = if (edges.top)
+        @as(i64, initial.y) + initial.size.height - height
+    else
+        initial.y;
+    return .{
+        .x = @intCast(std.math.clamp(x, std.math.minInt(i32), std.math.maxInt(i32))),
+        .y = @intCast(std.math.clamp(y, std.math.minInt(i32), std.math.maxInt(i32))),
+        .size = types.Size.init(width, height),
+    };
+}
+
+fn resizedLength(
+    initial: u32,
+    delta: i64,
+    leading: bool,
+    minimum: u32,
+    maximum: u32,
+) u32 {
+    std.debug.assert(minimum > 0 and minimum <= maximum);
+    const requested = @as(i64, initial) + if (leading) -delta else delta;
+    return @intCast(std.math.clamp(
+        requested,
+        @as(i64, minimum),
+        @as(i64, maximum),
+    ));
+}
+
+fn pointerDelta(value: f64) i64 {
+    return @intFromFloat(@round(std.math.clamp(
         value,
         @as(f64, @floatFromInt(std.math.minInt(i32))),
         @as(f64, @floatFromInt(std.math.maxInt(i32))),
@@ -1959,6 +2366,71 @@ test "toplevel drag preserves the grab offset and clamps coordinates" {
         Scene.Position{ .x = std.math.maxInt(i32), .y = std.math.minInt(i32) },
         toplevelDragPosition(1.0e20, -1.0e20, 0, 0),
     );
+}
+
+test "floating resize anchors the opposite corner and honors constraints" {
+    const initial: types.Rect = .{
+        .x = 100,
+        .y = 200,
+        .size = types.Size.init(400, 300),
+    };
+    const edges: ResizeEdges = .{ .top = true, .left = true };
+    const constraints: types.SizeConstraints = .{
+        .min_width = 300,
+        .min_height = 250,
+        .max_width = 450,
+        .max_height = 350,
+    };
+    try std.testing.expectEqual(
+        types.Rect{ .x = 150, .y = 220, .size = types.Size.init(350, 280) },
+        resizedFloatingRect(initial, 150, 250, edges, constraints, 200, 270),
+    );
+    try std.testing.expectEqual(
+        types.Rect{ .x = 200, .y = 250, .size = types.Size.init(300, 250) },
+        resizedFloatingRect(initial, 150, 250, edges, constraints, 1000, 1000),
+    );
+    try std.testing.expectEqual(
+        types.Rect{ .x = 100, .y = 200, .size = types.Size.init(450, 250) },
+        resizedFloatingRect(
+            initial,
+            450,
+            450,
+            .{ .right = true, .bottom = true },
+            constraints,
+            550,
+            -50,
+        ),
+    );
+    try std.testing.expectEqual(
+        types.Rect{ .x = 100, .y = 220, .size = types.Size.init(400, 280) },
+        resizedFloatingRect(
+            initial,
+            300,
+            202,
+            .{ .top = true },
+            constraints,
+            900,
+            222,
+        ),
+    );
+}
+
+test "floating resize edges are restricted to the pointer hit region" {
+    const rect: types.Rect = .{
+        .x = 100,
+        .y = 200,
+        .size = types.Size.init(400, 300),
+    };
+    try std.testing.expectEqual(
+        ResizeEdges{ .top = true, .left = true },
+        resizeEdgesAt(rect, 102, 202, 8).?,
+    );
+    try std.testing.expectEqual(
+        ResizeEdges{ .right = true },
+        resizeEdgesAt(rect, 499, 350, 8).?,
+    );
+    try std.testing.expect(resizeEdgesAt(rect, 300, 350, 8) == null);
+    try std.testing.expect(resizeEdgesAt(rect, 500, 350, 8) == null);
 }
 
 test "directional navigation prefers aligned neighbors then distance" {

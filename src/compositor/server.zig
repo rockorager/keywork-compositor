@@ -3436,7 +3436,7 @@ fn sessionLockStateChanged(context: *anyopaque, locked: bool) void {
     const self: *Self = @ptrCast(@alignCast(context));
     self.refreshIdleInhibition();
     if (locked) self.xwayland_keyboard_grab.cancelAll();
-    if (self.window_manager_initialized and self.window_manager.endTilingDrag(false)) {
+    if (self.window_manager_initialized and self.window_manager.endCompositorPointerGrab(false)) {
         requestRepaint(self);
     }
     self.pointer_constraints.deactivateAll();
@@ -4238,9 +4238,9 @@ fn pointerEnter(context: *anyopaque, x: f64, y: f64) void {
         self.seat.pointerEnter(point.x, point.y, route.focus);
         return;
     }
-    if (self.window_manager.tilingDragActive()) {
+    if (self.window_manager.compositorPointerGrabActive()) {
         self.seat.pointerEnter(point.x, point.y, null);
-        if (self.window_manager.updateTilingDrag(point.x, point.y)) requestRepaint(self);
+        if (self.window_manager.updateCompositorPointerGrab(point.x, point.y)) requestRepaint(self);
         return;
     }
     if (self.data_device.isDragging()) {
@@ -4261,7 +4261,7 @@ fn pointerEnter(context: *anyopaque, x: f64, y: f64) void {
 
 fn pointerLeave(context: *anyopaque) void {
     const self = serverForOutput(context);
-    if (self.window_manager.endTilingDrag(false)) requestRepaint(self);
+    if (self.window_manager.endCompositorPointerGrab(false)) requestRepaint(self);
     self.pointer_constraints.deactivateAll();
     self.data_device.pointerLeft();
     if (self.xwm_initialized) self.xwm.dragLeft();
@@ -4297,10 +4297,10 @@ fn pointerMotionGlobalForSeat(
         );
         return;
     }
-    if (seat == &self.seat and self.window_manager.tilingDragActive()) {
+    if (seat == &self.seat and self.window_manager.compositorPointerGrabActive()) {
         self.pointer_constraints.deactivateAll();
         seat.pointerMotion(time, x, y, null);
-        if (self.window_manager.updateTilingDrag(x, y)) requestRepaint(self);
+        if (self.window_manager.updateCompositorPointerGrab(x, y)) requestRepaint(self);
         return;
     }
     if (seat == &self.seat and self.data_device.isDragging()) {
@@ -4577,13 +4577,13 @@ fn pointerButtonForSeat(
         }
         return;
     }
-    if (seat == &self.seat and self.window_manager.tilingDragActive()) {
+    if (seat == &self.seat and self.window_manager.compositorPointerGrabActive()) {
         if (button == linux_button_left and state == .released) {
             const position = seat.pointerPosition();
             if (position) |point| {
-                _ = self.window_manager.updateTilingDrag(point.x, point.y);
+                _ = self.window_manager.updateCompositorPointerGrab(point.x, point.y);
             }
-            _ = self.window_manager.endTilingDrag(true);
+            _ = self.window_manager.endCompositorPointerGrab(true);
             if (position) |point| {
                 const route = self.pointerRoute(point.x, point.y);
                 seat.pointerEnter(point.x, point.y, route.focus);
@@ -4603,18 +4603,23 @@ fn pointerButtonForSeat(
     else
         null;
     if (seat == &self.seat and button == linux_button_left and state == .pressed and
-        seat.effectiveModifiers() & Config.super != 0 and
-        !seat.hasPressedPointerButtons() and
-        !self.keyboard_shortcuts_inhibit.inhibitsSeatNamed(InputManager.default_seat_name) and
-        !self.xdg_shell.hasPopupGrab() and self.window_manager.beginTilingDrag(root))
+        !seat.hasPressedPointerButtons() and !self.xdg_shell.hasPopupGrab())
     {
-        self.pointer_constraints.deactivateAll();
-        seat.suppressPointerFocus(true);
         if (seat.pointerPosition()) |position| {
-            _ = self.window_manager.updateTilingDrag(position.x, position.y);
+            const modifier_move = seat.effectiveModifiers() & Config.super != 0 and
+                !self.keyboard_shortcuts_inhibit.inhibitsSeatNamed(InputManager.default_seat_name);
+            const started = if (modifier_move)
+                self.window_manager.beginModifierMove(root, position.x, position.y)
+            else
+                self.window_manager.beginInteractiveResize(root, position.x, position.y);
+            if (started) {
+                self.pointer_constraints.deactivateAll();
+                seat.suppressPointerFocus(true);
+                _ = self.window_manager.updateCompositorPointerGrab(position.x, position.y);
+                requestRepaint(self);
+                return;
+            }
         }
-        requestRepaint(self);
-        return;
     }
     self.window_manager.pointerButton(root, state);
     if (state == .pressed) {
@@ -4639,7 +4644,7 @@ fn pointerButtonForSeat(
 
 fn dragStarted(context: *anyopaque) void {
     const self: *Self = @ptrCast(@alignCast(context));
-    if (self.window_manager.endTilingDrag(false)) requestRepaint(self);
+    if (self.window_manager.endCompositorPointerGrab(false)) requestRepaint(self);
     self.pointer_constraints.deactivateAll();
     if (self.xwm_initialized) self.xwm.dragStarted();
     const position = self.seat.pointerPosition() orelse return;
