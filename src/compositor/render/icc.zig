@@ -215,14 +215,23 @@ fn createLinearProfile(primaries: render.Chromaticities) !c.cmsHPROFILE {
 }
 
 fn xyY(x_fixed: i32, y_fixed: i32) !c.cmsCIExyY {
-    const x = @as(f64, @floatFromInt(x_fixed)) / 1_000_000.0;
-    const y = @as(f64, @floatFromInt(y_fixed)) / 1_000_000.0;
-    if (!std.math.isFinite(x) or !std.math.isFinite(y) or
-        x < 0 or y <= 0 or x > 1 or y > 1 or x + y > 1)
+    const scale: i64 = 1_000_000;
+    const x_value: i64 = x_fixed;
+    const y_value: i64 = y_fixed;
+    const sum = x_value + y_value;
+    if (x_value < 0 or y_value <= 0 or x_value > scale or y_value > scale or
+        sum > scale + 1)
     {
         return error.InvalidIccProfile;
     }
-    return .{ .x = x, .y = y, .Y = 1 };
+    // Independent fixed-point rounding can move a boundary coordinate one
+    // unit past x + y = 1. Normalize that representational error away.
+    const denominator: f64 = @floatFromInt(@max(sum, scale));
+    return .{
+        .x = @as(f64, @floatFromInt(x_value)) / denominator,
+        .y = @as(f64, @floatFromInt(y_value)) / denominator,
+        .Y = 1,
+    };
 }
 
 fn readVcgt(profile: c.cmsHPROFILE) !?[*]const *c.cmsToneCurve {
@@ -412,6 +421,18 @@ fn xyzChromaticity(value: c.cmsCIEXYZ) !struct { x: i32, y: i32 } {
     };
 }
 
+test "ICC linear profiles tolerate fixed-point boundary rounding" {
+    const red = try xyY(679688, 320313);
+    try std.testing.expectApproxEqAbs(@as(f64, 1), red.x + red.y, 0.000000000001);
+    try std.testing.expectError(error.InvalidIccProfile, xyY(679688, 320314));
+
+    var primaries = render.display_p3_chromaticities;
+    primaries.red_x = 679688;
+    primaries.red_y = 320313;
+    const profile = try createLinearProfile(primaries);
+    defer _ = c.cmsCloseProfile(profile);
+}
+
 test "ICC matrix profiles expose primaries and a shared transfer curve" {
     const white: c.cmsCIExyY = .{ .x = 0.3127, .y = 0.3290, .Y = 1 };
     const primaries: c.cmsCIExyYTRIPLE = .{
@@ -481,10 +502,13 @@ test "ICC output LUT includes transfer and VCGT calibration curves" {
     const profile = c.cmsCreateRGBProfile(&white, &primaries, &output_curves) orelse
         return error.OutOfMemory;
     defer _ = c.cmsCloseProfile(profile);
+    var linear_primaries = render.display_p3_chromaticities;
+    linear_primaries.red_x = 679688;
+    linear_primaries.red_y = 320313;
     var uncalibrated = try compileCalibrationLut(
         std.testing.allocator,
         profile,
-        render.srgb_chromaticities,
+        linear_primaries,
     );
     defer uncalibrated.deinit(std.testing.allocator);
     const calibration_curve = c.cmsBuildGamma(null, 2) orelse return error.OutOfMemory;
@@ -499,7 +523,7 @@ test "ICC output LUT includes transfer and VCGT calibration curves" {
     var selected = try outputProfile(
         std.testing.allocator,
         profile,
-        render.srgb_chromaticities,
+        linear_primaries,
     );
     defer selected.deinit(std.testing.allocator);
     try std.testing.expect(selected == .calibration);
