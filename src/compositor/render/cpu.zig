@@ -30,6 +30,11 @@ pub fn render(self: *Self, frame: render_types.Frame, target: render_types.Pixel
     defer _ = pixman.pixman_image_unref(destination);
     try setDestinationDamage(destination, frame);
 
+    var captures: std.ArrayList(BackdropSnapshot) = .empty;
+    defer {
+        for (captures.items) |snapshot| self.allocator.free(snapshot.pixels);
+        captures.deinit(self.allocator);
+    }
     for (frame.commands) |command| {
         switch (command) {
             .clear => |color| try fill(
@@ -46,11 +51,38 @@ pub fn render(self: *Self, frame: render_types.Frame, target: render_types.Pixel
                 try fill(destination, clipped, solid.color, pixman.PIXMAN_OP_OVER);
             },
             .shadow => |shadow| try drawShadow(destination, frame.size, shadow),
-            .backdrop_blur => |blur| if (!blur.cache_only)
-                try self.drawBackdropBlur(target, blur, frame.damage),
+            .backdrop_capture => |marker| {
+                if (try self.captureBackdrop(target, marker)) |snapshot| {
+                    captures.append(self.allocator, snapshot) catch |err| {
+                        self.allocator.free(snapshot.pixels);
+                        return err;
+                    };
+                }
+            },
+            .backdrop_blur => |blur| try drawBackdropBlur(
+                target,
+                blur,
+                frame.damage,
+                backdropSnapshot(captures.items, blur.capture_id),
+            ),
             .image => |image| try composite(destination, frame.size, image),
         }
     }
+}
+
+const BackdropSnapshot = struct {
+    marker: render_types.BackdropCapture,
+    sample_rect: render_types.Rect,
+    pixels: []u32,
+};
+
+fn backdropSnapshot(captures: []const BackdropSnapshot, id: u32) ?BackdropSnapshot {
+    var index = captures.len;
+    while (index > 0) {
+        index -= 1;
+        if (captures[index].marker.id == id) return captures[index];
+    }
+    return null;
 }
 
 fn setDestinationDamage(
@@ -261,32 +293,43 @@ fn drawShadow(
     );
 }
 
-fn drawBackdropBlur(
+fn captureBackdrop(
     self: *Self,
     target: render_types.PixelBuffer,
-    blur: render_types.BackdropBlur,
-    damage: ?[]const render_types.Rect,
-) Error!void {
-    if (blur.radius == 0 or blur.rect.width == 0 or blur.rect.height == 0) return;
-    var clipped = blur.rect.clipTo(target.size) orelse return;
-    if (blur.clip) |clip| clipped = clipped.intersection(clip) orelse return;
-    const bounds = damageBounds(damage, clipped) orelse return;
-    const level = configuredBlurLevel(blur.radius, blur.downsample_level);
+    marker: render_types.BackdropCapture,
+) Error!?BackdropSnapshot {
+    const clipped = marker.rect.clipTo(target.size) orelse return null;
+    const level = configuredBlurLevel(marker.radius, marker.downsample_level);
     const sample_rect = blurSampleRect(
-        bounds,
-        backdropBlurFootprint(blur.radius, blur.downsample_level),
+        clipped,
+        backdropBlurFootprint(marker.radius, marker.downsample_level),
         level,
         target.size,
     );
-
     const pixels = try dualKawaseArgb(
         self.allocator,
         target,
         sample_rect,
-        blur.radius,
-        blur.downsample_level,
+        marker.radius,
+        marker.downsample_level,
     );
-    defer self.allocator.free(pixels);
+    return .{ .marker = marker, .sample_rect = sample_rect, .pixels = pixels };
+}
+
+fn drawBackdropBlur(
+    target: render_types.PixelBuffer,
+    blur: render_types.BackdropBlur,
+    damage: ?[]const render_types.Rect,
+    capture: ?BackdropSnapshot,
+) Error!void {
+    if (blur.radius == 0 or blur.rect.width == 0 or blur.rect.height == 0) return;
+    var clipped = blur.rect.clipTo(target.size) orelse return;
+    if (blur.clip) |clip| clipped = clipped.intersection(clip) orelse return;
+    const snapshot = capture orelse return error.InvalidTarget;
+    if (blur.radius != snapshot.marker.radius or
+        blur.downsample_level != snapshot.marker.downsample_level or
+        !rectContains(snapshot.marker.rect, clipped)) return error.InvalidTarget;
+    _ = damageBounds(damage, clipped) orelse return;
 
     if (damage) |rectangles| {
         for (rectangles) |rectangle| {
@@ -295,10 +338,10 @@ fn drawBackdropBlur(
                 target,
                 blur,
                 composite_rect,
-                pixels,
-                @intCast(sample_rect.x),
-                @intCast(sample_rect.y),
-                sample_rect.width,
+                snapshot.pixels,
+                @intCast(snapshot.sample_rect.x),
+                @intCast(snapshot.sample_rect.y),
+                snapshot.sample_rect.width,
             );
         }
     } else {
@@ -306,12 +349,19 @@ fn drawBackdropBlur(
             target,
             blur,
             clipped,
-            pixels,
-            @intCast(sample_rect.x),
-            @intCast(sample_rect.y),
-            sample_rect.width,
+            snapshot.pixels,
+            @intCast(snapshot.sample_rect.x),
+            @intCast(snapshot.sample_rect.y),
+            snapshot.sample_rect.width,
         );
     }
+}
+
+fn rectContains(outer: render_types.Rect, inner: render_types.Rect) bool {
+    return @as(i64, inner.x) >= outer.x and
+        @as(i64, inner.y) >= outer.y and
+        @as(i64, inner.x) + inner.width <= @as(i64, outer.x) + outer.width and
+        @as(i64, inner.y) + inner.height <= @as(i64, outer.y) + outer.height;
 }
 
 fn compositeBackdropBlur(
@@ -1489,6 +1539,10 @@ test "CPU renderer applies dual Kawase blur inside a window region" {
         0xff000000,
     });
     const commands = [_]render_types.Command{
+        .{ .backdrop_capture = .{
+            .rect = .{ .x = 1, .y = 0, .width = 3, .height = 1 },
+            .radius = 1,
+        } },
         .{ .backdrop_blur = .{
             .rect = .{ .x = 1, .y = 0, .width = 3, .height = 1 },
             .corner_radius = 0,
@@ -1508,7 +1562,107 @@ test "CPU renderer applies dual Kawase blur inside a window region" {
     try std.testing.expectEqual(@as(u32, 0xff000000), output.pixel(4, 0));
 }
 
-test "CPU dual Kawase blur snapshots disjoint damage before compositing" {
+test "CPU backdrop blur only requires a capture when visible" {
+    const size: render_types.Size = .{ .width = 2, .height = 1 };
+    var output = try headless.init(std.testing.allocator, size);
+    defer output.deinit();
+
+    const invisible = [_]render_types.Command{
+        .{ .backdrop_blur = .{
+            .rect = .{ .x = 2, .y = 0, .width = 1, .height = 1 },
+            .corner_radius = 0,
+            .radius = 1,
+        } },
+        .{ .backdrop_blur = .{
+            .rect = .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+            .corner_radius = 0,
+            .radius = 1,
+            .clip = .{ .x = 1, .y = 0, .width = 1, .height = 1 },
+        } },
+    };
+    var renderer = Self.init(std.testing.allocator);
+    defer renderer.deinit();
+    try renderer.render(.{ .size = size, .commands = &invisible }, output.target());
+
+    const visible = [_]render_types.Command{.{ .backdrop_blur = .{
+        .rect = .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+        .corner_radius = 0,
+        .radius = 1,
+    } }};
+    try std.testing.expectError(
+        error.InvalidTarget,
+        renderer.render(.{ .size = size, .commands = &visible }, output.target()),
+    );
+}
+
+test "CPU backdrop capture excludes owner content emitted after it" {
+    const size: render_types.Size = .{ .width = 3, .height = 1 };
+    var output = try headless.init(std.testing.allocator, size);
+    defer output.deinit();
+
+    const target = output.target();
+    @memset(target.pixels[0..3], 0xff000000);
+    const commands = [_]render_types.Command{
+        .{ .backdrop_capture = .{
+            .rect = .{ .x = 0, .y = 0, .width = 3, .height = 1 },
+            .radius = 1,
+        } },
+        .{ .solid_rect = .{
+            .rect = .{ .x = 1, .y = 0, .width = 1, .height = 1 },
+            .color = render_types.Color.rgba(255, 255, 255, 255),
+        } },
+        .{ .backdrop_blur = .{
+            .rect = .{ .x = 1, .y = 0, .width = 1, .height = 1 },
+            .corner_radius = 0,
+            .radius = 1,
+        } },
+    };
+
+    var renderer = Self.init(std.testing.allocator);
+    defer renderer.deinit();
+    try renderer.render(.{ .size = size, .commands = &commands }, target);
+
+    try std.testing.expectEqual(@as(u32, 0xff000000), output.pixel(1, 0));
+}
+
+test "CPU backdrop blur keeps its capture across an interleaved owner" {
+    const size: render_types.Size = .{ .width = 3, .height = 1 };
+    var output = try headless.init(std.testing.allocator, size);
+    defer output.deinit();
+
+    const target = output.target();
+    @memset(target.pixels[0..3], 0xff000000);
+    const commands = [_]render_types.Command{
+        .{ .backdrop_capture = .{
+            .id = 1,
+            .rect = .{ .x = 0, .y = 0, .width = 3, .height = 1 },
+            .radius = 1,
+        } },
+        .{ .solid_rect = .{
+            .rect = .{ .x = 1, .y = 0, .width = 1, .height = 1 },
+            .color = render_types.Color.rgba(255, 255, 255, 255),
+        } },
+        .{ .backdrop_capture = .{
+            .id = 2,
+            .rect = .{ .x = 0, .y = 0, .width = 3, .height = 1 },
+            .radius = 1,
+        } },
+        .{ .backdrop_blur = .{
+            .capture_id = 1,
+            .rect = .{ .x = 1, .y = 0, .width = 1, .height = 1 },
+            .corner_radius = 0,
+            .radius = 1,
+        } },
+    };
+
+    var renderer = Self.init(std.testing.allocator);
+    defer renderer.deinit();
+    try renderer.render(.{ .size = size, .commands = &commands }, target);
+
+    try std.testing.expectEqual(@as(u32, 0xff000000), output.pixel(1, 0));
+}
+
+test "CPU backdrop blur snapshots disjoint damage before compositing" {
     const size: render_types.Size = .{ .width = 5, .height = 1 };
     var output = try headless.init(std.testing.allocator, size);
     defer output.deinit();
@@ -1522,6 +1676,10 @@ test "CPU dual Kawase blur snapshots disjoint damage before compositing" {
         0xff000000,
     });
     const commands = [_]render_types.Command{
+        .{ .backdrop_capture = .{
+            .rect = .{ .x = 0, .y = 0, .width = 5, .height = 1 },
+            .radius = 1,
+        } },
         .{ .backdrop_blur = .{
             .rect = .{ .x = 0, .y = 0, .width = 5, .height = 1 },
             .corner_radius = 0,

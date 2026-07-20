@@ -188,6 +188,13 @@ pub fn build(b: *std.Build) void {
     addVulkanShaderVariant(
         b,
         compositor,
+        "vulkan-backdrop-image",
+        "src/compositor/render/shaders/image.frag",
+        &.{"KEYWORK_BACKDROP"},
+    );
+    addVulkanShaderVariant(
+        b,
+        compositor,
         "vulkan-image-catmull-rom",
         "src/compositor/render/shaders/image.frag",
         &.{"KEYWORK_CATMULL_ROM"},

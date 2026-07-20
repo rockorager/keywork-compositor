@@ -7,6 +7,7 @@ pub const solid_instanced = spirvWords(@embedFile("vulkan-solid"));
 pub const image_alpha_instanced = spirvWords(@embedFile("vulkan-image"));
 pub const image_nearest_instanced = spirvWords(@embedFile("vulkan-image-nearest"));
 pub const image_nearest_gamma22_instanced = spirvWords(@embedFile("vulkan-image-nearest-gamma22"));
+pub const backdrop_image_instanced = spirvWords(@embedFile("vulkan-backdrop-image"));
 pub const image_catmull_rom_instanced = spirvWords(@embedFile("vulkan-image-catmull-rom"));
 pub const image_area_instanced = spirvWords(@embedFile("vulkan-image-area"));
 pub const video_manual_instanced = spirvWords(@embedFile("vulkan-video-manual"));

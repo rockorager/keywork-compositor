@@ -484,13 +484,20 @@ fn translateCommand(
             } else null,
             .clip = if (shadow.clip) |clip| translateRect(clip, origin) else null,
         } },
+        .backdrop_capture => |capture| .{ .backdrop_capture = .{
+            .id = capture.id,
+            .rect = translateRect(capture.rect, origin),
+            .radius = capture.radius,
+            .downsample_level = capture.downsample_level,
+            .base = capture.base,
+        } },
         .backdrop_blur => |blur| .{ .backdrop_blur = .{
+            .capture_id = blur.capture_id,
             .rect = translateRect(blur.rect, origin),
             .corner_radius = blur.corner_radius,
             .radius = blur.radius,
             .downsample_level = blur.downsample_level,
             .clip = if (blur.clip) |clip| translateRect(clip, origin) else null,
-            .cache_only = blur.cache_only,
         } },
         .image => |image| .{ .image = .{
             .x = translateCoordinate(image.x, origin.x),
@@ -548,13 +555,20 @@ fn scaleCommand(command: render_types.Command, scale: render_types.Scale) render
             } else null,
             .clip = if (shadow.clip) |clip| scaleRect(clip, scale) else null,
         } },
+        .backdrop_capture => |capture| .{ .backdrop_capture = .{
+            .id = capture.id,
+            .rect = scaleRect(capture.rect, scale),
+            .radius = scaleUnsigned(capture.radius, scale),
+            .downsample_level = capture.downsample_level,
+            .base = capture.base,
+        } },
         .backdrop_blur => |blur| .{ .backdrop_blur = .{
+            .capture_id = blur.capture_id,
             .rect = scaleRect(blur.rect, scale),
             .corner_radius = scaleUnsigned(blur.corner_radius, scale),
             .radius = scaleUnsigned(blur.radius, scale),
             .downsample_level = blur.downsample_level,
             .clip = if (blur.clip) |clip| scaleRect(clip, scale) else null,
-            .cache_only = blur.cache_only,
         } },
         .image => |image| scaled: {
             const rect = scaleRect(.{

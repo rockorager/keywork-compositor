@@ -48,6 +48,7 @@ blend_pipeline: vk.Pipeline,
 image_pipeline: vk.Pipeline,
 nearest_image_pipeline: vk.Pipeline,
 nearest_gamma22_image_pipeline: vk.Pipeline,
+backdrop_image_pipeline: vk.Pipeline,
 reconstruction_image_pipeline: vk.Pipeline,
 area_image_pipeline: vk.Pipeline,
 shadow_pipeline: vk.Pipeline,
@@ -170,6 +171,7 @@ const BackdropCache = struct {
     image: BlurImage,
     framebuffer: vk.Framebuffer,
     key: ?u64 = null,
+    geometry_key: u64 = 0,
     initialized: bool = false,
 
     fn matches(self: BackdropCache, key: ?u64) bool {
@@ -261,6 +263,7 @@ const PipelineKind = enum {
     replace,
     blend,
     image,
+    backdrop_image,
     shadow,
     downsample,
     blur_downsample,
@@ -273,7 +276,10 @@ const BlurOp = struct {
     cache_index: u32 = 0,
     cache_key: ?u64 = null,
     cache_hit: bool = false,
-    cache_only: bool = false,
+    cache_rekey: bool = false,
+    geometry_key: u64 = 0,
+    used: bool = false,
+    base_capture: bool = false,
     reuse_op_index: ?u32 = null,
     level: u8 = 0,
     downsample_instances: [blur_level_count]u32 = @splat(0),
@@ -283,12 +289,19 @@ const BlurOp = struct {
     upsample_rects: [blur_level_count]render.Rect = @splat(.{ .x = 0, .y = 0, .width = 0, .height = 0 }),
 };
 
-const BaseBackdropCache = struct {
+const CompiledBackdropCapture = struct {
+    id: u32,
     command_index: usize,
     op_index: u32,
     radius: u32,
     downsample_level: ?u8,
     key: ?u64,
+    level: u8,
+    sample_rect: render.Rect,
+};
+
+const PendingBackdropComposite = struct {
+    capture: CompiledBackdropCapture,
 };
 
 const DrawRun = struct {
@@ -301,6 +314,7 @@ const DrawRun = struct {
     instance_count: u32,
     color_transform: ColorTransform = .{},
     manual_ycbcr: ?ManualYcbcr = null,
+    backdrop_op_index: ?u32 = null,
 };
 
 const UploadRun = struct {
@@ -375,6 +389,7 @@ const Graphics = struct {
     image_pipeline: vk.Pipeline,
     nearest_image_pipeline: vk.Pipeline,
     nearest_gamma22_image_pipeline: vk.Pipeline,
+    backdrop_image_pipeline: vk.Pipeline,
     reconstruction_image_pipeline: vk.Pipeline,
     area_image_pipeline: vk.Pipeline,
     shadow_pipeline: vk.Pipeline,
@@ -551,6 +566,11 @@ fn initGraphics(
         .p_code = &shaders.image_nearest_gamma22_instanced,
     }, null);
     defer wrapper.destroyShaderModule(device, nearest_gamma22_image_shader, null);
+    const backdrop_image_shader = try wrapper.createShaderModule(device, &.{
+        .code_size = @sizeOf(@TypeOf(shaders.backdrop_image_instanced)),
+        .p_code = &shaders.backdrop_image_instanced,
+    }, null);
+    defer wrapper.destroyShaderModule(device, backdrop_image_shader, null);
     const reconstruction_image_shader = try wrapper.createShaderModule(device, &.{
         .code_size = @sizeOf(@TypeOf(shaders.image_catmull_rom_instanced)),
         .p_code = &shaders.image_catmull_rom_instanced,
@@ -698,6 +718,8 @@ fn initGraphics(
     errdefer wrapper.destroyPipeline(device, blur_upsample_pipeline, null);
     const blur_composite_pipeline = try createPipeline(wrapper, device, render_pass, pipeline_layout, vertex_shader, image_shader, true);
     errdefer wrapper.destroyPipeline(device, blur_composite_pipeline, null);
+    const backdrop_image_pipeline = try createPipeline(wrapper, device, render_pass, pipeline_layout, vertex_shader, backdrop_image_shader, true);
+    errdefer wrapper.destroyPipeline(device, backdrop_image_pipeline, null);
     const encode_pipeline = try createPipeline(
         wrapper,
         device,
@@ -767,6 +789,7 @@ fn initGraphics(
         .image_pipeline = image_pipeline,
         .nearest_image_pipeline = nearest_image_pipeline,
         .nearest_gamma22_image_pipeline = nearest_gamma22_image_pipeline,
+        .backdrop_image_pipeline = backdrop_image_pipeline,
         .reconstruction_image_pipeline = reconstruction_image_pipeline,
         .area_image_pipeline = area_image_pipeline,
         .shadow_pipeline = shadow_pipeline,
@@ -903,6 +926,7 @@ fn destroyGraphics(wrapper: vk.DeviceWrapper, device: vk.Device, graphics: Graph
     if (graphics.output_10bit) |output| destroyOutputGraphics(wrapper, device, output);
     wrapper.destroyPipeline(device, graphics.encode_calibrated_pipeline, null);
     wrapper.destroyPipeline(device, graphics.encode_pipeline, null);
+    wrapper.destroyPipeline(device, graphics.backdrop_image_pipeline, null);
     wrapper.destroyPipeline(device, graphics.blur_composite_pipeline, null);
     wrapper.destroyPipeline(device, graphics.blur_upsample_pipeline, null);
     wrapper.destroyPipeline(device, graphics.blur_downsample_pipeline, null);
@@ -2142,6 +2166,7 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
         .image_pipeline = graphics.image_pipeline,
         .nearest_image_pipeline = graphics.nearest_image_pipeline,
         .nearest_gamma22_image_pipeline = graphics.nearest_gamma22_image_pipeline,
+        .backdrop_image_pipeline = graphics.backdrop_image_pipeline,
         .reconstruction_image_pipeline = graphics.reconstruction_image_pipeline,
         .area_image_pipeline = graphics.area_image_pipeline,
         .shadow_pipeline = graphics.shadow_pipeline,
@@ -2235,6 +2260,7 @@ pub fn deinit(self: *Self) void {
         .image_pipeline = self.image_pipeline,
         .nearest_image_pipeline = self.nearest_image_pipeline,
         .nearest_gamma22_image_pipeline = self.nearest_gamma22_image_pipeline,
+        .backdrop_image_pipeline = self.backdrop_image_pipeline,
         .reconstruction_image_pipeline = self.reconstruction_image_pipeline,
         .area_image_pipeline = self.area_image_pipeline,
         .shadow_pipeline = self.shadow_pipeline,
@@ -2949,7 +2975,9 @@ fn renderFrameWithCompletion(
         self.prepared_images.items,
         frame.output_color_description,
     );
-    if (try self.prepareBackdropCaches(output, frame.commands) and frame.damage != null) {
+    if (try self.prepareBackdropCaches(output, compiled_frame.damage) and
+        compiled_frame.damage != null)
+    {
         self.instances.clearRetainingCapacity();
         self.draw_runs.clearRetainingCapacity();
         self.blur_ops.clearRetainingCapacity();
@@ -2959,7 +2987,7 @@ fn renderFrameWithCompletion(
             self.prepared_images.items,
             frame.output_color_description,
         );
-        _ = try self.prepareBackdropCaches(output, frame.commands);
+        _ = try self.prepareBackdropCaches(output, compiled_frame.damage);
     }
     if (self.instances.items.len >= std.math.maxInt(u32)) return error.InvalidTarget;
     const encode_instance: u32 = @intCast(self.instances.items.len);
@@ -3223,9 +3251,10 @@ fn renderFrameWithCompletion(
         }
         var bound_pipeline = vk.Pipeline.null_handle;
         var bound_pipeline_layout = vk.PipelineLayout.null_handle;
-        var bound_descriptor: ?vk.DescriptorSet = null;
+        var bound_descriptors: [2]?vk.DescriptorSet = @splat(null);
         for (self.draw_runs.items, 0..) |run, run_index| {
             if (self.blurOpAt(run_index)) |blur_op| {
+                if (!blur_op.used) continue;
                 const backdrop_cache = output.backdrop_cache.items[blur_op.cache_index];
                 if (!blur_op.cache_hit) {
                     const scratch = output.blur.?;
@@ -3289,7 +3318,7 @@ fn renderFrameWithCompletion(
                     self.setViewportAndScissor(command_buffer, frame.size);
                     bound_pipeline = .null_handle;
                     bound_pipeline_layout = .null_handle;
-                    bound_descriptor = null;
+                    bound_descriptors = @splat(null);
                 }
             }
             const run_pipeline = if (run.pipeline_handle != .null_handle)
@@ -3310,14 +3339,18 @@ fn renderFrameWithCompletion(
             }
             if (bound_pipeline_layout != run_pipeline_layout) {
                 bound_pipeline_layout = run_pipeline_layout;
-                bound_descriptor = null;
+                bound_descriptors = @splat(null);
             }
-            const run_descriptor = if (run.pipeline == .blur_composite) blk: {
-                const blur_op = self.blurOpAt(run_index).?;
+            const backdrop_descriptor = if (run.backdrop_op_index) |op_index| blk: {
+                const blur_op = self.blur_ops.items[op_index];
                 break :blk output.backdrop_cache.items[blur_op.cache_index].image.descriptor_set;
-            } else run.descriptor_set;
-            if (run_descriptor) |descriptor_set| {
-                if (bound_descriptor != descriptor_set) {
+            } else null;
+            const primary_descriptor = if (run.pipeline == .blur_composite)
+                backdrop_descriptor
+            else
+                run.descriptor_set;
+            if (primary_descriptor) |descriptor_set| {
+                if (bound_descriptors[0] != descriptor_set) {
                     self.device_wrapper.cmdBindDescriptorSets(
                         command_buffer,
                         .graphics,
@@ -3326,7 +3359,21 @@ fn renderFrameWithCompletion(
                         &.{descriptor_set},
                         null,
                     );
-                    bound_descriptor = descriptor_set;
+                    bound_descriptors[0] = descriptor_set;
+                }
+            }
+            if (run.pipeline == .backdrop_image) {
+                const descriptor_set = backdrop_descriptor orelse return error.InvalidTarget;
+                if (bound_descriptors[1] != descriptor_set) {
+                    self.device_wrapper.cmdBindDescriptorSets(
+                        command_buffer,
+                        .graphics,
+                        run_pipeline_layout,
+                        1,
+                        &.{descriptor_set},
+                        null,
+                    );
+                    bound_descriptors[1] = descriptor_set;
                 }
             }
             const push: FramePush = .{
@@ -3604,9 +3651,13 @@ fn renderFrameWithCompletion(
     }
     if (self.blur_ops.items.len != 0) output.blur_initialized = blur_initialized;
     for (self.blur_ops.items) |blur_op| {
-        if (blur_op.cache_hit) continue;
         const cache = &output.backdrop_cache.items[blur_op.cache_index];
+        if (blur_op.cache_hit) {
+            if (blur_op.cache_rekey) cache.key = blur_op.cache_key;
+            continue;
+        }
         cache.key = blur_op.cache_key;
+        cache.geometry_key = blur_op.geometry_key;
         cache.initialized = true;
     }
     for (self.prepared_images.items) |prepared| {
@@ -3710,7 +3761,7 @@ fn isFirstImportedTexture(prepared_images: []const PreparedImage, index: usize) 
 fn supports(commands: []const render.Command) bool {
     for (commands) |command| switch (command) {
         .clear => {},
-        .solid_rect, .image, .shadow, .backdrop_blur => {},
+        .solid_rect, .image, .shadow, .backdrop_capture, .backdrop_blur => {},
     };
     return true;
 }
@@ -4088,12 +4139,13 @@ fn ensureBlurLevel(self: *Self, scratch: *BlurScratch, output_size: render.Size,
 fn prepareBackdropCaches(
     self: *Self,
     output: *Output,
-    commands: []const render.Command,
+    damage: ?[]const render.Rect,
 ) Error!bool {
     var cache_changed = false;
     var next_cache_index: usize = 0;
-    var base_cache_miss = false;
+    var incomplete_capture_damage = false;
     for (self.blur_ops.items, 0..) |*blur_op, op_index| {
+        if (!blur_op.used) continue;
         if (blur_op.reuse_op_index) |source_index| {
             std.debug.assert(source_index < op_index);
             blur_op.cache_index = self.blur_ops.items[source_index].cache_index;
@@ -4111,8 +4163,24 @@ fn prepareBackdropCaches(
         ) or cache_changed;
         const cache = try self.ensureBackdropCache(output, next_cache_index, cache_size);
         blur_op.cache_hit = cache.matches(blur_op.cache_key);
+        if (!blur_op.cache_hit and cache.initialized and
+            blur_op.cache_key != null and cache.geometry_key == blur_op.geometry_key)
+        {
+            if (damage) |rectangles| {
+                if (!damageIntersectsRect(rectangles, blur_op.sample_rect)) {
+                    blur_op.cache_hit = true;
+                    blur_op.cache_rekey = true;
+                }
+            }
+        }
         next_cache_index += 1;
-        if (blur_op.cache_only and !blur_op.cache_hit) base_cache_miss = true;
+        if (!blur_op.cache_hit) {
+            if (damage) |rectangles| {
+                if (!try damageCoversRect(self.allocator, rectangles, blur_op.sample_rect)) {
+                    incomplete_capture_damage = true;
+                }
+            }
+        }
         if (blur_op.cache_hit) continue;
 
         if (output.blur == null) output.blur = .{};
@@ -4124,13 +4192,72 @@ fn prepareBackdropCaches(
         }
     }
 
-    const cache_limit = backdropBlurCommandCount(commands);
-    while (output.backdrop_cache.items.len > cache_limit) {
+    while (output.backdrop_cache.items.len > next_cache_index) {
         self.destroyBackdropCache(output.backdrop_cache.pop().?);
         cache_changed = true;
     }
     if (cache_changed) output.recorded_frame.valid = false;
-    return base_cache_miss;
+    return incomplete_capture_damage;
+}
+
+fn damageCoversRect(
+    allocator: std.mem.Allocator,
+    damage: []const render.Rect,
+    rect: render.Rect,
+) error{OutOfMemory}!bool {
+    var uncovered: std.ArrayList(render.Rect) = .empty;
+    defer uncovered.deinit(allocator);
+    var next: std.ArrayList(render.Rect) = .empty;
+    defer next.deinit(allocator);
+    try uncovered.append(allocator, rect);
+
+    for (damage) |damaged| {
+        next.clearRetainingCapacity();
+        for (uncovered.items) |fragment| {
+            const overlap = fragment.intersection(damaged) orelse {
+                try next.append(allocator, fragment);
+                continue;
+            };
+            const fragment_right = @as(i64, fragment.x) + fragment.width;
+            const fragment_bottom = @as(i64, fragment.y) + fragment.height;
+            const overlap_right = @as(i64, overlap.x) + overlap.width;
+            const overlap_bottom = @as(i64, overlap.y) + overlap.height;
+            if (overlap.y > fragment.y) try next.append(allocator, .{
+                .x = fragment.x,
+                .y = fragment.y,
+                .width = fragment.width,
+                .height = @intCast(overlap.y - fragment.y),
+            });
+            if (overlap_bottom < fragment_bottom) try next.append(allocator, .{
+                .x = fragment.x,
+                .y = @intCast(overlap_bottom),
+                .width = fragment.width,
+                .height = @intCast(fragment_bottom - overlap_bottom),
+            });
+            if (overlap.x > fragment.x) try next.append(allocator, .{
+                .x = fragment.x,
+                .y = overlap.y,
+                .width = @intCast(overlap.x - fragment.x),
+                .height = overlap.height,
+            });
+            if (overlap_right < fragment_right) try next.append(allocator, .{
+                .x = @intCast(overlap_right),
+                .y = overlap.y,
+                .width = @intCast(fragment_right - overlap_right),
+                .height = overlap.height,
+            });
+        }
+        std.mem.swap(std.ArrayList(render.Rect), &uncovered, &next);
+        if (uncovered.items.len == 0) return true;
+    }
+    return false;
+}
+
+fn damageIntersectsRect(damage: []const render.Rect, rect: render.Rect) bool {
+    for (damage) |damaged| {
+        if (damaged.intersection(rect) != null) return true;
+    }
+    return false;
 }
 
 fn ensureBackdropCache(
@@ -5249,17 +5376,6 @@ fn backdropCacheKey(commands: []const render.Command) ?u64 {
     return hasher.final();
 }
 
-fn backdropBlurCommandCount(commands: []const render.Command) usize {
-    var count: usize = 0;
-    for (commands) |command| switch (command) {
-        .backdrop_blur => |blur| {
-            if (blur.radius != 0 and blur.rect.width != 0 and blur.rect.height != 0) count += 1;
-        },
-        else => {},
-    };
-    return count;
-}
-
 fn hashRenderCommand(hasher: *std.hash.Wyhash, command: render.Command) bool {
     switch (command) {
         .clear => |color| {
@@ -5282,18 +5398,24 @@ fn hashRenderCommand(hasher: *std.hash.Wyhash, command: render.Command) bool {
             hashOptionalRoundedClip(hasher, shadow.cutout);
             hashOptionalRect(hasher, shadow.clip);
         },
-        .backdrop_blur => |blur| {
+        .backdrop_capture => |capture| {
             hashScalar(hasher, @as(u8, 3));
+            hashRect(hasher, capture.rect);
+            hashScalar(hasher, capture.radius);
+            hashOptionalScalar(hasher, capture.downsample_level);
+            hashScalar(hasher, @intFromBool(capture.base));
+        },
+        .backdrop_blur => |blur| {
+            hashScalar(hasher, @as(u8, 4));
             hashRect(hasher, blur.rect);
             hashScalar(hasher, blur.corner_radius);
             hashScalar(hasher, blur.radius);
             hashOptionalScalar(hasher, blur.downsample_level);
             hashOptionalRect(hasher, blur.clip);
-            hashScalar(hasher, @intFromBool(blur.cache_only));
         },
         .image => |image| {
             const source_cache = image.buffer.source_cache orelse return false;
-            hashScalar(hasher, @as(u8, 4));
+            hashScalar(hasher, @as(u8, 5));
             hashScalar(hasher, image.x);
             hashScalar(hasher, image.y);
             hashSize(hasher, image.size);
@@ -5468,8 +5590,8 @@ fn commandVisibleRect(command: render.Command, frame_size: render.Size) ?render.
             break :clipped rect;
         },
         .shadow => |shadow| shadowVisibleRect(shadow, frame_size),
+        .backdrop_capture => null,
         .backdrop_blur => |blur| clipped: {
-            if (blur.cache_only) break :clipped null;
             var rect = blur.rect.clipTo(frame_size) orelse break :clipped null;
             if (blur.clip) |clip| rect = rect.intersection(clip) orelse break :clipped null;
             break :clipped rect;
@@ -5503,36 +5625,6 @@ fn shadowVisibleRect(shadow: render.Shadow, frame_size: render.Size) ?render.Rec
     return rect;
 }
 
-fn baseBackdropCacheUsed(
-    commands: []const render.Command,
-    marker_index: usize,
-    marker: render.BackdropBlur,
-    frame_size: render.Size,
-    damage: ?[]const render.Rect,
-) bool {
-    for (commands[marker_index + 1 ..], marker_index + 1..) |command, command_index| {
-        const blur = switch (command) {
-            .backdrop_blur => |blur| blur,
-            else => continue,
-        };
-        if (blur.cache_only or blur.radius != marker.radius or
-            blur.downsample_level != marker.downsample_level) continue;
-        var clipped = blur.rect.clipTo(frame_size) orelse continue;
-        if (blur.clip) |clip| clipped = clipped.intersection(clip) orelse continue;
-        _ = damageBounds(damage, clipped) orelse continue;
-        const level = configuredBlurLevel(blur.radius, blur.downsample_level);
-        const scale: u32 = @as(u32, 1) << @intCast(level);
-        const sample_radius = (ceilDiv(blur.radius, scale) + 3) * scale;
-        const sample_rect = blurSampleRect(clipped, sample_radius, level, frame_size);
-        if (!commandsAffectRect(
-            commands[marker_index + 1 .. command_index],
-            sample_rect,
-            frame_size,
-        )) return true;
-    }
-    return false;
-}
-
 fn compileDrawRuns(
     self: *Self,
     frame: render.Frame,
@@ -5540,8 +5632,25 @@ fn compileDrawRuns(
     output_color_description: render.ColorDescription,
 ) Error!void {
     var prepared_index: usize = 0;
-    var base_backdrop: ?BaseBackdropCache = null;
+    var captures: std.ArrayList(CompiledBackdropCapture) = .empty;
+    defer captures.deinit(self.allocator);
+    var base_capture: ?CompiledBackdropCapture = null;
+    var pending_backdrop: ?PendingBackdropComposite = null;
     for (frame.commands, 0..) |command, command_index| switch (command) {
+        .backdrop_capture => |capture| {
+            std.debug.assert(pending_backdrop == null);
+            const compiled = try self.compileBackdropCapture(
+                frame,
+                capture,
+                command_index,
+                base_capture,
+            );
+            try captures.append(self.allocator, compiled);
+            if (capture.base) {
+                if (base_capture != null) return error.InvalidTarget;
+                base_capture = compiled;
+            }
+        },
         .clear => |color| {
             const rect: render.Rect = .{
                 .x = 0,
@@ -5549,7 +5658,7 @@ fn compileDrawRuns(
                 .width = frame.size.width,
                 .height = frame.size.height,
             };
-            try self.emitDamaged(frame, rect, .replace, .null_handle, .null_handle, null, .{ .width = 1, .height = 1 }, .{}, null, .{
+            try self.emitDamaged(frame, rect, .replace, .null_handle, .null_handle, null, .{ .width = 1, .height = 1 }, .{}, null, null, .{
                 .destination = rectFloats(rect),
                 .source = .{ 0, 0, 1, 1 },
                 .clip = undefined,
@@ -5561,7 +5670,7 @@ fn compileDrawRuns(
         .solid_rect => |solid| {
             var clipped = solid.rect.clipTo(frame.size) orelse continue;
             if (solid.clip) |clip| clipped = clipped.intersection(clip) orelse continue;
-            try self.emitDamaged(frame, clipped, .blend, .null_handle, .null_handle, null, .{ .width = 1, .height = 1 }, .{}, null, .{
+            try self.emitDamaged(frame, clipped, .blend, .null_handle, .null_handle, null, .{ .width = 1, .height = 1 }, .{}, null, null, .{
                 .destination = rectFloats(clipped),
                 .source = .{ 0, 0, 1, 1 },
                 .clip = undefined,
@@ -5571,6 +5680,8 @@ fn compileDrawRuns(
             });
         },
         .image => |image| {
+            const backdrop = pending_backdrop;
+            pending_backdrop = null;
             const prepared = prepared_images[prepared_index];
             prepared_index += 1;
             const destination: render.Rect = .{
@@ -5597,7 +5708,9 @@ fn compileDrawRuns(
             };
             const radius = @min(rounded.radius, @min(rounded.rect.width, rounded.rect.height) / 2);
             const dmabuf = image.buffer.dmabuf;
-            const image_pipeline = if (prepared.texture.pipeline != .null_handle)
+            const image_pipeline = if (backdrop != null)
+                self.backdrop_image_pipeline
+            else if (prepared.texture.pipeline != .null_handle)
                 prepared.texture.pipeline
             else switch (image.samplingFilter()) {
                 .nearest => if (image.buffer.color_description.transfer_function == .gamma22)
@@ -5610,7 +5723,7 @@ fn compileDrawRuns(
             try self.emitDamaged(
                 frame,
                 clipped,
-                .image,
+                if (backdrop != null) .backdrop_image else .image,
                 image_pipeline,
                 prepared.texture.pipeline_layout,
                 prepared.texture.descriptor_set,
@@ -5619,7 +5732,8 @@ fn compileDrawRuns(
                     image.buffer.color_description,
                     output_color_description,
                 ),
-                prepared.texture.manual_ycbcr,
+                if (backdrop != null) null else prepared.texture.manual_ycbcr,
+                if (backdrop) |pending| pending.capture.op_index else null,
                 .{
                     .destination = rectFloats(destination),
                     .source = .{
@@ -5675,7 +5789,7 @@ fn compileDrawRuns(
                 cutout.radius,
                 @min(cutout.rect.width, cutout.rect.height) / 2,
             );
-            try self.emitDamaged(frame, clipped, .shadow, .null_handle, .null_handle, null, .{ .width = 1, .height = 1 }, .{}, null, .{
+            try self.emitDamaged(frame, clipped, .shadow, .null_handle, .null_handle, null, .{ .width = 1, .height = 1 }, .{}, null, null, .{
                 .destination = rectFloats(cutout.rect),
                 .source = .{ 0, 0, 1, 1 },
                 .clip = undefined,
@@ -5696,76 +5810,35 @@ fn compileDrawRuns(
         },
         .backdrop_blur => |blur| {
             if (blur.radius == 0 or blur.rect.width == 0 or blur.rect.height == 0) continue;
-            if (blur.cache_only and !baseBackdropCacheUsed(
-                frame.commands,
-                command_index,
-                blur,
-                frame.size,
-                frame.damage,
-            )) continue;
             var clipped = blur.rect.clipTo(frame.size) orelse continue;
             if (blur.clip) |clip| clipped = clipped.intersection(clip) orelse continue;
-            if (!blur.cache_only) _ = damageBounds(frame.damage, clipped) orelse continue;
+            const capture = compiledBackdropCapture(captures.items, blur.capture_id) orelse
+                return error.InvalidTarget;
             const level = configuredBlurLevel(blur.radius, blur.downsample_level);
             const scale: u32 = @as(u32, 1) << @intCast(level);
-            const low_radius = ceilDiv(blur.radius, scale);
-            const sample_radius = (low_radius + 3) * scale;
+            const sample_radius = (ceilDiv(blur.radius, scale) + 3) * scale;
             const sample_rect = blurSampleRect(clipped, sample_radius, level, frame.size);
-            const own_cache_key = backdropCacheKey(frame.commands[0 .. command_index + 1]);
-            const reuse_op_index = if (!blur.cache_only) reuse: {
-                const base = base_backdrop orelse break :reuse null;
-                if (base.radius != blur.radius or
-                    base.downsample_level != blur.downsample_level or
-                    commandsAffectRect(
-                        frame.commands[base.command_index + 1 .. command_index],
-                        sample_rect,
-                        frame.size,
-                    )) break :reuse null;
-                break :reuse base.op_index;
-            } else null;
-            const cache_key = if (reuse_op_index != null)
-                base_backdrop.?.key
-            else
-                own_cache_key;
-            var level_rects: [blur_level_count]render.Rect = undefined;
-            for (&level_rects, 0..) |*rect, index| rect.* = scaleRect(sample_rect, @intCast(index));
-            const kawase_offset = kawaseOffset(blur.radius, level);
-            const source_expansion = kawaseSourceExpansion(blur.radius, level);
-            var upsample_rects: [blur_level_count]render.Rect = @splat(.{ .x = 0, .y = 0, .width = 0, .height = 0 });
-            upsample_rects[0] = clipped;
-            for (1..@as(usize, level) + 1) |index| {
-                upsample_rects[index] = expandRectWithin(
-                    scaleRect(upsample_rects[index - 1], 1),
-                    source_expansion,
-                    level_rects[index],
-                );
-            }
-            var downsample_instances: [blur_level_count]u32 = @splat(0);
-            if (level == 0) {
-                downsample_instances[0] = @intCast(self.instances.items.len);
-                try self.instances.append(self.allocator, kawaseDownsampleInstance(
-                    level_rects[0],
-                    level_rects[0],
-                    kawase_offset,
-                ));
-            } else for (0..level) |index| {
-                const destination_index = index + 1;
-                downsample_instances[destination_index] = @intCast(self.instances.items.len);
-                try self.instances.append(self.allocator, kawaseDownsampleInstance(
-                    level_rects[destination_index],
-                    level_rects[index],
-                    kawase_offset,
-                ));
-            }
-            var upsample_instances: [blur_level_count]u32 = @splat(0);
-            const upsample_passes: usize = @max(level, 1);
-            for (0..upsample_passes) |index| {
-                upsample_instances[index] = @intCast(self.instances.items.len);
-                try self.instances.append(self.allocator, kawaseUpsampleInstance(
-                    upsample_rects[index],
-                    kawase_offset,
-                    level == 0,
-                ));
+            if (capture.radius != blur.radius or
+                capture.downsample_level != blur.downsample_level or
+                capture.level != level or
+                !rectContains(capture.sample_rect, sample_rect)) return error.InvalidTarget;
+            self.markBackdropCaptureUsed(capture.op_index);
+            _ = damageBounds(frame.damage, clipped) orelse continue;
+            if (command_index + 1 < frame.commands.len) {
+                const next_image = switch (frame.commands[command_index + 1]) {
+                    .image => |image| image,
+                    else => null,
+                };
+                if (next_image) |image| {
+                    const prepared = prepared_images[prepared_index];
+                    if (prepared.texture.pipeline == .null_handle and
+                        prepared.texture.manual_ycbcr == null and
+                        canFuseBackdropImage(blur, image))
+                    {
+                        pending_backdrop = .{ .capture = capture };
+                        continue;
+                    }
+                }
             }
             const radius = @min(blur.corner_radius, @min(blur.rect.width, blur.rect.height) / 2);
             const blur_rect = rectFloats(blur.rect);
@@ -5779,55 +5852,195 @@ fn compileDrawRuns(
             };
             const composite_instance: u32 = @intCast(self.instances.items.len);
             var composite_count: u32 = 0;
-            if (!blur.cache_only) {
-                if (frame.damage) |damage| {
-                    for (damage) |damaged| {
-                        const damaged_clip = damaged.clipTo(frame.size) orelse continue;
-                        const composite_clip = clipped.intersection(damaged_clip) orelse continue;
-                        var instance = composite;
-                        instance.clip = rectFloats(composite_clip);
-                        try self.instances.append(self.allocator, instance);
-                        composite_count = std.math.add(u32, composite_count, 1) catch
-                            return error.InvalidTarget;
-                    }
-                } else {
+            if (frame.damage) |damage| {
+                for (damage) |damaged| {
+                    const damaged_clip = damaged.clipTo(frame.size) orelse continue;
+                    const composite_clip = clipped.intersection(damaged_clip) orelse continue;
                     var instance = composite;
-                    instance.clip = rectFloats(clipped);
+                    instance.clip = rectFloats(composite_clip);
                     try self.instances.append(self.allocator, instance);
-                    composite_count = 1;
+                    composite_count = std.math.add(u32, composite_count, 1) catch
+                        return error.InvalidTarget;
                 }
-                std.debug.assert(composite_count > 0);
+            } else {
+                var instance = composite;
+                instance.clip = rectFloats(clipped);
+                try self.instances.append(self.allocator, instance);
+                composite_count = 1;
             }
-            const op_index: u32 = @intCast(self.blur_ops.items.len);
-            try self.blur_ops.append(self.allocator, .{
-                .run_index = @intCast(self.draw_runs.items.len),
-                .cache_key = cache_key,
-                .cache_only = blur.cache_only,
-                .reuse_op_index = reuse_op_index,
-                .level = level,
-                .downsample_instances = downsample_instances,
-                .upsample_instances = upsample_instances,
-                .sample_rect = sample_rect,
-                .level_rects = level_rects,
-                .upsample_rects = upsample_rects,
-            });
-            if (blur.cache_only) base_backdrop = .{
-                .command_index = command_index,
-                .op_index = op_index,
-                .radius = blur.radius,
-                .downsample_level = blur.downsample_level,
-                .key = own_cache_key,
-            };
+            std.debug.assert(composite_count > 0);
             try self.draw_runs.append(self.allocator, .{
                 .pipeline = .blur_composite,
                 .descriptor_set = null,
                 .texture_size = frame.size,
                 .first_instance = composite_instance,
                 .instance_count = composite_count,
+                .backdrop_op_index = capture.op_index,
             });
         },
     };
+    std.debug.assert(pending_backdrop == null);
     std.debug.assert(prepared_index == prepared_images.len);
+}
+
+fn compiledBackdropCapture(
+    captures: []const CompiledBackdropCapture,
+    id: u32,
+) ?CompiledBackdropCapture {
+    var index = captures.len;
+    while (index > 0) {
+        index -= 1;
+        if (captures[index].id == id) return captures[index];
+    }
+    return null;
+}
+
+fn markBackdropCaptureUsed(self: *Self, op_index: u32) void {
+    var current: ?u32 = op_index;
+    while (current) |index| {
+        const op = &self.blur_ops.items[index];
+        if (op.used) return;
+        op.used = true;
+        current = op.reuse_op_index;
+    }
+}
+
+fn canFuseBackdropImage(blur: render.BackdropBlur, image: render.Image) bool {
+    if (image.buffer.dmabuf != null or image.samplingFilter() != .nearest) return false;
+    const destination: render.Rect = .{
+        .x = image.x,
+        .y = image.y,
+        .width = image.size.width,
+        .height = image.size.height,
+    };
+    if (!std.meta.eql(destination, blur.rect) or !std.meta.eql(image.clip, blur.clip)) {
+        return false;
+    }
+    if (image.rounded_clip) |rounded| {
+        return std.meta.eql(rounded.rect, destination) and rounded.radius == blur.corner_radius;
+    }
+    return blur.corner_radius == 0;
+}
+
+fn compileBackdropCapture(
+    self: *Self,
+    frame: render.Frame,
+    capture: render.BackdropCapture,
+    command_index: usize,
+    base_capture: ?CompiledBackdropCapture,
+) Error!CompiledBackdropCapture {
+    if (capture.radius == 0 or capture.rect.width == 0 or capture.rect.height == 0) {
+        return error.InvalidTarget;
+    }
+    const clipped = capture.rect.clipTo(frame.size) orelse return error.InvalidTarget;
+    const level = configuredBlurLevel(capture.radius, capture.downsample_level);
+    const scale: u32 = @as(u32, 1) << @intCast(level);
+    const sample_radius = (ceilDiv(capture.radius, scale) + 3) * scale;
+    const sample_rect = blurSampleRect(clipped, sample_radius, level, frame.size);
+    const own_cache_key = backdropCacheKey(frame.commands[0 .. command_index + 1]);
+    const geometry_key = backdropGeometryKey(capture);
+    const reuse_op_index = if (!capture.base) reuse: {
+        const base = base_capture orelse break :reuse null;
+        if (base.radius != capture.radius or
+            base.downsample_level != capture.downsample_level or
+            !rectContains(base.sample_rect, sample_rect) or
+            commandsAffectRect(
+                frame.commands[base.command_index + 1 .. command_index],
+                sample_rect,
+                frame.size,
+            )) break :reuse null;
+        break :reuse base.op_index;
+    } else null;
+    const cache_key = if (reuse_op_index != null) base_capture.?.key else own_cache_key;
+
+    var level_rects: [blur_level_count]render.Rect = undefined;
+    for (&level_rects, 0..) |*rect, index| rect.* = scaleRect(sample_rect, @intCast(index));
+    const kawase_offset = kawaseOffset(capture.radius, level);
+    const source_expansion = kawaseSourceExpansion(capture.radius, level);
+    var upsample_rects: [blur_level_count]render.Rect = @splat(.{ .x = 0, .y = 0, .width = 0, .height = 0 });
+    upsample_rects[0] = clipped;
+    for (1..@as(usize, level) + 1) |index| {
+        upsample_rects[index] = expandRectWithin(
+            scaleRect(upsample_rects[index - 1], 1),
+            source_expansion,
+            level_rects[index],
+        );
+    }
+    var downsample_instances: [blur_level_count]u32 = @splat(0);
+    if (level == 0) {
+        downsample_instances[0] = @intCast(self.instances.items.len);
+        try self.instances.append(self.allocator, kawaseDownsampleInstance(
+            level_rects[0],
+            level_rects[0],
+            kawase_offset,
+        ));
+    } else for (0..level) |index| {
+        const destination_index = index + 1;
+        downsample_instances[destination_index] = @intCast(self.instances.items.len);
+        try self.instances.append(self.allocator, kawaseDownsampleInstance(
+            level_rects[destination_index],
+            level_rects[index],
+            kawase_offset,
+        ));
+    }
+    var upsample_instances: [blur_level_count]u32 = @splat(0);
+    const upsample_passes: usize = @max(level, 1);
+    for (0..upsample_passes) |index| {
+        upsample_instances[index] = @intCast(self.instances.items.len);
+        try self.instances.append(self.allocator, kawaseUpsampleInstance(
+            upsample_rects[index],
+            kawase_offset,
+            level == 0,
+        ));
+    }
+
+    const op_index: u32 = @intCast(self.blur_ops.items.len);
+    try self.blur_ops.append(self.allocator, .{
+        .run_index = @intCast(self.draw_runs.items.len),
+        .cache_key = cache_key,
+        .geometry_key = geometry_key,
+        .base_capture = capture.base,
+        .reuse_op_index = reuse_op_index,
+        .level = level,
+        .downsample_instances = downsample_instances,
+        .upsample_instances = upsample_instances,
+        .sample_rect = sample_rect,
+        .level_rects = level_rects,
+        .upsample_rects = upsample_rects,
+    });
+    try self.draw_runs.append(self.allocator, .{
+        .pipeline = .blur_composite,
+        .descriptor_set = null,
+        .texture_size = frame.size,
+        .first_instance = @intCast(self.instances.items.len),
+        .instance_count = 0,
+        .backdrop_op_index = op_index,
+    });
+    return .{
+        .id = capture.id,
+        .command_index = command_index,
+        .op_index = op_index,
+        .radius = capture.radius,
+        .downsample_level = capture.downsample_level,
+        .key = cache_key,
+        .level = level,
+        .sample_rect = sample_rect,
+    };
+}
+
+fn backdropGeometryKey(capture: render.BackdropCapture) u64 {
+    var hasher = std.hash.Wyhash.init(0x6261636b64726f70);
+    hashRect(&hasher, capture.rect);
+    hashScalar(&hasher, capture.radius);
+    hashOptionalScalar(&hasher, capture.downsample_level);
+    return hasher.final();
+}
+
+fn rectContains(outer: render.Rect, inner: render.Rect) bool {
+    return @as(i64, inner.x) >= outer.x and
+        @as(i64, inner.y) >= outer.y and
+        @as(i64, inner.x) + inner.width <= @as(i64, outer.x) + outer.width and
+        @as(i64, inner.y) + inner.height <= @as(i64, outer.y) + outer.height;
 }
 
 fn emitDamaged(
@@ -5841,6 +6054,7 @@ fn emitDamaged(
     texture_size: render.Size,
     color_transform: ColorTransform,
     manual_ycbcr: ?ManualYcbcr,
+    backdrop_op_index: ?u32,
     instance: Instance,
 ) Error!void {
     if (frame.damage) |damage| {
@@ -5855,6 +6069,7 @@ fn emitDamaged(
                 texture_size,
                 color_transform,
                 manual_ycbcr,
+                backdrop_op_index,
                 instance,
                 clipped,
             );
@@ -5868,6 +6083,7 @@ fn emitDamaged(
             texture_size,
             color_transform,
             manual_ycbcr,
+            backdrop_op_index,
             instance,
             visible_rect,
         );
@@ -5914,6 +6130,7 @@ fn emitInstance(
     texture_size: render.Size,
     color_transform: ColorTransform,
     manual_ycbcr: ?ManualYcbcr,
+    backdrop_op_index: ?u32,
     template: Instance,
     clip: render.Rect,
 ) Error!void {
@@ -5929,6 +6146,7 @@ fn emitInstance(
             last.pipeline_handle == pipeline_handle and
             last.pipeline_layout == pipeline_layout and
             last.descriptor_set == descriptor_set and
+            last.backdrop_op_index == backdrop_op_index and
             std.meta.eql(last.texture_size, texture_size) and
             std.meta.eql(last.color_transform, color_transform) and
             std.meta.eql(last.manual_ycbcr, manual_ycbcr))
@@ -5948,6 +6166,7 @@ fn emitInstance(
         .instance_count = 1,
         .color_transform = color_transform,
         .manual_ycbcr = manual_ycbcr,
+        .backdrop_op_index = backdrop_op_index,
     });
 }
 
@@ -5956,6 +6175,7 @@ fn pipelineForKind(self: *const Self, kind: PipelineKind) vk.Pipeline {
         .replace => self.replace_pipeline,
         .blend => self.blend_pipeline,
         .image => self.image_pipeline,
+        .backdrop_image => self.backdrop_image_pipeline,
         .shadow => self.shadow_pipeline,
         .downsample => self.downsample_pipeline,
         .blur_downsample => self.blur_downsample_pipeline,
@@ -6835,6 +7055,18 @@ test "backdrop blur geometry scales odd rectangles and clips aligned edges" {
     try std.testing.expectEqual(render.Rect{ .x = 4, .y = 0, .width = 27, .height = 23 }, blurSampleRect(.{ .x = 17, .y = 9, .width = 1, .height = 1 }, 12, 2, .{ .width = 31, .height = 23 }));
 }
 
+test "damage coverage combines disjoint rectangles without accepting holes" {
+    const target: render.Rect = .{ .x = 2, .y = 3, .width = 6, .height = 4 };
+    try std.testing.expect(try damageCoversRect(std.testing.allocator, &.{
+        .{ .x = 2, .y = 3, .width = 3, .height = 4 },
+        .{ .x = 5, .y = 3, .width = 3, .height = 4 },
+    }, target));
+    try std.testing.expect(!try damageCoversRect(std.testing.allocator, &.{
+        .{ .x = 2, .y = 3, .width = 3, .height = 4 },
+        .{ .x = 6, .y = 3, .width = 2, .height = 4 },
+    }, target));
+}
+
 test "backdrop cache keys ignore owner changes and track lower content" {
     var lower_pixels = [_]u32{0xff112233};
     var owner_pixels = [_]u32{0x80112233};
@@ -6850,6 +7082,10 @@ test "backdrop cache keys ignore owner changes and track lower content" {
                 .pixels = &lower_pixels,
                 .source_cache = .{ .id = 1, .version = 1 },
             },
+        } },
+        .{ .backdrop_capture = .{
+            .rect = .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+            .radius = 8,
         } },
         .{ .backdrop_blur = .{
             .rect = .{ .x = 0, .y = 0, .width = 1, .height = 1 },
@@ -6870,7 +7106,7 @@ test "backdrop cache keys ignore owner changes and track lower content" {
     };
     const original = backdropCacheKey(commands[0..3]).?;
 
-    commands[3].image.buffer.source_cache.?.version = 2;
+    commands[4].image.buffer.source_cache.?.version = 2;
     try std.testing.expectEqual(original, backdropCacheKey(commands[0..3]).?);
 
     commands[1].image.buffer.source_cache.?.version = 2;
@@ -6881,13 +7117,13 @@ test "backdrop cache keys ignore owner changes and track lower content" {
     try std.testing.expect(original != backdropCacheKey(commands[0..3]).?);
     commands[1].image.buffer.color_description = .{};
 
-    commands[2].backdrop_blur.radius = 9;
+    commands[2].backdrop_capture.radius = 9;
     try std.testing.expect(original != backdropCacheKey(commands[0..3]).?);
     commands[1].image.buffer.source_cache = null;
     try std.testing.expectEqual(@as(?u64, null), backdropCacheKey(commands[0..3]));
 }
 
-test "base backdrop cache is shared only across untouched regions" {
+test "owner capture aliases base before owner shadow but not intersecting lower content" {
     var renderer: Self = undefined;
     renderer.allocator = std.testing.allocator;
     renderer.instances = .empty;
@@ -6899,15 +7135,25 @@ test "base backdrop cache is shared only across untouched regions" {
 
     var commands = [_]render.Command{
         .{ .clear = render.Color.rgba(0, 0, 0, 255) },
-        .{ .backdrop_blur = .{
+        .{ .backdrop_capture = .{
             .rect = .{ .x = 0, .y = 0, .width = 64, .height = 32 },
-            .corner_radius = 0,
             .radius = 8,
-            .cache_only = true,
+            .base = true,
         } },
         .{ .solid_rect = .{
             .rect = .{ .x = 0, .y = 0, .width = 4, .height = 4 },
             .color = render.Color.rgba(255, 255, 255, 255),
+        } },
+        .{ .backdrop_capture = .{
+            .rect = .{ .x = 48, .y = 8, .width = 8, .height = 8 },
+            .radius = 8,
+        } },
+        .{ .shadow = .{
+            .rect = .{ .x = 48, .y = 8, .width = 8, .height = 8 },
+            .corner_radius = 2,
+            .blur_radius = 8,
+            .spread = 0,
+            .color = render.Color.rgba(0, 0, 0, 128),
         } },
         .{ .backdrop_blur = .{
             .rect = .{ .x = 48, .y = 8, .width = 8, .height = 8 },
@@ -6922,6 +7168,8 @@ test "base backdrop cache is shared only across untouched regions" {
     try renderer.compileDrawRuns(frame, &.{}, .{});
     try std.testing.expectEqual(@as(usize, 2), renderer.blur_ops.items.len);
     try std.testing.expectEqual(@as(?u32, 0), renderer.blur_ops.items[1].reuse_op_index);
+    try std.testing.expect(renderer.blur_ops.items[0].used);
+    try std.testing.expect(renderer.blur_ops.items[1].used);
 
     renderer.instances.clearRetainingCapacity();
     renderer.draw_runs.clearRetainingCapacity();
@@ -6929,7 +7177,10 @@ test "base backdrop cache is shared only across untouched regions" {
     const unrelated_damage = [_]render.Rect{.{ .x = 0, .y = 0, .width = 4, .height = 4 }};
     frame.damage = &unrelated_damage;
     try renderer.compileDrawRuns(frame, &.{}, .{});
-    try std.testing.expectEqual(@as(usize, 0), renderer.blur_ops.items.len);
+    try std.testing.expectEqual(@as(usize, 2), renderer.blur_ops.items.len);
+    try std.testing.expectEqual(@as(?u32, 0), renderer.blur_ops.items[1].reuse_op_index);
+    try std.testing.expect(renderer.blur_ops.items[0].used);
+    try std.testing.expect(renderer.blur_ops.items[1].used);
 
     renderer.instances.clearRetainingCapacity();
     renderer.draw_runs.clearRetainingCapacity();
@@ -6937,8 +7188,8 @@ test "base backdrop cache is shared only across untouched regions" {
     frame.damage = null;
     commands[2].solid_rect.rect.x = 40;
     try renderer.compileDrawRuns(frame, &.{}, .{});
-    try std.testing.expectEqual(@as(usize, 1), renderer.blur_ops.items.len);
-    try std.testing.expectEqual(@as(?u32, null), renderer.blur_ops.items[0].reuse_op_index);
+    try std.testing.expectEqual(@as(usize, 2), renderer.blur_ops.items.len);
+    try std.testing.expectEqual(@as(?u32, null), renderer.blur_ops.items[1].reuse_op_index);
 }
 
 test "backdrop caches only reuse initialized stable keys" {
@@ -7139,11 +7390,19 @@ test "reproducible scene: Vulkan applies ordered backdrop blurs on GPU" {
     var pixels = [_]u32{ 0xff000000, 0xff000000, 0xffffffff, 0xff000000, 0xff000000 };
     const target: render.PixelBuffer = .{ .size = .{ .width = 5, .height = 1 }, .stride_pixels = 5, .pixels = &pixels };
     const commands = [_]render.Command{
+        .{ .backdrop_capture = .{
+            .rect = .{ .x = 1, .y = 0, .width = 3, .height = 1 },
+            .radius = 1,
+        } },
         .{ .backdrop_blur = .{
             .rect = .{ .x = 1, .y = 0, .width = 3, .height = 1 },
             .corner_radius = 0,
             .radius = 1,
             .clip = .{ .x = 2, .y = 0, .width = 1, .height = 1 },
+        } },
+        .{ .backdrop_capture = .{
+            .rect = .{ .x = 1, .y = 0, .width = 3, .height = 1 },
+            .radius = 1,
         } },
         .{ .backdrop_blur = .{
             .rect = .{ .x = 1, .y = 0, .width = 3, .height = 1 },
@@ -7159,6 +7418,109 @@ test "reproducible scene: Vulkan applies ordered backdrop blurs on GPU" {
     // The blur is composited in linear light and encoded only at output.
     try std.testing.expect(blurred >= 157 and blurred <= 159);
     try std.testing.expectEqual(@as(u32, 0xff000000), pixels[3]);
+}
+
+test "Vulkan backdrop blur keeps its capture across an interleaved owner" {
+    var renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
+        error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+
+    var pixels = [_]u32{0xff000000} ** 3;
+    const target: render.PixelBuffer = .{ .size = .{ .width = 3, .height = 1 }, .stride_pixels = 3, .pixels = &pixels };
+    const commands = [_]render.Command{
+        .{ .backdrop_capture = .{
+            .id = 1,
+            .rect = .{ .x = 0, .y = 0, .width = 3, .height = 1 },
+            .radius = 1,
+        } },
+        .{ .solid_rect = .{
+            .rect = .{ .x = 1, .y = 0, .width = 1, .height = 1 },
+            .color = render.Color.rgba(255, 255, 255, 255),
+        } },
+        .{ .backdrop_capture = .{
+            .id = 2,
+            .rect = .{ .x = 0, .y = 0, .width = 3, .height = 1 },
+            .radius = 1,
+        } },
+        .{ .backdrop_blur = .{
+            .capture_id = 1,
+            .rect = .{ .x = 1, .y = 0, .width = 1, .height = 1 },
+            .corner_radius = 0,
+            .radius = 1,
+        } },
+    };
+    try renderer.renderFrame(.{ .size = target.size, .commands = &commands }, .{ .pixels = target });
+
+    try std.testing.expectEqual(@as(u32, 0xff000000), pixels[1]);
+}
+
+test "reproducible scene: Vulkan fused backdrop image matches separate composites" {
+    var fused_renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
+        error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
+        else => return err,
+    };
+    defer fused_renderer.deinit();
+    var separate_renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
+        error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
+        else => return err,
+    };
+    defer separate_renderer.deinit();
+
+    const size: render.Size = .{ .width = 9, .height = 5 };
+    var owner_pixels = [_]u32{0x80000080} ** (size.width * size.height);
+    var fused_pixels = [_]u32{0} ** (size.width * size.height);
+    var separate_pixels = [_]u32{0} ** (size.width * size.height);
+    const prefix = [_]render.Command{
+        .{ .clear = render.Color.rgba(0, 0, 0, 255) },
+        .{ .solid_rect = .{
+            .rect = .{ .x = 3, .y = 1, .width = 2, .height = 2 },
+            .color = render.Color.rgba(255, 255, 255, 255),
+        } },
+        .{ .backdrop_capture = .{
+            .rect = .{ .x = 0, .y = 0, .width = size.width, .height = size.height },
+            .radius = 8,
+        } },
+        .{ .backdrop_blur = .{
+            .rect = .{ .x = 0, .y = 0, .width = size.width, .height = size.height },
+            .corner_radius = 2,
+            .radius = 8,
+        } },
+    };
+    const owner: render.Command = .{ .image = .{
+        .x = 0,
+        .y = 0,
+        .size = size,
+        .buffer = .{
+            .size = size,
+            .stride_pixels = size.width,
+            .pixels = &owner_pixels,
+        },
+        .rounded_clip = .{
+            .rect = .{ .x = 0, .y = 0, .width = size.width, .height = size.height },
+            .radius = 2,
+        },
+    } };
+    const fused_commands = prefix ++ [_]render.Command{owner};
+    const separate_commands = prefix ++ [_]render.Command{
+        .{ .solid_rect = .{
+            .rect = .{ .x = 0, .y = 0, .width = size.width, .height = size.height },
+            .color = render.Color.rgba(0, 0, 0, 0),
+        } },
+        owner,
+    };
+    try fused_renderer.renderFrame(
+        .{ .size = size, .commands = &fused_commands },
+        .{ .pixels = .{ .size = size, .stride_pixels = size.width, .pixels = &fused_pixels } },
+    );
+    try separate_renderer.renderFrame(
+        .{ .size = size, .commands = &separate_commands },
+        .{ .pixels = .{ .size = size, .stride_pixels = size.width, .pixels = &separate_pixels } },
+    );
+    for (fused_pixels, separate_pixels) |fused, separate| {
+        try expectArgbNear(separate, fused, 1);
+    }
 }
 
 test "Vulkan base backdrop cache survives partial background and owner changes" {
@@ -7192,11 +7554,9 @@ test "Vulkan base backdrop cache survives partial background and owner changes" 
             .rect = .{ .x = 22, .y = 7, .width = 1, .height = 1 },
             .color = render.Color.rgba(255, 255, 255, 255),
         } },
-        .{ .backdrop_blur = .{
+        .{ .backdrop_capture = .{
             .rect = .{ .x = 0, .y = 0, .width = size.width, .height = size.height },
-            .corner_radius = 0,
             .radius = 2,
-            .cache_only = true,
         } },
         .{ .backdrop_blur = .{
             .rect = .{ .x = 20, .y = 4, .width = 8, .height = 8 },
@@ -7242,6 +7602,104 @@ test "Vulkan base backdrop cache survives partial background and owner changes" 
     try std.testing.expectEqualSlices(u32, &reference_pixels, &cached_pixels);
 }
 
+test "Vulkan capture cache miss preserves pixels outside a complete sample damage region" {
+    var renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
+        error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+
+    const size: render.Size = .{ .width = 32, .height = 16 };
+    var pixels = [_]u32{0} ** (size.width * size.height);
+    const target: render.PixelBuffer = .{
+        .size = size,
+        .stride_pixels = size.width,
+        .pixels = &pixels,
+    };
+    var commands = [_]render.Command{
+        .{ .clear = render.Color.rgba(0, 0, 0, 255) },
+        .{ .solid_rect = .{
+            .rect = .{ .x = 10, .y = 7, .width = 1, .height = 1 },
+            .color = render.Color.rgba(255, 255, 255, 255),
+        } },
+        .{ .backdrop_capture = .{
+            .rect = .{ .x = 8, .y = 4, .width = 8, .height = 8 },
+            .radius = 2,
+        } },
+        .{ .backdrop_blur = .{
+            .rect = .{ .x = 8, .y = 4, .width = 8, .height = 8 },
+            .corner_radius = 0,
+            .radius = 2,
+        } },
+    };
+    try renderer.renderFrame(.{ .size = size, .commands = &commands }, .{ .pixels = target });
+
+    const untouched = 0xfeedbeef;
+    pixels[31] = untouched;
+    commands[1].solid_rect.color = render.Color.rgba(255, 0, 0, 255);
+    try renderer.renderFrame(.{
+        .size = size,
+        .commands = &commands,
+        .damage = &.{.{ .x = 3, .y = 0, .width = 18, .height = 16 }},
+    }, .{ .pixels = target });
+
+    try std.testing.expectEqual(@as(u32, untouched), pixels[31]);
+}
+
+test "Vulkan capture cache rekeys when lower damage misses its sample region" {
+    var renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
+        error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+
+    const size: render.Size = .{ .width = 32, .height = 16 };
+    var source_pixels = [_]u32{0xff000000} ** (size.width * size.height);
+    var output_pixels = [_]u32{0} ** (size.width * size.height);
+    const target: render.PixelBuffer = .{
+        .size = size,
+        .stride_pixels = size.width,
+        .pixels = &output_pixels,
+    };
+    var commands = [_]render.Command{
+        .{ .clear = render.Color.rgba(0, 0, 0, 255) },
+        .{ .image = .{
+            .x = 0,
+            .y = 0,
+            .size = size,
+            .buffer = .{
+                .size = size,
+                .stride_pixels = size.width,
+                .pixels = &source_pixels,
+                .source_cache = .{ .id = 1, .version = 1 },
+            },
+        } },
+        .{ .backdrop_capture = .{
+            .rect = .{ .x = 8, .y = 4, .width = 8, .height = 8 },
+            .radius = 2,
+        } },
+        .{ .backdrop_blur = .{
+            .rect = .{ .x = 8, .y = 4, .width = 8, .height = 8 },
+            .corner_radius = 0,
+            .radius = 2,
+        } },
+    };
+    try renderer.renderFrame(.{ .size = size, .commands = &commands }, .{ .pixels = target });
+
+    const untouched = 0xfeedbeef;
+    output_pixels[30] = untouched;
+    source_pixels[31] = 0xffffffff;
+    commands[1].image.buffer.source_cache.?.version = 2;
+    try renderer.renderFrame(.{
+        .size = size,
+        .commands = &commands,
+        .damage = &.{.{ .x = 31, .y = 0, .width = 1, .height = 1 }},
+    }, .{ .pixels = target });
+
+    try std.testing.expectEqual(@as(u32, untouched), output_pixels[30]);
+    try std.testing.expectEqual(@as(u32, 0xffffffff), output_pixels[31]);
+}
+
 test "reproducible scene: Vulkan partial backdrop blur matches a full redraw" {
     var partial_renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
         error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
@@ -7260,6 +7718,7 @@ test "reproducible scene: Vulkan partial backdrop blur matches a full redraw" {
     const initial = [_]render.Command{
         .{ .clear = render.Color.rgba(0, 0, 0, 255) },
         .{ .solid_rect = .{ .rect = .{ .x = 8, .y = 7, .width = 1, .height = 1 }, .color = render.Color.rgba(255, 255, 255, 255) } },
+        .{ .backdrop_capture = .{ .rect = .{ .x = 0, .y = 0, .width = size.width, .height = size.height }, .radius = 8 } },
         .{ .backdrop_blur = .{ .rect = .{ .x = 0, .y = 0, .width = size.width, .height = size.height }, .corner_radius = 0, .radius = 8 } },
     };
     try partial_renderer.renderFrame(.{ .size = size, .commands = &initial }, .{ .pixels = .{ .size = size, .stride_pixels = size.width, .pixels = &partial_pixels } });
@@ -7268,6 +7727,7 @@ test "reproducible scene: Vulkan partial backdrop blur matches a full redraw" {
     const updated = [_]render.Command{
         .{ .clear = render.Color.rgba(0, 0, 0, 255) },
         .{ .solid_rect = .{ .rect = .{ .x = 10, .y = 7, .width = 1, .height = 1 }, .color = render.Color.rgba(255, 255, 255, 255) } },
+        .{ .backdrop_capture = .{ .rect = .{ .x = 0, .y = 0, .width = size.width, .height = size.height }, .radius = 8 } },
         .{ .backdrop_blur = .{ .rect = .{ .x = 0, .y = 0, .width = size.width, .height = size.height }, .corner_radius = 0, .radius = 8 } },
     };
     try partial_renderer.renderFrame(.{

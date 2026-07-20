@@ -917,7 +917,15 @@ const OutputFrame = struct {
     visible_rect: render.Rect,
     track_visibility: bool,
     presentation_damage: ?*const Region = null,
+    next_backdrop_capture_id: *u32,
 };
+
+fn allocateBackdropCaptureId(frame: *const OutputFrame) renderer_types.Renderer.Error!u32 {
+    const id = frame.next_backdrop_capture_id.*;
+    if (id == std.math.maxInt(u32)) return error.InvalidTarget;
+    frame.next_backdrop_capture_id.* = id + 1;
+    return id;
+}
 
 pub fn create(
     allocator: std.mem.Allocator,
@@ -6001,11 +6009,13 @@ fn captureCursor(
     );
     var renderer_frame_active = true;
     errdefer if (renderer_frame_active) self.renderer.cancelFrame();
+    var next_backdrop_capture_id: u32 = 1;
     const frame: OutputFrame = .{
         .render_output = render_output,
         .output = output,
         .visible_rect = state.bounds,
         .track_visibility = false,
+        .next_backdrop_capture_id = &next_backdrop_capture_id,
     };
     const clear_command = [_]render.Command{.{ .clear = render.Color.rgba(0, 0, 0, 0) }};
     try self.renderCommands(&frame, &clear_command);
@@ -6201,11 +6211,13 @@ fn captureOutputRegion(
     );
     var renderer_frame_active = true;
     errdefer if (renderer_frame_active) self.renderer.cancelFrame();
+    var next_backdrop_capture_id: u32 = 1;
     const frame: OutputFrame = .{
         .render_output = render_output,
         .output = output,
         .visible_rect = visible_rect,
         .track_visibility = false,
+        .next_backdrop_capture_id = &next_backdrop_capture_id,
     };
     const clear_command = [_]render.Command{.{ .clear = if (self.session_lock.isLocked())
         render.Color.rgba(0, 0, 0, 255)
@@ -6248,11 +6260,13 @@ fn captureToplevel(
     );
     var renderer_frame_active = true;
     errdefer if (renderer_frame_active) self.renderer.cancelFrame();
+    var next_backdrop_capture_id: u32 = 1;
     const frame: OutputFrame = .{
         .render_output = render_output,
         .output = output,
         .visible_rect = bounds,
         .track_visibility = false,
+        .next_backdrop_capture_id = &next_backdrop_capture_id,
     };
     const clear_command = [_]render.Command{.{ .clear = render.Color.rgba(0, 0, 0, 0) }};
     try self.renderCommands(&frame, &clear_command);
@@ -6635,12 +6649,14 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
     };
     var renderer_frame_active = true;
     errdefer if (renderer_frame_active) self.renderer.cancelFrame();
+    var next_backdrop_capture_id: u32 = 1;
     const frame: OutputFrame = .{
         .render_output = render_output,
         .output = output,
         .visible_rect = output.logicalRect(),
         .track_visibility = true,
         .presentation_damage = &frame_damage,
+        .next_backdrop_capture_id = &next_backdrop_capture_id,
     };
     const clear_command = [_]render.Command{.{ .clear = if (self.session_lock.isLocked())
         render.Color.rgba(0, 0, 0, 255)
@@ -6870,12 +6886,12 @@ fn renderDesktopContents(
     try self.renderLayerSurfaces(frame, .background);
     if (self.hasBackgroundEffect()) {
         const blur = Scene.background_blur;
-        const cache_command = [_]render.Command{.{ .backdrop_blur = .{
+        const cache_command = [_]render.Command{.{ .backdrop_capture = .{
+            .id = try allocateBackdropCaptureId(frame),
             .rect = frame.visible_rect,
-            .corner_radius = 0,
             .radius = blur.radius,
             .downsample_level = blur.downsample_level,
-            .cache_only = true,
+            .base = true,
         } }};
         try self.renderCommands(frame, &cache_command);
     }
@@ -7165,6 +7181,11 @@ fn renderLayerSurfaces(
         const layer_surface = entry.layer_surface;
         if (!layer_surface.mapped) continue;
         const effects_rect = self.layerSurfaceEffectsRect(layer_surface);
+        const rounded_clip: ?render.RoundedClip = if (effects_rect) |rect|
+            if (self.layer_shell_effects.corner_radius == 0) null else .{ .rect = rect, .radius = self.layer_shell_effects.corner_radius }
+        else
+            null;
+        const capture_id = try self.renderSurfaceTreeCapture(frame, layer_surface.surface_id, layer_surface.position.x, layer_surface.position.y, rounded_clip, null);
         if (effects_rect) |rect| {
             if (self.layer_shell_effects.shadow) |shadow| {
                 try self.renderShadow(
@@ -7176,20 +7197,14 @@ fn renderLayerSurfaces(
                 );
             }
         }
-        const rounded_clip: ?render.RoundedClip = if (effects_rect) |rect|
-            if (self.layer_shell_effects.corner_radius == 0)
-                null
-            else
-                .{ .rect = rect, .radius = self.layer_shell_effects.corner_radius }
-        else
-            null;
-        try self.renderSurfaceTree(
+        try self.renderSurfaceTreeContents(
             frame,
             layer_surface.surface_id,
             layer_surface.position.x,
             layer_surface.position.y,
             rounded_clip,
             null,
+            capture_id,
         );
     }
 }
@@ -7333,16 +7348,12 @@ fn renderWindow(
         clip_box.translated(window.position.x, window.position.y)
     else
         null;
-    if (window.effects.shadow) |shadow| {
-        try self.renderShadow(
-            frame,
-            content_rect,
-            window.effects.corner_radius,
-            shadow,
-            shadow_clip,
-        );
-    }
-    try self.renderWindowDecorations(frame, id, window, .below, window_clip);
+    const tree_x = window.position.x -| content_geometry.offset.x;
+    const tree_y = window.position.y -| content_geometry.offset.y;
+    const rounded_clip: ?render.RoundedClip = if (window.effects.corner_radius == 0)
+        null
+    else
+        .{ .rect = content_rect, .radius = window.effects.corner_radius };
     var content_visible = true;
     var content_clip = if (window.content_clip_box != null) content_rect else null;
     if (window_clip) |clip| {
@@ -7355,18 +7366,36 @@ fn renderWindow(
             content_clip = clip;
         }
     }
+    var capture_id: ?u32 = null;
     if (content_visible) {
-        const rounded_clip: ?render.RoundedClip = if (window.effects.corner_radius == 0)
-            null
-        else
-            .{ .rect = content_rect, .radius = window.effects.corner_radius };
-        try self.renderSurfaceTree(
+        capture_id = try self.renderSurfaceTreeCapture(
             frame,
             window.surface_id,
-            window.position.x -| content_geometry.offset.x,
-            window.position.y -| content_geometry.offset.y,
+            tree_x,
+            tree_y,
             rounded_clip,
             content_clip,
+        );
+    }
+    if (window.effects.shadow) |shadow| {
+        try self.renderShadow(
+            frame,
+            content_rect,
+            window.effects.corner_radius,
+            shadow,
+            shadow_clip,
+        );
+    }
+    try self.renderWindowDecorations(frame, id, window, .below, window_clip);
+    if (content_visible) {
+        try self.renderSurfaceTreeContents(
+            frame,
+            window.surface_id,
+            tree_x,
+            tree_y,
+            rounded_clip,
+            content_clip,
+            capture_id,
         );
     }
     try self.renderWindowBorders(frame, window, content_rect, window_clip);
@@ -7410,6 +7439,44 @@ fn renderSurfaceTree(
     rounded_clip: ?render.RoundedClip,
     clip: ?render.Rect,
 ) renderer_types.Renderer.Error!void {
+    const capture_id = try self.renderSurfaceTreeCapture(frame, surface_id, x, y, rounded_clip, clip);
+    try self.renderSurfaceTreeContents(frame, surface_id, x, y, rounded_clip, clip, capture_id);
+}
+
+fn renderSurfaceTreeCapture(
+    self: *Self,
+    frame: *const OutputFrame,
+    surface_id: Surface.Id,
+    x: i32,
+    y: i32,
+    rounded_clip: ?render.RoundedClip,
+    clip: ?render.Rect,
+) renderer_types.Renderer.Error!?u32 {
+    if (self.surfaceTreeBlurBounds(frame, surface_id, x, y, rounded_clip, clip)) |rect| {
+        const blur = Scene.background_blur;
+        const capture_id = try allocateBackdropCaptureId(frame);
+        const command = [_]render.Command{.{ .backdrop_capture = .{
+            .id = capture_id,
+            .rect = rect,
+            .radius = blur.radius,
+            .downsample_level = blur.downsample_level,
+        } }};
+        try self.renderCommands(frame, &command);
+        return capture_id;
+    }
+    return null;
+}
+
+fn renderSurfaceTreeContents(
+    self: *Self,
+    frame: *const OutputFrame,
+    surface_id: Surface.Id,
+    x: i32,
+    y: i32,
+    rounded_clip: ?render.RoundedClip,
+    clip: ?render.Rect,
+    capture_id: ?u32,
+) renderer_types.Renderer.Error!void {
     if (Surface.currentBuffer(self.compositor.surfaceStore(), surface_id) == null) return;
 
     var stack = self.subcompositor.stackIterator(surface_id);
@@ -7445,6 +7512,7 @@ fn renderSurfaceTree(
                 buffer.logical_size,
                 rounded_clip,
                 clip,
+                capture_id,
             );
             const pixel_buffer = buffer.pixelBuffer();
             const alpha_multiplier = Surface.currentAlphaMultiplier(
@@ -7471,15 +7539,65 @@ fn renderSurfaceTree(
             };
             try self.renderCommands(frame, &image_command);
         },
-        .child => |child| try self.renderSurfaceTree(
+        .child => |child| try self.renderSurfaceTreeContents(
             frame,
             child.surface_id,
             x +| child.position.x,
             y +| child.position.y,
             rounded_clip,
             clip,
+            capture_id,
         ),
     };
+}
+
+fn surfaceTreeBlurBounds(
+    self: *Self,
+    frame: *const OutputFrame,
+    surface_id: Surface.Id,
+    x: i32,
+    y: i32,
+    rounded_clip: ?render.RoundedClip,
+    clip: ?render.Rect,
+) ?render.Rect {
+    if (Surface.currentBuffer(self.compositor.surfaceStore(), surface_id) == null) return null;
+    var result: ?render.Rect = null;
+    var stack = self.subcompositor.stackIterator(surface_id);
+    while (stack.next()) |entry| switch (entry) {
+        .parent => {
+            const surfaces = self.compositor.surfaceStore();
+            const buffer = Surface.currentBuffer(surfaces, surface_id) orelse continue;
+            if (surfaceFullyOpaque(surfaces, surface_id, buffer)) continue;
+            const region = Surface.currentBlurRegion(surfaces, surface_id) orelse continue;
+            var rectangles = region.rectangleIterator();
+            while (rectangles.next()) |rectangle| {
+                var effect = (surfaceEffectRect(rectangle, buffer.logical_size) orelse continue).translated(x, y);
+                effect = effect.intersection(frame.visible_rect) orelse continue;
+                if (rounded_clip) |rounded| effect = effect.intersection(rounded.rect) orelse continue;
+                if (clip) |clip_rect| effect = effect.intersection(clip_rect) orelse continue;
+                result = if (result) |old| rectUnion(old, effect) else effect;
+            }
+        },
+        .child => |child| {
+            if (self.surfaceTreeBlurBounds(
+                frame,
+                child.surface_id,
+                x +| child.position.x,
+                y +| child.position.y,
+                rounded_clip,
+                clip,
+            )) |child_rect| result = if (result) |old| rectUnion(old, child_rect) else child_rect;
+        },
+    };
+    return result;
+}
+
+fn rectUnion(a: render.Rect, b: render.Rect) render.Rect {
+    const left = @min(a.x, b.x);
+    const top = @min(a.y, b.y);
+    const right = @max(@as(i64, a.x) + a.width, @as(i64, b.x) + b.width);
+    const bottom = @max(@as(i64, a.y) + a.height, @as(i64, b.y) + b.height);
+    return .{ .x = left, .y = top, .width = @intCast(right - left), .height = @intCast(bottom - top) };
 }
 
 fn renderSurfaceBackgroundEffect(
@@ -7491,6 +7609,7 @@ fn renderSurfaceBackgroundEffect(
     size: render.Size,
     rounded_clip: ?render.RoundedClip,
     clip: ?render.Rect,
+    capture_id: ?u32,
 ) renderer_types.Renderer.Error!void {
     const blur = Scene.background_blur;
     const surfaces = self.compositor.surfaceStore();
@@ -7501,12 +7620,18 @@ fn renderSurfaceBackgroundEffect(
     while (rectangles.next()) |rectangle| {
         var effect_rect = surfaceEffectRect(rectangle, size) orelse continue;
         effect_rect = effect_rect.translated(x, y);
+        if (effect_rect.intersection(frame.visible_rect) == null) continue;
+        if (clip) |clip_rect| {
+            if (effect_rect.intersection(clip_rect) == null) continue;
+        }
         var corner_radius: u32 = 0;
         if (rounded_clip) |rounded| {
             effect_rect = effect_rect.intersection(rounded.rect) orelse continue;
             if (std.meta.eql(effect_rect, rounded.rect)) corner_radius = rounded.radius;
         }
+        const backdrop_capture_id = capture_id orelse return error.InvalidTarget;
         const command = [_]render.Command{.{ .backdrop_blur = .{
+            .capture_id = backdrop_capture_id,
             .rect = effect_rect,
             .corner_radius = corner_radius,
             .radius = blur.radius,

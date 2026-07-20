@@ -5,6 +5,10 @@ layout(set=0,binding=1) uniform sampler2D chroma_plane;
 #else
 layout(set=0,binding=0) uniform sampler2D tex;
 #endif
+#ifdef KEYWORK_BACKDROP
+layout(set=1,binding=0) uniform sampler2D backdrop_tex;
+#define KEYWORK_NEAREST
+#endif
 layout(push_constant) uniform Push {
     vec2 target_size;
     vec2 texture_size;
@@ -288,10 +292,18 @@ void main() {
     vec3 straight=color.a>0.0 ? color.rgb/color.a : vec3(0.0);
     color.rgb=decodeColor(straight)*color.a;
     color*=parameters.w;
+    float coverage=1.0;
     if (parameters.x>0.0) {
         vec2 center=clamp(pixel,rounded.xy+vec2(parameters.x),rounded.xy+rounded.zw-vec2(parameters.x));
-        float coverage=clamp(parameters.x+0.5-distance(pixel,center),0.0,1.0);
-        color*=coverage;
+        coverage=clamp(parameters.x+0.5-distance(pixel,center),0.0,1.0);
     }
+#ifdef KEYWORK_BACKDROP
+    ivec2 backdrop_size=textureSize(backdrop_tex,0);
+    float backdrop_scale=all(equal(vec2(backdrop_size),pc.target_size)) ? 1.0 : 2.0;
+    vec4 backdrop=texture(backdrop_tex,(pixel/backdrop_scale)/vec2(backdrop_size));
+    color=color*coverage+backdrop*(coverage*(1.0-coverage*color.a));
+#else
+    color*=coverage;
+#endif
     out_color=color;
 }

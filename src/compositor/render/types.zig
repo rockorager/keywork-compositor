@@ -390,14 +390,27 @@ pub const Shadow = struct {
     clip: ?Rect = null,
 };
 
+/// Captures the completed target at this command-stream position. Subsequent
+/// backdrop blurs explicitly reference this immutable source by ID.
+pub const BackdropCapture = struct {
+    id: u32 = 0,
+    rect: Rect,
+    radius: u32,
+    downsample_level: ?u8 = null,
+    /// The base scene can be shared by later captures whose footprints contain
+    /// no intervening content.
+    base: bool = false,
+};
+
+/// Composites from the nearest preceding BackdropCapture with the matching ID.
+/// The capture must cover this command and have matching blur parameters.
 pub const BackdropBlur = struct {
+    capture_id: u32 = 0,
     rect: Rect,
     corner_radius: u32,
     radius: u32,
     downsample_level: ?u8 = null,
     clip: ?Rect = null,
-    /// Populate a reusable backdrop without compositing it into the target.
-    cache_only: bool = false,
 };
 
 pub const maximum_blur_downsample_level: u8 = 5;
@@ -406,6 +419,7 @@ pub const Command = union(enum) {
     clear: Color,
     solid_rect: SolidRect,
     shadow: Shadow,
+    backdrop_capture: BackdropCapture,
     backdrop_blur: BackdropBlur,
     image: Image,
 };
