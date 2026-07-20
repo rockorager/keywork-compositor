@@ -1,13 +1,21 @@
 //! Application entry point.
 
 const std = @import("std");
+const ControlProtocol = @import("keywork-control");
 const OutputBackend = @import("backend/output.zig");
 const Config = @import("config.zig");
 const Launcher = @import("launcher.zig");
+const Logging = @import("logging.zig");
 const Renderer = @import("render/renderer.zig").Renderer;
 const render = @import("render/types.zig");
 const Server = @import("server.zig");
 const Systemd = @import("systemd.zig");
+
+pub const std_options: std.Options = .{
+    // Compile every level in; Logging applies the selected level at runtime.
+    .log_level = .debug,
+    .logFn = Logging.logFn,
+};
 
 const log = std.log.scoped(.main);
 const default_cursor_size = "24";
@@ -21,6 +29,7 @@ const usage =
     \\  --headless-size WIDTHxHEIGHT
     \\  --headless-scale SCALE
     \\  --drm-device PATH         use an explicit DRM device
+    \\  --log-level LEVEL         select error, warning, info, or debug logging
     \\  --help                    show this help
     \\
 ;
@@ -33,6 +42,7 @@ const StartupOptions = struct {
     headless_size: ?render.Size = null,
     headless_scale: ?render.Scale = null,
     drm_device: ?[]const u8 = null,
+    log_level: ?ControlProtocol.LogLevel = null,
 
     fn outputKind(self: StartupOptions) OutputBackend.Kind {
         return self.output orelse .drm;
@@ -61,6 +71,7 @@ pub fn main(init: std.process.Init) !void {
         try writer.interface.writeAll(usage);
         return;
     }
+    Logging.setLevel(options.log_level orelse Logging.defaultLevel());
     const output_kind = options.outputKind();
     const renderer_kind = options.rendererKind();
     const native_session = output_kind == .drm;
@@ -203,6 +214,13 @@ fn parseArguments(arguments: anytype) !StartupOptions {
             const value = arguments.next() orelse return error.MissingArgument;
             if (value.len == 0) return error.InvalidDrmDevice;
             options.drm_device = value;
+        } else if (std.mem.eql(u8, argument, "--log-level")) {
+            if (options.log_level != null) return error.DuplicateArgument;
+            const value = arguments.next() orelse return error.MissingArgument;
+            options.log_level = std.meta.stringToEnum(
+                ControlProtocol.LogLevel,
+                value,
+            ) orelse return error.InvalidLogLevel;
         } else {
             return error.InvalidArgument;
         }
@@ -321,6 +339,8 @@ test "startup options replace environment backend controls" {
         "2880x1800",
         "--headless-scale",
         "1.5",
+        "--log-level",
+        "debug",
     } };
     const options = try parseArguments(&configured);
     try std.testing.expectEqualStrings("/tmp/keywork.conf", options.config_path.?);
@@ -328,6 +348,7 @@ test "startup options replace environment backend controls" {
     try std.testing.expectEqual(Renderer.Kind.vulkan, options.rendererKind());
     try std.testing.expectEqual(render.Size{ .width = 2880, .height = 1800 }, options.headless_size.?);
     try std.testing.expectEqual(@as(u32, 180), options.headless_scale.?.numerator);
+    try std.testing.expectEqual(ControlProtocol.LogLevel.debug, options.log_level.?);
 
     var drm: TestArguments = .{ .values = &.{ "--drm-device", "/dev/dri/card1" } };
     const drm_options = try parseArguments(&drm);
@@ -346,6 +367,9 @@ test "startup options reject duplicates and backend-specific misuse" {
 
     var invalid_output: TestArguments = .{ .values = &.{ "--output", "windowed" } };
     try std.testing.expectError(error.InvalidOutputBackend, parseArguments(&invalid_output));
+
+    var invalid_log_level: TestArguments = .{ .values = &.{ "--log-level", "verbose" } };
+    try std.testing.expectError(error.InvalidLogLevel, parseArguments(&invalid_log_level));
 
     var misplaced_headless: TestArguments = .{ .values = &.{ "--headless-size", "1920x1080" } };
     try std.testing.expectError(

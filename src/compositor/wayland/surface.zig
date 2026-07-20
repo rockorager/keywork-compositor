@@ -932,6 +932,28 @@ pub fn sendFrameDoneFor(store: *Store, id: Id, time_milliseconds: u32) void {
     }
 }
 
+pub fn hasCallbackOnlyFrameCallback(store: *Store, id: Id) bool {
+    const surface_state = store.get(id) orelse return false;
+    for (surface_state.callbacks.items) |callback| {
+        if (callback.state == .active and callback.callback_only) return true;
+    }
+    return false;
+}
+
+pub fn sendCallbackOnlyFrameDoneFor(store: *Store, id: Id, time_milliseconds: u32) bool {
+    const surface_state = store.get(id) orelse return false;
+    var sent = false;
+    while (true) {
+        const callback = for (surface_state.callbacks.items) |candidate| {
+            if (candidate.state == .active or candidate.state == .submitted) break candidate;
+        } else return sent;
+        if (callback.state == .submitted or !callback.callback_only) return sent;
+
+        callback.resource.destroySendDone(time_milliseconds);
+        sent = true;
+    }
+}
+
 pub fn setPreferredBufferScale(store: *Store, id: Id, scale: u32) void {
     std.debug.assert(scale > 0 and scale <= std.math.maxInt(i32));
     const surface_state = store.get(id) orelse return;
@@ -1353,6 +1375,7 @@ fn applyPending(self: *Self, commit_info: CommitInfo) void {
     if (surface_state.pending_blur_region_changed) {
         surface_state.current_damage_precise = false;
     }
+    const callback_only = currentCommitIsCallbackOnly(surface_state);
     surface_state.pending_offset_x = 0;
     surface_state.pending_offset_y = 0;
     applyFifoSet(surface_state, surface_state.pending_fifo_set);
@@ -1368,7 +1391,10 @@ fn applyPending(self: *Self, commit_info: CommitInfo) void {
     if (surface_state.presentation_output != null) surface_state.commit_after_submission = true;
     discardCommitFeedbacks(surface_state, .active);
     for (surface_state.callbacks.items) |callback| {
-        if (callback.state == .pending) callback.state = .active;
+        if (callback.state == .pending) {
+            callback.state = .active;
+            callback.callback_only = callback_only;
+        }
     }
     if (applied_info.has_buffer) {
         setCommitFeedbackState(surface_state, .pending, .active);
@@ -1587,6 +1613,7 @@ fn applyCached(self: *Self, cached: *CachedCommit) void {
     if (color_description_changed) surface_state.current_damage_precise = false;
     if (color_representation_changed) surface_state.current_damage_precise = false;
     if (cached.blur_region_changed) surface_state.current_damage_precise = false;
+    const callback_only = currentCommitIsCallbackOnly(surface_state);
     applyFifoSet(surface_state, cached.fifo_set);
     if (surface_state.presentation_output != null) surface_state.commit_after_submission = true;
     discardCommitFeedbacks(surface_state, .active);
@@ -1594,6 +1621,7 @@ fn applyCached(self: *Self, cached: *CachedCommit) void {
         if (callback.state == .cached and callback.cached_sequence == cached.sequence) {
             callback.state = .active;
             callback.cached_sequence = null;
+            callback.callback_only = callback_only;
         }
     }
     if (commit_info.has_buffer) {
@@ -2094,6 +2122,10 @@ fn updateCurrentDamage(
     if (!addBufferDamage(&surface_state.current_damage, buffer_damage, buffer)) {
         setFullCurrentDamage(surface_state);
     }
+}
+
+fn currentCommitIsCallbackOnly(surface_state: *const State) bool {
+    return surface_state.current_damage_precise and surface_state.current_damage.isEmpty();
 }
 
 fn setFullCurrentDamage(surface_state: *State) void {
@@ -2652,6 +2684,7 @@ const FrameCallback = struct {
     resource: *wl.Callback,
     state: enum { pending, cached, active, submitted },
     cached_sequence: ?u64,
+    callback_only: bool,
 
     fn handleDestroy(resource: *wl.Resource) callconv(.c) void {
         const self: *FrameCallback = @ptrCast(@alignCast(resource.getUserData().?));
@@ -2688,6 +2721,7 @@ fn createFrameCallback(self: *Self, id: u32) error{OutOfMemory}!void {
         .resource = resource,
         .state = .pending,
         .cached_sequence = null,
+        .callback_only = false,
     };
     try self.state().callbacks.append(self.allocator, callback);
 
@@ -2860,6 +2894,21 @@ test "buffer damage maps into logical surface coordinates" {
         rectangles.next().?,
     );
     try std.testing.expectEqual(@as(?Region.Rectangle, null), rectangles.next());
+}
+
+test "callback-only commits require precise empty damage" {
+    var surface_state = State.init(undefined);
+    defer surface_state.deinit(std.testing.allocator);
+
+    surface_state.current_damage_precise = true;
+    try std.testing.expect(currentCommitIsCallbackOnly(&surface_state));
+
+    try surface_state.current_damage.add(0, 0, 1, 1);
+    try std.testing.expect(!currentCommitIsCallbackOnly(&surface_state));
+
+    surface_state.current_damage.clear();
+    surface_state.current_damage_precise = false;
+    try std.testing.expect(!currentCommitIsCallbackOnly(&surface_state));
 }
 
 test "SHM snapshot copying updates only damaged rows" {

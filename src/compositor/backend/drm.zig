@@ -5,6 +5,7 @@ const Self = @This();
 const std = @import("std");
 const Gbm = @import("gbm.zig");
 const NestedOutput = @import("nested_wayland.zig");
+const Logging = @import("../logging.zig");
 const presentation = @import("../presentation.zig");
 const Region = @import("../region.zig");
 const Icc = @import("../render/icc.zig");
@@ -41,6 +42,15 @@ old_crtc: ?*c.drmModeCrtc,
 buffers: [buffer_count]Buffer,
 shadow_pixels: []u32,
 buffer_damage: [buffer_count]Region,
+acquired_damage: Region,
+cursor_buffers: [2]Buffer,
+cursor_width: u32,
+cursor_height: u32,
+cursor_buffer_index: ?usize,
+cursor_source: ?render.SourceCache,
+cursor_scale: render.Scale,
+cursor_active: bool,
+cursor_failed: bool,
 mode: c.drmModeModeInfo,
 mode_index: usize,
 modes: []Mode,
@@ -422,6 +432,15 @@ pub fn init(
         .buffers = .{ .{}, .{} },
         .shadow_pixels = &.{},
         .buffer_damage = .{ Region.init(), Region.init() },
+        .acquired_damage = Region.init(),
+        .cursor_buffers = .{ .{}, .{} },
+        .cursor_width = 0,
+        .cursor_height = 0,
+        .cursor_buffer_index = null,
+        .cursor_source = null,
+        .cursor_scale = .{},
+        .cursor_active = false,
+        .cursor_failed = false,
         .mode = std.mem.zeroes(c.drmModeModeInfo),
         .mode_index = 0,
         .modes = &.{},
@@ -501,6 +520,7 @@ pub fn deinit(self: *Self) void {
     self.allocator.free(self.scanout_formats);
     if (self.overlay_plane) |plane| plane.deinit(self.allocator);
     for (&self.buffer_damage) |*damage| damage.deinit();
+    self.acquired_damage.deinit();
     self.* = undefined;
 }
 
@@ -671,8 +691,91 @@ pub fn ready(self: *const Self) bool {
     return self.availableBuffer() != null;
 }
 
+pub const ShapeCursor = struct {
+    buffer: render.PixelBuffer,
+    global_x: i32,
+    global_y: i32,
+};
+
+pub fn canUseShapeCursor(self: *const Self, cursor: ShapeCursor) bool {
+    if (!self.enabled or !self.powered or !self.mode_set or self.cursor_failed or
+        self.output_color_mode != .sdr or
+        !self.device_access.active(self.device_access.context)) return false;
+    if (cursor.buffer.source_cache == null or cursor.buffer.dmabuf != null or
+        cursor.buffer.pixels.len == 0) return false;
+    const scaled = self.scale.apply(cursor.buffer.size) catch return false;
+    return scaled.width != 0 and scaled.height != 0 and
+        scaled.width <= self.cursor_width and scaled.height <= self.cursor_height;
+}
+
+/// Apply a built-in shape cursor, returning false when software composition is required.
+/// Failure is sticky for this activation to avoid retrying an unsupported ioctl path.
+pub fn setShapeCursor(self: *Self, cursor: ShapeCursor) bool {
+    if (!self.canUseShapeCursor(cursor)) return false;
+    const fd = self.device_access.fd(self.device_access.context) orelse return false;
+    const source = cursor.buffer.source_cache.?;
+    const scaled = self.scale.apply(cursor.buffer.size) catch return false;
+    if (scaled.width == 0 or scaled.height == 0 or
+        scaled.width > self.cursor_width or scaled.height > self.cursor_height) unreachable;
+    const local = cursorLocalPosition(
+        cursor.global_x,
+        cursor.global_y,
+        self.logical_x,
+        self.logical_y,
+        self.scale,
+    );
+    const unchanged = self.cursor_source != null and
+        std.meta.eql(self.cursor_source.?, source) and std.meta.eql(self.cursor_scale, self.scale);
+    if (!unchanged) {
+        const index = if (self.cursor_buffer_index) |active| 1 - active else 0;
+        if (self.cursor_buffers[index].handle == 0) {
+            self.createCursorBuffer(fd, &self.cursor_buffers[index]) catch |err| {
+                self.failCursor(err);
+                return false;
+            };
+        }
+        rescaleCursor(cursor.buffer, scaled, &self.cursor_buffers[index]);
+        if (c.drmModeSetCursor(fd, self.crtc_id, self.cursor_buffers[index].handle, self.cursor_width, self.cursor_height) != 0) {
+            self.failCursor(error.SetCursorFailed);
+            return false;
+        }
+        self.cursor_buffer_index = index;
+        self.cursor_source = source;
+        self.cursor_scale = self.scale;
+        self.cursor_active = true;
+        log.debug(
+            "hardware cursor enabled on {s}: source={d}:{d} image={d}x{d} plane={d}x{d}",
+            .{
+                self.name(),
+                source.id,
+                source.version,
+                scaled.width,
+                scaled.height,
+                self.cursor_width,
+                self.cursor_height,
+            },
+        );
+    }
+    if (c.drmModeMoveCursor(fd, self.crtc_id, local.x, local.y) != 0) {
+        self.failCursor(error.MoveCursorFailed);
+        return false;
+    }
+    return true;
+}
+
+pub fn disableShapeCursor(self: *Self) bool {
+    if (!self.cursor_active) return true;
+    const fd = self.device_access.fd(self.device_access.context) orelse return false;
+    return self.disableCursor(fd);
+}
+
+pub fn shapeCursorActive(self: *const Self) bool {
+    return self.cursor_active;
+}
+
 pub fn acquire(self: *Self) ?render.Target {
     std.debug.assert(self.acquired == null);
+    std.debug.assert(self.acquired_damage.isEmpty());
     if (!self.ready()) return null;
     const index = self.availableBuffer().?;
     self.acquired = index;
@@ -691,24 +794,41 @@ pub fn acquire(self: *Self) ?render.Target {
 
 pub fn repairDamage(self: *Self, damage: *Region) !void {
     const index = self.acquired orelse unreachable;
+    std.debug.assert(self.acquired_damage.isEmpty());
+    try self.acquired_damage.copyFrom(damage);
     if (self.buffers[index].render_target_id != null) {
+        if (Logging.enabled(.debug)) {
+            const full_damage = damage.coversRectangle(0, 0, self.size.width, self.size.height);
+            const full_repair = self.buffer_damage[index].coversRectangle(
+                0,
+                0,
+                self.size.width,
+                self.size.height,
+            );
+            if (full_damage) {
+                log.debug("new scene damage is full-output before buffer {d} repair", .{index});
+            } else if (full_repair) {
+                log.debug("buffer {d} repair adds a full-output backlog", .{index});
+            }
+        }
         try damage.unionWith(&self.buffer_damage[index]);
     }
 }
 
 pub fn cancel(self: *Self) void {
     self.acquired = null;
+    self.acquired_damage.clear();
     self.discardValidatedOverlay();
 }
 
 pub fn present(
     self: *Self,
-    frame_damage: *const Region,
+    _: *const Region,
     render_fence_fd: ?std.posix.fd_t,
     allow_tearing: bool,
 ) !?presentation.Info {
     std.debug.assert(self.validated_overlay == null);
-    const frame = try self.prepareAcquiredFrame(frame_damage, render_fence_fd);
+    const frame = try self.prepareAcquiredFrame(render_fence_fd);
     if (!self.mode_set) {
         var connector_id = self.connector_id;
         if (c.drmModeSetCrtc(
@@ -774,13 +894,13 @@ pub fn present(
 /// the incomplete primary buffer by itself.
 pub fn presentValidatedOverlay(
     self: *Self,
-    frame_damage: *const Region,
+    _: *const Region,
     render_fence_fd: ?std.posix.fd_t,
     allow_tearing: bool,
 ) !?presentation.Info {
     const validated = self.validated_overlay orelse return error.NoValidatedOverlay;
     std.debug.assert(self.mode_set);
-    const frame = try self.prepareAcquiredFrame(frame_damage, render_fence_fd);
+    const frame = try self.prepareAcquiredFrame(render_fence_fd);
     const page_flip = self.queuePageFlip(
         frame.fd,
         frame.buffer.framebuffer_id,
@@ -815,7 +935,6 @@ pub fn presentValidatedOverlay(
 
 fn prepareAcquiredFrame(
     self: *Self,
-    frame_damage: *const Region,
     render_fence_fd: ?std.posix.fd_t,
 ) !AcquiredFrame {
     const index = self.acquired orelse return error.NoAcquiredBuffer;
@@ -839,15 +958,21 @@ fn prepareAcquiredFrame(
             try waitSyncFile(fence_fd);
         }
     }
-    for (&self.buffer_damage) |*damage| try damage.unionWith(frame_damage);
-    if (buffer.render_target_id == null) copyShadowDamage(
-        buffer.pixels,
-        buffer.stride_pixels,
-        self.shadow_pixels,
-        self.size,
-        &self.buffer_damage[index],
+    if (buffer.render_target_id == null) {
+        try self.buffer_damage[index].unionWith(&self.acquired_damage);
+        copyShadowDamage(
+            buffer.pixels,
+            buffer.stride_pixels,
+            self.shadow_pixels,
+            self.size,
+            &self.buffer_damage[index],
+        );
+    }
+    try finishBufferDamageRepair(
+        &self.buffer_damage,
+        &self.acquired_damage,
+        index,
     );
-    self.buffer_damage[index].clear();
     return .{
         .fd = fd,
         .index = index,
@@ -1078,6 +1203,7 @@ pub fn tryDirectScanout(
     };
     self.pending_page_flip = page_flip;
     self.acquired = null;
+    self.acquired_damage.clear();
     self.resetBufferDamage(self.size);
     return .accepted;
 }
@@ -1193,6 +1319,16 @@ pub fn activate(self: *Self, fd: std.posix.fd_t, selection: Selection, device_pa
         @intCast(self.old_crtc.?.*.gamma_size)
     else
         0;
+    var cursor_width: u64 = 0;
+    var cursor_height: u64 = 0;
+    if (c.drmGetCap(fd, c.DRM_CAP_CURSOR_WIDTH, &cursor_width) == 0 and
+        c.drmGetCap(fd, c.DRM_CAP_CURSOR_HEIGHT, &cursor_height) == 0 and
+        cursor_width <= std.math.maxInt(u32) and cursor_height <= std.math.maxInt(u32))
+    {
+        self.cursor_width = @intCast(cursor_width);
+        self.cursor_height = @intCast(cursor_height);
+    }
+    self.cursor_failed = self.cursor_width == 0 or self.cursor_height == 0;
     const expected_gamma_values = std.math.mul(usize, self.gamma_size, 3) catch 0;
     if (self.gamma_lut.len != 0 and self.gamma_lut.len != expected_gamma_values) {
         self.allocator.free(self.gamma_lut);
@@ -1459,6 +1595,8 @@ pub fn disconnect(self: *Self, fd: std.posix.fd_t) void {
 }
 
 fn release(self: *Self, fd: std.posix.fd_t) void {
+    _ = self.disableCursor(fd);
+    for (&self.cursor_buffers) |*buffer| self.destroyBuffer(fd, buffer);
     const restore_color_state = self.output_color_mode != .sdr or self.output_color_dirty;
     self.destroyHdrMetadataBlob(fd);
     self.output_color_mode = .sdr;
@@ -1472,6 +1610,7 @@ fn release(self: *Self, fd: std.posix.fd_t) void {
     self.atomic_color = null;
     self.async_page_flip_supported = false;
     self.acquired = null;
+    self.acquired_damage.clear();
     self.pending = null;
     self.displayed = null;
     self.pending_page_flip = null;
@@ -1511,6 +1650,7 @@ pub fn setPowered(self: *Self, fd: std.posix.fd_t, powered: bool) !void {
         self.resetBufferDamage(self.size);
         self.powered = true;
         self.mode_set = false;
+        self.cursor_failed = self.cursor_width == 0 or self.cursor_height == 0;
         return;
     }
 
@@ -1518,10 +1658,16 @@ pub fn setPowered(self: *Self, fd: std.posix.fd_t, powered: bool) !void {
     // configuration is infrequent, so reject a busy head and let the client
     // retry rather than complicating the page-flip lifetime.
     if (self.pending != null or self.direct_pending != null) return error.OutputBusy;
+    _ = self.disableCursor(fd);
     self.acquired = null;
+    self.acquired_damage.clear();
     if (c.drmModeSetCrtc(fd, self.crtc_id, 0, 0, 0, null, 0, null) != 0) {
         return error.DisableFailed;
     }
+    self.cursor_active = false;
+    self.cursor_source = null;
+    self.cursor_buffer_index = null;
+    for (&self.cursor_buffers) |*buffer| self.destroyBuffer(fd, buffer);
     self.powered = false;
     self.mode_set = false;
     self.displayed = null;
@@ -1541,13 +1687,19 @@ pub fn setMode(self: *Self, fd: std.posix.fd_t, mode_index: usize) !void {
     const size = mode.size();
 
     if (self.powered) {
+        _ = self.disableCursor(fd);
         const pair = try self.allocatePair(fd, size);
         self.acquired = null;
+        self.acquired_damage.clear();
         if (c.drmModeSetCrtc(fd, self.crtc_id, 0, 0, 0, null, 0, null) != 0) {
             var failed_buffers = pair.buffers;
             self.destroyPair(fd, &failed_buffers, pair.shadow_pixels);
             return error.DisableFailed;
         }
+        self.cursor_active = false;
+        self.cursor_source = null;
+        self.cursor_buffer_index = null;
+        for (&self.cursor_buffers) |*buffer| self.destroyBuffer(fd, buffer);
         self.notifyDeactivated();
         var old_buffers = self.buffers;
         const old_shadow_pixels = self.shadow_pixels;
@@ -2355,10 +2507,24 @@ fn refreshNanoseconds(mode: c.drmModeModeInfo) u32 {
     return @intCast(std.time.ns_per_s / mode.vrefresh);
 }
 
-fn resetBufferDamage(self: *Self, size: render.Size) void {
+noinline fn resetBufferDamage(self: *Self, size: render.Size) void {
+    log.debug("resetting full buffer damage from 0x{x}", .{@returnAddress()});
     for (&self.buffer_damage) |*damage| {
         damage.setRectangle(0, 0, size.width, size.height);
     }
+}
+
+fn finishBufferDamageRepair(
+    buffer_damage: *[buffer_count]Region,
+    acquired_damage: *Region,
+    acquired_index: usize,
+) Region.Error!void {
+    std.debug.assert(acquired_index < buffer_damage.len);
+    for (buffer_damage, 0..) |*damage, index| {
+        if (index != acquired_index) try damage.unionWith(acquired_damage);
+    }
+    buffer_damage[acquired_index].clear();
+    acquired_damage.clear();
 }
 
 fn createShadowBuffer(
@@ -2994,6 +3160,70 @@ fn clearInheritedCursor(self: *Self, fd: std.posix.fd_t) void {
     }
     if (c.drmModeSetCursor(fd, self.crtc_id, 0, 0, 0) != 0) {
         log.warn("failed to clear inherited cursor on CRTC {d}", .{self.crtc_id});
+    }
+}
+
+fn disableCursor(self: *Self, fd: std.posix.fd_t) bool {
+    const was_active = self.cursor_active;
+    if (self.cursor_active and c.drmModeSetCursor(fd, self.crtc_id, 0, 0, 0) != 0) {
+        log.warn("failed to disable hardware cursor on CRTC {d}", .{self.crtc_id});
+        return false;
+    }
+    self.cursor_active = false;
+    self.cursor_source = null;
+    self.cursor_buffer_index = null;
+    if (was_active) log.debug("hardware cursor disabled on {s}", .{self.name()});
+    return true;
+}
+
+fn failCursor(self: *Self, err: anyerror) void {
+    log.warn("hardware cursor unavailable for {s} until reactivation: {t}", .{ self.name(), err });
+    self.cursor_failed = true;
+}
+
+fn createCursorBuffer(self: *Self, fd: std.posix.fd_t, buffer: *Buffer) !void {
+    var create = std.mem.zeroes(c.struct_drm_mode_create_dumb);
+    create.width = self.cursor_width;
+    create.height = self.cursor_height;
+    create.bpp = 32;
+    if (c.drmIoctl(fd, c.DRM_IOCTL_MODE_CREATE_DUMB, &create) != 0) return error.CreateDumbBufferFailed;
+    buffer.handle = create.handle;
+    errdefer self.destroyBuffer(fd, buffer);
+    var map = std.mem.zeroes(c.struct_drm_mode_map_dumb);
+    map.handle = create.handle;
+    if (c.drmIoctl(fd, c.DRM_IOCTL_MODE_MAP_DUMB, &map) != 0) return error.MapDumbBufferFailed;
+    const mapping = try std.posix.mmap(null, @intCast(create.size), .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, fd, map.offset);
+    buffer.mapping = mapping;
+    buffer.stride_pixels = create.pitch / @sizeOf(u32);
+    buffer.pixels = @as([*]u32, @ptrCast(@alignCast(mapping.ptr)))[0 .. mapping.len / @sizeOf(u32)];
+    @memset(buffer.pixels, 0);
+}
+
+fn cursorLocalPosition(global_x: i32, global_y: i32, output_x: i32, output_y: i32, scale: render.Scale) render.Position {
+    return .{
+        .x = scaleSigned(global_x -| output_x, scale),
+        .y = scaleSigned(global_y -| output_y, scale),
+    };
+}
+
+fn scaleSigned(value: i32, scale: render.Scale) i32 {
+    const product = @as(i64, value) * scale.numerator;
+    const half: i64 = render.Scale.denominator / 2;
+    return @intCast(if (product >= 0)
+        @divTrunc(product + half, render.Scale.denominator)
+    else
+        @divTrunc(product - half, render.Scale.denominator));
+}
+
+fn rescaleCursor(source: render.PixelBuffer, size: render.Size, destination: *Buffer) void {
+    @memset(destination.pixels, 0);
+    for (0..size.height) |y| {
+        const source_y = y * source.size.height / size.height;
+        for (0..size.width) |x| {
+            const source_x = x * source.size.width / size.width;
+            destination.pixels[y * destination.stride_pixels + x] =
+                source.pixels[source_y * source.stride_pixels + source_x];
+        }
     }
 }
 
@@ -3868,6 +4098,79 @@ fn testDeviceActive(_: *anyopaque) bool {
 
 fn testDeviceFail(_: *anyopaque, _: anyerror) void {
     unreachable;
+}
+
+test "DRM buffer repair does not propagate an acquired buffer's backlog" {
+    var context: u8 = 0;
+    var output: Self = undefined;
+    output.init(std.testing.allocator, std.testing.io, .{
+        .context = &context,
+        .fd = testDeviceFd,
+        .gbm = testDeviceGbm,
+        .active = testDeviceActive,
+        .fail = testDeviceFail,
+    });
+    defer output.deinit();
+    output.buffers[0].render_target_id = 1;
+    output.buffers[1].render_target_id = 2;
+    output.resetBufferDamage(.{ .width = 100, .height = 100 });
+
+    var first_damage = Region.init();
+    defer first_damage.deinit();
+    first_damage.setRectangle(10, 10, 2, 2);
+    output.acquired = 0;
+    try output.repairDamage(&first_damage);
+    try std.testing.expect(first_damage.coversRectangle(0, 0, 100, 100));
+    try finishBufferDamageRepair(&output.buffer_damage, &output.acquired_damage, 0);
+    try std.testing.expect(output.buffer_damage[0].isEmpty());
+    try std.testing.expect(output.buffer_damage[1].coversRectangle(0, 0, 100, 100));
+
+    var second_damage = Region.init();
+    defer second_damage.deinit();
+    second_damage.setRectangle(20, 20, 2, 2);
+    output.acquired = 1;
+    try output.repairDamage(&second_damage);
+    try std.testing.expect(second_damage.coversRectangle(0, 0, 100, 100));
+    try finishBufferDamageRepair(&output.buffer_damage, &output.acquired_damage, 1);
+    try std.testing.expect(output.buffer_damage[0].coversRectangle(20, 20, 2, 2));
+    try std.testing.expect(output.buffer_damage[1].isEmpty());
+
+    var third_damage = Region.init();
+    defer third_damage.deinit();
+    third_damage.setRectangle(30, 30, 2, 2);
+    output.acquired = 0;
+    try output.repairDamage(&third_damage);
+    try std.testing.expect(!third_damage.coversRectangle(0, 0, 100, 100));
+    try std.testing.expect(third_damage.coversRectangle(20, 20, 2, 2));
+    try std.testing.expect(third_damage.coversRectangle(30, 30, 2, 2));
+    try finishBufferDamageRepair(&output.buffer_damage, &output.acquired_damage, 0);
+    output.acquired = null;
+}
+
+test "cursor coordinates preserve signed fractional output-local positions" {
+    const scale: render.Scale = .{ .numerator = 180 };
+    try std.testing.expectEqual(
+        render.Position{ .x = -2, .y = 3 },
+        cursorLocalPosition(99, 52, 100, 50, scale),
+    );
+    try std.testing.expectEqual(@as(i32, 36), scaleSigned(24, scale));
+}
+
+test "cursor nearest rescale clears padding and duplicates nearest pixels" {
+    const source_pixels = [_]u32{ 1, 2, 3, 4 };
+    var destination_pixels = [_]u32{9} ** 12;
+    var destination: Buffer = .{
+        .pixels = &destination_pixels,
+        .stride_pixels = 4,
+    };
+    rescaleCursor(.{
+        .size = .{ .width = 2, .height = 2 },
+        .stride_pixels = 2,
+        .pixels = @constCast(&source_pixels),
+    }, .{ .width = 3, .height = 3 }, &destination);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 1, 2, 0 }, destination_pixels[0..4]);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 1, 2, 0 }, destination_pixels[4..8]);
+    try std.testing.expectEqualSlices(u32, &.{ 3, 3, 4, 0 }, destination_pixels[8..12]);
 }
 
 test "preferred DRM mode wins over the first mode" {

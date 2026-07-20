@@ -16,6 +16,9 @@ layer_stacks: [layer_count]std.ArrayList(LayerSurfaceId),
 popups: PopupStore,
 popup_stack: std.ArrayList(PopupId),
 stack: std.ArrayList(NodeId),
+stack_snapshot: std.ArrayList(NodeId),
+stack_update_active: bool,
+stack_update_repaint: bool,
 repaint_listener: ?RepaintListener,
 
 pub const Store = slot_map.SlotMap(Window, enum { scene_window });
@@ -404,6 +407,9 @@ pub fn init(self: *Self, allocator: std.mem.Allocator) void {
         .popups = .{},
         .popup_stack = .empty,
         .stack = .empty,
+        .stack_snapshot = .empty,
+        .stack_update_active = false,
+        .stack_update_repaint = false,
         .repaint_listener = null,
     };
 }
@@ -416,6 +422,8 @@ pub fn deinit(self: *Self) void {
     std.debug.assert(self.popups.len() == 0);
     std.debug.assert(self.popup_stack.items.len == 0);
     std.debug.assert(self.stack.items.len == 0);
+    std.debug.assert(!self.stack_update_active);
+    std.debug.assert(self.stack_snapshot.items.len == 0);
     self.windows.deinit(self.allocator);
     self.decorations.deinit(self.allocator);
     self.shell_surfaces.deinit(self.allocator);
@@ -427,6 +435,7 @@ pub fn deinit(self: *Self) void {
     self.popups.deinit(self.allocator);
     self.popup_stack.deinit(self.allocator);
     self.stack.deinit(self.allocator);
+    self.stack_snapshot.deinit(self.allocator);
     self.* = undefined;
 }
 
@@ -704,7 +713,7 @@ pub fn placeNodeTop(self: *Self, id: NodeId) void {
     if (index == self.stack.items.len - 1) return;
     const moved = self.stack.orderedRemove(index);
     self.stack.appendAssumeCapacity(moved);
-    if (self.nodeMapped(id)) self.requestRepaint();
+    self.requestStackRepaint(id);
 }
 
 pub fn placeNodeBottom(self: *Self, id: NodeId) void {
@@ -712,27 +721,50 @@ pub fn placeNodeBottom(self: *Self, id: NodeId) void {
     if (index == 0) return;
     const moved = self.stack.orderedRemove(index);
     self.stack.insertAssumeCapacity(0, moved);
-    if (self.nodeMapped(id)) self.requestRepaint();
+    self.requestStackRepaint(id);
 }
 
 pub fn placeNodeAbove(self: *Self, id: NodeId, other: NodeId) void {
     if (std.meta.eql(id, other)) return;
     const index = self.nodeIndex(id) orelse return;
-    if (self.nodeIndex(other) == null) return;
+    const other_index_before = self.nodeIndex(other) orelse return;
+    if (index == other_index_before + 1) return;
     const moved = self.stack.orderedRemove(index);
     const other_index = self.nodeIndex(other) orelse unreachable;
     self.stack.insertAssumeCapacity(other_index + 1, moved);
-    if (self.nodeMapped(id)) self.requestRepaint();
+    self.requestStackRepaint(id);
 }
 
 pub fn placeNodeBelow(self: *Self, id: NodeId, other: NodeId) void {
     if (std.meta.eql(id, other)) return;
     const index = self.nodeIndex(id) orelse return;
-    if (self.nodeIndex(other) == null) return;
+    const other_index_before = self.nodeIndex(other) orelse return;
+    if (index + 1 == other_index_before) return;
     const moved = self.stack.orderedRemove(index);
     const other_index = self.nodeIndex(other) orelse unreachable;
     self.stack.insertAssumeCapacity(other_index, moved);
-    if (self.nodeMapped(id)) self.requestRepaint();
+    self.requestStackRepaint(id);
+}
+
+/// Defers repaint notification until a sequence of stack operations has
+/// produced a final order different from the initial order.
+pub fn beginStackUpdate(self: *Self) error{OutOfMemory}!void {
+    std.debug.assert(!self.stack_update_active);
+    std.debug.assert(self.stack_snapshot.items.len == 0);
+    try self.stack_snapshot.resize(self.allocator, self.stack.items.len);
+    @memcpy(self.stack_snapshot.items, self.stack.items);
+    self.stack_update_active = true;
+    self.stack_update_repaint = false;
+}
+
+pub fn endStackUpdate(self: *Self) void {
+    std.debug.assert(self.stack_update_active);
+    const changed = !nodeStacksEqual(self.stack_snapshot.items, self.stack.items);
+    const repaint = self.stack_update_repaint;
+    self.stack_snapshot.clearRetainingCapacity();
+    self.stack_update_active = false;
+    self.stack_update_repaint = false;
+    if (changed and repaint) self.requestRepaint();
 }
 
 pub fn setFocused(self: *Self, id: Id, focused: bool) void {
@@ -931,6 +963,18 @@ pub fn surfaceMapped(self: *Self, surface_id: Surface.Id) bool {
     return false;
 }
 
+/// Returns whether both roots are top-level scene nodes and the first is
+/// painted above the second. Other surface categories have no node ordering.
+pub fn surfaceNodeAbove(
+    self: *Self,
+    surface_id: Surface.Id,
+    other_surface_id: Surface.Id,
+) ?bool {
+    const index = self.surfaceNodeIndex(surface_id) orelse return null;
+    const other_index = self.surfaceNodeIndex(other_surface_id) orelse return null;
+    return index > other_index;
+}
+
 pub fn topFullscreen(self: *Self) ?Id {
     var index = self.stack.items.len;
     while (index > 0) {
@@ -975,6 +1019,15 @@ pub fn topWindowSurface(self: *Self) ?Surface.Id {
 
 fn requestRepaint(self: *Self) void {
     if (self.repaint_listener) |listener| listener.request(listener.context);
+}
+
+fn requestStackRepaint(self: *Self, id: NodeId) void {
+    if (!self.nodeMapped(id)) return;
+    if (self.stack_update_active) {
+        self.stack_update_repaint = true;
+    } else {
+        self.requestRepaint();
+    }
 }
 
 fn requestSurfaceChanged(self: *Self, surface_id: Surface.Id) void {
@@ -1122,6 +1175,25 @@ fn nodeIndex(self: *Self, id: NodeId) ?usize {
     unreachable;
 }
 
+fn nodeStacksEqual(first: []const NodeId, second: []const NodeId) bool {
+    if (first.len != second.len) return false;
+    for (first, second) |first_node, second_node| {
+        if (!std.meta.eql(first_node, second_node)) return false;
+    }
+    return true;
+}
+
+fn surfaceNodeIndex(self: *Self, surface_id: Surface.Id) ?usize {
+    for (self.stack.items, 0..) |node, index| {
+        const node_surface_id = switch (node) {
+            .window => |id| (self.windows.get(id) orelse continue).surface_id,
+            .shell_surface => |id| (self.shell_surfaces.get(id) orelse continue).surface_id,
+        };
+        if (std.meta.eql(node_surface_id, surface_id)) return index;
+    }
+    return null;
+}
+
 fn nodeExists(self: *Self, id: NodeId) bool {
     return switch (id) {
         .window => |window_id| self.windows.get(window_id) != null,
@@ -1262,13 +1334,70 @@ test "scene reorders windows through handles" {
     scene.removeWindow(third);
 }
 
+const RepaintCounter = struct {
+    count: usize = 0,
+
+    fn listener(self: *RepaintCounter) RepaintListener {
+        return .{
+            .context = self,
+            .request = request,
+            .surface_changed = surfaceChanged,
+        };
+    }
+
+    fn request(context: *anyopaque) void {
+        const self: *RepaintCounter = @ptrCast(@alignCast(context));
+        self.count += 1;
+    }
+
+    fn surfaceChanged(_: *anyopaque, _: Surface.Id) void {}
+};
+
+test "scene stack updates only repaint for a different final order" {
+    var scene: Self = undefined;
+    scene.init(std.testing.allocator);
+    defer scene.deinit();
+
+    const first = try scene.addWindow(.{ .index = 1, .generation = 1 });
+    const second = try scene.addWindow(.{ .index = 2, .generation = 1 });
+    const third = try scene.addWindow(.{ .index = 3, .generation = 1 });
+    scene.setMapped(first, true);
+    scene.setMapped(second, true);
+    scene.setMapped(third, true);
+    var repaint: RepaintCounter = .{};
+    scene.setRepaintListener(repaint.listener());
+    defer scene.clearRepaintListener();
+
+    try scene.beginStackUpdate();
+    scene.placeTop(first);
+    scene.placeTop(second);
+    scene.placeTop(third);
+    scene.endStackUpdate();
+    try std.testing.expectEqual(@as(usize, 0), repaint.count);
+
+    try scene.beginStackUpdate();
+    scene.placeTop(first);
+    scene.endStackUpdate();
+    try std.testing.expectEqual(@as(usize, 1), repaint.count);
+
+    scene.placeAbove(first, third);
+    scene.placeBelow(third, first);
+    try std.testing.expectEqual(@as(usize, 1), repaint.count);
+
+    scene.removeWindow(first);
+    scene.removeWindow(second);
+    scene.removeWindow(third);
+}
+
 test "scene interleaves shell surfaces and windows through node handles" {
     var scene: Self = undefined;
     scene.init(std.testing.allocator);
     defer scene.deinit();
 
-    const window = try scene.addWindow(.{ .index = 1, .generation = 1 });
-    const shell_surface = try scene.addShellSurface(.{ .index = 2, .generation = 1 });
+    const window_surface: Surface.Id = .{ .index = 1, .generation = 1 };
+    const shell_surface_root: Surface.Id = .{ .index = 2, .generation = 1 };
+    const window = try scene.addWindow(window_surface);
+    const shell_surface = try scene.addShellSurface(shell_surface_root);
     scene.setMapped(window, true);
     scene.setShellSurfaceMapped(shell_surface, true);
     scene.setShellSurfacePosition(shell_surface, .{ .x = 20, .y = 30 });
@@ -1291,6 +1420,12 @@ test "scene interleaves shell surfaces and windows through node handles" {
     try std.testing.expect(std.meta.eql(window, reverse_nodes.next().?.window.id));
     try std.testing.expect(std.meta.eql(shell_surface, reverse_nodes.next().?.shell_surface.id));
     try std.testing.expectEqual(@as(?NodeIterator.Entry, null), reverse_nodes.next());
+    try std.testing.expect(scene.surfaceNodeAbove(window_surface, shell_surface_root).?);
+    try std.testing.expect(!scene.surfaceNodeAbove(shell_surface_root, window_surface).?);
+    try std.testing.expectEqual(
+        @as(?bool, null),
+        scene.surfaceNodeAbove(window_surface, .{ .index = 3, .generation = 1 }),
+    );
 
     scene.removeShellSurface(shell_surface);
     scene.removeWindow(window);

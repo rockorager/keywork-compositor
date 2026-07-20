@@ -76,6 +76,13 @@ pub const Renderer = struct {
         };
     }
 
+    pub fn supportsBackdropCaptureReuse(self: *const Renderer) bool {
+        return switch (self.backend) {
+            .cpu => false,
+            .vulkan => true,
+        };
+    }
+
     pub fn supportsColorManagement(self: *const Renderer) bool {
         return switch (self.backend) {
             .cpu => false,

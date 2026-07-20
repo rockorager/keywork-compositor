@@ -303,6 +303,26 @@ fn effectivelySynchronized(self: *Self, id: Id) bool {
     return self.effectivelySynchronized(parent_subsurface);
 }
 
+fn nodesEqual(first: Parent.Node, second: Parent.Node) bool {
+    return switch (first) {
+        .parent => second == .parent,
+        .child => |first_id| switch (second) {
+            .parent => false,
+            .child => |second_id| std.meta.eql(first_id, second_id),
+        },
+    };
+}
+
+fn nodeMatchesCommit(current: Parent.Node, committed: Parent.CommitNode) bool {
+    return switch (current) {
+        .parent => committed == .parent,
+        .child => |current_id| switch (committed) {
+            .parent => false,
+            .child => |child| std.meta.eql(current_id, child.id),
+        },
+    };
+}
+
 fn applyParent(self: *Self, parent: *Parent) void {
     if (parent.surface == null) return;
     if (parent.commits.items.len == 0) {
@@ -311,6 +331,14 @@ fn applyParent(self: *Self, parent: *Parent) void {
     }
     var commit = parent.commits.orderedRemove(0);
     defer commit.deinit(parent.allocator);
+    var visual_state_changed = parent.current.items.len != commit.nodes.len;
+    if (!visual_state_changed) {
+        for (parent.current.items, commit.nodes) |current, committed| {
+            if (nodeMatchesCommit(current, committed)) continue;
+            visual_state_changed = true;
+            break;
+        }
+    }
     parent.current.clearRetainingCapacity();
     for (commit.nodes) |node| parent.current.appendAssumeCapacity(switch (node) {
         .parent => .{ .parent = {} },
@@ -321,6 +349,9 @@ fn applyParent(self: *Self, parent: *Parent) void {
         .parent => {},
         .child => |child| {
             const state = self.subsurfaces.get(child.id) orelse continue;
+            if (state.active and !std.meta.eql(state.current_position, child.position)) {
+                visual_state_changed = true;
+            }
             state.current_position = child.position;
             state.active = true;
         },
@@ -335,9 +366,18 @@ fn applyParent(self: *Self, parent: *Parent) void {
             surface.applyCachedUpTo(sequence);
         },
     };
+    if (visual_state_changed) self.requestRepaint();
 }
 
 fn applyLiveParentState(self: *Self, parent: *Parent) void {
+    var visual_state_changed = parent.current.items.len != parent.pending.items.len;
+    if (!visual_state_changed) {
+        for (parent.current.items, parent.pending.items) |current, pending| {
+            if (nodesEqual(current, pending)) continue;
+            visual_state_changed = true;
+            break;
+        }
+    }
     parent.current.clearRetainingCapacity();
     parent.current.appendSliceAssumeCapacity(parent.pending.items);
 
@@ -345,6 +385,9 @@ fn applyLiveParentState(self: *Self, parent: *Parent) void {
         .parent => {},
         .child => |id| {
             const state = self.subsurfaces.get(id) orelse continue;
+            if (state.active and !std.meta.eql(state.current_position, state.pending_position)) {
+                visual_state_changed = true;
+            }
             state.current_position = state.pending_position;
             state.active = true;
         },
@@ -359,6 +402,7 @@ fn applyLiveParentState(self: *Self, parent: *Parent) void {
             surface.applyCachedUpTo(std.math.maxInt(u64));
         },
     };
+    if (visual_state_changed) self.requestRepaint();
 }
 
 fn flushDesynchronizedDescendants(self: *Self, parent_id: Surface.Id) void {
@@ -770,7 +814,6 @@ const SubsurfaceResource = struct {
     fn afterSurfaceCommit(context: *anyopaque, _: Surface.CommitInfo) void {
         const self: *SubsurfaceResource = @ptrCast(@alignCast(context));
         const surface = self.surface orelse return;
-        if (surface.hasCachedCommit()) return;
         if (self.shell.repaint_listener) |listener| {
             listener.surface_changed(listener.context, surface.handle());
         }
@@ -850,4 +893,59 @@ test "stack iterator preserves children below and above their parent" {
     const reverse_below = reverse_iterator.next().?;
     try std.testing.expect(std.meta.eql(below_surface, reverse_below.child.surface_id));
     try std.testing.expectEqual(@as(?StackEntry, null), reverse_iterator.next());
+}
+
+test "applying changed subsurface parent state requests one repaint" {
+    var shell: Self = undefined;
+    shell.subsurfaces = .{};
+    defer shell.subsurfaces.deinit(std.testing.allocator);
+    shell.adapters = .empty;
+    defer shell.adapters.deinit(std.testing.allocator);
+
+    const parent_surface: Surface.Id = .{ .index = 10, .generation = 1 };
+    const child_surface: Surface.Id = .{ .index = 11, .generation = 1 };
+    const child = try shell.subsurfaces.insert(std.testing.allocator, .{
+        .surface_id = child_surface,
+        .parent_id = parent_surface,
+        .pending_position = .{ .x = 8, .y = 12 },
+        .current_position = .{ .x = 2, .y = 3 },
+        .active = true,
+    });
+    defer _ = shell.subsurfaces.remove(child);
+
+    var repaint_count: usize = 0;
+    shell.repaint_listener = .{
+        .context = &repaint_count,
+        .request = struct {
+            fn request(context: *anyopaque) void {
+                const count: *usize = @ptrCast(@alignCast(context));
+                count.* += 1;
+            }
+        }.request,
+        .surface_changed = struct {
+            fn changed(_: *anyopaque, _: Surface.Id) void {}
+        }.changed,
+    };
+
+    var parent: Parent = undefined;
+    parent.current = .empty;
+    defer parent.current.deinit(std.testing.allocator);
+    parent.pending = .empty;
+    defer parent.pending.deinit(std.testing.allocator);
+    try parent.current.append(std.testing.allocator, .{ .parent = {} });
+    try parent.current.append(std.testing.allocator, .{ .child = child });
+    try parent.pending.append(std.testing.allocator, .{ .parent = {} });
+    try parent.pending.append(std.testing.allocator, .{ .child = child });
+
+    shell.applyLiveParentState(&parent);
+    try std.testing.expectEqual(@as(usize, 1), repaint_count);
+    try std.testing.expectEqual(Point{ .x = 8, .y = 12 }, shell.subsurfaces.get(child).?.current_position);
+
+    shell.applyLiveParentState(&parent);
+    try std.testing.expectEqual(@as(usize, 1), repaint_count);
+
+    const moved = parent.pending.orderedRemove(1);
+    try parent.pending.insert(std.testing.allocator, 0, moved);
+    shell.applyLiveParentState(&parent);
+    try std.testing.expectEqual(@as(usize, 2), repaint_count);
 }

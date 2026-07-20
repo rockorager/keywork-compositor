@@ -7,6 +7,7 @@ pub const interface_description = @embedFile("control-interface");
 pub const Direction = enum { next, previous, left, down, up, right };
 pub const WindowTarget = enum { focused };
 pub const Layout = enum { master_stack, dwindle, scrolling };
+pub const LogLevel = enum(u8) { @"error", warning, info, debug };
 
 pub const LatencyStatistics = struct {
     samples: i64,
@@ -119,6 +120,7 @@ pub const set_layout_method = interface_name ++ ".SetLayout";
 pub const switch_workspace_method = interface_name ++ ".SwitchWorkspace";
 pub const move_focused_to_workspace_method = interface_name ++ ".MoveFocusedToWorkspace";
 pub const get_performance_statistics_method = interface_name ++ ".GetPerformanceStatistics";
+pub const set_log_level_method = interface_name ++ ".SetLogLevel";
 pub const reload_configuration_method = interface_name ++ ".ReloadConfiguration";
 pub const quit_method = interface_name ++ ".Quit";
 pub const configuration_reload_failed_error = interface_name ++ ".ConfigurationReloadFailed";

@@ -356,6 +356,28 @@ pub fn containsSurface(self: *const Self, surface_id: Surface.Id) bool {
     return false;
 }
 
+pub fn hasCallbackOnlyFrameCallbacks(self: *const Self) bool {
+    for (self.memberships.items) |membership| {
+        if (Surface.hasCallbackOnlyFrameCallback(self.surfaces, membership.surface_id)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+pub fn sendCallbackOnlyFrameCallbacks(self: *Self, time_milliseconds: u32) bool {
+    std.debug.assert(!self.frame_active);
+    var sent = false;
+    for (self.memberships.items) |membership| {
+        sent = Surface.sendCallbackOnlyFrameDoneFor(
+            self.surfaces,
+            membership.surface_id,
+            time_milliseconds,
+        ) or sent;
+    }
+    return sent;
+}
+
 fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
     const resource = wl.Output.create(client, version, id) catch {
         client.postNoMemory();

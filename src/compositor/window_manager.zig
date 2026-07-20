@@ -1711,6 +1711,25 @@ fn publish(self: *Self) void {
             self.scene.setContentClipBox(window.scene_id, null);
         }
     }
+    self.publishStacking();
+    self.xwayland.stacking_changed(self.xwayland.context);
+    if (self.session_listener) |listener| {
+        var windows = self.windows.iterator();
+        while (windows.next()) |entry| switch (entry.value.backend) {
+            .xdg => |id| listener.changed(listener.context, id),
+            .xwayland => {},
+        };
+    }
+    if (self.transaction.consumeDirty()) self.relayout();
+}
+
+fn publishStacking(self: *Self) void {
+    const batched = update: {
+        self.scene.beginStackUpdate() catch break :update false;
+        break :update true;
+    };
+    defer if (batched) self.scene.endStackUpdate();
+
     for (self.workspaces.items) |workspace| {
         if (!workspace.active) continue;
         for (workspace.workspace.members.items) |member| {
@@ -1744,15 +1763,6 @@ fn publish(self: *Self) void {
             }
         }
     }
-    self.xwayland.stacking_changed(self.xwayland.context);
-    if (self.session_listener) |listener| {
-        var windows = self.windows.iterator();
-        while (windows.next()) |entry| switch (entry.value.backend) {
-            .xdg => |id| listener.changed(listener.context, id),
-            .xwayland => {},
-        };
-    }
-    if (self.transaction.consumeDirty()) self.relayout();
 }
 
 fn clampI16(value: i32) i16 {

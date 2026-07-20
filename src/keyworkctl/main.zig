@@ -12,10 +12,11 @@ const usage =
     \\          close TARGET
     \\          toggle-fullscreen TARGET | toggle-floating TARGET
     \\          switch-workspace WORKSPACE | move-focused-to-workspace WORKSPACE
-    \\          stats [--json] [--reset] | reload | quit
+    \\          stats [--json] [--reset] | set-log-level LEVEL | reload | quit
     \\directions: next, previous, left, down, up, right
     \\targets: focused
     \\layouts: master-stack, dwindle, scrolling
+    \\log levels: error, warning, info, debug
     \\
 ;
 
@@ -29,6 +30,7 @@ const Command = union(enum) {
     switch_workspace: i64,
     move_to_workspace: i64,
     stats: StatisticsOptions,
+    set_log_level: control.LogLevel,
     reload,
     quit,
 };
@@ -97,6 +99,7 @@ fn run(init: std.process.Init) !void {
         .switch_workspace => |workspace| try client.call(control.switch_workspace_method, .{ .workspace = workspace }),
         .move_to_workspace => |workspace| try client.call(control.move_focused_to_workspace_method, .{ .workspace = workspace }),
         .stats => |options| try client.call(control.get_performance_statistics_method, .{ .reset = options.reset }),
+        .set_log_level => |level| try client.call(control.set_log_level_method, .{ .level = level }),
         .reload => try client.call(control.reload_configuration_method, Empty{}),
         .quit => unreachable,
     };
@@ -430,6 +433,10 @@ fn parse(arguments: []const []const u8) !Command {
     if (std.mem.eql(u8, name, "toggle-fullscreen")) return .{ .toggle_fullscreen = parseWindowTarget(value) orelse return error.InvalidWindowTarget };
     if (std.mem.eql(u8, name, "toggle-floating")) return .{ .toggle_floating = parseWindowTarget(value) orelse return error.InvalidWindowTarget };
     if (std.mem.eql(u8, name, "set-layout")) return .{ .set_layout = parseLayout(value) orelse return error.InvalidLayout };
+    if (std.mem.eql(u8, name, "set-log-level")) return .{
+        .set_log_level = std.meta.stringToEnum(control.LogLevel, value) orelse
+            return error.InvalidLogLevel,
+    };
     if (std.mem.eql(u8, name, "switch-workspace")) return .{
         .switch_workspace = try parseWorkspace(value),
     };
@@ -464,6 +471,7 @@ test "CLI parsing maps wire values and validates workspaces" {
     try std.testing.expectEqual(control.WindowTarget.focused, (try parse(&.{ "toggle-fullscreen", "focused" })).toggle_fullscreen);
     try std.testing.expectEqual(control.WindowTarget.focused, (try parse(&.{ "toggle-floating", "focused" })).toggle_floating);
     try std.testing.expectEqual(control.Layout.master_stack, (try parse(&.{ "set-layout", "master-stack" })).set_layout);
+    try std.testing.expectEqual(control.LogLevel.debug, (try parse(&.{ "set-log-level", "debug" })).set_log_level);
     try std.testing.expectEqual(@as(i64, 10), (try parse(&.{ "switch-workspace", "10" })).switch_workspace);
     try std.testing.expect(!(try parse(&.{"stats"})).stats.reset);
     try std.testing.expect((try parse(&.{ "stats", "--reset" })).stats.reset);
@@ -477,6 +485,7 @@ test "CLI parsing maps wire values and validates workspaces" {
     try std.testing.expectError(error.InvalidWorkspace, parse(&.{ "switch-workspace", "11" }));
     try std.testing.expectError(error.InvalidDirection, parse(&.{ "focus", "sideways" }));
     try std.testing.expectError(error.InvalidWindowTarget, parse(&.{ "close", "all" }));
+    try std.testing.expectError(error.InvalidLogLevel, parse(&.{ "set-log-level", "verbose" }));
     try std.testing.expectError(error.UnknownCommand, parse(&.{ "unknown", "value" }));
 }
 
@@ -504,6 +513,24 @@ test "reload parameters encode as an empty object" {
     );
     try std.testing.expectEqualStrings(
         "{\"method\":\"dev.rockorager.keywork.compositor.ReloadConfiguration\",\"parameters\":{}}\x00",
+        output.items,
+    );
+}
+
+test "log level parameters encode as a typed value" {
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(std.testing.allocator);
+    try varlink.encode(
+        std.testing.allocator,
+        &output,
+        .{
+            .method = control.set_log_level_method,
+            .parameters = .{ .level = control.LogLevel.warning },
+        },
+        1024,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"method\":\"dev.rockorager.keywork.compositor.SetLogLevel\",\"parameters\":{\"level\":\"warning\"}}\x00",
         output.items,
     );
 }

@@ -44,6 +44,7 @@ pub const Executor = struct {
         std.mem.Allocator,
         bool,
     ) anyerror![]control.OutputStatistics,
+    set_log_level: *const fn (*anyopaque, control.LogLevel) void,
     reload: *const fn (*anyopaque) ?[]const u8,
     quit: *const fn (*anyopaque) void,
 };
@@ -51,6 +52,7 @@ pub const Executor = struct {
 const Direction = control.Direction;
 const WindowTarget = control.WindowTarget;
 const Layout = control.Layout;
+const LogLevel = control.LogLevel;
 
 pub fn init(
     self: *Self,
@@ -503,6 +505,16 @@ fn handleMessage(
         });
         return;
     }
+    if (std.mem.eql(u8, call.method, control.set_log_level_method)) {
+        const parameters = parseParameters(struct { level: LogLevel }, allocator, call.parameters) catch {
+            if (!call.oneway) try writeInvalidParameter(allocator, output, "level");
+            return;
+        };
+        defer parameters.deinit();
+        executor.set_log_level(executor.context, parameters.value.level);
+        if (!call.oneway) try writeSuccess(allocator, output);
+        return;
+    }
     if (std.mem.eql(u8, call.method, control.reload_configuration_method)) {
         if (!emptyParameters(call.parameters)) {
             if (!call.oneway) try writeInvalidParameter(allocator, output, "parameters");
@@ -618,6 +630,7 @@ const Recorder = struct {
     commands: std.ArrayList(command.Command) = .empty,
     statistics_count: usize = 0,
     statistics_reset: bool = false,
+    log_level: ?control.LogLevel = null,
     reload_count: usize = 0,
     reload_failure: ?[]const u8 = null,
     quit_count: usize = 0,
@@ -631,6 +644,7 @@ const Recorder = struct {
             .context = self,
             .execute = execute,
             .statistics = statistics,
+            .set_log_level = setLogLevel,
             .reload = reload,
             .quit = quit,
         };
@@ -733,6 +747,11 @@ const Recorder = struct {
             .commit_to_presentation = latency,
         };
         return result;
+    }
+
+    fn setLogLevel(context: *anyopaque, level: control.LogLevel) void {
+        const self: *Recorder = @ptrCast(@alignCast(context));
+        self.log_level = level;
     }
 
     fn reload(context: *anyopaque) ?[]const u8 {
@@ -885,6 +904,24 @@ test "configuration reload returns success or a typed failure" {
         "{\"error\":\"dev.rockorager.keywork.compositor.ConfigurationReloadFailed\",\"parameters\":{\"message\":\"/home/test/.config/keywork/config:3: unknown general setting\"}}\x00",
         output.items,
     );
+}
+
+test "log level calls forward the typed level" {
+    var recorder: Recorder = .{};
+    defer recorder.deinit();
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(std.testing.allocator);
+    var quit_requested = false;
+
+    try handleMessage(
+        std.testing.allocator,
+        recorder.executor(),
+        "{\"method\":\"dev.rockorager.keywork.compositor.SetLogLevel\",\"parameters\":{\"level\":\"debug\"}}",
+        &output,
+        &quit_requested,
+    );
+    try std.testing.expectEqual(control.LogLevel.debug, recorder.log_level.?);
+    try std.testing.expectEqualStrings("{\"parameters\":{}}\x00", output.items);
 }
 
 test "performance statistics return typed output snapshots and forward reset" {

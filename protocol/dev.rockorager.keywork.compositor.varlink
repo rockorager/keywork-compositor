@@ -10,6 +10,9 @@ type WindowTarget (focused)
 # A built-in tiling layout.
 type Layout (master_stack, dwindle, scrolling)
 
+# Logging verbosity selected for the compositor.
+type LogLevel (error, warning, info, debug)
+
 # Rolling latency distribution in microseconds.
 type LatencyStatistics (
     samples: int,
@@ -140,6 +143,9 @@ method MoveFocusedToWorkspace (workspace: int) -> ()
 
 # Return a snapshot of per-output frame statistics, then optionally reset them.
 method GetPerformanceStatistics (reset: bool) -> (outputs: []OutputStatistics)
+
+# Change the maximum log level without restarting the compositor.
+method SetLogLevel (level: LogLevel) -> ()
 
 # Parse and atomically apply the selected configuration.
 method ReloadConfiguration () -> ()

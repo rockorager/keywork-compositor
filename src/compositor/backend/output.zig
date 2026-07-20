@@ -30,6 +30,7 @@ pub const Kind = enum {
 
 pub const Listener = NestedOutput.Listener;
 pub const DirectScanoutResult = DrmOutput.DirectScanoutResult;
+pub const ShapeCursor = DrmOutput.ShapeCursor;
 
 pub fn init(
     self: *Self,
@@ -230,6 +231,36 @@ pub fn powered(self: *const Self) bool {
     return switch (self.backend) {
         .drm => |output| output.powered,
         .headless, .nested => true,
+    };
+}
+
+/// Applies a built-in cursor shape when this backend can safely use hardware.
+/// False means the caller must retain software composition.
+pub fn setShapeCursor(self: *Self, cursor: ShapeCursor) bool {
+    return switch (self.backend) {
+        .drm => |output| output.setShapeCursor(cursor),
+        .headless, .nested => false,
+    };
+}
+
+pub fn canUseShapeCursor(self: *const Self, cursor: ShapeCursor) bool {
+    return switch (self.backend) {
+        .drm => |output| output.canUseShapeCursor(cursor),
+        .headless, .nested => false,
+    };
+}
+
+pub fn disableShapeCursor(self: *Self) bool {
+    return switch (self.backend) {
+        .drm => |output| output.disableShapeCursor(),
+        .headless, .nested => true,
+    };
+}
+
+pub fn shapeCursorActive(self: *const Self) bool {
+    return switch (self.backend) {
+        .drm => |output| output.shapeCursorActive(),
+        .headless, .nested => false,
     };
 }
 

@@ -86,6 +86,7 @@ const BuiltinKeybindings = @import("builtin_keybindings.zig");
 const Command = @import("command.zig").Command;
 const Config = @import("config.zig");
 const Launcher = @import("launcher.zig");
+const Logging = @import("logging.zig");
 const Control = @import("control.zig");
 const ControlProtocol = @import("keywork-control");
 const WindowManager = @import("window_manager.zig");
@@ -223,15 +224,20 @@ const RenderOutput = struct {
     output_calibration: ?render.OutputCalibration,
     timer: ?*wl.EventSource,
     repaint_idle: ?*wl.EventSource,
+    frame_callback_timer: ?*wl.EventSource,
     damage: Region,
     damage_rectangles: std.ArrayList(render.Rect),
     repaint_needed: bool,
     render_scheduled: bool,
+    frame_callback_scheduled: bool,
     lock_frame_pending: bool,
     consecutive_output_busy_retries: u8,
     frame_statistics: FrameStatistics,
     request_started_nanoseconds: ?i96,
+    last_frame_callback_nanoseconds: ?i96,
     pending_frame: ?PendingFrame,
+    cursor_state: enum { software, activating, hardware, deactivating },
+    cursor_transition_committed: bool,
 
     const Point = struct { x: f64, y: f64 };
 
@@ -265,6 +271,9 @@ const RenderOutput = struct {
         pending.commit_nanoseconds = nowNanoseconds(self.server.io);
         self.consecutive_output_busy_retries = 0;
         self.frame_statistics.recordFrame(path, scanout_format, damage);
+        if (self.cursor_state == .activating or self.cursor_state == .deactivating) {
+            self.cursor_transition_committed = true;
+        }
         switch (path) {
             .composited => increment(&self.frame_statistics.composited_frames),
             .direct_scanout => increment(&self.frame_statistics.direct_scanout_frames),
@@ -649,9 +658,26 @@ fn nanosecondsToMicroseconds(nanoseconds: u64) u64 {
 
 fn presentationRefreshNanoseconds(info: presentation.Info, refresh_millihertz: i32) u64 {
     if (info.refresh_nanoseconds != 0) return info.refresh_nanoseconds;
+    return outputRefreshNanoseconds(refresh_millihertz);
+}
+
+fn outputRefreshNanoseconds(refresh_millihertz: i32) u64 {
     if (refresh_millihertz <= 0) return presentation.nominal_refresh_nanoseconds;
     const frequency: u64 = @intCast(refresh_millihertz);
     return (std.time.ns_per_s * 1000 + frequency / 2) / frequency;
+}
+
+fn frameCallbackDelayMilliseconds(
+    now_nanoseconds: i96,
+    last_callback_nanoseconds: ?i96,
+    refresh_millihertz: i32,
+) i32 {
+    const last = last_callback_nanoseconds orelse return 1;
+    const deadline = last + @as(i96, @intCast(outputRefreshNanoseconds(refresh_millihertz)));
+    if (deadline <= now_nanoseconds) return 1;
+    const remaining = deadline - now_nanoseconds;
+    const delay = @divTrunc(remaining + std.time.ns_per_ms - 1, std.time.ns_per_ms);
+    return @intCast(@min(delay, std.math.maxInt(i32)));
 }
 
 fn percentile(sorted: []const u64, percentage: u8) u64 {
@@ -694,6 +720,26 @@ fn controlScanoutFormat(format: ?render.DmabufFormat) ControlProtocol.BufferForm
 
 fn increment(value: *u64) void {
     value.* +|= 1;
+}
+
+test "callback-only frames remain refresh paced without a repaint" {
+    const last: i96 = 100 * std.time.ns_per_ms;
+    try std.testing.expectEqual(
+        @as(i32, 9),
+        frameCallbackDelayMilliseconds(last, last, 120_000),
+    );
+    try std.testing.expectEqual(
+        @as(i32, 8),
+        frameCallbackDelayMilliseconds(last + std.time.ns_per_ms, last, 120_000),
+    );
+    try std.testing.expectEqual(
+        @as(i32, 1),
+        frameCallbackDelayMilliseconds(last + 9 * std.time.ns_per_ms, last, 120_000),
+    );
+    try std.testing.expectEqual(
+        @as(i32, 1),
+        frameCallbackDelayMilliseconds(last, null, 120_000),
+    );
 }
 
 test "frame statistics summarize rolling latency and classify over-budget frames" {
@@ -1648,7 +1694,7 @@ pub fn createWithVirtualOutput(
     self.seat.setRepaintListener(.{
         .context = self,
         .request = requestRepaint,
-        .cursor_moved = cursorMoved,
+        .cursor_changed = cursorChanged,
     });
     self.layer_shell.setRepaintListener(.{
         .context = self,
@@ -1874,15 +1920,20 @@ fn addRenderOutput(
         .output_calibration = null,
         .timer = null,
         .repaint_idle = null,
+        .frame_callback_timer = null,
         .damage = Region.init(),
         .damage_rectangles = .empty,
         .repaint_needed = false,
         .render_scheduled = false,
+        .frame_callback_scheduled = false,
         .lock_frame_pending = false,
         .consecutive_output_busy_retries = 0,
         .frame_statistics = .{},
         .request_started_nanoseconds = null,
+        .last_frame_callback_nanoseconds = null,
         .pending_frame = null,
+        .cursor_state = .software,
+        .cursor_transition_committed = false,
     };
     errdefer render_output.damage.deinit();
     errdefer render_output.damage_rectangles.deinit(self.allocator);
@@ -1923,6 +1974,7 @@ fn addRenderOutput(
         .model = render_output.backend.model(config.model),
     });
     errdefer std.debug.assert(self.outputs.remove(render_output.protocol_id));
+    errdefer stopRenderOutput(render_output);
     if (render_output.backend.repaintDelayMilliseconds() != null) {
         render_output.timer = try self.display.getEventLoop().addTimer(
             *RenderOutput,
@@ -1930,7 +1982,11 @@ fn addRenderOutput(
             render_output,
         );
     }
-    errdefer stopRenderOutput(render_output);
+    render_output.frame_callback_timer = try self.display.getEventLoop().addTimer(
+        *RenderOutput,
+        handleFrameCallbackTimer,
+        render_output,
+    );
     const id = try self.render_outputs.insert(self.allocator, render_output);
     errdefer std.debug.assert(self.render_outputs.remove(id) != null);
     if (self.workspace_initialized) try self.workspace.addOutput(render_output.protocol_id);
@@ -2779,6 +2835,9 @@ fn drmDeviceFailed(context: *anyopaque) void {
 }
 
 fn stopRenderOutput(render_output: *RenderOutput) void {
+    _ = render_output.backend.disableShapeCursor();
+    render_output.cursor_state = .software;
+    render_output.cursor_transition_committed = false;
     if (render_output.timer) |timer| {
         timer.remove();
         render_output.timer = null;
@@ -2787,7 +2846,12 @@ fn stopRenderOutput(render_output: *RenderOutput) void {
         idle.remove();
         render_output.repaint_idle = null;
     }
+    if (render_output.frame_callback_timer) |timer| {
+        timer.remove();
+        render_output.frame_callback_timer = null;
+    }
     render_output.render_scheduled = false;
+    render_output.frame_callback_scheduled = false;
 }
 
 pub fn listen(self: *Self) ![:0]const u8 {
@@ -2807,6 +2871,7 @@ pub fn listenControl(self: *Self, runtime_directory: []const u8) !void {
             .context = self,
             .execute = executeControlCommand,
             .statistics = controlPerformanceStatistics,
+            .set_log_level = setControlLogLevel,
             .reload = reloadControlConfiguration,
             .quit = quitControlSession,
         },
@@ -2854,6 +2919,11 @@ fn outputStatisticsId(tag: u64) OutputLayout.Id {
         .index = @truncate(tag),
         .generation = @truncate(tag >> 32),
     };
+}
+
+fn setControlLogLevel(_: *anyopaque, level: ControlProtocol.LogLevel) void {
+    Logging.setLevel(level);
+    log.info("log level set to {s}", .{@tagName(level)});
 }
 
 fn collectGpuTimings(self: *Self) void {
@@ -3212,8 +3282,9 @@ pub fn terminate(self: *Self) void {
     self.display.terminate();
 }
 
-fn requestRepaint(context: *anyopaque) void {
+noinline fn requestRepaint(context: *anyopaque) void {
     const self: *Self = @ptrCast(@alignCast(context));
+    log.debug("full repaint requested by 0x{x}", .{@returnAddress()});
     self.refreshIdleInhibition();
     if (self.image_copy_capture_initialized) self.image_copy_capture.refreshCursors();
     var render_outputs = self.render_outputs.iterator();
@@ -3228,32 +3299,197 @@ fn requestRepaint(context: *anyopaque) void {
     }
 }
 
-fn cursorMoved(context: *anyopaque, old: Seat.CursorInfo, new: Seat.CursorInfo) void {
+fn cursorChanged(context: *anyopaque, old: ?Seat.CursorInfo, new: ?Seat.CursorInfo) void {
     const self: *Self = @ptrCast(@alignCast(context));
     self.refreshIdleInhibition();
     if (self.image_copy_capture_initialized) self.image_copy_capture.refreshCursors();
-    const old_bounds = self.cursorBounds(old) orelse return requestRepaint(self);
-    const new_bounds = self.cursorBounds(new) orelse return requestRepaint(self);
-    self.damageGlobalRect(old_bounds);
-    self.damageGlobalRect(new_bounds);
+    var outputs = self.render_outputs.iterator();
+    while (outputs.next()) |entry| {
+        const output = entry.value.*;
+        self.updateOutputCursor(output, old, new);
+    }
+}
+
+fn shapeCursorForOutput(self: *Self, output: *RenderOutput, info: ?Seat.CursorInfo) ?OutputBackend.ShapeCursor {
+    if (self.data_device.iconInfo() != null or output.output_calibration != null) return null;
+    const cursor = info orelse return null;
+    const shape = switch (cursor) {
+        .shape => |shape| shape,
+        .surface => return null,
+    };
+    const bounds = self.cursorBounds(cursor) orelse return null;
+    if (bounds.intersection(self.outputs.get(output.protocol_id).?.logicalRect()) == null) return null;
+    const hardware: OutputBackend.ShapeCursor = .{
+        .buffer = shape.buffer,
+        .global_x = shape.x,
+        .global_y = shape.y,
+    };
+    return if (output.backend.canUseShapeCursor(hardware)) hardware else null;
+}
+
+fn addOutputCursorDamage(self: *Self, output: *RenderOutput, info: ?Seat.CursorInfo) bool {
+    const cursor = info orelse return false;
+    const bounds = self.cursorBounds(cursor) orelse {
+        const size = output.backend.modeSize();
+        output.damage.setRectangle(0, 0, size.width, size.height);
+        return true;
+    };
+    const output_rect = self.outputs.get(output.protocol_id).?.logicalRect();
+    const intersection = bounds.intersection(output_rect) orelse return false;
+    const physical = scaleDamageRect(.{
+        .x = intersection.x -| output_rect.x,
+        .y = intersection.y -| output_rect.y,
+        .width = intersection.width,
+        .height = intersection.height,
+    }, output.backend.renderScale(), output.backend.modeSize()) orelse return false;
+    output.damage.add(physical.x, physical.y, @intCast(physical.width), @intCast(physical.height)) catch {
+        const size = output.backend.modeSize();
+        output.damage.setRectangle(0, 0, size.width, size.height);
+    };
+    return true;
+}
+
+fn damageOutputCursor(self: *Self, output: *RenderOutput, info: ?Seat.CursorInfo) void {
+    if (!self.addOutputCursorDamage(output, info)) return;
+    output.requestFrame();
+    self.scheduleRepaint(output);
+}
+
+fn cursorIntersectsOutput(self: *Self, output: *RenderOutput, info: ?Seat.CursorInfo) bool {
+    const cursor = info orelse return false;
+    const bounds = self.cursorBounds(cursor) orelse return true;
+    return bounds.intersection(self.outputs.get(output.protocol_id).?.logicalRect()) != null;
+}
+
+fn updateOutputCursor(self: *Self, output: *RenderOutput, old: ?Seat.CursorInfo, new: ?Seat.CursorInfo) void {
+    if (!output.backend.powered()) return;
+    const eligible = self.shapeCursorForOutput(output, new);
+    switch (output.cursor_state) {
+        .software => if (eligible) |shape| {
+            if (self.cursorIntersectsOutput(output, old)) {
+                self.damageOutputCursor(output, old);
+                output.cursor_state = .activating;
+                output.cursor_transition_committed = false;
+            } else if (output.backend.setShapeCursor(shape)) {
+                output.cursor_state = .hardware;
+            } else self.damageOutputCursor(output, new);
+        } else {
+            self.damageOutputCursor(output, old);
+            self.damageOutputCursor(output, new);
+        },
+        .activating => if (eligible == null) {
+            if (!output.cursor_transition_committed) {
+                output.cursor_state = .software;
+                self.damageOutputCursor(output, new);
+            }
+        },
+        .hardware => if (eligible) |shape| {
+            if (!output.backend.setShapeCursor(shape)) {
+                output.cursor_state = if (output.backend.shapeCursorActive()) .deactivating else .software;
+                output.cursor_transition_committed = false;
+                self.damageOutputCursor(output, new);
+            }
+        } else if (!self.cursorIntersectsOutput(output, new)) {
+            if (output.backend.disableShapeCursor()) output.cursor_state = .software else {
+                output.cursor_state = .deactivating;
+                output.cursor_transition_committed = false;
+                self.damageOutputCursor(output, old);
+            }
+        } else {
+            output.cursor_state = .deactivating;
+            output.cursor_transition_committed = false;
+            self.damageOutputCursor(output, new);
+        },
+        .deactivating => {
+            self.damageOutputCursor(output, old);
+            self.damageOutputCursor(output, new);
+        },
+    }
+}
+
+fn reconcileOutputCursors(self: *Self) void {
+    const cursor = self.seatCursorInfo(&self.seat, self.session_lock.isLocked());
+    var outputs = self.render_outputs.iterator();
+    while (outputs.next()) |entry| self.updateOutputCursor(entry.value.*, cursor, cursor);
+}
+
+fn prepareOutputCursorFrame(self: *Self, output: *RenderOutput) void {
+    if ((output.cursor_state == .hardware or output.cursor_state == .deactivating) and
+        !output.backend.shapeCursorActive())
+    {
+        output.cursor_state = .software;
+        output.cursor_transition_committed = false;
+        _ = self.addOutputCursorDamage(
+            output,
+            self.seatCursorInfo(&self.seat, self.session_lock.isLocked()),
+        );
+    }
+
+    const cursor = self.seatCursorInfo(&self.seat, self.session_lock.isLocked());
+    const eligible = self.shapeCursorForOutput(output, cursor);
+    switch (output.cursor_state) {
+        .software => {},
+        .activating => if (eligible == null and !output.cursor_transition_committed) {
+            output.cursor_state = .software;
+            _ = self.addOutputCursorDamage(output, cursor);
+        },
+        .hardware => if (eligible) |shape| {
+            if (!output.backend.setShapeCursor(shape)) {
+                output.cursor_state = if (output.backend.shapeCursorActive()) .deactivating else .software;
+                output.cursor_transition_committed = false;
+                _ = self.addOutputCursorDamage(output, cursor);
+            }
+        } else if (self.cursorIntersectsOutput(output, cursor)) {
+            output.cursor_state = .deactivating;
+            output.cursor_transition_committed = false;
+            _ = self.addOutputCursorDamage(output, cursor);
+        } else if (output.backend.disableShapeCursor()) {
+            output.cursor_state = .software;
+        } else {
+            output.cursor_state = .deactivating;
+            output.cursor_transition_committed = false;
+            const size = output.backend.modeSize();
+            output.damage.setRectangle(0, 0, size.width, size.height);
+        },
+        .deactivating => {},
+    }
+}
+
+fn scheduleCursorFallbackAfterColorChange(self: *Self, output: *RenderOutput) void {
+    if (output.cursor_state != .hardware) return;
+    const cursor = self.seatCursorInfo(&self.seat, self.session_lock.isLocked());
+    if (self.shapeCursorForOutput(output, cursor) != null) return;
+    self.damageOutputCursor(output, cursor);
 }
 
 fn surfaceChanged(context: *anyopaque, surface_id: Surface.Id) void {
     const self: *Self = @ptrCast(@alignCast(context));
     const surfaces = self.compositor.surfaceStore();
-    if (!Surface.currentDamagePrecise(surfaces, surface_id)) return requestRepaint(self);
     const root = self.subcompositor.rootSurface(surface_id);
     const root_position = self.scene.surfacePosition(root) orelse return requestRepaint(self);
+    // Subsurface commits bypass the Scene commit path that filters hidden roots.
+    if (!self.scene.surfaceMapped(root)) return;
+    if (!Surface.currentDamagePrecise(surfaces, surface_id)) return requestRepaint(self);
     const offset = self.subcompositor.surfaceOffset(surface_id);
     const damage = Surface.currentDamage(surfaces, surface_id) orelse
         return requestRepaint(self);
     const layer_shadow = if (std.meta.eql(surface_id, root) and
         self.layer_shell.usesEffects(root)) self.layer_shell_effects.shadow else null;
     if (damage.isEmpty()) {
-        var bounds: ?render.Rect = null;
-        self.addSurfaceTreeBounds(root, root_position.x, root_position.y, &bounds) catch
-            return requestRepaint(self);
-        if (bounds) |rectangle| self.damageGlobalRect(rectangle);
+        if (Logging.enabled(.debug)) {
+            const resource = Surface.resourceFor(surfaces, surface_id) orelse return;
+            log.debug(
+                "surface commit has no damage: pid={} surface={}:{} root={}:{}",
+                .{
+                    resource.getClient().getCredentials().pid,
+                    surface_id.index,
+                    surface_id.generation,
+                    root.index,
+                    root.generation,
+                },
+            );
+        }
+        self.scheduleSurfaceFrameCallback(surface_id);
         return;
     }
 
@@ -3265,10 +3501,45 @@ fn surfaceChanged(context: *anyopaque, surface_id: Surface.Id) void {
             .width = rectangle.width,
             .height = rectangle.height,
         };
+        if (Logging.enabled(.debug)) {
+            const resource = Surface.resourceFor(surfaces, surface_id) orelse return;
+            log.debug(
+                "surface damage: pid={} surface={}:{} root={}:{} local={},{},{}x{} global={},{},{}x{}",
+                .{
+                    resource.getClient().getCredentials().pid,
+                    surface_id.index,
+                    surface_id.generation,
+                    root.index,
+                    root.generation,
+                    rectangle.x,
+                    rectangle.y,
+                    rectangle.width,
+                    rectangle.height,
+                    global.x,
+                    global.y,
+                    global.width,
+                    global.height,
+                },
+            );
+        }
         self.damageGlobalRect(if (layer_shadow) |shadow|
             shadowDamageRect(global, shadow)
         else
-            global);
+            global, root);
+    }
+}
+
+fn scheduleSurfaceFrameCallback(self: *Self, surface_id: Surface.Id) void {
+    const surfaces = self.compositor.surfaceStore();
+    if (!Surface.hasCallbackOnlyFrameCallback(surfaces, surface_id)) return;
+
+    var render_outputs = self.render_outputs.iterator();
+    while (render_outputs.next()) |entry| {
+        const render_output = entry.value.*;
+        if (!render_output.backend.powered()) continue;
+        const output = self.outputs.get(render_output.protocol_id).?;
+        if (!output.containsSurface(surface_id)) continue;
+        self.scheduleFrameCallback(render_output);
     }
 }
 
@@ -3293,7 +3564,13 @@ fn cursorBounds(self: *Self, cursor: Seat.CursorInfo) ?render.Rect {
     };
 }
 
-fn damageGlobalRect(self: *Self, rectangle: render.Rect) void {
+fn damageGlobalRect(
+    self: *Self,
+    rectangle: render.Rect,
+    source_root: ?Surface.Id,
+) void {
+    // Surface commits carry their root for source-aware capture invalidation.
+    // Cursors are painted after backdrop captures and only damage their bounds.
     var render_outputs = self.render_outputs.iterator();
     while (render_outputs.next()) |entry| {
         const render_output = entry.value.*;
@@ -3311,15 +3588,65 @@ fn damageGlobalRect(self: *Self, rectangle: render.Rect) void {
             render_output.backend.renderScale(),
             render_output.backend.modeSize(),
         ) orelse continue;
-        render_output.damage.add(
-            physical.x,
-            physical.y,
-            @intCast(physical.width),
-            @intCast(physical.height),
-        ) catch {
-            self.damageFullOutput(render_output);
-            continue;
-        };
+        if (source_root) |root| {
+            var surface_damage = Region.init();
+            defer surface_damage.deinit();
+            surface_damage.setRectangle(
+                physical.x,
+                physical.y,
+                physical.width,
+                physical.height,
+            );
+            self.expandBackdropBlurDamage(
+                render_output,
+                output,
+                &surface_damage,
+                root,
+            ) catch {
+                self.damageFullOutput(render_output);
+                continue;
+            };
+            if (Logging.enabled(.debug) and surface_damage.coversRectangle(
+                0,
+                0,
+                render_output.backend.modeSize().width,
+                render_output.backend.modeSize().height,
+            )) {
+                log.debug(
+                    "surface damage expanded to full output: root={}:{} source={},{},{}x{}",
+                    .{
+                        root.index,
+                        root.generation,
+                        physical.x,
+                        physical.y,
+                        physical.width,
+                        physical.height,
+                    },
+                );
+            }
+            var rectangles = surface_damage.rectangleIterator();
+            while (rectangles.next()) |damaged| {
+                render_output.damage.add(
+                    damaged.x,
+                    damaged.y,
+                    @intCast(damaged.width),
+                    @intCast(damaged.height),
+                ) catch {
+                    self.damageFullOutput(render_output);
+                    break;
+                };
+            }
+        } else {
+            render_output.damage.add(
+                physical.x,
+                physical.y,
+                @intCast(physical.width),
+                @intCast(physical.height),
+            ) catch {
+                self.damageFullOutput(render_output);
+                continue;
+            };
+        }
         render_output.requestFrame();
         self.scheduleRepaint(render_output);
     }
@@ -3359,7 +3686,8 @@ fn scaleDamageRect(
     };
 }
 
-fn damageFullOutput(self: *Self, output: *RenderOutput) void {
+noinline fn damageFullOutput(self: *Self, output: *RenderOutput) void {
+    log.debug("full output damage requested by 0x{x}", .{@returnAddress()});
     const size = output.backend.modeSize();
     output.damage.setRectangle(0, 0, size.width, size.height);
     output.requestFrame();
@@ -3435,6 +3763,7 @@ fn workspaceActivationRequested(context: *anyopaque, output: OutputLayout.Id, nu
 fn sessionLockStateChanged(context: *anyopaque, locked: bool) void {
     const self: *Self = @ptrCast(@alignCast(context));
     self.refreshIdleInhibition();
+    self.reconcileOutputCursors();
     if (locked) self.xwayland_keyboard_grab.cancelAll();
     if (self.window_manager_initialized and self.window_manager.endCompositorPointerGrab(false)) {
         requestRepaint(self);
@@ -3502,6 +3831,22 @@ fn scheduleRepaint(self: *Self, output: *RenderOutput) void {
     output.render_scheduled = true;
 }
 
+fn scheduleFrameCallback(self: *Self, output: *RenderOutput) void {
+    if (!output.backend.powered()) return;
+    const timer = output.frame_callback_timer orelse unreachable;
+    const delay = frameCallbackDelayMilliseconds(
+        nowNanoseconds(self.io),
+        output.last_frame_callback_nanoseconds,
+        output.backend.refreshMillihertz(),
+    );
+    timer.timerUpdate(delay) catch |err| {
+        log.err("failed to schedule frame callback: {t}", .{err});
+        self.terminate();
+        return;
+    };
+    output.frame_callback_scheduled = true;
+}
+
 fn outputReady(context: *anyopaque) void {
     const output: *RenderOutput = @ptrCast(@alignCast(context));
     output.server.scheduleRepaint(output);
@@ -3510,10 +3855,38 @@ fn outputReady(context: *anyopaque) void {
 fn outputPresented(context: *anyopaque, info: presentation.Info) void {
     const output: *RenderOutput = @ptrCast(@alignCast(context));
     const self = output.server;
+    const transition_presented = output.cursor_transition_committed;
     output.presentFrame(info);
+    if (transition_presented) {
+        output.cursor_transition_committed = false;
+        switch (output.cursor_state) {
+            .activating => {
+                const cursor = self.seatCursorInfo(&self.seat, self.session_lock.isLocked());
+                if (self.shapeCursorForOutput(output, cursor)) |shape| {
+                    output.cursor_state = if (output.backend.setShapeCursor(shape)) .hardware else .software;
+                    if (output.cursor_state == .software) self.damageOutputCursor(output, cursor);
+                } else {
+                    output.cursor_state = .software;
+                    self.damageOutputCursor(output, cursor);
+                }
+            },
+            .deactivating => {
+                if (output.backend.disableShapeCursor()) {
+                    output.cursor_state = .software;
+                    const cursor = self.seatCursorInfo(&self.seat, self.session_lock.isLocked());
+                    self.updateOutputCursor(output, cursor, cursor);
+                } else {
+                    self.damageFullOutput(output);
+                }
+            },
+            else => {},
+        }
+    }
     const protocol_output = self.outputs.get(output.protocol_id).?;
     protocol_output.setRefresh(info);
     Surface.finishPresentation(self.compositor.surfaceStore(), protocol_output, info);
+    output.last_frame_callback_nanoseconds = nowNanoseconds(self.io);
+    if (protocol_output.hasCallbackOnlyFrameCallbacks()) self.scheduleFrameCallback(output);
     if (output.lock_frame_pending) {
         output.lock_frame_pending = false;
         self.session_lock.outputPresented(output.protocol_id);
@@ -3524,6 +3897,7 @@ fn outputDiscarded(context: *anyopaque) void {
     const output: *RenderOutput = @ptrCast(@alignCast(context));
     const self = output.server;
     output.discardFrame();
+    output.cursor_transition_committed = false;
     output.lock_frame_pending = false;
     Surface.discardPresentation(
         self.compositor.surfaceStore(),
@@ -4647,6 +5021,7 @@ fn dragStarted(context: *anyopaque) void {
     if (self.window_manager.endCompositorPointerGrab(false)) requestRepaint(self);
     self.pointer_constraints.deactivateAll();
     if (self.xwm_initialized) self.xwm.dragStarted();
+    self.reconcileOutputCursors();
     const position = self.seat.pointerPosition() orelse return;
     const route = self.dragPointerRoute(position.x, position.y);
     if (!self.data_device.dragIsExternal()) self.seat.suppressPointerFocus(true);
@@ -4686,6 +5061,7 @@ fn xdgToplevelDragEnd(context: *anyopaque) void {
 fn dragEnded(context: *anyopaque) void {
     const self: *Self = @ptrCast(@alignCast(context));
     if (self.xwm_initialized) self.xwm.physicalDragEnded();
+    self.reconcileOutputCursors();
     const position = self.seat.pointerPosition() orelse return;
     const route = self.pointerRoute(position.x, position.y);
     self.seat.pointerEnter(position.x, position.y, route.focus);
@@ -6230,9 +6606,9 @@ fn captureOutputRegion(
         render.Color.rgba(24, 24, 27, 255) }};
     try self.renderCommands(&frame, &clear_command);
     if (self.session_lock.isLocked()) {
-        try self.renderSessionLockContents(&frame, paint_cursors);
+        try self.renderSessionLockContents(&frame, paint_cursors, paint_cursors);
     } else {
-        _ = try self.renderDesktopContents(&frame, paint_cursors);
+        _ = try self.renderDesktopContents(&frame, paint_cursors, paint_cursors);
     }
     renderer_frame_active = false;
     try self.renderer.finishFrame();
@@ -6379,6 +6755,20 @@ test "capture bounds include negative child offsets" {
 
 fn handleRenderTimer(output_context: *RenderOutput) c_int {
     handleScheduledRender(output_context);
+    return 0;
+}
+
+fn handleFrameCallbackTimer(output_context: *RenderOutput) c_int {
+    output_context.frame_callback_scheduled = false;
+    if (!output_context.backend.powered()) return 0;
+
+    const now = nowNanoseconds(output_context.server.io);
+    const timestamp = presentation.Timestamp.fromNanoseconds(now);
+    const output = output_context.server.outputs.get(output_context.protocol_id).?;
+    if (output.sendCallbackOnlyFrameCallbacks(timestamp.milliseconds())) {
+        output_context.last_frame_callback_nanoseconds = now;
+        log.debug("completed callback-only frame callbacks for {s}", .{output.name()});
+    }
     return 0;
 }
 
@@ -6531,6 +6921,7 @@ fn expandBackdropBlurDamage(
     render_output: *const RenderOutput,
     output: *const Output,
     damage: *Region,
+    source_root: ?Surface.Id,
 ) Region.Error!void {
     const surface_blur = Scene.background_blur;
     var changed = true;
@@ -6543,6 +6934,15 @@ fn expandBackdropBlurDamage(
             const buffer = Surface.currentBuffer(surfaces, surface_entry.id) orelse continue;
             if (surfaceFullyOpaque(surfaces, surface_entry.id, buffer)) continue;
             const root = self.subcompositor.rootSurface(surface_entry.id);
+            if (source_root) |source| {
+                // A tree is painted after its backdrop capture, so its own commits
+                // cannot change that capture. A lower top-level node cannot depend
+                // on a commit above it; other surface categories remain conservative.
+                if (std.meta.eql(root, source)) continue;
+                if (self.scene.surfaceNodeAbove(root, source)) |above| {
+                    if (!above) continue;
+                }
+            }
             if (!self.scene.surfaceMapped(root)) continue;
             const root_position = self.scene.surfacePosition(root) orelse continue;
             const offset = self.subcompositor.surfaceOffset(surface_entry.id);
@@ -6614,6 +7014,9 @@ test "backdrop blur damage expands transitively across overlapping effects" {
 }
 
 fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Renderer.Error!void {
+    self.prepareOutputCursorFrame(render_output);
+    const paint_primary_cursor = render_output.cursor_state == .software or
+        render_output.cursor_state == .deactivating;
     const render_target = render_output.backend.acquire() orelse {
         increment(&render_output.frame_statistics.acquire_retries);
         render_output.repaint_needed = true;
@@ -6630,8 +7033,14 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
     defer frame_damage.deinit();
     try frame_damage.copyFrom(&render_output.damage);
     render_output.damage.clear();
+    // CPU captures read the live persistent target, so every dependency must
+    // be repainted. Vulkan reuses captures keyed by preceding scene content.
+    if (!self.renderer.supportsBackdropCaptureReuse()) {
+        try self.expandBackdropBlurDamage(render_output, output, &frame_damage, null);
+    }
+    // Buffer-age repair must retain the post-effect damage as this frame's new
+    // damage while adding only the acquired buffer's backlog to the redraw.
     try render_output.backend.repairDamage(&frame_damage);
-    try self.expandBackdropBlurDamage(render_output, output, &frame_damage);
     const damage = if (render_output.backend.persistentRenderTarget() and
         self.renderer.supportsPartialDamage())
         try self.outputDamageRectangles(render_output, &frame_damage)
@@ -6669,8 +7078,9 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
         render.Color.rgba(24, 24, 27, 255) }};
     try self.renderCommands(&frame, &clear_command);
     if (self.session_lock.isLocked()) {
-        try self.renderSessionLockContents(&frame, true);
+        try self.renderSessionLockContents(&frame, paint_primary_cursor, true);
         try self.selectFrameOutputColorDescription(render_output, null);
+        self.scheduleCursorFallbackAfterColorChange(render_output);
         renderer_frame_active = false;
         const completion = self.renderer.finishFrameScanout(
             outputStatisticsTag(render_output.protocol_id),
@@ -6687,7 +7097,7 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
         return self.presentSessionLockFrame(&frame, render_fence_fd);
     }
 
-    const top_fullscreen = self.renderDesktopContents(&frame, true) catch |err| {
+    const top_fullscreen = self.renderDesktopContents(&frame, paint_primary_cursor, true) catch |err| {
         log.err("desktop frame assembly failed: {t}", .{err});
         return err;
     };
@@ -6695,6 +7105,7 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
         render_output,
         self.renderer.preferredOutputTransfer(),
     );
+    self.scheduleCursorFallbackAfterColorChange(render_output);
     const fifo_barrier = Surface.hasFifoBarrierForOutput(
         self.compositor.surfaceStore(),
         output,
@@ -6864,7 +7275,7 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
     while (input_popups.next()) |popup| self.submitSurfaceTree(output, popup.surface_id);
     const drag_icon = self.data_device.iconInfo();
     if (drag_icon) |info| self.submitSurfaceTree(output, info.surface_id);
-    self.submitSeatCursor(output, &self.seat, false);
+    if (paint_primary_cursor) self.submitSeatCursor(output, &self.seat, false);
     self.submitTabletCursors(output, false);
     Surface.clearFifoBarriersForOutput(self.compositor.surfaceStore(), output);
     self.finishRepaintIfIdle();
@@ -6886,7 +7297,8 @@ fn selectFrameOutputColorDescription(
 fn renderDesktopContents(
     self: *Self,
     frame: *const OutputFrame,
-    paint_cursors: bool,
+    paint_primary_cursor: bool,
+    paint_tablet_cursors: bool,
 ) renderer_types.Renderer.Error!?Scene.Id {
     try self.renderLayerSurfaces(frame, .background);
     if (self.hasBackgroundEffect()) {
@@ -6959,10 +7371,8 @@ fn renderDesktopContents(
         );
     }
 
-    if (paint_cursors) {
-        try self.renderSeatCursor(frame, &self.seat, false);
-        try self.renderTabletCursors(frame, false);
-    }
+    if (paint_primary_cursor) try self.renderSeatCursor(frame, &self.seat, false);
+    if (paint_tablet_cursors) try self.renderTabletCursors(frame, false);
     return top_fullscreen;
 }
 
@@ -7018,7 +7428,9 @@ fn presentSessionLockFrame(
     self.color_management.refreshPreferred();
     self.foreign_toplevel_list.syncOutput(frame.render_output.protocol_id);
     if (lock_surface) |info| self.submitSurfaceTree(frame.output, info.surface_id);
-    self.submitSeatCursor(frame.output, &self.seat, true);
+    if (frame.render_output.cursor_state == .software or
+        frame.render_output.cursor_state == .deactivating)
+        self.submitSeatCursor(frame.output, &self.seat, true);
     self.submitTabletCursors(frame.output, true);
     Surface.clearFifoBarriersForOutput(self.compositor.surfaceStore(), frame.output);
     self.finishRepaintIfIdle();
@@ -7029,7 +7441,8 @@ fn presentSessionLockFrame(
 fn renderSessionLockContents(
     self: *Self,
     frame: *const OutputFrame,
-    paint_cursors: bool,
+    paint_primary_cursor: bool,
+    paint_tablet_cursors: bool,
 ) renderer_types.Renderer.Error!void {
     const lock_surface = self.session_lock.surfaceForOutput(frame.render_output.protocol_id);
     if (lock_surface) |info| {
@@ -7043,10 +7456,8 @@ fn renderSessionLockContents(
         );
     }
 
-    if (paint_cursors) {
-        try self.renderSeatCursor(frame, &self.seat, true);
-        try self.renderTabletCursors(frame, true);
-    }
+    if (paint_primary_cursor) try self.renderSeatCursor(frame, &self.seat, true);
+    if (paint_tablet_cursors) try self.renderTabletCursors(frame, true);
 }
 
 fn refreshKeyboardFocus(self: *Self) void {

@@ -205,7 +205,7 @@ pub const CursorInfo = union(enum) {
 pub const RepaintListener = struct {
     context: *anyopaque,
     request: *const fn (*anyopaque) void,
-    cursor_moved: *const fn (*anyopaque, CursorInfo, CursorInfo) void,
+    cursor_changed: *const fn (*anyopaque, ?CursorInfo, ?CursorInfo) void,
 };
 
 pub const KeyboardFocusListener = struct {
@@ -692,8 +692,9 @@ pub fn cursorInfo(self: *const Self) ?CursorInfo {
 }
 
 pub fn setDefaultCursor(self: *Self, cursor: ?CursorImage) void {
+    const old_cursor = self.cursorInfo();
     self.default_cursor = cursor;
-    self.requestRepaint();
+    self.notifyCursorChanged(old_cursor);
 }
 
 pub fn setKeyboardAvailable(self: *Self, available: bool) void {
@@ -1083,13 +1084,14 @@ pub fn warpPointer(
 }
 
 pub fn pointerLeave(self: *Self) void {
+    const old_cursor = self.cursorInfo();
     const fallback_visible = self.active_cursor == null and self.cursorInfo() != null;
     self.clearCursor();
     self.sendPointerLeave();
     self.pointer_focus = null;
     self.pointer_position = null;
     self.latest_pointer_enter = null;
-    if (fallback_visible) self.requestRepaint();
+    if (fallback_visible) self.notifyCursorChanged(old_cursor);
 }
 
 pub fn pointerButton(
@@ -1860,15 +1862,7 @@ fn setPointerPosition(self: *Self, x: f64, y: f64) void {
     std.debug.assert(std.math.isFinite(x) and std.math.isFinite(y));
     const old_cursor = self.cursorInfo();
     self.pointer_position = .{ .x = x, .y = y };
-    const new_cursor = self.cursorInfo();
-    if (self.repaint_listener) |listener| {
-        if (old_cursor) |old| {
-            const new = new_cursor orelse unreachable;
-            listener.cursor_moved(listener.context, old, new);
-        } else if (new_cursor) |new| {
-            listener.cursor_moved(listener.context, new, new);
-        }
-    }
+    self.notifyCursorChanged(old_cursor);
 }
 
 fn setCursor(
@@ -1920,6 +1914,7 @@ fn setCursor(
         .hotspot_x = hotspot_x,
         .hotspot_y = hotspot_y,
     } } else null;
+    const old_cursor = self.cursorInfo();
     if (manager_controller and !drag_controller) {
         self.cursor_controller.?.cursor = requested;
         self.cursor_controller.?.configured = true;
@@ -1929,7 +1924,7 @@ fn setCursor(
         }
     }
     self.active_cursor = requested;
-    self.requestRepaint();
+    self.notifyCursorChanged(old_cursor);
 }
 
 pub fn setCursorShape(
@@ -1954,6 +1949,7 @@ pub fn setCursorShape(
     if (!controller and !focused_client and !self.activeCursorOwnedBy(client)) return;
 
     const requested: ActiveCursor = .{ .shape = shape };
+    const old_cursor = self.cursorInfo();
     if (manager_controller and !drag_controller) {
         self.cursor_controller.?.cursor = requested;
         self.cursor_controller.?.configured = true;
@@ -1963,19 +1959,21 @@ pub fn setCursorShape(
         }
     }
     self.active_cursor = requested;
-    self.requestRepaint();
+    self.notifyCursorChanged(old_cursor);
 }
 
 pub fn clearCursorShapes(self: *Self) void {
+    const old_cursor = self.cursorInfo();
     self.default_cursor = null;
     if (self.active_cursor) |cursor| switch (cursor) {
         .surface => {},
-        .shape => self.clearCursor(),
+        .shape => self.active_cursor = null,
     };
     if (self.cursor_controller) |*controller| if (controller.cursor) |cursor| switch (cursor) {
         .surface => {},
         .shape => controller.cursor = null,
     };
+    self.notifyCursorChanged(old_cursor);
 }
 
 fn activeCursorOwnedBy(self: *Self, client: *wl.Client) bool {
@@ -1990,14 +1988,16 @@ fn activeCursorOwnedBy(self: *Self, client: *wl.Client) bool {
 }
 
 fn restoreControllerCursor(self: *Self) void {
+    const old_cursor = self.cursorInfo();
     self.active_cursor = if (self.cursor_controller) |controller| controller.cursor else null;
-    self.requestRepaint();
+    self.notifyCursorChanged(old_cursor);
 }
 
 fn clearCursor(self: *Self) void {
     if (self.active_cursor == null) return;
+    const old_cursor = self.cursorInfo();
     self.active_cursor = null;
-    self.requestRepaint();
+    self.notifyCursorChanged(old_cursor);
 }
 
 fn cursorSurfaceCommitted(self: *Self, id: Surface.Id, info: Surface.CommitInfo) void {
@@ -2041,6 +2041,11 @@ fn cursorSurfaceDestroyed(self: *Self, id: Surface.Id) void {
 
 fn requestRepaint(self: *Self) void {
     if (self.repaint_listener) |listener| listener.request(listener.context);
+}
+
+fn notifyCursorChanged(self: *Self, old_cursor: ?CursorInfo) void {
+    const listener = self.repaint_listener orelse return;
+    listener.cursor_changed(listener.context, old_cursor, self.cursorInfo());
 }
 
 fn recordUserAction(self: *Self, client: *wl.Client, serial: u32) void {
