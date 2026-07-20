@@ -3651,6 +3651,7 @@ fn renderFrameWithCompletion(
     }
     if (self.blur_ops.items.len != 0) output.blur_initialized = blur_initialized;
     for (self.blur_ops.items) |blur_op| {
+        if (!blur_op.used) continue;
         const cache = &output.backdrop_cache.items[blur_op.cache_index];
         if (blur_op.cache_hit) {
             if (blur_op.cache_rekey) cache.key = blur_op.cache_key;
@@ -7454,6 +7455,32 @@ test "Vulkan backdrop blur keeps its capture across an interleaved owner" {
     try renderer.renderFrame(.{ .size = target.size, .commands = &commands }, .{ .pixels = target });
 
     try std.testing.expectEqual(@as(u32, 0xff000000), pixels[1]);
+}
+
+test "Vulkan ignores an unused backdrop capture" {
+    var renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
+        error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+
+    const size: render.Size = .{ .width = 2, .height = 1 };
+    var pixels = [_]u32{0} ** 2;
+    const commands = [_]render.Command{
+        .{ .clear = render.Color.rgba(1, 2, 3, 255) },
+        .{ .backdrop_capture = .{
+            .rect = .{ .x = 0, .y = 0, .width = size.width, .height = size.height },
+            .radius = 1,
+            .base = true,
+        } },
+    };
+    try renderer.renderFrame(.{ .size = size, .commands = &commands }, .{ .pixels = .{
+        .size = size,
+        .stride_pixels = size.width,
+        .pixels = &pixels,
+    } });
+
+    for (pixels) |pixel| try expectArgbNear(0xff010203, pixel, 1);
 }
 
 test "reproducible scene: Vulkan fused backdrop image matches separate composites" {
