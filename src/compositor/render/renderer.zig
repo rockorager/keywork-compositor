@@ -96,7 +96,7 @@ pub const Renderer = struct {
         downsample_level: ?u8,
     ) u32 {
         return switch (self.backend) {
-            .cpu => radius,
+            .cpu => CpuRenderer.backdropBlurFootprint(radius, downsample_level),
             .vulkan => VulkanRenderer.backdropBlurFootprint(radius, downsample_level),
         };
     }

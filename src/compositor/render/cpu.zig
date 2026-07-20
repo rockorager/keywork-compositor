@@ -271,37 +271,22 @@ fn drawBackdropBlur(
     var clipped = blur.rect.clipTo(target.size) orelse return;
     if (blur.clip) |clip| clipped = clipped.intersection(clip) orelse return;
     const bounds = damageBounds(damage, clipped) orelse return;
+    const level = configuredBlurLevel(blur.radius, blur.downsample_level);
+    const sample_rect = blurSampleRect(
+        bounds,
+        backdropBlurFootprint(blur.radius, blur.downsample_level),
+        level,
+        target.size,
+    );
 
-    const radius: i64 = blur.radius;
-    const sample_left: u32 = @intCast(@max(@as(i64, bounds.x) - radius, 0));
-    const sample_top: u32 = @intCast(@max(@as(i64, bounds.y) - radius, 0));
-    const sample_right: u32 = @intCast(@min(
-        @as(i64, bounds.x) + bounds.width + radius,
-        target.size.width,
-    ));
-    const sample_bottom: u32 = @intCast(@min(
-        @as(i64, bounds.y) + bounds.height + radius,
-        target.size.height,
-    ));
-    const sample_width = sample_right - sample_left;
-    const sample_height = sample_bottom - sample_top;
-    const pixel_count = std.math.mul(usize, sample_width, sample_height) catch
-        return error.InvalidTarget;
-
-    const pixels = self.allocator.alloc(u32, pixel_count) catch return error.OutOfMemory;
+    const pixels = try dualKawaseArgb(
+        self.allocator,
+        target,
+        sample_rect,
+        blur.radius,
+        blur.downsample_level,
+    );
     defer self.allocator.free(pixels);
-    const temporary = self.allocator.alloc(u32, pixel_count) catch return error.OutOfMemory;
-    defer self.allocator.free(temporary);
-
-    for (0..sample_height) |y| {
-        const source_offset = (@as(usize, sample_top) + y) * target.stride_pixels + sample_left;
-        const destination_offset = y * sample_width;
-        @memcpy(
-            pixels[destination_offset..][0..sample_width],
-            target.pixels[source_offset..][0..sample_width],
-        );
-    }
-    blurArgb(pixels, temporary, sample_width, sample_height, blur.radius);
 
     if (damage) |rectangles| {
         for (rectangles) |rectangle| {
@@ -311,9 +296,9 @@ fn drawBackdropBlur(
                 blur,
                 composite_rect,
                 pixels,
-                sample_left,
-                sample_top,
-                sample_width,
+                @intCast(sample_rect.x),
+                @intCast(sample_rect.y),
+                sample_rect.width,
             );
         }
     } else {
@@ -322,9 +307,9 @@ fn drawBackdropBlur(
             blur,
             clipped,
             pixels,
-            sample_left,
-            sample_top,
-            sample_width,
+            @intCast(sample_rect.x),
+            @intCast(sample_rect.y),
+            sample_rect.width,
         );
     }
 }
@@ -396,71 +381,276 @@ fn unionRect(a: render_types.Rect, b: render_types.Rect) render_types.Rect {
     };
 }
 
-fn blurArgb(
-    pixels: []u32,
-    temporary: []u32,
-    width_value: u32,
-    height_value: u32,
-    radius_value: u32,
+const kawase_level_count = render_types.maximum_blur_downsample_level + 1;
+const KawaseColor = [4]f32;
+
+const KawaseImage = struct {
+    size: render_types.Size,
+    pixels: []KawaseColor,
+
+    fn init(allocator: std.mem.Allocator, size: render_types.Size) Error!KawaseImage {
+        const pixel_count = std.math.mul(usize, size.width, size.height) catch
+            return error.InvalidTarget;
+        const pixels = allocator.alloc(KawaseColor, pixel_count) catch
+            return error.OutOfMemory;
+        return .{ .size = size, .pixels = pixels };
+    }
+
+    fn fromTarget(
+        allocator: std.mem.Allocator,
+        target: render_types.PixelBuffer,
+        rect: render_types.Rect,
+    ) Error!KawaseImage {
+        std.debug.assert(rect.x >= 0 and rect.y >= 0);
+        var image = try KawaseImage.init(allocator, .{
+            .width = rect.width,
+            .height = rect.height,
+        });
+        errdefer image.deinit(allocator);
+        for (0..rect.height) |y| {
+            const source_y: usize = @intCast(@as(i64, rect.y) + @as(i64, @intCast(y)));
+            for (0..rect.width) |x| {
+                const source_x: usize = @intCast(@as(i64, rect.x) + @as(i64, @intCast(x)));
+                image.pixels[y * rect.width + x] = unpackKawaseColor(
+                    target.pixels[source_y * target.stride_pixels + source_x],
+                );
+            }
+        }
+        return image;
+    }
+
+    fn deinit(self: *KawaseImage, allocator: std.mem.Allocator) void {
+        allocator.free(self.pixels);
+        self.* = undefined;
+    }
+};
+
+comptime {
+    std.debug.assert(kawase_level_count == 6);
+}
+
+pub fn backdropBlurFootprint(radius: u32, downsample_level: ?u8) u32 {
+    if (radius == 0) return 0;
+    const level = configuredBlurLevel(radius, downsample_level);
+    const scale: u32 = @as(u32, 1) << @intCast(level);
+    return (ceilDiv(radius, scale) + 3) * scale;
+}
+
+fn dualKawaseArgb(
+    allocator: std.mem.Allocator,
+    target: render_types.PixelBuffer,
+    sample_rect: render_types.Rect,
+    radius: u32,
+    downsample_level: ?u8,
+) Error![]u32 {
+    const level = configuredBlurLevel(radius, downsample_level);
+    const offset = kawaseOffset(radius, level);
+    const sample_size: render_types.Size = .{
+        .width = sample_rect.width,
+        .height = sample_rect.height,
+    };
+    var current = try KawaseImage.fromTarget(allocator, target, sample_rect);
+    defer current.deinit(allocator);
+
+    const downsample_passes: usize = @max(level, 1);
+    for (0..downsample_passes) |index| {
+        const destination_level: u8 = if (level == 0) 0 else @intCast(index + 1);
+        const destination = try KawaseImage.init(
+            allocator,
+            kawaseLevelSize(sample_size, destination_level),
+        );
+        kawaseDownsample(current, destination, offset);
+        current.deinit(allocator);
+        current = destination;
+    }
+
+    var source_level: usize = level;
+    const upsample_passes: usize = @max(level, 1);
+    for (0..upsample_passes) |_| {
+        const destination_level: u8 = if (level == 0)
+            0
+        else
+            @intCast(source_level - 1);
+        const destination = try KawaseImage.init(
+            allocator,
+            kawaseLevelSize(sample_size, destination_level),
+        );
+        kawaseUpsample(current, destination, offset, level == 0);
+        current.deinit(allocator);
+        current = destination;
+        if (level > 0) source_level -= 1;
+    }
+    return packKawaseImage(allocator, current);
+}
+
+fn blurLevel(radius: u32) u8 {
+    var level: u8 = 0;
+    while (level < kawase_level_count - 1 and
+        ceilDiv(radius, @as(u32, 1) << @intCast(level)) > 2) level += 1;
+    return level;
+}
+
+fn configuredBlurLevel(radius: u32, configured: ?u8) u8 {
+    std.debug.assert(configured == null or configured.? < kawase_level_count);
+    return configured orelse blurLevel(radius);
+}
+
+fn ceilDiv(value: u32, divisor: u32) u32 {
+    return value / divisor + @intFromBool(value % divisor != 0);
+}
+
+fn kawaseLevelSize(size: render_types.Size, level: u8) render_types.Size {
+    const scale: u32 = @as(u32, 1) << @intCast(level);
+    return .{
+        .width = ceilDiv(size.width, scale),
+        .height = ceilDiv(size.height, scale),
+    };
+}
+
+fn kawaseOffset(radius: u32, level: u8) f32 {
+    const kernel_extent: u32 = if (level == 0) 2 else blk: {
+        const scale: u32 = @as(u32, 1) << @intCast(level);
+        break :blk 3 * scale - 3;
+    };
+    return @as(f32, @floatFromInt(radius)) / @as(f32, @floatFromInt(kernel_extent));
+}
+
+fn blurSampleRect(
+    rect: render_types.Rect,
+    radius: u32,
+    level: u8,
+    frame_size: render_types.Size,
+) render_types.Rect {
+    const alignment: i64 = @as(i64, 1) << @intCast(level);
+    const left = @max(@divFloor(@as(i64, rect.x) - radius, alignment) * alignment, 0);
+    const top = @max(@divFloor(@as(i64, rect.y) - radius, alignment) * alignment, 0);
+    const raw_right = @as(i64, rect.x) + rect.width + radius;
+    const raw_bottom = @as(i64, rect.y) + rect.height + radius;
+    const right = @min(
+        @divFloor(raw_right + alignment - 1, alignment) * alignment,
+        frame_size.width,
+    );
+    const bottom = @min(
+        @divFloor(raw_bottom + alignment - 1, alignment) * alignment,
+        frame_size.height,
+    );
+    return .{
+        .x = @intCast(left),
+        .y = @intCast(top),
+        .width = @intCast(right - left),
+        .height = @intCast(bottom - top),
+    };
+}
+
+fn kawaseDownsample(source: KawaseImage, destination: KawaseImage, offset: f32) void {
+    for (0..destination.size.height) |y| {
+        const coordinate_y = (@as(f32, @floatFromInt(y)) + 0.5) *
+            @as(f32, @floatFromInt(source.size.height)) /
+            @as(f32, @floatFromInt(destination.size.height));
+        for (0..destination.size.width) |x| {
+            const coordinate_x = (@as(f32, @floatFromInt(x)) + 0.5) *
+                @as(f32, @floatFromInt(source.size.width)) /
+                @as(f32, @floatFromInt(destination.size.width));
+            var color: KawaseColor = @splat(0);
+            addKawaseColor(&color, sampleKawase(source, coordinate_x, coordinate_y), 4);
+            addKawaseColor(&color, sampleKawase(source, coordinate_x - offset, coordinate_y - offset), 1);
+            addKawaseColor(&color, sampleKawase(source, coordinate_x + offset, coordinate_y - offset), 1);
+            addKawaseColor(&color, sampleKawase(source, coordinate_x - offset, coordinate_y + offset), 1);
+            addKawaseColor(&color, sampleKawase(source, coordinate_x + offset, coordinate_y + offset), 1);
+            inline for (0..4) |component| color[component] /= 8;
+            destination.pixels[y * destination.size.width + x] = color;
+        }
+    }
+}
+
+fn kawaseUpsample(
+    source: KawaseImage,
+    destination: KawaseImage,
+    offset: f32,
+    same_size: bool,
 ) void {
-    std.debug.assert(pixels.len == temporary.len);
-    std.debug.assert(pixels.len == @as(usize, width_value) * height_value);
-
-    const width: usize = width_value;
-    const height: usize = height_value;
-    const radius: usize = radius_value;
-    for (0..height) |y| {
-        var sums: [4]u64 = @splat(0);
-        var count = @min(radius + 1, width);
-        for (0..count) |x| addPixel(&sums, pixels[y * width + x]);
-        for (0..width) |x| {
-            temporary[y * width + x] = averagePixel(sums, count);
-            if (x >= radius) {
-                subtractPixel(&sums, pixels[y * width + x - radius]);
-                count -= 1;
-            }
-            const added = x + radius + 1;
-            if (added < width) {
-                addPixel(&sums, pixels[y * width + added]);
-                count += 1;
-            }
-        }
-    }
-
-    for (0..width) |x| {
-        var sums: [4]u64 = @splat(0);
-        var count = @min(radius + 1, height);
-        for (0..count) |y| addPixel(&sums, temporary[y * width + x]);
-        for (0..height) |y| {
-            pixels[y * width + x] = averagePixel(sums, count);
-            if (y >= radius) {
-                subtractPixel(&sums, temporary[(y - radius) * width + x]);
-                count -= 1;
-            }
-            const added = y + radius + 1;
-            if (added < height) {
-                addPixel(&sums, temporary[added * width + x]);
-                count += 1;
-            }
+    const divisor: f32 = if (same_size) 1 else 2;
+    const diagonal = offset * 0.5;
+    for (0..destination.size.height) |y| {
+        const coordinate_y = (@as(f32, @floatFromInt(y)) + 0.5) / divisor;
+        for (0..destination.size.width) |x| {
+            const coordinate_x = (@as(f32, @floatFromInt(x)) + 0.5) / divisor;
+            var color: KawaseColor = @splat(0);
+            addKawaseColor(&color, sampleKawase(source, coordinate_x - offset, coordinate_y), 1);
+            addKawaseColor(&color, sampleKawase(source, coordinate_x + offset, coordinate_y), 1);
+            addKawaseColor(&color, sampleKawase(source, coordinate_x, coordinate_y - offset), 1);
+            addKawaseColor(&color, sampleKawase(source, coordinate_x, coordinate_y + offset), 1);
+            addKawaseColor(&color, sampleKawase(source, coordinate_x - diagonal, coordinate_y - diagonal), 2);
+            addKawaseColor(&color, sampleKawase(source, coordinate_x + diagonal, coordinate_y - diagonal), 2);
+            addKawaseColor(&color, sampleKawase(source, coordinate_x - diagonal, coordinate_y + diagonal), 2);
+            addKawaseColor(&color, sampleKawase(source, coordinate_x + diagonal, coordinate_y + diagonal), 2);
+            inline for (0..4) |component| color[component] /= 12;
+            destination.pixels[y * destination.size.width + x] = color;
         }
     }
 }
 
-fn addPixel(sums: *[4]u64, pixel: u32) void {
-    inline for (0..4) |component| sums[component] += @as(u8, @truncate(pixel >> component * 8));
+fn sampleKawase(image: KawaseImage, coordinate_x: f32, coordinate_y: f32) KawaseColor {
+    const texel_x = coordinate_x - 0.5;
+    const texel_y = coordinate_y - 0.5;
+    const base_x: i64 = @intFromFloat(@floor(texel_x));
+    const base_y: i64 = @intFromFloat(@floor(texel_y));
+    const fraction_x = texel_x - @as(f32, @floatFromInt(base_x));
+    const fraction_y = texel_y - @as(f32, @floatFromInt(base_y));
+    const x0 = clampedKawaseIndex(base_x, image.size.width);
+    const x1 = clampedKawaseIndex(base_x + 1, image.size.width);
+    const y0 = clampedKawaseIndex(base_y, image.size.height);
+    const y1 = clampedKawaseIndex(base_y + 1, image.size.height);
+    const top = mixKawaseColor(
+        image.pixels[y0 * image.size.width + x0],
+        image.pixels[y0 * image.size.width + x1],
+        fraction_x,
+    );
+    const bottom = mixKawaseColor(
+        image.pixels[y1 * image.size.width + x0],
+        image.pixels[y1 * image.size.width + x1],
+        fraction_x,
+    );
+    return mixKawaseColor(top, bottom, fraction_y);
 }
 
-fn subtractPixel(sums: *[4]u64, pixel: u32) void {
-    inline for (0..4) |component| sums[component] -= @as(u8, @truncate(pixel >> component * 8));
+fn clampedKawaseIndex(value: i64, limit: u32) usize {
+    std.debug.assert(limit > 0);
+    if (value <= 0) return 0;
+    if (value >= @as(i64, limit) - 1) return limit - 1;
+    return @intCast(value);
 }
 
-fn averagePixel(sums: [4]u64, count: usize) u32 {
-    std.debug.assert(count > 0);
-    var pixel: u32 = 0;
+fn mixKawaseColor(a: KawaseColor, b: KawaseColor, amount: f32) KawaseColor {
+    var result: KawaseColor = undefined;
     inline for (0..4) |component| {
-        pixel |= @as(u32, @intCast(sums[component] / count)) << component * 8;
+        result[component] = a[component] + (b[component] - a[component]) * amount;
     }
-    return pixel;
+    return result;
+}
+
+fn addKawaseColor(sum: *KawaseColor, color: KawaseColor, weight: f32) void {
+    inline for (0..4) |component| sum[component] += color[component] * weight;
+}
+
+fn unpackKawaseColor(pixel: u32) KawaseColor {
+    var color: KawaseColor = undefined;
+    inline for (0..4) |component| {
+        color[component] = @floatFromInt(@as(u8, @truncate(pixel >> component * 8)));
+    }
+    return color;
+}
+
+fn packKawaseImage(allocator: std.mem.Allocator, image: KawaseImage) Error![]u32 {
+    const pixels = allocator.alloc(u32, image.pixels.len) catch return error.OutOfMemory;
+    for (pixels, image.pixels) |*pixel, color| {
+        pixel.* = 0;
+        inline for (0..4) |component| {
+            const value: u32 = @intFromFloat(std.math.clamp(color[component], 0, 255) + 0.5);
+            pixel.* |= value << component * 8;
+        }
+    }
+    return pixels;
 }
 
 fn blendArgb(source: u32, destination: u32, coverage: u8) u32 {
@@ -1285,7 +1475,7 @@ test "CPU renderer bounds shadow work to the clipped output" {
     try std.testing.expectEqual(@as(u32, 0), output.pixel(3, 4));
 }
 
-test "CPU renderer blurs the backdrop inside a window region" {
+test "CPU renderer applies dual Kawase blur inside a window region" {
     const size: render_types.Size = .{ .width = 5, .height = 1 };
     var output = try headless.init(std.testing.allocator, size);
     defer output.deinit();
@@ -1313,12 +1503,12 @@ test "CPU renderer blurs the backdrop inside a window region" {
 
     try std.testing.expectEqual(@as(u32, 0xff000000), output.pixel(0, 0));
     try std.testing.expectEqual(@as(u32, 0xff000000), output.pixel(1, 0));
-    try std.testing.expectEqual(@as(u32, 0xff555555), output.pixel(2, 0));
+    try std.testing.expectEqual(@as(u32, 0xff979797), output.pixel(2, 0));
     try std.testing.expectEqual(@as(u32, 0xff000000), output.pixel(3, 0));
     try std.testing.expectEqual(@as(u32, 0xff000000), output.pixel(4, 0));
 }
 
-test "CPU backdrop blur snapshots disjoint damage before compositing" {
+test "CPU dual Kawase blur snapshots disjoint damage before compositing" {
     const size: render_types.Size = .{ .width = 5, .height = 1 };
     var output = try headless.init(std.testing.allocator, size);
     defer output.deinit();
@@ -1347,9 +1537,86 @@ test "CPU backdrop blur snapshots disjoint damage before compositing" {
     defer renderer.deinit();
     try renderer.render(.{ .size = size, .commands = &commands, .damage = &damage }, target);
 
-    try std.testing.expectEqual(@as(u32, 0xff555555), output.pixel(1, 0));
-    try std.testing.expectEqual(@as(u32, 0xff555555), output.pixel(2, 0));
+    try std.testing.expectEqual(@as(u32, 0xff303030), output.pixel(1, 0));
+    try std.testing.expectEqual(@as(u32, 0xff979797), output.pixel(2, 0));
     try std.testing.expectEqual(@as(u32, 0xff000000), output.pixel(3, 0));
+}
+
+test "CPU dual Kawase blur derives levels and footprints from radius" {
+    try std.testing.expectEqual(@as(u8, 0), blurLevel(2));
+    try std.testing.expectEqual(@as(u8, 1), blurLevel(3));
+    try std.testing.expectEqual(@as(u8, 3), blurLevel(16));
+    try std.testing.expectEqual(@as(u8, 5), blurLevel(65));
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), kawaseOffset(1, 0), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 16.0 / 21.0), kawaseOffset(16, 3), 0.0001);
+    try std.testing.expectEqual(@as(u32, 40), backdropBlurFootprint(16, null));
+    try std.testing.expectEqual(@as(u32, 19), backdropBlurFootprint(16, 0));
+}
+
+test "CPU dual Kawase pyramid preserves a uniform odd-sized image" {
+    const size: render_types.Size = .{ .width = 5, .height = 3 };
+    var source = [_]u32{0x80402010} ** (size.width * size.height);
+    const blurred = try dualKawaseArgb(
+        std.testing.allocator,
+        .{
+            .size = size,
+            .stride_pixels = size.width,
+            .pixels = &source,
+        },
+        .{ .x = 0, .y = 0, .width = size.width, .height = size.height },
+        16,
+        null,
+    );
+    defer std.testing.allocator.free(blurred);
+
+    try std.testing.expectEqualSlices(u32, &source, blurred);
+}
+
+test "CPU dual Kawase scoped pyramid matches full-frame results" {
+    const size: render_types.Size = .{ .width = 64, .height = 32 };
+    var source: [size.width * size.height]u32 = undefined;
+    for (&source, 0..) |*pixel, index| {
+        const x = index % size.width;
+        const y = index / size.width;
+        const value: u8 = @intCast((x * 3 + y * 5) % 256);
+        pixel.* = 0xff000000 | @as(u32, value) * 0x00010101;
+    }
+    const target: render_types.PixelBuffer = .{
+        .size = size,
+        .stride_pixels = size.width,
+        .pixels = &source,
+    };
+    const full_rect: render_types.Rect = .{
+        .x = 0,
+        .y = 0,
+        .width = size.width,
+        .height = size.height,
+    };
+    const output_rect: render_types.Rect = .{ .x = 28, .y = 14, .width = 4, .height = 4 };
+    const level = configuredBlurLevel(3, null);
+    const sample_rect = blurSampleRect(
+        output_rect,
+        backdropBlurFootprint(3, null),
+        level,
+        size,
+    );
+    const full = try dualKawaseArgb(std.testing.allocator, target, full_rect, 3, null);
+    defer std.testing.allocator.free(full);
+    const scoped = try dualKawaseArgb(std.testing.allocator, target, sample_rect, 3, null);
+    defer std.testing.allocator.free(scoped);
+
+    for (0..output_rect.height) |y| {
+        for (0..output_rect.width) |x| {
+            const output_x: usize = @intCast(@as(i64, output_rect.x) + @as(i64, @intCast(x)));
+            const output_y: usize = @intCast(@as(i64, output_rect.y) + @as(i64, @intCast(y)));
+            const sample_x: usize = @intCast(@as(i64, output_rect.x - sample_rect.x) + @as(i64, @intCast(x)));
+            const sample_y: usize = @intCast(@as(i64, output_rect.y - sample_rect.y) + @as(i64, @intCast(y)));
+            try std.testing.expectEqual(
+                full[output_y * size.width + output_x],
+                scoped[sample_y * sample_rect.width + sample_x],
+            );
+        }
+    }
 }
 
 test "CPU renderer clips writes to frame damage and preserves stride padding" {

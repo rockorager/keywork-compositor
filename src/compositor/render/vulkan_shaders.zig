@@ -10,8 +10,8 @@ pub const image_catmull_rom_instanced = spirvWords(@embedFile("vulkan-image-catm
 pub const image_area_instanced = spirvWords(@embedFile("vulkan-image-area"));
 pub const video_manual_instanced = spirvWords(@embedFile("vulkan-video-manual"));
 pub const shadow_instanced = spirvWords(@embedFile("vulkan-shadow"));
-pub const blur_horizontal_paired = spirvWords(@embedFile("vulkan-blur-horizontal"));
-pub const blur_vertical_paired = spirvWords(@embedFile("vulkan-blur-vertical"));
+pub const blur_downsample = spirvWords(@embedFile("vulkan-blur-downsample"));
+pub const blur_upsample = spirvWords(@embedFile("vulkan-blur-upsample"));
 pub const output_encode = spirvWords(@embedFile("vulkan-encode"));
 pub const output_encode_calibrated = spirvWords(@embedFile("vulkan-encode-calibrated"));
 

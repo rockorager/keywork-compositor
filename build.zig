@@ -200,8 +200,8 @@ pub fn build(b: *std.Build) void {
         "KEYWORK_MANUAL_YCBCR",
     );
     addVulkanShader(b, compositor, "vulkan-shadow", "src/compositor/render/shaders/shadow.frag");
-    addVulkanShader(b, compositor, "vulkan-blur-horizontal", "src/compositor/render/shaders/blur_horizontal.frag");
-    addVulkanShader(b, compositor, "vulkan-blur-vertical", "src/compositor/render/shaders/blur_vertical.frag");
+    addVulkanShader(b, compositor, "vulkan-blur-downsample", "src/compositor/render/shaders/blur_downsample.frag");
+    addVulkanShader(b, compositor, "vulkan-blur-upsample", "src/compositor/render/shaders/blur_upsample.frag");
     addVulkanShader(b, compositor, "vulkan-encode", "src/compositor/render/shaders/encode.frag");
     addVulkanShader(b, compositor, "vulkan-encode-calibrated", "src/compositor/render/shaders/encode_calibrated.frag");
     compositor.linkSystemLibrary("lcms2", .{});
