@@ -2788,7 +2788,14 @@ fn renderFrameWithCompletion(
     gpu_sample_tag: ?u64,
 ) Error!render.FrameCompletion {
     try self.drainPending();
-    const required_pixels = try validateTarget(frame, target);
+    const required_pixels = validateTarget(frame, target) catch |err| {
+        const target_size = target.size();
+        log.err(
+            "Vulkan render target validation failed: frame={d}x{d} target={d}x{d}: {t}",
+            .{ frame.size.width, frame.size.height, target_size.width, target_size.height, err },
+        );
+        return err;
+    };
     const target_key = targetKey(target);
     if (!supports(frame.commands)) {
         var completion: render.FrameCompletion = .{};
@@ -2847,9 +2854,40 @@ fn renderFrameWithCompletion(
             return error.InvalidTarget,
         .offscreen, .dmabuf => 0,
     };
-    for (frame.commands) |command| switch (command) {
+    for (frame.commands, 0..) |command, command_index| switch (command) {
         .image => |image| {
-            try validateImage(image);
+            validateImage(image) catch |err| {
+                if (image.buffer.dmabuf) |dmabuf| {
+                    log.err(
+                        "Vulkan image command {d} validation failed: image={d}x{d} buffer={d}x{d} format=0x{x} modifier=0x{x} planes={d}: {t}",
+                        .{
+                            command_index,
+                            image.size.width,
+                            image.size.height,
+                            image.buffer.size.width,
+                            image.buffer.size.height,
+                            dmabuf.format,
+                            dmabuf.modifier,
+                            dmabuf.plane_count,
+                            err,
+                        },
+                    );
+                } else {
+                    log.err(
+                        "Vulkan image command {d} validation failed: image={d}x{d} buffer={d}x{d} stride={d}: {t}",
+                        .{
+                            command_index,
+                            image.size.width,
+                            image.size.height,
+                            image.buffer.size.width,
+                            image.buffer.size.height,
+                            image.buffer.stride_pixels,
+                            err,
+                        },
+                    );
+                }
+                return err;
+            };
             try self.prepared_images.append(
                 self.allocator,
                 try self.prepareTexture(image.buffer, self.prepared_images.items, &work_size),
@@ -2857,17 +2895,29 @@ fn renderFrameWithCompletion(
         },
         else => {},
     };
-    const prepared_calibration = try self.prepareCalibration(
+    const prepared_calibration = self.prepareCalibration(
         frame.output_calibration,
         &work_size,
-    );
+    ) catch |err| {
+        log.err("Vulkan output calibration preparation failed: {t}", .{err});
+        return err;
+    };
     if (prepared_calibration) |prepared| {
         if (prepared.upload_offset != null) new_calibration_identity = prepared.identity;
     }
 
     try self.ensureWorkBuffer(work_size);
-    const output = try self.getOutput(target_key);
-    if (!std.meta.eql(output.size, frame.size)) return error.InvalidTarget;
+    const output = self.getOutput(target_key) catch |err| {
+        log.err("Vulkan output target lookup failed: {t}", .{err});
+        return err;
+    };
+    if (!std.meta.eql(output.size, frame.size)) {
+        log.err(
+            "Vulkan output target size changed: frame={d}x{d} output={d}x{d}",
+            .{ frame.size.width, frame.size.height, output.size.width, output.size.height },
+        );
+        return error.InvalidTarget;
+    }
     output.last_used = self.frame_number;
     var compiled_frame = frame;
     const calibration_identity = if (frame.output_calibration) |calibration|
@@ -4338,13 +4388,38 @@ fn prepareTexture(
         if (self.supportsDmabufSource(buffer.size, dmabuf)) {
             const imported = self.prepareImportedTexture(buffer, previously_prepared) catch |err| blk: {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
-                if (dmabuf.modifier != 0) return error.InvalidTarget;
+                if (dmabuf.modifier != 0) {
+                    log.err(
+                        "Vulkan DMA-BUF source import failed: size={d}x{d} format=0x{x} modifier=0x{x} planes={d}: {t}",
+                        .{
+                            buffer.size.width,
+                            buffer.size.height,
+                            dmabuf.format,
+                            dmabuf.modifier,
+                            dmabuf.plane_count,
+                            err,
+                        },
+                    );
+                    return error.InvalidTarget;
+                }
                 log.warn("Vulkan linear DMA-BUF source import failed; using CPU upload fallback: {t}", .{err});
                 break :blk null;
             };
             if (imported) |prepared| return prepared;
         }
-        if (dmabuf.modifier != 0 or dmabuf.plane_count != 1) return error.InvalidTarget;
+        if (dmabuf.modifier != 0 or dmabuf.plane_count != 1) {
+            log.err(
+                "Vulkan DMA-BUF source is not importable: size={d}x{d} format=0x{x} modifier=0x{x} planes={d}",
+                .{
+                    buffer.size.width,
+                    buffer.size.height,
+                    dmabuf.format,
+                    dmabuf.modifier,
+                    dmabuf.plane_count,
+                },
+            );
+            return error.InvalidTarget;
+        }
     }
     if (buffer.source_cache) |source| {
         for (previously_prepared) |prepared| {

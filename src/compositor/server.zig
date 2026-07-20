@@ -6620,13 +6620,19 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
         null;
     const scale = render_output.backend.renderScale();
     const origin: render.Position = .{ .x = position.x, .y = position.y };
-    try self.renderer.beginFrame(
+    self.renderer.beginFrame(
         render_target,
         scale,
         origin,
         damage,
         render_output.color_description,
-    );
+    ) catch |err| {
+        log.err(
+            "output renderer setup failed for {d}x{d} target: {t}",
+            .{ render_target.size().width, render_target.size().height, err },
+        );
+        return err;
+    };
     var renderer_frame_active = true;
     errdefer if (renderer_frame_active) self.renderer.cancelFrame();
     const frame: OutputFrame = .{
@@ -6645,9 +6651,12 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
         try self.renderSessionLockContents(&frame, true);
         try self.selectFrameOutputColorDescription(render_output, null);
         renderer_frame_active = false;
-        const completion = try self.renderer.finishFrameScanout(
+        const completion = self.renderer.finishFrameScanout(
             outputStatisticsTag(render_output.protocol_id),
-        );
+        ) catch |err| {
+            log.err("session-lock renderer frame completion failed: {t}", .{err});
+            return err;
+        };
         render_output.frame_statistics.addFrameCompletion(completion);
         self.collectGpuTimings();
         const render_fence_fd = completion.sync_file_fd;
@@ -6657,7 +6666,10 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
         return self.presentSessionLockFrame(&frame, render_fence_fd);
     }
 
-    const top_fullscreen = try self.renderDesktopContents(&frame, true);
+    const top_fullscreen = self.renderDesktopContents(&frame, true) catch |err| {
+        log.err("desktop frame assembly failed: {t}", .{err});
+        return err;
+    };
     try self.selectFrameOutputColorDescription(
         render_output,
         self.renderer.preferredOutputTransfer(),
@@ -6712,10 +6724,16 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
         }
         renderer_frame_active = false;
         const gpu_sample_tag = outputStatisticsTag(render_output.protocol_id);
-        const completion = if (overlay_destination != null)
-            try self.renderer.finishFrameScanoutWithoutTopmost(gpu_sample_tag)
+        const completion = (if (overlay_destination != null)
+            self.renderer.finishFrameScanoutWithoutTopmost(gpu_sample_tag)
         else
-            try self.renderer.finishFrameScanout(gpu_sample_tag);
+            self.renderer.finishFrameScanout(gpu_sample_tag)) catch |err| {
+            log.err(
+                "renderer frame completion failed (overlay={any}): {t}",
+                .{ overlay_destination != null, err },
+            );
+            return err;
+        };
         render_output.frame_statistics.addFrameCompletion(completion);
         self.collectGpuTimings();
         const render_fence_fd = completion.sync_file_fd;
