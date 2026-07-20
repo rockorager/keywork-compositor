@@ -16,7 +16,7 @@ const wl = wayland.server.wl;
 const wp = wayland.server.wp;
 const log = std.log.scoped(.cursor_shape);
 
-const Shape = wp.CursorShapeDeviceV1.Shape;
+pub const Shape = wp.CursorShapeDeviceV1.Shape;
 const shape_count = @intFromEnum(Shape.all_resize);
 const default_cursor_size = 24;
 
@@ -125,7 +125,8 @@ fn cursor(self: *Self, client: *wl.Client, shape: Shape) ?Seat.ShapeCursor {
     };
 }
 
-fn cursorImage(self: *Self, shape: Shape) ?Seat.CursorImage {
+/// Returns a themed image whose pixel storage remains valid until deinit.
+pub fn cursorImage(self: *Self, shape: Shape) ?Seat.CursorImage {
     const index = shapeIndex(shape);
     const image = self.images[index] orelse loaded: {
         const name = shapeName(shape);

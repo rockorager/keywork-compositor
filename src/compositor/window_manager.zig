@@ -22,6 +22,7 @@ const Command = command_mod.Command;
 const Direction = command_mod.Direction;
 
 const wl = wayland.server.wl;
+const PointerShape = wayland.server.wp.CursorShapeDeviceV1.Shape;
 const workspace_count = 10;
 const resize_edge_threshold: f64 = 8;
 
@@ -926,6 +927,19 @@ pub fn compositorPointerGrabActive(self: *const Self) bool {
         if (self.toplevel_drag) |drag| drag.modifier else false;
 }
 
+pub fn interactiveResizeCursorShape(self: *const Self) ?PointerShape {
+    const resize = self.interactive_resize orelse return null;
+    return switch (resize) {
+        .floating => |value| floatingResizeCursorShape(value.edges),
+        .tiled => |value| switch (value.resize) {
+            .dwindle => |dwindle| switch (dwindle.axis) {
+                .horizontal => .ew_resize,
+                .vertical => .ns_resize,
+            },
+        },
+    };
+}
+
 pub fn updateCompositorPointerGrab(self: *Self, pointer_x: f64, pointer_y: f64) bool {
     if (self.tiling_drag != null) return self.updateTilingDrag(pointer_x, pointer_y);
     if (self.toplevel_drag) |drag| {
@@ -1812,6 +1826,23 @@ fn resizeEdgesAt(
     return if (@as(u4, @bitCast(edges)) == 0) null else edges;
 }
 
+fn floatingResizeCursorShape(edges: ResizeEdges) PointerShape {
+    std.debug.assert(!(edges.left and edges.right) and !(edges.top and edges.bottom));
+    if (edges.top) {
+        if (edges.left) return .nw_resize;
+        if (edges.right) return .ne_resize;
+        return .n_resize;
+    }
+    if (edges.bottom) {
+        if (edges.left) return .sw_resize;
+        if (edges.right) return .se_resize;
+        return .s_resize;
+    }
+    if (edges.left) return .w_resize;
+    std.debug.assert(edges.right);
+    return .e_resize;
+}
+
 fn resizedFloatingRect(
     initial: types.Rect,
     initial_pointer_x: f64,
@@ -2441,6 +2472,29 @@ test "floating resize edges are restricted to the pointer hit region" {
     );
     try std.testing.expect(resizeEdgesAt(rect, 300, 350, 8) == null);
     try std.testing.expect(resizeEdgesAt(rect, 500, 350, 8) == null);
+}
+
+test "floating resize edges select directional cursor shapes" {
+    try std.testing.expectEqual(PointerShape.n_resize, floatingResizeCursorShape(.{ .top = true }));
+    try std.testing.expectEqual(PointerShape.ne_resize, floatingResizeCursorShape(.{
+        .top = true,
+        .right = true,
+    }));
+    try std.testing.expectEqual(PointerShape.e_resize, floatingResizeCursorShape(.{ .right = true }));
+    try std.testing.expectEqual(PointerShape.se_resize, floatingResizeCursorShape(.{
+        .bottom = true,
+        .right = true,
+    }));
+    try std.testing.expectEqual(PointerShape.s_resize, floatingResizeCursorShape(.{ .bottom = true }));
+    try std.testing.expectEqual(PointerShape.sw_resize, floatingResizeCursorShape(.{
+        .bottom = true,
+        .left = true,
+    }));
+    try std.testing.expectEqual(PointerShape.w_resize, floatingResizeCursorShape(.{ .left = true }));
+    try std.testing.expectEqual(PointerShape.nw_resize, floatingResizeCursorShape(.{
+        .top = true,
+        .left = true,
+    }));
 }
 
 test "directional navigation prefers aligned neighbors then distance" {

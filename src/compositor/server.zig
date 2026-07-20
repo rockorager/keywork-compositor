@@ -3765,7 +3765,7 @@ fn sessionLockStateChanged(context: *anyopaque, locked: bool) void {
     self.refreshIdleInhibition();
     self.reconcileOutputCursors();
     if (locked) self.xwayland_keyboard_grab.cancelAll();
-    if (self.window_manager_initialized and self.window_manager.endCompositorPointerGrab(false)) {
+    if (self.window_manager_initialized and self.endCompositorPointerGrab(false)) {
         requestRepaint(self);
     }
     self.pointer_constraints.deactivateAll();
@@ -4635,7 +4635,7 @@ fn pointerEnter(context: *anyopaque, x: f64, y: f64) void {
 
 fn pointerLeave(context: *anyopaque) void {
     const self = serverForOutput(context);
-    if (self.window_manager.endCompositorPointerGrab(false)) requestRepaint(self);
+    if (self.endCompositorPointerGrab(false)) requestRepaint(self);
     self.pointer_constraints.deactivateAll();
     self.data_device.pointerLeft();
     if (self.xwm_initialized) self.xwm.dragLeft();
@@ -4957,7 +4957,7 @@ fn pointerButtonForSeat(
             if (position) |point| {
                 _ = self.window_manager.updateCompositorPointerGrab(point.x, point.y);
             }
-            _ = self.window_manager.endCompositorPointerGrab(true);
+            _ = self.endCompositorPointerGrab(true);
             if (position) |point| {
                 const route = self.pointerRoute(point.x, point.y);
                 seat.pointerEnter(point.x, point.y, route.focus);
@@ -4989,6 +4989,10 @@ fn pointerButtonForSeat(
             if (started) {
                 self.pointer_constraints.deactivateAll();
                 seat.suppressPointerFocus(true);
+                seat.setCompositorCursor(if (self.window_manager.interactiveResizeCursorShape()) |shape|
+                    self.cursor_shape.cursorImage(shape)
+                else
+                    null);
                 _ = self.window_manager.updateCompositorPointerGrab(position.x, position.y);
                 requestRepaint(self);
                 return;
@@ -5018,7 +5022,7 @@ fn pointerButtonForSeat(
 
 fn dragStarted(context: *anyopaque) void {
     const self: *Self = @ptrCast(@alignCast(context));
-    if (self.window_manager.endCompositorPointerGrab(false)) requestRepaint(self);
+    if (self.endCompositorPointerGrab(false)) requestRepaint(self);
     self.pointer_constraints.deactivateAll();
     if (self.xwm_initialized) self.xwm.dragStarted();
     self.reconcileOutputCursors();
@@ -5026,6 +5030,12 @@ fn dragStarted(context: *anyopaque) void {
     const route = self.dragPointerRoute(position.x, position.y);
     if (!self.data_device.dragIsExternal()) self.seat.suppressPointerFocus(true);
     self.routeActiveDrag(0, route, position.x, position.y, false);
+}
+
+fn endCompositorPointerGrab(self: *Self, commit: bool) bool {
+    const ended = self.window_manager.endCompositorPointerGrab(commit);
+    if (ended) self.seat.setCompositorCursor(null);
+    return ended;
 }
 
 fn xdgToplevelDragBegin(

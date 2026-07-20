@@ -48,6 +48,7 @@ touch_points: std.ArrayList(TouchPoint),
 touch_frame_resources: std.ArrayList(*wl.Touch),
 latest_pointer_enter: ?UserAction,
 active_cursor: ?ActiveCursor,
+compositor_cursor: ?CursorImage,
 default_cursor: ?CursorImage,
 cursor_controller: ?CursorController,
 drag_cursor_client: ?*wl.Client,
@@ -276,6 +277,7 @@ pub fn init(
         .touch_frame_resources = .empty,
         .latest_pointer_enter = null,
         .active_cursor = null,
+        .compositor_cursor = null,
         .default_cursor = null,
         .cursor_controller = null,
         .drag_cursor_client = null,
@@ -667,6 +669,11 @@ pub fn keyboardFocusedSurface(self: *const Self) ?Surface.Id {
 
 pub fn cursorInfo(self: *const Self) ?CursorInfo {
     const position = self.pointer_position orelse return null;
+    if (self.compositor_cursor) |cursor| return .{ .shape = .{
+        .buffer = cursor.buffer,
+        .x = cursorCoordinate(position.x, cursor.hotspot_x),
+        .y = cursorCoordinate(position.y, cursor.hotspot_y),
+    } };
     const cursor = self.active_cursor orelse {
         if (self.pointer_focus != null or self.drag_cursor_client != null) return null;
         if (self.cursor_controller) |controller| if (controller.configured) return null;
@@ -689,6 +696,14 @@ pub fn cursorInfo(self: *const Self) ?CursorInfo {
             .y = cursorCoordinate(position.y, shape.hotspot_y),
         } },
     };
+}
+
+/// Overrides client and fallback cursors while the compositor owns the pointer.
+/// The image's pixel storage must remain valid until this override is replaced.
+pub fn setCompositorCursor(self: *Self, cursor: ?CursorImage) void {
+    const old_cursor = self.cursorInfo();
+    self.compositor_cursor = cursor;
+    self.notifyCursorChanged(old_cursor);
 }
 
 pub fn setDefaultCursor(self: *Self, cursor: ?CursorImage) void {
@@ -1964,6 +1979,7 @@ pub fn setCursorShape(
 
 pub fn clearCursorShapes(self: *Self) void {
     const old_cursor = self.cursorInfo();
+    self.compositor_cursor = null;
     self.default_cursor = null;
     if (self.active_cursor) |cursor| switch (cursor) {
         .surface => {},
