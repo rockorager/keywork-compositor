@@ -312,6 +312,7 @@ fn captureBackdrop(
         sample_rect,
         marker.radius,
         marker.downsample_level,
+        marker.finish,
     );
     return .{ .marker = marker, .sample_rect = sample_rect, .pixels = pixels };
 }
@@ -328,6 +329,7 @@ fn drawBackdropBlur(
     const snapshot = capture orelse return error.InvalidTarget;
     if (blur.radius != snapshot.marker.radius or
         blur.downsample_level != snapshot.marker.downsample_level or
+        !std.meta.eql(blur.finish, snapshot.marker.finish) or
         !rectContains(snapshot.marker.rect, clipped)) return error.InvalidTarget;
     _ = damageBounds(damage, clipped) orelse return;
 
@@ -492,6 +494,7 @@ fn dualKawaseArgb(
     sample_rect: render_types.Rect,
     radius: u32,
     downsample_level: ?u8,
+    finish: render_types.BackdropBlurFinish,
 ) Error![]u32 {
     const level = configuredBlurLevel(radius, downsample_level);
     const offset = kawaseOffset(radius, level);
@@ -530,6 +533,7 @@ fn dualKawaseArgb(
         current = destination;
         if (level > 0) source_level -= 1;
     }
+    applyBackdropBlurFinish(current, sample_rect, finish);
     return packKawaseImage(allocator, current);
 }
 
@@ -681,6 +685,49 @@ fn mixKawaseColor(a: KawaseColor, b: KawaseColor, amount: f32) KawaseColor {
 
 fn addKawaseColor(sum: *KawaseColor, color: KawaseColor, weight: f32) void {
     inline for (0..4) |component| sum[component] += color[component] * weight;
+}
+
+fn applyBackdropBlurFinish(
+    image: KawaseImage,
+    sample_rect: render_types.Rect,
+    finish: render_types.BackdropBlurFinish,
+) void {
+    if (finish.isNeutral()) return;
+    std.debug.assert(sample_rect.x >= 0 and sample_rect.y >= 0);
+    for (0..image.size.height) |y| {
+        for (0..image.size.width) |x| {
+            const color = &image.pixels[y * image.size.width + x];
+            const alpha = color[3];
+            if (alpha <= 0) {
+                color.* = @splat(0);
+                continue;
+            }
+            var straight: [3]f32 = undefined;
+            inline for (0..3) |component| straight[component] = color[component] * 255 / alpha;
+            const luminance = straight[0] * 0.0722 + straight[1] * 0.7152 + straight[2] * 0.2126;
+            const grain = backdropBlurNoise(
+                @intCast(@as(i64, sample_rect.x) + @as(i64, @intCast(x))),
+                @intCast(@as(i64, sample_rect.y) + @as(i64, @intCast(y))),
+            ) * finish.noise * 255;
+            inline for (0..3) |component| {
+                var value = luminance + (straight[component] - luminance) * finish.saturation;
+                value += (finish.brightness - 1) * 255;
+                value = (value - 127.5) * finish.contrast + 127.5;
+                value = @max(value + grain, 0);
+                color[component] = value * alpha / 255;
+            }
+        }
+    }
+}
+
+fn backdropBlurNoise(x: u32, y: u32) f32 {
+    var value = x *% 0x9e3779b9 ^ y *% 0x85ebca6b;
+    value ^= value >> 16;
+    value *%= 0x7feb352d;
+    value ^= value >> 15;
+    value *%= 0x846ca68b;
+    value ^= value >> 16;
+    return @as(f32, @floatFromInt(value & 0xffff)) / 65535 - 0.5;
 }
 
 fn unpackKawaseColor(pixel: u32) KawaseColor {
@@ -1724,6 +1771,7 @@ test "CPU dual Kawase pyramid preserves a uniform odd-sized image" {
         .{ .x = 0, .y = 0, .width = size.width, .height = size.height },
         16,
         null,
+        .{},
     );
     defer std.testing.allocator.free(blurred);
 
@@ -1758,9 +1806,9 @@ test "CPU dual Kawase scoped pyramid matches full-frame results" {
         level,
         size,
     );
-    const full = try dualKawaseArgb(std.testing.allocator, target, full_rect, 3, null);
+    const full = try dualKawaseArgb(std.testing.allocator, target, full_rect, 3, null, .{});
     defer std.testing.allocator.free(full);
-    const scoped = try dualKawaseArgb(std.testing.allocator, target, sample_rect, 3, null);
+    const scoped = try dualKawaseArgb(std.testing.allocator, target, sample_rect, 3, null, .{});
     defer std.testing.allocator.free(scoped);
 
     for (0..output_rect.height) |y| {
@@ -1775,6 +1823,46 @@ test "CPU dual Kawase scoped pyramid matches full-frame results" {
             );
         }
     }
+}
+
+test "CPU backdrop blur finish is stable across scoped captures" {
+    const size: render_types.Size = .{ .width = 64, .height = 32 };
+    var source = [_]u32{0xff806040} ** (size.width * size.height);
+    const target: render_types.PixelBuffer = .{
+        .size = size,
+        .stride_pixels = size.width,
+        .pixels = &source,
+    };
+    const full_rect: render_types.Rect = .{
+        .x = 0,
+        .y = 0,
+        .width = size.width,
+        .height = size.height,
+    };
+    const scoped_rect: render_types.Rect = .{ .x = 16, .y = 8, .width = 24, .height = 16 };
+    const finish: render_types.BackdropBlurFinish = .{
+        .brightness = 0.95,
+        .contrast = 0.92,
+        .saturation = 1.08,
+        .noise = 0.01,
+    };
+    const full = try dualKawaseArgb(std.testing.allocator, target, full_rect, 3, null, finish);
+    defer std.testing.allocator.free(full);
+    const scoped = try dualKawaseArgb(std.testing.allocator, target, scoped_rect, 3, null, finish);
+    defer std.testing.allocator.free(scoped);
+
+    for (0..scoped_rect.height) |y| {
+        for (0..scoped_rect.width) |x| {
+            const full_x: usize = @intCast(@as(i64, scoped_rect.x) + @as(i64, @intCast(x)));
+            const full_y: usize = @intCast(@as(i64, scoped_rect.y) + @as(i64, @intCast(y)));
+            try std.testing.expectEqual(
+                full[full_y * size.width + full_x],
+                scoped[y * scoped_rect.width + x],
+            );
+        }
+    }
+    try std.testing.expect(full[0] != 0xff806040);
+    try std.testing.expect(full[0] != full[1]);
 }
 
 test "CPU renderer clips writes to frame damage and preserves stride padding" {

@@ -489,6 +489,7 @@ fn translateCommand(
             .rect = translateRect(capture.rect, origin),
             .radius = capture.radius,
             .downsample_level = capture.downsample_level,
+            .finish = capture.finish,
             .base = capture.base,
         } },
         .backdrop_blur => |blur| .{ .backdrop_blur = .{
@@ -497,6 +498,7 @@ fn translateCommand(
             .corner_radius = blur.corner_radius,
             .radius = blur.radius,
             .downsample_level = blur.downsample_level,
+            .finish = blur.finish,
             .clip = if (blur.clip) |clip| translateRect(clip, origin) else null,
         } },
         .image => |image| .{ .image = .{
@@ -560,6 +562,7 @@ fn scaleCommand(command: render_types.Command, scale: render_types.Scale) render
             .rect = scaleRect(capture.rect, scale),
             .radius = scaleUnsigned(capture.radius, scale),
             .downsample_level = capture.downsample_level,
+            .finish = capture.finish,
             .base = capture.base,
         } },
         .backdrop_blur => |blur| .{ .backdrop_blur = .{
@@ -568,6 +571,7 @@ fn scaleCommand(command: render_types.Command, scale: render_types.Scale) render
             .corner_radius = scaleUnsigned(blur.corner_radius, scale),
             .radius = scaleUnsigned(blur.radius, scale),
             .downsample_level = blur.downsample_level,
+            .finish = blur.finish,
             .clip = if (blur.clip) |clip| scaleRect(clip, scale) else null,
         } },
         .image => |image| scaled: {

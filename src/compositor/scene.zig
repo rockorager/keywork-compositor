@@ -65,6 +65,7 @@ pub const ContentGeometry = struct {
 pub const Blur = struct {
     radius: u32,
     downsample_level: ?u8 = null,
+    finish: render.BackdropBlurFinish = .{},
 };
 
 pub const Shadow = struct {
@@ -79,7 +80,16 @@ pub const Effects = struct {
     shadow: ?Shadow = null,
 };
 
-pub const background_blur: Blur = .{ .radius = 16 };
+pub const background_blur: Blur = .{
+    .radius = 48,
+    .downsample_level = 4,
+    .finish = .{
+        .brightness = 0.88,
+        .contrast = 0.87,
+        .saturation = 1,
+        .noise = 0.003,
+    },
+};
 
 pub const default_effects: Effects = .{
     .corner_radius = 12,

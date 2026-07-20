@@ -390,6 +390,18 @@ pub const Shadow = struct {
     clip: ?Rect = null,
 };
 
+pub const BackdropBlurFinish = struct {
+    brightness: f32 = 1,
+    contrast: f32 = 1,
+    saturation: f32 = 1,
+    noise: f32 = 0,
+
+    pub fn isNeutral(self: BackdropBlurFinish) bool {
+        return self.brightness == 1 and self.contrast == 1 and
+            self.saturation == 1 and self.noise == 0;
+    }
+};
+
 /// Captures the completed target at this command-stream position. Subsequent
 /// backdrop blurs explicitly reference this immutable source by ID.
 pub const BackdropCapture = struct {
@@ -397,6 +409,7 @@ pub const BackdropCapture = struct {
     rect: Rect,
     radius: u32,
     downsample_level: ?u8 = null,
+    finish: BackdropBlurFinish = .{},
     /// The base scene can be shared by later captures whose footprints contain
     /// no intervening content.
     base: bool = false,
@@ -410,6 +423,7 @@ pub const BackdropBlur = struct {
     corner_radius: u32,
     radius: u32,
     downsample_level: ?u8 = null,
+    finish: BackdropBlurFinish = .{},
     clip: ?Rect = null,
 };
 

@@ -6891,6 +6891,7 @@ fn renderDesktopContents(
             .rect = frame.visible_rect,
             .radius = blur.radius,
             .downsample_level = blur.downsample_level,
+            .finish = blur.finish,
             .base = true,
         } }};
         try self.renderCommands(frame, &cache_command);
@@ -7460,6 +7461,7 @@ fn renderSurfaceTreeCapture(
             .rect = rect,
             .radius = blur.radius,
             .downsample_level = blur.downsample_level,
+            .finish = blur.finish,
         } }};
         try self.renderCommands(frame, &command);
         return capture_id;
@@ -7636,6 +7638,7 @@ fn renderSurfaceBackgroundEffect(
             .corner_radius = corner_radius,
             .radius = blur.radius,
             .downsample_level = blur.downsample_level,
+            .finish = blur.finish,
             .clip = clip,
         } }};
         try self.renderCommands(frame, &command);

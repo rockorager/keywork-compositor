@@ -295,6 +295,7 @@ const CompiledBackdropCapture = struct {
     op_index: u32,
     radius: u32,
     downsample_level: ?u8,
+    finish: render.BackdropBlurFinish,
     key: ?u64,
     level: u8,
     sample_rect: render.Rect,
@@ -5404,6 +5405,7 @@ fn hashRenderCommand(hasher: *std.hash.Wyhash, command: render.Command) bool {
             hashRect(hasher, capture.rect);
             hashScalar(hasher, capture.radius);
             hashOptionalScalar(hasher, capture.downsample_level);
+            hashBackdropBlurFinish(hasher, capture.finish);
             hashScalar(hasher, @intFromBool(capture.base));
         },
         .backdrop_blur => |blur| {
@@ -5412,6 +5414,7 @@ fn hashRenderCommand(hasher: *std.hash.Wyhash, command: render.Command) bool {
             hashScalar(hasher, blur.corner_radius);
             hashScalar(hasher, blur.radius);
             hashOptionalScalar(hasher, blur.downsample_level);
+            hashBackdropBlurFinish(hasher, blur.finish);
             hashOptionalRect(hasher, blur.clip);
         },
         .image => |image| {
@@ -5475,6 +5478,13 @@ fn hashColor(hasher: *std.hash.Wyhash, color: render.Color) void {
     hashScalar(hasher, color.green);
     hashScalar(hasher, color.blue);
     hashScalar(hasher, color.alpha);
+}
+
+fn hashBackdropBlurFinish(hasher: *std.hash.Wyhash, finish: render.BackdropBlurFinish) void {
+    hashScalar(hasher, finish.brightness);
+    hashScalar(hasher, finish.contrast);
+    hashScalar(hasher, finish.saturation);
+    hashScalar(hasher, finish.noise);
 }
 
 fn hashColorDescription(hasher: *std.hash.Wyhash, description: render.ColorDescription) void {
@@ -5821,6 +5831,7 @@ fn compileDrawRuns(
             const sample_rect = blurSampleRect(clipped, sample_radius, level, frame.size);
             if (capture.radius != blur.radius or
                 capture.downsample_level != blur.downsample_level or
+                !std.meta.eql(capture.finish, blur.finish) or
                 capture.level != level or
                 !rectContains(capture.sample_rect, sample_rect)) return error.InvalidTarget;
             self.markBackdropCaptureUsed(capture.op_index);
@@ -5944,6 +5955,7 @@ fn compileBackdropCapture(
         const base = base_capture orelse break :reuse null;
         if (base.radius != capture.radius or
             base.downsample_level != capture.downsample_level or
+            !std.meta.eql(base.finish, capture.finish) or
             !rectContains(base.sample_rect, sample_rect) or
             commandsAffectRect(
                 frame.commands[base.command_index + 1 .. command_index],
@@ -5992,6 +6004,7 @@ fn compileBackdropCapture(
             upsample_rects[index],
             kawase_offset,
             level == 0,
+            if (index == 0) capture.finish else null,
         ));
     }
 
@@ -6023,6 +6036,7 @@ fn compileBackdropCapture(
         .op_index = op_index,
         .radius = capture.radius,
         .downsample_level = capture.downsample_level,
+        .finish = capture.finish,
         .key = cache_key,
         .level = level,
         .sample_rect = sample_rect,
@@ -6034,6 +6048,7 @@ fn backdropGeometryKey(capture: render.BackdropCapture) u64 {
     hashRect(&hasher, capture.rect);
     hashScalar(&hasher, capture.radius);
     hashOptionalScalar(&hasher, capture.downsample_level);
+    hashBackdropBlurFinish(&hasher, capture.finish);
     return hasher.final();
 }
 
@@ -6264,16 +6279,32 @@ fn kawaseDownsampleInstance(destination: render.Rect, source: render.Rect, offse
     };
 }
 
-fn kawaseUpsampleInstance(destination: render.Rect, offset: f32, same_size: bool) Instance {
+fn kawaseUpsampleInstance(
+    destination: render.Rect,
+    offset: f32,
+    same_size: bool,
+    finish: ?render.BackdropBlurFinish,
+) Instance {
     const destination_floats = rectFloats(destination);
     const divisor: f32 = if (same_size) 1 else 2;
+    const finish_parameters = finish orelse render.BackdropBlurFinish{};
     return .{
         .destination = destination_floats,
         .source = .{ destination_floats[0] / divisor, destination_floats[1] / divisor, destination_floats[2] / divisor, destination_floats[3] / divisor },
         .clip = destination_floats,
-        .color = .{ 1, 1, 1, 1 },
+        .color = .{
+            finish_parameters.brightness,
+            @floatFromInt(@intFromBool(finish != null and !finish_parameters.isNeutral())),
+            0,
+            0,
+        },
         .rounded = .{ 0, 0, 0, 0 },
-        .parameters = .{ offset, 0, 0, 1 },
+        .parameters = .{
+            offset,
+            finish_parameters.contrast,
+            finish_parameters.saturation,
+            finish_parameters.noise,
+        },
     };
 }
 
@@ -7046,6 +7077,22 @@ test "backdrop blur level keeps low resolution radius bounded" {
     try std.testing.expectApproxEqAbs(@as(f32, 16.0 / 21.0), kawaseOffset(16, 3), 0.0001);
     try std.testing.expectEqual(@as(u32, 2), kawaseSourceExpansion(1, 0));
     try std.testing.expectEqual(@as(u32, 2), kawaseSourceExpansion(16, 3));
+}
+
+test "backdrop blur finish is attached only to the final upsample" {
+    const destination: render.Rect = .{ .x = 4, .y = 8, .width = 32, .height = 16 };
+    const intermediate = kawaseUpsampleInstance(destination, 0.75, false, null);
+    try std.testing.expectEqual(@as(f32, 0), intermediate.color[1]);
+    try std.testing.expectEqualSlices(f32, &.{ 0.75, 1, 1, 0 }, &intermediate.parameters);
+
+    const final = kawaseUpsampleInstance(destination, 0.75, false, .{
+        .brightness = 0.95,
+        .contrast = 0.92,
+        .saturation = 1.08,
+        .noise = 0.01,
+    });
+    try std.testing.expectEqualSlices(f32, &.{ 0.95, 1, 0, 0 }, &final.color);
+    try std.testing.expectEqualSlices(f32, &.{ 0.75, 0.92, 1.08, 0.01 }, &final.parameters);
 }
 
 test "backdrop blur geometry scales odd rectangles and clips aligned edges" {
