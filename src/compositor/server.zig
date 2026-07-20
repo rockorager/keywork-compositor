@@ -228,6 +228,7 @@ const RenderOutput = struct {
     repaint_needed: bool,
     render_scheduled: bool,
     lock_frame_pending: bool,
+    consecutive_output_busy_retries: u8,
     frame_statistics: FrameStatistics,
     request_started_nanoseconds: ?i96,
     pending_frame: ?PendingFrame,
@@ -262,12 +263,25 @@ const RenderOutput = struct {
         std.debug.assert(pending.commit_nanoseconds == null);
         std.debug.assert(path == .composited or scanout_format != null);
         pending.commit_nanoseconds = nowNanoseconds(self.server.io);
+        self.consecutive_output_busy_retries = 0;
         self.frame_statistics.recordFrame(path, scanout_format, damage);
         switch (path) {
             .composited => increment(&self.frame_statistics.composited_frames),
             .direct_scanout => increment(&self.frame_statistics.direct_scanout_frames),
             .overlay_scanout => increment(&self.frame_statistics.overlay_scanout_frames),
         }
+    }
+
+    fn retryOutputBusy(self: *RenderOutput) bool {
+        if (self.consecutive_output_busy_retries == maximum_output_busy_retries) {
+            log.err(
+                "output remained busy after {d} page flip retries",
+                .{maximum_output_busy_retries},
+            );
+            return false;
+        }
+        self.consecutive_output_busy_retries += 1;
+        return true;
     }
 
     fn presentFrame(self: *RenderOutput, info: presentation.Info) void {
@@ -301,6 +315,7 @@ const RenderOutput = struct {
     }
 };
 
+const maximum_output_busy_retries = 60;
 const frame_latency_capacity = 1024;
 const frame_budget_tolerance_nanoseconds = std.time.ns_per_ms;
 const direct_scanout_rejection_count = std.meta.fields(render.DirectScanoutRejection).len;
@@ -1856,6 +1871,7 @@ fn addRenderOutput(
         .repaint_needed = false,
         .render_scheduled = false,
         .lock_frame_pending = false,
+        .consecutive_output_busy_retries = 0,
         .frame_statistics = .{},
         .request_started_nanoseconds = null,
         .pending_frame = null,
@@ -6719,6 +6735,14 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
                     self.damageFullOutput(render_output);
                     return;
                 },
+                error.OutputBusy => {
+                    if (!render_output.retryOutputBusy()) return error.InvalidTarget;
+                    render_output.backend.cancel();
+                    render_output.discardFrame();
+                    output.cancelFrame();
+                    self.damageFullOutput(render_output);
+                    return;
+                },
                 error.OverlayCommitFailed => {
                     render_output.discardFrame();
                     output.cancelFrame();
@@ -6726,7 +6750,10 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
                     self.damageFullOutput(render_output);
                     return;
                 },
-                else => return error.InvalidTarget,
+                else => {
+                    log.err("validated overlay presentation failed: {t}", .{err});
+                    return error.InvalidTarget;
+                },
             };
             preservePromotedDamage(
                 &render_output.damage,
@@ -6746,7 +6773,18 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
                 self.damageFullOutput(render_output);
                 return;
             },
-            else => return error.InvalidTarget,
+            error.OutputBusy => {
+                if (!render_output.retryOutputBusy()) return error.InvalidTarget;
+                render_output.backend.cancel();
+                render_output.discardFrame();
+                output.cancelFrame();
+                self.damageFullOutput(render_output);
+                return;
+            },
+            else => {
+                log.err("composited output presentation failed: {t}", .{err});
+                return error.InvalidTarget;
+            },
         };
         render_output.commitFrame(
             if (overlay_destination != null) .overlay_scanout else .composited,
@@ -6917,7 +6955,18 @@ fn presentSessionLockFrame(
             self.damageFullOutput(frame.render_output);
             return;
         },
-        else => return error.InvalidTarget,
+        error.OutputBusy => {
+            if (!frame.render_output.retryOutputBusy()) return error.InvalidTarget;
+            frame.render_output.backend.cancel();
+            frame.render_output.discardFrame();
+            frame.output.cancelFrame();
+            self.damageFullOutput(frame.render_output);
+            return;
+        },
+        else => {
+            log.err("session-lock output presentation failed: {t}", .{err});
+            return error.InvalidTarget;
+        },
     };
     frame.render_output.commitFrame(
         .composited,

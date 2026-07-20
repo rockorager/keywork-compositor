@@ -752,7 +752,10 @@ pub fn present(
         null,
         .commit,
         allow_tearing,
-    ) catch unreachable orelse {
+    ) catch |err| switch (err) {
+        error.OutputBusy => return err,
+        error.AtomicTestFailed, error.OverlaySynchronizationFailed => unreachable,
+    } orelse {
         if (self.color_fallback_pending) {
             self.acquired = null;
             self.color_fallback_pending = false;
@@ -786,8 +789,9 @@ pub fn presentValidatedOverlay(
         validated.atomic,
         .commit,
         allow_tearing,
-    ) catch {
+    ) catch |err| {
         self.discardFailedValidatedFrame();
+        if (err == error.OutputBusy) return err;
         if (self.color_fallback_pending) {
             self.color_fallback_pending = false;
             return error.OutputColorFallback;
@@ -1000,6 +1004,7 @@ pub fn validateOverlayScanout(
         const reason: render.OverlayScanoutRejection = switch (err) {
             error.AtomicTestFailed => .atomic_test_failed,
             error.OverlaySynchronizationFailed => .synchronization_failed,
+            error.OutputBusy => .output_busy,
         };
         return .{ .rejected = reason };
     };
@@ -1057,7 +1062,13 @@ pub fn tryDirectScanout(
         null,
         .commit,
         allow_tearing,
-    ) catch unreachable orelse {
+    ) catch |err| {
+        source.release(source.context);
+        return .{ .rejected = if (err == error.OutputBusy)
+            .output_busy
+        else
+            .page_flip_failed };
+    } orelse {
         source.release(source.context);
         return .{ .rejected = .page_flip_failed };
     };
@@ -2666,7 +2677,7 @@ fn queuePageFlip(
     overlay: ?AtomicOverlay,
     action: PageFlipAction,
     allow_tearing: bool,
-) error{ AtomicTestFailed, OverlaySynchronizationFailed }!?PageFlipMode {
+) error{ AtomicTestFailed, OverlaySynchronizationFailed, OutputBusy }!?PageFlipMode {
     const preferred_mode: PageFlipMode = if (!self.output_color_dirty and
         allow_tearing and self.async_page_flip_supported and overlay == null and
         self.overlay_displayed == null)
@@ -2675,26 +2686,73 @@ fn queuePageFlip(
         .vsync;
     const properties = self.atomic_plane orelse {
         std.debug.assert(overlay == null and action == .commit);
-        if (c.drmModePageFlip(
+        const preferred_result = c.drmModePageFlip(
             fd,
             self.crtc_id,
             framebuffer_id,
             pageFlipFlags(preferred_mode),
             self,
-        ) == 0) return preferred_mode;
-        if (preferred_mode == .async and c.drmModePageFlip(
-            fd,
-            self.crtc_id,
-            framebuffer_id,
-            pageFlipFlags(.vsync),
-            self,
-        ) == 0) return .vsync;
+        );
+        if (preferred_result == 0) return preferred_mode;
+        const preferred_errno = drmModeError(preferred_result);
+        if (preferred_mode == .async) {
+            const fallback_result = c.drmModePageFlip(
+                fd,
+                self.crtc_id,
+                framebuffer_id,
+                pageFlipFlags(.vsync),
+                self,
+            );
+            if (fallback_result == 0) return .vsync;
+            const fallback_errno = drmModeError(fallback_result);
+            if (fallback_errno == .BUSY) {
+                log.warn(
+                    "legacy page flip busy on {s}: CRTC={d} framebuffer={d} async_errno={t} vsync_errno={t}; retrying frame",
+                    .{
+                        self.name(),
+                        self.crtc_id,
+                        framebuffer_id,
+                        preferred_errno,
+                        fallback_errno,
+                    },
+                );
+                return error.OutputBusy;
+            }
+            log.err(
+                "legacy page flip failed on {s}: CRTC={d} framebuffer={d} async_errno={t} vsync_errno={t}",
+                .{
+                    self.name(),
+                    self.crtc_id,
+                    framebuffer_id,
+                    preferred_errno,
+                    fallback_errno,
+                },
+            );
+            return null;
+        }
+        if (preferred_errno == .BUSY) {
+            log.warn(
+                "legacy page flip busy on {s}: CRTC={d} framebuffer={d}; retrying frame",
+                .{ self.name(), self.crtc_id, framebuffer_id },
+            );
+            return error.OutputBusy;
+        }
+        log.err(
+            "legacy page flip failed on {s}: CRTC={d} framebuffer={d} errno={t}",
+            .{ self.name(), self.crtc_id, framebuffer_id, preferred_errno },
+        );
         return null;
     };
-    const request = c.drmModeAtomicAlloc() orelse return null;
+    const request = c.drmModeAtomicAlloc() orelse {
+        log.err("failed to allocate atomic page flip request on {s}", .{self.name()});
+        return null;
+    };
     defer c.drmModeAtomicFree(request);
 
-    const plane_id = self.primary_plane_id orelse return null;
+    const plane_id = self.primary_plane_id orelse {
+        log.err("atomic page flip on {s} has no primary plane", .{self.name()});
+        return null;
+    };
     const fence_fd = if (properties.in_fence_fd != 0 and source != null)
         source.?.export_read_fence(source.?.context, 0)
     else
@@ -2720,7 +2778,22 @@ fn queuePageFlip(
         null,
         fence_fd,
         null,
-    )) return null;
+    )) {
+        log.err(
+            "failed to add primary plane state for atomic page flip on {s}: plane={d} CRTC={d} framebuffer={d} source={d}x{d} destination={d}x{d}",
+            .{
+                self.name(),
+                plane_id,
+                self.crtc_id,
+                framebuffer_id,
+                source_size.width,
+                source_size.height,
+                self.size.width,
+                self.size.height,
+            },
+        );
+        return null;
+    }
     if (self.overlay_plane) |plane| {
         if (overlay) |value| {
             const in_fence_fd = if (plane.atomic.in_fence_fd != 0)
@@ -2786,23 +2859,109 @@ fn queuePageFlip(
         std.debug.assert(overlay != null);
         return .vsync;
     }
-    if (c.drmModeAtomicCommit(
+    const preferred_flags = atomic_flags | pageFlipFlags(preferred_mode);
+    const preferred_result = c.drmModeAtomicCommit(
         fd,
         request,
-        atomic_flags | pageFlipFlags(preferred_mode),
+        preferred_flags,
         self,
-    ) == 0) {
+    );
+    if (preferred_result == 0) {
         self.output_color_dirty = false;
         return preferred_mode;
     }
-    if (preferred_mode == .async and c.drmModeAtomicCommit(
-        fd,
-        request,
-        atomic_flags | pageFlipFlags(.vsync),
-        self,
-    ) == 0) {
-        self.output_color_dirty = false;
-        return .vsync;
+    const preferred_errno = drmModeError(preferred_result);
+    if (preferred_mode == .async) {
+        const fallback_flags = atomic_flags | pageFlipFlags(.vsync);
+        const fallback_result = c.drmModeAtomicCommit(
+            fd,
+            request,
+            fallback_flags,
+            self,
+        );
+        if (fallback_result == 0) {
+            self.output_color_dirty = false;
+            return .vsync;
+        }
+        const fallback_errno = drmModeError(fallback_result);
+        if (fallback_errno == .BUSY) {
+            log.warn(
+                "atomic page flip busy on {s}: CRTC={d} plane={d} framebuffer={d} source={d}x{d} destination={d}x{d} overlay={any} color_dirty={any} async_flags=0x{x} async_errno={t} vsync_flags=0x{x} vsync_errno={t}; retrying frame",
+                .{
+                    self.name(),
+                    self.crtc_id,
+                    plane_id,
+                    framebuffer_id,
+                    source_size.width,
+                    source_size.height,
+                    self.size.width,
+                    self.size.height,
+                    overlay != null,
+                    color_dirty,
+                    preferred_flags,
+                    preferred_errno,
+                    fallback_flags,
+                    fallback_errno,
+                },
+            );
+            return error.OutputBusy;
+        }
+        log.err(
+            "atomic page flip commit failed on {s}: CRTC={d} plane={d} framebuffer={d} source={d}x{d} destination={d}x{d} overlay={any} color_dirty={any} async_flags=0x{x} async_errno={t} vsync_flags=0x{x} vsync_errno={t}",
+            .{
+                self.name(),
+                self.crtc_id,
+                plane_id,
+                framebuffer_id,
+                source_size.width,
+                source_size.height,
+                self.size.width,
+                self.size.height,
+                overlay != null,
+                color_dirty,
+                preferred_flags,
+                preferred_errno,
+                fallback_flags,
+                fallback_errno,
+            },
+        );
+    } else {
+        if (preferred_errno == .BUSY) {
+            log.warn(
+                "atomic page flip busy on {s}: CRTC={d} plane={d} framebuffer={d} source={d}x{d} destination={d}x{d} overlay={any} color_dirty={any} flags=0x{x}; retrying frame",
+                .{
+                    self.name(),
+                    self.crtc_id,
+                    plane_id,
+                    framebuffer_id,
+                    source_size.width,
+                    source_size.height,
+                    self.size.width,
+                    self.size.height,
+                    overlay != null,
+                    color_dirty,
+                    preferred_flags,
+                },
+            );
+            return error.OutputBusy;
+        }
+        log.err(
+            "atomic page flip commit failed on {s}: CRTC={d} plane={d} framebuffer={d} source={d}x{d} destination={d}x{d} overlay={any} color_dirty={any} flags=0x{x} errno={t}",
+            .{
+                self.name(),
+                self.crtc_id,
+                plane_id,
+                framebuffer_id,
+                source_size.width,
+                source_size.height,
+                self.size.width,
+                self.size.height,
+                overlay != null,
+                color_dirty,
+                preferred_flags,
+                preferred_errno,
+            },
+        );
     }
     if (color_dirty and self.output_color_mode != .sdr) self.rejectOutputColorState();
     return null;
@@ -2820,6 +2979,11 @@ fn supportsAsyncPageFlips(fd: std.posix.fd_t, atomic: bool) bool {
 fn pageFlipFlags(mode: PageFlipMode) c_uint {
     return @as(c_uint, @intCast(c.DRM_MODE_PAGE_FLIP_EVENT)) |
         if (mode == .async) @as(c_uint, @intCast(c.DRM_MODE_PAGE_FLIP_ASYNC)) else 0;
+}
+
+fn drmModeError(result: c_int) std.posix.E {
+    std.debug.assert(result < 0);
+    return @enumFromInt(@as(u16, @intCast(-@as(i64, result))));
 }
 
 fn clearInheritedCursor(self: *Self, fd: std.posix.fd_t) void {
