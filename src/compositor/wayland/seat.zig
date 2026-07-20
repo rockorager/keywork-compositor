@@ -701,6 +701,7 @@ pub fn cursorInfo(self: *const Self) ?CursorInfo {
 /// Overrides client and fallback cursors while the compositor owns the pointer.
 /// The image's pixel storage must remain valid until this override is replaced.
 pub fn setCompositorCursor(self: *Self, cursor: ?CursorImage) void {
+    if (std.meta.eql(self.compositor_cursor, cursor)) return;
     const old_cursor = self.cursorInfo();
     self.compositor_cursor = cursor;
     self.notifyCursorChanged(old_cursor);

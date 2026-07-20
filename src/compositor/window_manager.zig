@@ -881,19 +881,42 @@ fn beginInteractiveResizeWindow(
     pointer_x: f64,
     pointer_y: f64,
 ) bool {
-    const window = self.windows.get(id) orelse return false;
-    if (!window.mapped or window.minimized or window.fullscreen_output != null) return false;
+    const resize = self.interactiveResizeForWindow(id, pointer_x, pointer_y) orelse return false;
+    self.interactive_resize = resize;
+    const window = self.windows.get(id).?;
     const workspace = &self.workspaces.items[window.workspace];
-    if (!workspace.active) return false;
+    switch (resize) {
+        .floating => {
+            _ = workspace.workspace.raise(neutral(id));
+            self.scene.placeTop(window.scene_id);
+        },
+        .tiled => {},
+    }
+    _ = workspace.workspace.focus(neutral(id));
+    self.default_output = workspace.output;
+    self.relayout();
+    return true;
+}
+
+fn interactiveResizeForWindow(
+    self: *Self,
+    id: WindowId,
+    pointer_x: f64,
+    pointer_y: f64,
+) ?InteractiveResize {
+    const window = self.windows.get(id) orelse return null;
+    if (!window.mapped or window.minimized or window.fullscreen_output != null) return null;
+    const workspace = &self.workspaces.items[window.workspace];
+    if (!workspace.active) return null;
     if (self.isFloating(window)) {
-        const rect = (window.placement orelse return false).rect;
+        const rect = (window.placement orelse return null).rect;
         const edges = resizeEdgesAt(
             rect,
             pointer_x,
             pointer_y,
             resize_edge_threshold,
-        ) orelse return false;
-        self.interactive_resize = .{ .floating = .{
+        ) orelse return null;
+        return .{ .floating = .{
             .window = id,
             .initial_rect = rect,
             .initial_pointer_x = pointer_x,
@@ -901,25 +924,18 @@ fn beginInteractiveResizeWindow(
             .edges = edges,
             .constraints = self.windowSizeConstraints(window),
         } };
-        _ = workspace.workspace.raise(neutral(id));
-        self.scene.placeTop(window.scene_id);
-    } else {
-        if (!self.isDraggableTiledWindow(window)) return false;
-        const resize = workspace.workspace.layout.beginResize(
-            neutral(id),
-            pointer_x,
-            pointer_y,
-            resize_edge_threshold,
-        ) orelse return false;
-        self.interactive_resize = .{ .tiled = .{
-            .workspace = window.workspace,
-            .resize = resize,
-        } };
     }
-    _ = workspace.workspace.focus(neutral(id));
-    self.default_output = workspace.output;
-    self.relayout();
-    return true;
+    if (!self.isDraggableTiledWindow(window)) return null;
+    const resize = workspace.workspace.layout.beginResize(
+        neutral(id),
+        pointer_x,
+        pointer_y,
+        resize_edge_threshold,
+    ) orelse return null;
+    return .{ .tiled = .{
+        .workspace = window.workspace,
+        .resize = resize,
+    } };
 }
 
 pub fn compositorPointerGrabActive(self: *const Self) bool {
@@ -929,6 +945,35 @@ pub fn compositorPointerGrabActive(self: *const Self) bool {
 
 pub fn interactiveResizeCursorShape(self: *const Self) ?PointerShape {
     const resize = self.interactive_resize orelse return null;
+    return cursorShapeForInteractiveResize(resize);
+}
+
+pub fn resizeCursorShapeAt(
+    self: *Self,
+    root: ?Surface.Id,
+    pointer_x: f64,
+    pointer_y: f64,
+) ?PointerShape {
+    if (self.pointerInteractionActive() or self.layer_focus == .exclusive) return null;
+    if (root) |surface_id| {
+        const id = self.windowForSurface(surface_id) orelse return null;
+        const resize = self.interactiveResizeForWindow(id, pointer_x, pointer_y) orelse return null;
+        return cursorShapeForInteractiveResize(resize);
+    }
+    for (self.workspaces.items) |workspace| {
+        if (!workspace.active) continue;
+        for (workspace.workspace.members.items) |member| {
+            const id = internal(member);
+            const window = self.windows.get(id) orelse continue;
+            if (self.isFloating(window)) continue;
+            const resize = self.interactiveResizeForWindow(id, pointer_x, pointer_y) orelse continue;
+            return cursorShapeForInteractiveResize(resize);
+        }
+    }
+    return null;
+}
+
+fn cursorShapeForInteractiveResize(resize: InteractiveResize) PointerShape {
     return switch (resize) {
         .floating => |value| floatingResizeCursorShape(value.edges),
         .tiled => |value| switch (value.resize) {

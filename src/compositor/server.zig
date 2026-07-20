@@ -3768,6 +3768,7 @@ fn sessionLockStateChanged(context: *anyopaque, locked: bool) void {
     if (self.window_manager_initialized and self.endCompositorPointerGrab(false)) {
         requestRepaint(self);
     }
+    self.seat.setCompositorCursor(null);
     self.pointer_constraints.deactivateAll();
     self.data_device.cancel();
     self.tablet.cancelFocus();
@@ -3783,11 +3784,9 @@ fn sessionLockStateChanged(context: *anyopaque, locked: bool) void {
         self.input_method.setInhibited(false);
         self.virtual_keyboard.setInhibited(false);
         if (self.seat.pointerPosition()) |position| {
-            self.seat.pointerEnter(
-                position.x,
-                position.y,
-                self.pointerFocus(position.x, position.y),
-            );
+            const route = self.pointerRoute(position.x, position.y);
+            self.seat.pointerEnter(position.x, position.y, route.focus);
+            self.updateResizeCursor(route.root, position.x, position.y);
         }
     }
 }
@@ -4629,13 +4628,19 @@ fn pointerEnter(context: *anyopaque, x: f64, y: f64) void {
         return;
     }
     self.seat.pointerEnter(point.x, point.y, route.focus);
-    if (!self.xdg_shell.hasPopupGrab()) self.window_manager.pointerMoved(route.root);
+    if (!self.xdg_shell.hasPopupGrab()) {
+        self.window_manager.pointerMoved(route.root);
+        self.updateResizeCursor(route.root, point.x, point.y);
+    } else {
+        self.seat.setCompositorCursor(null);
+    }
     self.pointer_constraints.syncFocus();
 }
 
 fn pointerLeave(context: *anyopaque) void {
     const self = serverForOutput(context);
     if (self.endCompositorPointerGrab(false)) requestRepaint(self);
+    self.seat.setCompositorCursor(null);
     self.pointer_constraints.deactivateAll();
     self.data_device.pointerLeft();
     if (self.xwm_initialized) self.xwm.dragLeft();
@@ -4714,7 +4719,12 @@ fn pointerMotionGlobalForSeat(
         motion.point.y,
         route.focus,
     );
-    if (!self.xdg_shell.hasPopupGrab()) self.window_manager.pointerMoved(route.root);
+    if (!self.xdg_shell.hasPopupGrab()) {
+        self.window_manager.pointerMoved(route.root);
+        self.updateResizeCursor(route.root, motion.point.x, motion.point.y);
+    } else {
+        self.seat.setCompositorCursor(null);
+    }
     self.pointer_constraints.syncFocus();
 }
 
@@ -4961,6 +4971,7 @@ fn pointerButtonForSeat(
             if (position) |point| {
                 const route = self.pointerRoute(point.x, point.y);
                 seat.pointerEnter(point.x, point.y, route.focus);
+                self.updateResizeCursor(route.root, point.x, point.y);
                 self.pointer_constraints.syncFocus();
             }
             requestRepaint(self);
@@ -5023,6 +5034,7 @@ fn pointerButtonForSeat(
 fn dragStarted(context: *anyopaque) void {
     const self: *Self = @ptrCast(@alignCast(context));
     if (self.endCompositorPointerGrab(false)) requestRepaint(self);
+    self.seat.setCompositorCursor(null);
     self.pointer_constraints.deactivateAll();
     if (self.xwm_initialized) self.xwm.dragStarted();
     self.reconcileOutputCursors();
@@ -5036,6 +5048,18 @@ fn endCompositorPointerGrab(self: *Self, commit: bool) bool {
     const ended = self.window_manager.endCompositorPointerGrab(commit);
     if (ended) self.seat.setCompositorCursor(null);
     return ended;
+}
+
+fn updateResizeCursor(self: *Self, root: ?Surface.Id, x: f64, y: f64) void {
+    if (!self.window_manager_initialized) {
+        self.seat.setCompositorCursor(null);
+        return;
+    }
+    const shape = self.window_manager.resizeCursorShapeAt(root, x, y) orelse {
+        self.seat.setCompositorCursor(null);
+        return;
+    };
+    self.seat.setCompositorCursor(self.cursor_shape.cursorImage(shape));
 }
 
 fn xdgToplevelDragBegin(
@@ -5075,7 +5099,10 @@ fn dragEnded(context: *anyopaque) void {
     const position = self.seat.pointerPosition() orelse return;
     const route = self.pointerRoute(position.x, position.y);
     self.seat.pointerEnter(position.x, position.y, route.focus);
-    if (!self.xdg_shell.hasPopupGrab()) self.window_manager.pointerMoved(route.root);
+    if (!self.xdg_shell.hasPopupGrab()) {
+        self.window_manager.pointerMoved(route.root);
+        self.updateResizeCursor(route.root, position.x, position.y);
+    }
     self.pointer_constraints.syncFocus();
 }
 
