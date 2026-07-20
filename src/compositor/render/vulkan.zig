@@ -5800,7 +5800,7 @@ fn compileDrawRuns(
                 cutout.radius,
                 @min(cutout.rect.width, cutout.rect.height) / 2,
             );
-            try self.emitDamaged(frame, clipped, .shadow, .null_handle, .null_handle, null, .{ .width = 1, .height = 1 }, .{}, null, null, .{
+            const instance: Instance = .{
                 .destination = rectFloats(cutout.rect),
                 .source = .{ 0, 0, 1, 1 },
                 .clip = undefined,
@@ -5817,7 +5817,20 @@ fn compileDrawRuns(
                     @floatFromInt(cutout_radius),
                     @floatFromInt(@intFromBool(shadow.cutout != null)),
                 },
-            });
+            };
+            var raster_rects: [4]?render.Rect = @splat(null);
+            if (shadow.cutout) |_| {
+                if (opaqueRoundedRectInterior(cutout.rect, cutout_radius)) |interior| {
+                    raster_rects = rectDifferenceStrips(clipped, interior);
+                } else {
+                    raster_rects[0] = clipped;
+                }
+            } else {
+                raster_rects[0] = clipped;
+            }
+            for (raster_rects) |raster_rect| {
+                try self.emitDamaged(frame, raster_rect orelse continue, .shadow, .null_handle, .null_handle, null, .{ .width = 1, .height = 1 }, .{}, null, null, instance);
+            }
         },
         .backdrop_blur => |blur| {
             if (blur.radius == 0 or blur.rect.width == 0 or blur.rect.height == 0) continue;
@@ -6059,6 +6072,55 @@ fn rectContains(outer: render.Rect, inner: render.Rect) bool {
         @as(i64, inner.y) + inner.height <= @as(i64, outer.y) + outer.height;
 }
 
+fn opaqueRoundedRectInterior(rect: render.Rect, radius: u32) ?render.Rect {
+    std.debug.assert(radius <= @min(rect.width, rect.height) / 2);
+    const inset = radius * 2;
+    if (rect.width <= inset or rect.height <= inset) return null;
+    return .{
+        .x = @intCast(@as(i64, rect.x) + radius),
+        .y = @intCast(@as(i64, rect.y) + radius),
+        .width = rect.width - inset,
+        .height = rect.height - inset,
+    };
+}
+
+fn rectDifferenceStrips(outer: render.Rect, removed: render.Rect) [4]?render.Rect {
+    var result: [4]?render.Rect = @splat(null);
+    const interior = outer.intersection(removed) orelse {
+        result[0] = outer;
+        return result;
+    };
+    const outer_right = @as(i64, outer.x) + outer.width;
+    const outer_bottom = @as(i64, outer.y) + outer.height;
+    const interior_right = @as(i64, interior.x) + interior.width;
+    const interior_bottom = @as(i64, interior.y) + interior.height;
+    if (interior.y > outer.y) result[0] = .{
+        .x = outer.x,
+        .y = outer.y,
+        .width = outer.width,
+        .height = @intCast(@as(i64, interior.y) - outer.y),
+    };
+    if (interior_bottom < outer_bottom) result[1] = .{
+        .x = outer.x,
+        .y = @intCast(interior_bottom),
+        .width = outer.width,
+        .height = @intCast(outer_bottom - interior_bottom),
+    };
+    if (interior.x > outer.x) result[2] = .{
+        .x = outer.x,
+        .y = interior.y,
+        .width = @intCast(@as(i64, interior.x) - outer.x),
+        .height = interior.height,
+    };
+    if (interior_right < outer_right) result[3] = .{
+        .x = @intCast(interior_right),
+        .y = interior.y,
+        .width = @intCast(outer_right - interior_right),
+        .height = interior.height,
+    };
+    return result;
+}
+
 fn emitDamaged(
     self: *Self,
     frame: render.Frame,
@@ -6135,6 +6197,43 @@ test "Vulkan blur bounds only cover damaged visible pixels" {
         }, visible).?,
     );
     try std.testing.expectEqual(null, damageBounds(&.{.{ .x = 0, .y = 0, .width = 5, .height = 5 }}, visible));
+}
+
+test "Vulkan shadow raster strips exclude only the opaque cutout interior" {
+    try std.testing.expectEqual(
+        render.Rect{ .x = 22, .y = 32, .width = 76, .height = 56 },
+        opaqueRoundedRectInterior(.{ .x = 10, .y = 20, .width = 100, .height = 80 }, 12).?,
+    );
+    try std.testing.expectEqual(
+        render.Rect{ .x = 10, .y = 20, .width = 100, .height = 80 },
+        opaqueRoundedRectInterior(.{ .x = 10, .y = 20, .width = 100, .height = 80 }, 0).?,
+    );
+    try std.testing.expectEqual(
+        @as(?render.Rect, null),
+        opaqueRoundedRectInterior(.{ .x = 10, .y = 20, .width = 24, .height = 24 }, 12),
+    );
+
+    try std.testing.expectEqualSlices(
+        ?render.Rect,
+        &.{
+            .{ .x = 10, .y = 20, .width = 100, .height = 15 },
+            .{ .x = 10, .y = 65, .width = 100, .height = 35 },
+            .{ .x = 10, .y = 35, .width = 20, .height = 30 },
+            .{ .x = 70, .y = 35, .width = 40, .height = 30 },
+        },
+        &rectDifferenceStrips(
+            .{ .x = 10, .y = 20, .width = 100, .height = 80 },
+            .{ .x = 30, .y = 35, .width = 40, .height = 30 },
+        ),
+    );
+    try std.testing.expectEqualSlices(
+        ?render.Rect,
+        &.{ .{ .x = 10, .y = 20, .width = 100, .height = 80 }, null, null, null },
+        &rectDifferenceStrips(
+            .{ .x = 10, .y = 20, .width = 100, .height = 80 },
+            .{ .x = -20, .y = -20, .width = 10, .height = 10 },
+        ),
+    );
 }
 
 fn emitInstance(
