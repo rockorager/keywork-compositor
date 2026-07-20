@@ -3990,7 +3990,21 @@ fn createImageDescriptor(self: *Self, view: vk.ImageView) Error!vk.DescriptorSet
         .descriptor_set_count = 1,
         .p_set_layouts = @ptrCast(&self.descriptor_set_layout),
     }, @ptrCast(&descriptor_set)) catch return error.VulkanFailure;
-    const image_info: vk.DescriptorImageInfo = .{ .sampler = self.sampler, .image_view = view, .image_layout = .shader_read_only_optimal };
+    self.updateImageDescriptor(descriptor_set, self.sampler, view);
+    return descriptor_set;
+}
+
+fn updateImageDescriptor(
+    self: *Self,
+    descriptor_set: vk.DescriptorSet,
+    sampler: vk.Sampler,
+    view: vk.ImageView,
+) void {
+    const image_info: vk.DescriptorImageInfo = .{
+        .sampler = sampler,
+        .image_view = view,
+        .image_layout = .shader_read_only_optimal,
+    };
     self.device_wrapper.updateDescriptorSets(self.device, &.{.{
         .dst_set = descriptor_set,
         .dst_binding = 0,
@@ -4001,7 +4015,6 @@ fn createImageDescriptor(self: *Self, view: vk.ImageView) Error!vk.DescriptorSet
         .p_buffer_info = undefined,
         .p_texel_buffer_view = undefined,
     }}, null);
-    return descriptor_set;
 }
 
 fn destroyImageDescriptor(self: *Self, descriptor_set: vk.DescriptorSet) void {
@@ -4650,32 +4663,8 @@ fn createTexture(self: *Self, size: render.Size) Error!Texture {
         .sampled_bit = true,
     });
     errdefer self.destroyImageAllocation(allocation);
-    var descriptor_set: vk.DescriptorSet = undefined;
-    self.device_wrapper.allocateDescriptorSets(self.device, &.{
-        .descriptor_pool = self.descriptor_pool,
-        .descriptor_set_count = 1,
-        .p_set_layouts = @ptrCast(&self.descriptor_set_layout),
-    }, @ptrCast(&descriptor_set)) catch return error.VulkanFailure;
-    errdefer self.device_wrapper.freeDescriptorSets(
-        self.device,
-        self.descriptor_pool,
-        &.{descriptor_set},
-    ) catch {};
-    const image_info: vk.DescriptorImageInfo = .{
-        .sampler = self.sampler,
-        .image_view = allocation.view,
-        .image_layout = .shader_read_only_optimal,
-    };
-    self.device_wrapper.updateDescriptorSets(self.device, &.{.{
-        .dst_set = descriptor_set,
-        .dst_binding = 0,
-        .dst_array_element = 0,
-        .descriptor_count = 1,
-        .descriptor_type = .combined_image_sampler,
-        .p_image_info = @ptrCast(&image_info),
-        .p_buffer_info = undefined,
-        .p_texel_buffer_view = undefined,
-    }}, null);
+    const descriptor_set = try self.createImageDescriptor(allocation.view);
+    errdefer self.destroyImageDescriptor(descriptor_set);
     const texture: Texture = .{
         .image = allocation.image,
         .memory = allocation.memory,
@@ -4891,11 +4880,15 @@ fn createImportedTexture(
             .p_texel_buffer_view = undefined,
         },
     };
-    self.device_wrapper.updateDescriptorSets(
-        self.device,
-        descriptor_writes[0..if (manual_parameters != null) 2 else 1],
-        null,
-    );
+    if (video_graphics == null) {
+        self.updateImageDescriptor(descriptor_set, self.sampler, view);
+    } else {
+        self.device_wrapper.updateDescriptorSets(
+            self.device,
+            descriptor_writes[0..if (manual_parameters != null) 2 else 1],
+            null,
+        );
+    }
     const texture: Texture = .{
         .image = image,
         .memory = memory,
