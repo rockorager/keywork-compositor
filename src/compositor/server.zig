@@ -7665,6 +7665,12 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
     if (drag_icon) |info| self.submitSurfaceTree(output, info.surface_id);
     if (paint_primary_cursor) self.submitSeatCursor(output, &self.seat, false);
     self.submitTabletCursors(output, false);
+    const callback_timestamp = presentation.Timestamp.fromNanoseconds(nowNanoseconds(self.io));
+    Surface.sendSubmittedFrameCallbacks(
+        self.compositor.surfaceStore(),
+        output,
+        callback_timestamp.milliseconds(),
+    );
     Surface.clearFifoBarriersForOutput(self.compositor.surfaceStore(), output);
     self.finishRepaintIfIdle();
     if (presented) |info| outputPresented(render_output, info);
@@ -7872,6 +7878,12 @@ fn presentSessionLockFrame(
         frame.render_output.cursor_state == .deactivating)
         self.submitSeatCursor(frame.output, &self.seat, true);
     self.submitTabletCursors(frame.output, true);
+    const callback_timestamp = presentation.Timestamp.fromNanoseconds(nowNanoseconds(self.io));
+    Surface.sendSubmittedFrameCallbacks(
+        self.compositor.surfaceStore(),
+        frame.output,
+        callback_timestamp.milliseconds(),
+    );
     Surface.clearFifoBarriersForOutput(self.compositor.surfaceStore(), frame.output);
     self.finishRepaintIfIdle();
     if (presented) |info| outputPresented(frame.render_output, info);
