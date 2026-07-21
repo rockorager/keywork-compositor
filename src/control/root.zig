@@ -9,6 +9,18 @@ pub const WindowTarget = enum { focused };
 pub const Layout = enum { master_stack, dwindle, scrolling };
 pub const LogLevel = enum(u8) { @"error", warning, info, debug };
 
+pub const Color = struct {
+    red: i64,
+    green: i64,
+    blue: i64,
+    alpha: i64,
+};
+
+pub const Border = struct {
+    width: i64,
+    color: Color,
+};
+
 pub const LatencyStatistics = struct {
     samples: i64,
     p50_microseconds: i64,
@@ -120,6 +132,7 @@ pub const set_layout_method = interface_name ++ ".SetLayout";
 pub const switch_workspace_method = interface_name ++ ".SwitchWorkspace";
 pub const move_focused_to_workspace_method = interface_name ++ ".MoveFocusedToWorkspace";
 pub const get_performance_statistics_method = interface_name ++ ".GetPerformanceStatistics";
+pub const set_unfocused_border_method = interface_name ++ ".SetUnfocusedBorder";
 pub const set_log_level_method = interface_name ++ ".SetLogLevel";
 pub const reload_configuration_method = interface_name ++ ".ReloadConfiguration";
 pub const quit_method = interface_name ++ ".Quit";
@@ -130,4 +143,16 @@ pub const maximum_workspace = 10;
 
 pub fn validWorkspace(workspace: i64) bool {
     return workspace >= minimum_workspace and workspace <= maximum_workspace;
+}
+
+pub fn validBorder(border: Border) bool {
+    return border.width >= 0 and border.width <= 256 and
+        validColorChannel(border.color.red) and
+        validColorChannel(border.color.green) and
+        validColorChannel(border.color.blue) and
+        validColorChannel(border.color.alpha);
+}
+
+fn validColorChannel(channel: i64) bool {
+    return channel >= 0 and channel <= 255;
 }

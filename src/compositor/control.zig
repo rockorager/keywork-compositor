@@ -44,6 +44,7 @@ pub const Executor = struct {
         std.mem.Allocator,
         bool,
     ) anyerror![]control.OutputStatistics,
+    set_unfocused_border: *const fn (*anyopaque, control.Border) void,
     set_log_level: *const fn (*anyopaque, control.LogLevel) void,
     reload: *const fn (*anyopaque) ?[]const u8,
     quit: *const fn (*anyopaque) void,
@@ -505,6 +506,20 @@ fn handleMessage(
         });
         return;
     }
+    if (std.mem.eql(u8, call.method, control.set_unfocused_border_method)) {
+        const parameters = parseParameters(struct { border: control.Border }, allocator, call.parameters) catch {
+            if (!call.oneway) try writeInvalidParameter(allocator, output, "border");
+            return;
+        };
+        defer parameters.deinit();
+        if (!control.validBorder(parameters.value.border)) {
+            if (!call.oneway) try writeInvalidParameter(allocator, output, "border");
+            return;
+        }
+        executor.set_unfocused_border(executor.context, parameters.value.border);
+        if (!call.oneway) try writeSuccess(allocator, output);
+        return;
+    }
     if (std.mem.eql(u8, call.method, control.set_log_level_method)) {
         const parameters = parseParameters(struct { level: LogLevel }, allocator, call.parameters) catch {
             if (!call.oneway) try writeInvalidParameter(allocator, output, "level");
@@ -630,6 +645,7 @@ const Recorder = struct {
     commands: std.ArrayList(command.Command) = .empty,
     statistics_count: usize = 0,
     statistics_reset: bool = false,
+    unfocused_border: ?control.Border = null,
     log_level: ?control.LogLevel = null,
     reload_count: usize = 0,
     reload_failure: ?[]const u8 = null,
@@ -644,6 +660,7 @@ const Recorder = struct {
             .context = self,
             .execute = execute,
             .statistics = statistics,
+            .set_unfocused_border = setUnfocusedBorder,
             .set_log_level = setLogLevel,
             .reload = reload,
             .quit = quit,
@@ -747,6 +764,11 @@ const Recorder = struct {
             .commit_to_presentation = latency,
         };
         return result;
+    }
+
+    fn setUnfocusedBorder(context: *anyopaque, border: control.Border) void {
+        const self: *Recorder = @ptrCast(@alignCast(context));
+        self.unfocused_border = border;
     }
 
     fn setLogLevel(context: *anyopaque, level: control.LogLevel) void {
@@ -922,6 +944,40 @@ test "log level calls forward the typed level" {
     );
     try std.testing.expectEqual(control.LogLevel.debug, recorder.log_level.?);
     try std.testing.expectEqualStrings("{\"parameters\":{}}\x00", output.items);
+}
+
+test "unfocused border calls validate and forward the typed border" {
+    var recorder: Recorder = .{};
+    defer recorder.deinit();
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(std.testing.allocator);
+    var quit_requested = false;
+
+    try handleMessage(
+        std.testing.allocator,
+        recorder.executor(),
+        "{\"method\":\"dev.rockorager.keywork.compositor.SetUnfocusedBorder\",\"parameters\":{\"border\":{\"width\":2,\"color\":{\"red\":58,\"green\":58,\"blue\":64,\"alpha\":255}}}}",
+        &output,
+        &quit_requested,
+    );
+    try std.testing.expectEqual(control.Border{
+        .width = 2,
+        .color = .{ .red = 58, .green = 58, .blue = 64, .alpha = 255 },
+    }, recorder.unfocused_border.?);
+    try std.testing.expectEqualStrings("{\"parameters\":{}}\x00", output.items);
+
+    output.clearRetainingCapacity();
+    try handleMessage(
+        std.testing.allocator,
+        recorder.executor(),
+        "{\"method\":\"dev.rockorager.keywork.compositor.SetUnfocusedBorder\",\"parameters\":{\"border\":{\"width\":257,\"color\":{\"red\":58,\"green\":58,\"blue\":64,\"alpha\":255}}}}",
+        &output,
+        &quit_requested,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"error\":\"org.varlink.service.InvalidParameter\",\"parameters\":{\"parameter\":\"border\"}}\x00",
+        output.items,
+    );
 }
 
 test "performance statistics return typed output snapshots and forward reset" {

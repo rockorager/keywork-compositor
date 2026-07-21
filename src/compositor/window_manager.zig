@@ -45,6 +45,7 @@ inner_gap: u32 = 16,
 outer_gap: u32 = 16,
 window_effects: Scene.Effects = Scene.default_effects,
 focused_window_effects: Scene.Effects = Scene.default_effects,
+unfocused_window_border: ?Scene.Borders = null,
 focused_window_border: ?Scene.Borders = null,
 tiling_drag: ?TilingDrag = null,
 toplevel_drag: ?ToplevelDrag = null,
@@ -669,9 +670,15 @@ pub fn setWindowEffects(
     }
 }
 
-pub fn setFocusedWindowBorder(self: *Self, border: ?Scene.Borders) void {
-    if (std.meta.eql(self.focused_window_border, border)) return;
-    self.focused_window_border = border;
+pub fn setWindowBorders(
+    self: *Self,
+    unfocused_border: ?Scene.Borders,
+    focused_border: ?Scene.Borders,
+) void {
+    if (std.meta.eql(self.unfocused_window_border, unfocused_border) and
+        std.meta.eql(self.focused_window_border, focused_border)) return;
+    self.unfocused_window_border = unfocused_border;
+    self.focused_window_border = focused_border;
     var it = self.windows.iterator();
     while (it.next()) |entry| {
         const window = entry.value;
@@ -683,34 +690,22 @@ pub fn setFocusedWindowBorder(self: *Self, border: ?Scene.Borders) void {
 
 fn borderForWindow(self: *Self, window: *const Window, focused: bool) ?Scene.Borders {
     const fullscreen = window.fullscreen_output != null;
-    const floating = self.isFloating(window);
-    const visible_window_count = if (focused and !fullscreen and !floating)
-        self.visibleWindowCount(window.workspace)
-    else
-        0;
-    return if (shouldShowFocusedBorder(focused, fullscreen, floating, visible_window_count))
-        self.focused_window_border
-    else
-        null;
+    return borderForWindowState(
+        self.unfocused_window_border,
+        self.focused_window_border,
+        focused,
+        fullscreen,
+    );
 }
 
-fn visibleWindowCount(self: *Self, workspace_index: usize) usize {
-    const workspace = &self.workspaces.items[workspace_index];
-    var count: usize = 0;
-    for (workspace.workspace.members.items) |member| {
-        const window = self.windows.get(internal(member)) orelse continue;
-        if (displayed(window.mapped, window.minimized, workspace.active, window.placement)) count += 1;
-    }
-    return count;
-}
-
-fn shouldShowFocusedBorder(
+fn borderForWindowState(
+    unfocused_border: ?Scene.Borders,
+    focused_border: ?Scene.Borders,
     focused: bool,
     fullscreen: bool,
-    floating: bool,
-    visible_window_count: usize,
-) bool {
-    return focused and !fullscreen and !floating and visible_window_count > 1;
+) ?Scene.Borders {
+    if (fullscreen) return null;
+    return if (focused) focused_border else unfocused_border;
 }
 
 pub fn focusedSurface(self: *Self) ?Surface.Id {
@@ -2312,12 +2307,20 @@ test "Xwayland does not enter configure barrier and hidden workspaces are invisi
     try std.testing.expect(displayed(true, false, true, plan));
 }
 
-test "focused borders are smart and exclude floating windows" {
-    try std.testing.expect(!shouldShowFocusedBorder(true, false, false, 1));
-    try std.testing.expect(shouldShowFocusedBorder(true, false, false, 2));
-    try std.testing.expect(!shouldShowFocusedBorder(true, false, true, 2));
-    try std.testing.expect(!shouldShowFocusedBorder(true, true, false, 2));
-    try std.testing.expect(!shouldShowFocusedBorder(false, false, false, 2));
+test "window borders distinguish focus and exclude fullscreen windows" {
+    const unfocused: Scene.Borders = .{
+        .edges = .{ .top = true },
+        .width = 1,
+        .color = .{ .red = 64, .green = 64, .blue = 64, .alpha = 255 },
+    };
+    const focused: Scene.Borders = .{
+        .edges = .{ .top = true },
+        .width = 2,
+        .color = .{ .red = 128, .green = 128, .blue = 128, .alpha = 255 },
+    };
+    try std.testing.expectEqual(unfocused, borderForWindowState(unfocused, focused, false, false).?);
+    try std.testing.expectEqual(focused, borderForWindowState(unfocused, focused, true, false).?);
+    try std.testing.expect(borderForWindowState(unfocused, focused, false, true) == null);
 }
 
 test "XDG configure is sent only for initial or changed state" {

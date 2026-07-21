@@ -13,6 +13,20 @@ type Layout (master_stack, dwindle, scrolling)
 # Logging verbosity selected for the compositor.
 type LogLevel (error, warning, info, debug)
 
+# An RGBA color with channels in the inclusive range 0 through 255.
+type Color (
+    red: int,
+    green: int,
+    blue: int,
+    alpha: int
+)
+
+# A window border. A width of zero disables the border.
+type Border (
+    width: int,
+    color: Color
+)
+
 # Rolling latency distribution in microseconds.
 type LatencyStatistics (
     samples: int,
@@ -143,6 +157,9 @@ method MoveFocusedToWorkspace (workspace: int) -> ()
 
 # Return a snapshot of per-output frame statistics, then optionally reset them.
 method GetPerformanceStatistics (reset: bool) -> (outputs: []OutputStatistics)
+
+# Change the border rendered around unfocused windows and window-like layer surfaces.
+method SetUnfocusedBorder (border: Border) -> ()
 
 # Change the maximum log level without restarting the compositor.
 method SetLogLevel (level: LogLevel) -> ()

@@ -193,7 +193,9 @@ pub const GeneralSettings = struct {
     shadow_blur_radius: u32 = 20,
     shadow_color: Color = .{ .red = 0x11, .green = 0x11, .blue = 0x13, .alpha = 0x80 },
     focused_shadow_color: Color = .{ .red = 0x11, .green = 0x11, .blue = 0x13, .alpha = 0x80 },
-    focused_border_width: u32 = 2,
+    unfocused_border_width: u32 = 1,
+    unfocused_border_color: Color = .{ .red = 0x3a, .green = 0x3a, .blue = 0x40, .alpha = 0xff },
+    focused_border_width: u32 = 1,
     focused_border_color: Color = .{ .red = 0x28, .green = 0x70, .blue = 0xbd, .alpha = 0xff },
 };
 
@@ -572,6 +574,8 @@ const GeneralSetting = enum {
     shadow_blur_radius,
     shadow_color,
     focused_shadow_color,
+    unfocused_border_width,
+    unfocused_border_color,
     focused_border_width,
     focused_border_color,
 };
@@ -598,6 +602,8 @@ fn parseGeneralSetting(
         .shadow_blur_radius => general.settings.shadow_blur_radius = try parseGeneralSize(value),
         .shadow_color => general.settings.shadow_color = try parseColor(value),
         .focused_shadow_color => general.settings.focused_shadow_color = try parseColor(value),
+        .unfocused_border_width => general.settings.unfocused_border_width = try parseGeneralSize(value),
+        .unfocused_border_color => general.settings.unfocused_border_color = try parseColor(value),
         .focused_border_width => general.settings.focused_border_width = try parseGeneralSize(value),
         .focused_border_color => general.settings.focused_border_color = try parseColor(value),
     }
@@ -1306,6 +1312,8 @@ test "general settings parse and reject invalid directives" {
         \\shadow-blur-radius=48
         \\shadow-color=#10203040
         \\focused-shadow-color=#aabbcc
+        \\unfocused-border-width=2
+        \\unfocused-border-color=#3a3a40
         \\focused-border-width=3
         \\focused-border-color=#7aa2f780
     );
@@ -1321,6 +1329,8 @@ test "general settings parse and reject invalid directives" {
     try std.testing.expectEqual(@as(u32, 48), snapshot.general.shadow_blur_radius);
     try std.testing.expectEqual(Color{ .red = 0x10, .green = 0x20, .blue = 0x30, .alpha = 0x40 }, snapshot.general.shadow_color);
     try std.testing.expectEqual(Color{ .red = 0xaa, .green = 0xbb, .blue = 0xcc, .alpha = 0xff }, snapshot.general.focused_shadow_color);
+    try std.testing.expectEqual(@as(u32, 2), snapshot.general.unfocused_border_width);
+    try std.testing.expectEqual(Color{ .red = 0x3a, .green = 0x3a, .blue = 0x40, .alpha = 0xff }, snapshot.general.unfocused_border_color);
     try std.testing.expectEqual(@as(u32, 3), snapshot.general.focused_border_width);
     try std.testing.expectEqual(Color{ .red = 0x7a, .green = 0xa2, .blue = 0xf7, .alpha = 0x80 }, snapshot.general.focused_border_color);
 

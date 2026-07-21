@@ -6,17 +6,19 @@ const varlink = @import("varlink");
 const Empty = struct {};
 
 const usage =
-    \\usage: keyworkctl COMMAND [ARGUMENT]
+    \\usage: keyworkctl COMMAND [ARGUMENT...]
     \\
     \\commands: focus DIRECTION | move-focused DIRECTION | set-layout LAYOUT
     \\          close TARGET
     \\          toggle-fullscreen TARGET | toggle-floating TARGET
     \\          switch-workspace WORKSPACE | move-focused-to-workspace WORKSPACE
+    \\          set-unfocused-border WIDTH COLOR
     \\          stats [--json] [--reset] | set-log-level LEVEL | reload | quit
     \\directions: next, previous, left, down, up, right
     \\targets: focused
     \\layouts: master-stack, dwindle, scrolling
     \\log levels: error, warning, info, debug
+    \\colors: '#RRGGBB' or '#RRGGBBAA'
     \\
 ;
 
@@ -30,6 +32,7 @@ const Command = union(enum) {
     switch_workspace: i64,
     move_to_workspace: i64,
     stats: StatisticsOptions,
+    set_unfocused_border: control.Border,
     set_log_level: control.LogLevel,
     reload,
     quit,
@@ -99,6 +102,7 @@ fn run(init: std.process.Init) !void {
         .switch_workspace => |workspace| try client.call(control.switch_workspace_method, .{ .workspace = workspace }),
         .move_to_workspace => |workspace| try client.call(control.move_focused_to_workspace_method, .{ .workspace = workspace }),
         .stats => |options| try client.call(control.get_performance_statistics_method, .{ .reset = options.reset }),
+        .set_unfocused_border => |border| try client.call(control.set_unfocused_border_method, .{ .border = border }),
         .set_log_level => |level| try client.call(control.set_log_level_method, .{ .level = level }),
         .reload => try client.call(control.reload_configuration_method, Empty{}),
         .quit => unreachable,
@@ -424,6 +428,14 @@ fn parse(arguments: []const []const u8) !Command {
     }
     if (arguments.len == 1 and std.mem.eql(u8, arguments[0], "reload")) return .reload;
     if (arguments.len == 1 and std.mem.eql(u8, arguments[0], "quit")) return .quit;
+    if (arguments.len == 3 and std.mem.eql(u8, arguments[0], "set-unfocused-border")) {
+        const width = std.fmt.parseInt(i64, arguments[1], 10) catch return error.InvalidBorderWidth;
+        if (width < 0 or width > 256) return error.InvalidBorderWidth;
+        return .{ .set_unfocused_border = .{
+            .width = width,
+            .color = parseColor(arguments[2]) orelse return error.InvalidColor,
+        } };
+    }
     if (arguments.len != 2) return error.InvalidArguments;
     const name = arguments[0];
     const value = arguments[1];
@@ -465,6 +477,19 @@ fn parseLayout(value: []const u8) ?control.Layout {
     return std.meta.stringToEnum(control.Layout, value);
 }
 
+fn parseColor(value: []const u8) ?control.Color {
+    if ((value.len != 7 and value.len != 9) or value[0] != '#') return null;
+    return .{
+        .red = std.fmt.parseInt(u8, value[1..3], 16) catch return null,
+        .green = std.fmt.parseInt(u8, value[3..5], 16) catch return null,
+        .blue = std.fmt.parseInt(u8, value[5..7], 16) catch return null,
+        .alpha = if (value.len == 9)
+            std.fmt.parseInt(u8, value[7..9], 16) catch return null
+        else
+            255,
+    };
+}
+
 test "CLI parsing maps wire values and validates workspaces" {
     try std.testing.expectEqual(control.Direction.left, (try parse(&.{ "focus", "left" })).focus);
     try std.testing.expectEqual(control.WindowTarget.focused, (try parse(&.{ "close", "focused" })).close);
@@ -479,6 +504,10 @@ test "CLI parsing maps wire values and validates workspaces" {
     const json_reset = (try parse(&.{ "stats", "--json", "--reset" })).stats;
     try std.testing.expect(json_reset.json);
     try std.testing.expect(json_reset.reset);
+    try std.testing.expectEqual(control.Border{
+        .width = 2,
+        .color = .{ .red = 0x3a, .green = 0x3a, .blue = 0x40, .alpha = 0xff },
+    }, (try parse(&.{ "set-unfocused-border", "2", "#3a3a40" })).set_unfocused_border);
     try std.testing.expectError(error.InvalidArguments, parse(&.{ "stats", "--json", "--json" }));
     try std.testing.expectEqual(Command.reload, try parse(&.{"reload"}));
     try std.testing.expectEqual(Command.quit, try parse(&.{"quit"}));
@@ -486,6 +515,8 @@ test "CLI parsing maps wire values and validates workspaces" {
     try std.testing.expectError(error.InvalidDirection, parse(&.{ "focus", "sideways" }));
     try std.testing.expectError(error.InvalidWindowTarget, parse(&.{ "close", "all" }));
     try std.testing.expectError(error.InvalidLogLevel, parse(&.{ "set-log-level", "verbose" }));
+    try std.testing.expectError(error.InvalidBorderWidth, parse(&.{ "set-unfocused-border", "257", "#3a3a40" }));
+    try std.testing.expectError(error.InvalidColor, parse(&.{ "set-unfocused-border", "2", "slate" }));
     try std.testing.expectError(error.UnknownCommand, parse(&.{ "unknown", "value" }));
 }
 
@@ -531,6 +562,27 @@ test "log level parameters encode as a typed value" {
     );
     try std.testing.expectEqualStrings(
         "{\"method\":\"dev.rockorager.keywork.compositor.SetLogLevel\",\"parameters\":{\"level\":\"warning\"}}\x00",
+        output.items,
+    );
+}
+
+test "unfocused border parameters encode as typed values" {
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(std.testing.allocator);
+    try varlink.encode(
+        std.testing.allocator,
+        &output,
+        .{
+            .method = control.set_unfocused_border_method,
+            .parameters = .{ .border = control.Border{
+                .width = 2,
+                .color = .{ .red = 58, .green = 58, .blue = 64, .alpha = 255 },
+            } },
+        },
+        1024,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"method\":\"dev.rockorager.keywork.compositor.SetUnfocusedBorder\",\"parameters\":{\"border\":{\"width\":2,\"color\":{\"red\":58,\"green\":58,\"blue\":64,\"alpha\":255}}}}\x00",
         output.items,
     );
 }

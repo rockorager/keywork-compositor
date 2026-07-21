@@ -102,6 +102,7 @@ control: Control,
 control_initialized: bool,
 configuration: ?Config.Store,
 layer_shell_effects: Scene.Effects,
+layer_shell_border: ?Scene.Borders,
 session: Session,
 session_initialized: bool,
 drm_device: DrmDevice,
@@ -1013,6 +1014,7 @@ pub fn createWithVirtualOutput(
         .control_initialized = false,
         .configuration = null,
         .layer_shell_effects = Scene.default_effects,
+        .layer_shell_border = null,
         .session = undefined,
         .session_initialized = false,
         .drm_device = undefined,
@@ -2871,6 +2873,7 @@ pub fn listenControl(self: *Self, runtime_directory: []const u8) !void {
             .context = self,
             .execute = executeControlCommand,
             .statistics = controlPerformanceStatistics,
+            .set_unfocused_border = setControlUnfocusedBorder,
             .set_log_level = setControlLogLevel,
             .reload = reloadControlConfiguration,
             .quit = quitControlSession,
@@ -2924,6 +2927,21 @@ fn outputStatisticsId(tag: u64) OutputLayout.Id {
 fn setControlLogLevel(_: *anyopaque, level: ControlProtocol.LogLevel) void {
     Logging.setLevel(level);
     log.info("log level set to {s}", .{@tagName(level)});
+}
+
+fn setControlUnfocusedBorder(context: *anyopaque, border: ControlProtocol.Border) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    std.debug.assert(ControlProtocol.validBorder(border));
+    const configuration = if (self.configuration) |*value| value else unreachable;
+    const general = &configuration.snapshot.general;
+    general.unfocused_border_width = @intCast(border.width);
+    general.unfocused_border_color = .{
+        .red = @intCast(border.color.red),
+        .green = @intCast(border.color.green),
+        .blue = @intCast(border.color.blue),
+        .alpha = @intCast(border.color.alpha),
+    };
+    self.applyWindowBorders(general.*);
 }
 
 fn collectGpuTimings(self: *Self) void {
@@ -2993,7 +3011,7 @@ fn applyGeneralConfiguration(self: *Self, general: Config.GeneralSettings) void 
         normal_effects,
         windowEffects(general, general.focused_shadow_color),
     );
-    self.window_manager.setFocusedWindowBorder(focusedWindowBorder(general));
+    self.applyWindowBorders(general);
     if (!std.meta.eql(self.layer_shell_effects, normal_effects)) {
         self.layer_shell_effects = normal_effects;
         requestRepaint(self);
@@ -3018,12 +3036,20 @@ fn windowEffects(general: Config.GeneralSettings, shadow_color: Config.Color) Sc
     };
 }
 
-fn focusedWindowBorder(general: Config.GeneralSettings) ?Scene.Borders {
-    if (general.focused_border_width == 0) return null;
-    const color = general.focused_border_color;
+fn applyWindowBorders(self: *Self, general: Config.GeneralSettings) void {
+    const unfocused = windowBorder(general.unfocused_border_width, general.unfocused_border_color);
+    const focused = windowBorder(general.focused_border_width, general.focused_border_color);
+    self.window_manager.setWindowBorders(unfocused, focused);
+    if (std.meta.eql(self.layer_shell_border, unfocused)) return;
+    self.layer_shell_border = unfocused;
+    requestRepaint(self);
+}
+
+fn windowBorder(width: u32, color: Config.Color) ?Scene.Borders {
+    if (width == 0) return null;
     return .{
         .edges = .{ .top = true, .bottom = true, .left = true, .right = true },
-        .width = general.focused_border_width,
+        .width = width,
         .color = render.Color.rgba(color.red, color.green, color.blue, color.alpha),
     };
 }
@@ -7660,6 +7686,15 @@ fn renderLayerSurfaces(
             null,
             capture_id,
         );
+        if (effects_rect) |rect| {
+            try self.renderBorders(
+                frame,
+                rect,
+                self.layer_shell_border,
+                self.layer_shell_effects.corner_radius,
+                null,
+            );
+        }
     }
 }
 
@@ -7852,7 +7887,13 @@ fn renderWindow(
             capture_id,
         );
     }
-    try self.renderWindowBorders(frame, window, content_rect, window_clip);
+    try self.renderBorders(
+        frame,
+        content_rect,
+        window.borders,
+        window.effects.corner_radius,
+        window_clip,
+    );
     try self.renderWindowDecorations(frame, id, window, .above, window_clip);
     try self.renderWindowPopups(frame, id);
 }
@@ -8147,19 +8188,20 @@ fn renderBufferTransform(transform: wl.Output.Transform) render.BufferTransform 
     };
 }
 
-fn renderWindowBorders(
+fn renderBorders(
     self: *Self,
     frame: *const OutputFrame,
-    window: *const Scene.Window,
     content_rect: render.Rect,
+    borders: ?Scene.Borders,
+    corner_radius: u32,
     clip: ?render.Rect,
 ) renderer_types.Renderer.Error!void {
-    const borders = window.borders orelse return;
+    const configured = borders orelse return;
     var commands: [4]render.Command = undefined;
     const border_commands = makeBorderCommands(
         content_rect,
-        borders,
-        window.effects.corner_radius,
+        configured,
+        corner_radius,
         clip,
         &commands,
     );
@@ -8390,28 +8432,30 @@ test "general configuration maps window shadows" {
     try std.testing.expect(effects.shadow == null);
 }
 
-test "general configuration maps focused window border" {
+test "general configuration maps window borders" {
     const defaults: Config.GeneralSettings = .{};
-    const default_border = focusedWindowBorder(defaults).?;
-    try std.testing.expectEqual(@as(u32, 2), default_border.width);
+    const default_unfocused = windowBorder(defaults.unfocused_border_width, defaults.unfocused_border_color).?;
+    try std.testing.expectEqual(@as(u32, 1), default_unfocused.width);
+    try std.testing.expectEqual(
+        render.Color.rgba(0x3a, 0x3a, 0x40, 0xff),
+        default_unfocused.color,
+    );
+    const default_focused = windowBorder(defaults.focused_border_width, defaults.focused_border_color).?;
+    try std.testing.expectEqual(@as(u32, 1), default_focused.width);
     try std.testing.expectEqual(
         render.Color.rgba(0x28, 0x70, 0xbd, 0xff),
-        default_border.color,
+        default_focused.color,
     );
 
-    var disabled = defaults;
-    disabled.focused_border_width = 0;
-    try std.testing.expect(focusedWindowBorder(disabled) == null);
+    try std.testing.expect(windowBorder(0, defaults.focused_border_color) == null);
 
-    var configured = defaults;
-    configured.focused_border_width = 3;
-    configured.focused_border_color = .{
+    const configured_color: Config.Color = .{
         .red = 0x7a,
         .green = 0xa2,
         .blue = 0xf7,
         .alpha = 0x80,
     };
-    const border = focusedWindowBorder(configured).?;
+    const border = windowBorder(3, configured_color).?;
     try std.testing.expectEqual(@as(u32, 3), border.width);
     try std.testing.expectEqual(
         render.Color.rgba(0x7a, 0xa2, 0xf7, 0x80),
