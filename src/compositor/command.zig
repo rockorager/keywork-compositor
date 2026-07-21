@@ -21,9 +21,7 @@ pub const Command = union(enum) {
     close: WindowTarget,
     toggle_fullscreen: WindowTarget,
     toggle_floating: WindowTarget,
-    layout_master_stack,
-    layout_dwindle,
-    layout_scrolling,
+    layout_tiled,
     switch_workspace: u8,
     move_to_workspace: u8,
 };

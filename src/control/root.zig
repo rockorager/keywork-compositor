@@ -6,7 +6,7 @@ pub const interface_description = @embedFile("control-interface");
 
 pub const Direction = enum { next, previous, left, down, up, right };
 pub const WindowTarget = enum { focused };
-pub const Layout = enum { master_stack, dwindle, scrolling };
+pub const Layout = enum { tiled };
 pub const LogLevel = enum(u8) { @"error", warning, info, debug };
 
 pub const Color = struct {

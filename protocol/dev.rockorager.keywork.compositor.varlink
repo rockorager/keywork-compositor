@@ -7,8 +7,8 @@ type Direction (next, previous, left, down, up, right)
 # A window selected for an operation.
 type WindowTarget (focused)
 
-# A built-in tiling layout.
-type Layout (master_stack, dwindle, scrolling)
+# A built-in workspace layout.
+type Layout (tiled)
 
 # Logging verbosity selected for the compositor.
 type LogLevel (error, warning, info, debug)

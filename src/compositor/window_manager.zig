@@ -1052,7 +1052,7 @@ fn cursorShapeForInteractiveResize(resize: InteractiveResize) PointerShape {
     return switch (resize) {
         .floating => |value| floatingResizeCursorShape(value.edges),
         .tiled => |value| switch (value.resize) {
-            .dwindle => |dwindle| switch (dwindle.axis) {
+            .tiled => |tiled| switch (tiled.axis) {
                 .horizontal => .ew_resize,
                 .vertical => .ns_resize,
             },
@@ -1359,9 +1359,7 @@ pub fn execute(self: *Self, command: Command) void {
         .toggle_floating => |target| switch (target) {
             .focused => self.toggleFocusedFloating(),
         },
-        .layout_master_stack => self.switchLayout(.master_stack),
-        .layout_dwindle => self.switchLayout(.dwindle),
-        .layout_scrolling => self.switchLayout(.scrolling),
+        .layout_tiled => self.switchLayout(.tiled),
         .switch_workspace => |number| self.switchWorkspace(number),
         .move_to_workspace => |number| self.moveFocusedToWorkspace(number),
     }
@@ -1753,7 +1751,7 @@ fn interactivelyResizing(self: *const Self, id: WindowId) bool {
     const target = switch (resize) {
         .floating => |value| value.window,
         .tiled => |value| switch (value.resize) {
-            .dwindle => |dwindle| internal(dwindle.window),
+            .tiled => |tiled| internal(tiled.window),
         },
     };
     return std.meta.eql(target, id);

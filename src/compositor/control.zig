@@ -454,9 +454,7 @@ fn handleMessage(
         };
         defer parameters.deinit();
         executor.execute(executor.context, switch (parameters.value.layout) {
-            .master_stack => .layout_master_stack,
-            .dwindle => .layout_dwindle,
-            .scrolling => .layout_scrolling,
+            .tiled => .layout_tiled,
         });
         if (!call.oneway) try writeSuccess(allocator, output);
         return;
@@ -846,11 +844,12 @@ test "oneway calls suppress replies and invalid workspaces return typed errors" 
     try handleMessage(
         std.testing.allocator,
         recorder.executor(),
-        "{\"method\":\"dev.rockorager.keywork.compositor.SetLayout\",\"parameters\":{\"layout\":\"dwindle\"},\"oneway\":true}",
+        "{\"method\":\"dev.rockorager.keywork.compositor.SetLayout\",\"parameters\":{\"layout\":\"tiled\"},\"oneway\":true}",
         &output,
         &quit_requested,
     );
     try std.testing.expectEqual(@as(usize, 1), recorder.commands.items.len);
+    try std.testing.expectEqual(command.Command.layout_tiled, recorder.commands.items[0]);
     try std.testing.expectEqual(@as(usize, 0), output.items.len);
 
     try handleMessage(

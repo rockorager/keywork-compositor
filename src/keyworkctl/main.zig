@@ -16,7 +16,7 @@ const usage =
     \\          stats [--json] [--reset] | set-log-level LEVEL | reload | quit
     \\directions: next, previous, left, down, up, right
     \\targets: focused
-    \\layouts: master-stack, dwindle, scrolling
+    \\layouts: tiled
     \\log levels: error, warning, info, debug
     \\colors: '#RRGGBB' or '#RRGGBBAA'
     \\
@@ -473,7 +473,6 @@ fn parseWindowTarget(value: []const u8) ?control.WindowTarget {
 }
 
 fn parseLayout(value: []const u8) ?control.Layout {
-    if (std.mem.eql(u8, value, "master-stack")) return .master_stack;
     return std.meta.stringToEnum(control.Layout, value);
 }
 
@@ -495,7 +494,7 @@ test "CLI parsing maps wire values and validates workspaces" {
     try std.testing.expectEqual(control.WindowTarget.focused, (try parse(&.{ "close", "focused" })).close);
     try std.testing.expectEqual(control.WindowTarget.focused, (try parse(&.{ "toggle-fullscreen", "focused" })).toggle_fullscreen);
     try std.testing.expectEqual(control.WindowTarget.focused, (try parse(&.{ "toggle-floating", "focused" })).toggle_floating);
-    try std.testing.expectEqual(control.Layout.master_stack, (try parse(&.{ "set-layout", "master-stack" })).set_layout);
+    try std.testing.expectEqual(control.Layout.tiled, (try parse(&.{ "set-layout", "tiled" })).set_layout);
     try std.testing.expectEqual(control.LogLevel.debug, (try parse(&.{ "set-log-level", "debug" })).set_log_level);
     try std.testing.expectEqual(@as(i64, 10), (try parse(&.{ "switch-workspace", "10" })).switch_workspace);
     try std.testing.expect(!(try parse(&.{"stats"})).stats.reset);

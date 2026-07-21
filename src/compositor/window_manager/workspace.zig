@@ -29,7 +29,7 @@ pub const TagSet = struct {
 };
 
 pub const Workspace = struct {
-    layout: layout_mod.Layout = .{ .tiled = .{ .dwindle = .{} } },
+    layout: layout_mod.Layout = .init(.tiled),
     members: std.ArrayList(types.WindowId) = .empty,
     focused: ?types.WindowId = null,
 
@@ -212,23 +212,13 @@ test "workspace membership move focus and order have single ownership" {
     try std.testing.expect(!first.remove(two));
 }
 
-test "exposed tiled policy state changes" {
-    var workspace: Workspace = .{ .layout = .init(.master_stack) };
-    defer workspace.deinit(std.testing.allocator);
-    workspace.layout.tiled.master_stack.setMasterCount(2);
-    workspace.layout.tiled.master_stack.setMasterRatio(70);
-    try std.testing.expectEqual(@as(u32, 2), workspace.layout.tiled.master_stack.master_count);
-    try std.testing.expectEqual(@as(u8, 70), workspace.layout.tiled.master_stack.master_ratio_percent);
-}
-
-test "workspaces default to dwindle" {
+test "workspaces default to tiled" {
     var workspace: Workspace = .{};
     defer workspace.deinit(std.testing.allocator);
     try std.testing.expect(workspace.layout == .tiled);
-    try std.testing.expect(workspace.layout.tiled == .dwindle);
 }
 
-test "switching to dwindle reconstructs tree order and tracks membership" {
+test "setting tiled layout reconstructs tree order and tracks membership" {
     var workspace: Workspace = .{};
     defer workspace.deinit(std.testing.allocator);
     const first = types.id(1);
@@ -237,7 +227,7 @@ test "switching to dwindle reconstructs tree order and tracks membership" {
     try std.testing.expect(try workspace.insert(std.testing.allocator, first));
     try std.testing.expect(try workspace.insert(std.testing.allocator, second));
     try std.testing.expect(try workspace.insert(std.testing.allocator, third));
-    try workspace.setLayout(std.testing.allocator, .dwindle, .{
+    try workspace.setLayout(std.testing.allocator, .tiled, .{
         .x = 0,
         .y = 0,
         .size = types.Size.init(120, 80),

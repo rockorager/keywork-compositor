@@ -1067,9 +1067,7 @@ fn parseWindowTarget(arguments: []const []const u8) BindingError!WindowTarget {
 
 fn parseLayout(arguments: []const []const u8) BindingError!Command {
     if (arguments.len != 1) return error.InvalidActionArguments;
-    if (std.mem.eql(u8, arguments[0], "master-stack")) return .layout_master_stack;
-    if (std.mem.eql(u8, arguments[0], "dwindle")) return .layout_dwindle;
-    if (std.mem.eql(u8, arguments[0], "scrolling")) return .layout_scrolling;
+    if (std.mem.eql(u8, arguments[0], "tiled")) return .layout_tiled;
     return error.InvalidLayout;
 }
 
@@ -1192,7 +1190,7 @@ test "configuration parses typed commands and explicit run argv" {
         \\bind=super+q close focused
         \\bind=super+f toggle-fullscreen focused
         \\bind=super+shift+space toggle-floating focused
-        \\bind=super+t set-layout master-stack
+        \\bind=super+t set-layout tiled
         \\bind=super+1 switch-workspace 1
         \\bind=super+shift+0 move-focused-to-workspace 10
         \\bind=super+return run foot --title "Keywork Terminal" 'empty='
@@ -1210,7 +1208,7 @@ test "configuration parses typed commands and explicit run argv" {
     try std.testing.expectEqual(WindowTarget.focused, snapshot.bindings[2].action.command.close);
     try std.testing.expectEqual(WindowTarget.focused, snapshot.bindings[3].action.command.toggle_fullscreen);
     try std.testing.expectEqual(WindowTarget.focused, snapshot.bindings[4].action.command.toggle_floating);
-    try std.testing.expectEqual(Command.layout_master_stack, snapshot.bindings[5].action.command);
+    try std.testing.expectEqual(Command.layout_tiled, snapshot.bindings[5].action.command);
     try std.testing.expectEqual(@as(u8, 10), snapshot.bindings[7].action.command.move_to_workspace);
     try std.testing.expectEqualStrings("foot", snapshot.bindings[8].action.run[0]);
     try std.testing.expectEqualStrings("Keywork Terminal", snapshot.bindings[8].action.run[2]);
@@ -1234,7 +1232,7 @@ test "embedded default configuration is valid and complete" {
     var snapshot = try defaultSnapshot(std.testing.allocator);
     defer snapshot.deinit();
     try std.testing.expectEqual(GeneralSettings{}, snapshot.general);
-    try std.testing.expectEqual(@as(usize, 35), snapshot.bindings.len);
+    try std.testing.expectEqual(@as(usize, 32), snapshot.bindings.len);
     try std.testing.expectEqual(@as(usize, 1), snapshot.input_rules.len);
     try std.testing.expectEqual(@as(usize, 0), snapshot.output_rules.len);
     const input_rule = snapshot.input_rules[0];
@@ -1244,7 +1242,7 @@ test "embedded default configuration is valid and complete" {
     try std.testing.expectEqual(WindowTarget.focused, snapshot.bindings[8].action.command.close);
     try std.testing.expectEqual(WindowTarget.focused, snapshot.bindings[9].action.command.toggle_fullscreen);
     try std.testing.expectEqual(WindowTarget.focused, snapshot.bindings[10].action.command.toggle_floating);
-    try std.testing.expectEqualStrings("monstar", snapshot.bindings[34].action.run[0]);
+    try std.testing.expectEqualStrings("monstar", snapshot.bindings[31].action.run[0]);
 }
 
 test "output rules parse in order and match output identity" {
