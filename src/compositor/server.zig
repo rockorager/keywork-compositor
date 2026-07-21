@@ -92,7 +92,6 @@ const ControlProtocol = @import("keywork-control");
 const WindowManager = @import("window_manager.zig");
 
 const c = @cImport({
-    @cInclude("fcntl.h");
     @cInclude("linux/sync_file.h");
     @cInclude("sys/ioctl.h");
 });
@@ -360,7 +359,11 @@ const PendingFrame = struct {
     fn trackRenderFence(self: *PendingFrame, render_fence_fd: ?std.posix.fd_t) void {
         const fd = render_fence_fd orelse return;
         std.debug.assert(self.render_fence_fd == null);
-        const duplicate = c.fcntl(fd, c.F_DUPFD_CLOEXEC, @as(c_int, 0));
+        const duplicate = std.c.fcntl(
+            fd,
+            std.posix.F.DUPFD_CLOEXEC,
+            @as(c_int, 0),
+        );
         if (duplicate < 0) {
             log.warn("failed to retain render fence for presentation timing: {t}", .{
                 std.posix.errno(duplicate),
