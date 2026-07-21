@@ -156,6 +156,24 @@ pub const Workspace = struct {
         return true;
     }
 
+    pub fn repositionWindowAtRoot(
+        self: *Workspace,
+        source: types.WindowId,
+        position: layout_mod.DropPosition,
+    ) bool {
+        std.debug.assert(position == .left or position == .right);
+        if (self.members.items.len < 2) return false;
+        const source_index = self.indexOf(source) orelse return false;
+        self.layout.repositionWindowAtRoot(source, position);
+        const moved = self.members.orderedRemove(source_index);
+        if (position == .left) {
+            self.members.insertAssumeCapacity(0, moved);
+        } else {
+            self.members.appendAssumeCapacity(moved);
+        }
+        return true;
+    }
+
     fn indexOf(self: *const Workspace, id: types.WindowId) ?usize {
         for (self.members.items, 0..) |candidate, index| if (candidate.eql(id)) return index;
         return null;
@@ -264,6 +282,18 @@ test "workspace reposition keeps membership in drop order" {
     try std.testing.expectEqualSlices(
         types.WindowId,
         &.{ first, third, second },
+        workspace.members.items,
+    );
+    try std.testing.expect(workspace.repositionWindowAtRoot(third, .left));
+    try std.testing.expectEqualSlices(
+        types.WindowId,
+        &.{ third, first, second },
+        workspace.members.items,
+    );
+    try std.testing.expect(workspace.repositionWindowAtRoot(third, .right));
+    try std.testing.expectEqualSlices(
+        types.WindowId,
+        &.{ first, second, third },
         workspace.members.items,
     );
 }

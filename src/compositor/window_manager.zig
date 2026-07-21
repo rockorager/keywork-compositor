@@ -26,6 +26,8 @@ const PointerShape = wayland.server.wp.CursorShapeDeviceV1.Shape;
 const workspace_count = 10;
 const resize_edge_threshold: f64 = 8;
 const tiling_drag_center_radius: f64 = 0.25;
+const tiling_drag_activation_threshold: f64 = 8;
+const tiling_drag_output_edge_threshold: f64 = 32;
 
 allocator: std.mem.Allocator,
 outputs: *OutputLayout,
@@ -77,10 +79,17 @@ pub const SessionListener = struct {
 
 const TilingDrag = struct {
     source: WindowId,
+    initial_x: f64,
+    initial_y: f64,
     target: ?TilingDragTarget = null,
 };
 
-const TilingDragTarget = struct {
+const TilingDragTarget = union(enum) {
+    window: WindowDropTarget,
+    workspace_edge: layout_mod.DropPosition,
+};
+
+const WindowDropTarget = struct {
     window: WindowId,
     position: layout_mod.DropPosition,
 };
@@ -771,14 +780,23 @@ fn focusWindow(self: *Self, id: WindowId) bool {
 
 /// Starts a compositor-owned Super+pointer tiling drag. The server owns the
 /// physical button grab; this object owns only policy and drop state.
-pub fn beginTilingDrag(self: *Self, root: ?Surface.Id) bool {
+pub fn beginTilingDrag(
+    self: *Self,
+    root: ?Surface.Id,
+    pointer_x: f64,
+    pointer_y: f64,
+) bool {
     if (self.pointerInteractionActive() or self.layer_focus == .exclusive) return false;
     const id = self.windowForSurface(root orelse return false) orelse return false;
     const window = self.windows.get(id) orelse return false;
     if (!self.isDraggableTiledWindow(window)) return false;
     const workspace = &self.workspaces.items[window.workspace];
     if (!workspace.active) return false;
-    self.tiling_drag = .{ .source = id };
+    self.tiling_drag = .{
+        .source = id,
+        .initial_x = pointer_x,
+        .initial_y = pointer_y,
+    };
     if (self.focusWindow(id)) self.relayout();
     return true;
 }
@@ -796,6 +814,32 @@ pub fn updateTilingDrag(self: *Self, x: f64, y: f64) bool {
     if (!self.isDraggableTiledWindow(source)) return previous != null;
     const workspace = &self.workspaces.items[source.workspace];
     if (!workspace.active) return previous != null;
+    var has_peer = false;
+    for (workspace.workspace.members.items) |member| {
+        const id = internal(member);
+        if (std.meta.eql(id, drag.source)) continue;
+        const window = self.windows.get(id) orelse continue;
+        if (!self.isDraggableTiledWindow(window)) continue;
+        has_peer = true;
+        break;
+    }
+    if (has_peer and
+        (@abs(x - drag.initial_x) >= tiling_drag_activation_threshold or
+            @abs(y - drag.initial_y) >= tiling_drag_activation_threshold))
+    {
+        const output = self.outputs.get(workspace.output) orelse return previous != null;
+        const position = output.logicalPosition();
+        const size = output.logicalSize();
+        const bounds: types.Rect = .{
+            .x = position.x,
+            .y = position.y,
+            .size = types.Size.init(size.width, size.height),
+        };
+        if (tilingOutputEdgeDropPosition(x, y, bounds, tiling_drag_output_edge_threshold)) |edge| {
+            drag.target = .{ .workspace_edge = edge };
+            return !std.meta.eql(previous, drag.target);
+        }
+    }
     for (workspace.workspace.members.items) |member| {
         const id = internal(member);
         if (std.meta.eql(id, drag.source)) continue;
@@ -804,10 +848,10 @@ pub fn updateTilingDrag(self: *Self, x: f64, y: f64) bool {
         const plan = window.placement orelse continue;
         if (!pointInLayoutPlan(x, y, plan)) continue;
         const rect = visibleLayoutRect(plan) orelse unreachable;
-        drag.target = .{
+        drag.target = .{ .window = .{
             .window = id,
             .position = tilingDropPosition(x, y, rect),
-        };
+        } };
         break;
     }
     return !std.meta.eql(previous, drag.target);
@@ -816,10 +860,25 @@ pub fn updateTilingDrag(self: *Self, x: f64, y: f64) bool {
 pub fn tilingDragPreview(self: *Self) ?types.Rect {
     const drag = self.tiling_drag orelse return null;
     const drag_target = drag.target orelse return null;
-    const target = self.windows.get(drag_target.window) orelse return null;
-    if (!self.isDraggableTiledWindow(target)) return null;
-    const rect = visibleLayoutRect(target.placement orelse return null) orelse return null;
-    return tilingDropPreview(rect, drag_target.position);
+    return switch (drag_target) {
+        .window => |window_target| preview: {
+            const target = self.windows.get(window_target.window) orelse return null;
+            if (!self.isDraggableTiledWindow(target)) return null;
+            const rect = visibleLayoutRect(target.placement orelse return null) orelse return null;
+            break :preview tilingDropPreview(rect, window_target.position);
+        },
+        .workspace_edge => |position| preview: {
+            const source = self.windows.get(drag.source) orelse return null;
+            const workspace = &self.workspaces.items[source.workspace];
+            const area = self.layer_shell.usableAreaFor(workspace.output) orelse return null;
+            if (area.width <= 0 or area.height <= 0) return null;
+            break :preview tilingDropPreview(.{
+                .x = area.x,
+                .y = area.y,
+                .size = types.Size.init(@intCast(area.width), @intCast(area.height)),
+            }, position);
+        },
+    };
 }
 
 /// Ends the pointer grab by applying the selected target-relative placement.
@@ -829,18 +888,26 @@ pub fn endTilingDrag(self: *Self, commit: bool) bool {
     if (!commit) return true;
     const drag_target = drag.target orelse return true;
     const source = self.windows.get(drag.source) orelse return true;
-    const target = self.windows.get(drag_target.window) orelse return true;
-    if (source.workspace != target.workspace or
-        !self.isDraggableTiledWindow(source) or
-        !self.isDraggableTiledWindow(target)) return true;
+    if (!self.isDraggableTiledWindow(source)) return true;
     const workspace_entry = &self.workspaces.items[source.workspace];
     if (!workspace_entry.active) return true;
-    const changed = workspace_entry.workspace.repositionWindow(
-        neutral(drag.source),
-        neutral(drag_target.window),
-        drag_target.position,
-    );
-    std.debug.assert(changed);
+    const changed = switch (drag_target) {
+        .window => |window_target| changed: {
+            const target = self.windows.get(window_target.window) orelse return true;
+            if (source.workspace != target.workspace or
+                !self.isDraggableTiledWindow(target)) return true;
+            break :changed workspace_entry.workspace.repositionWindow(
+                neutral(drag.source),
+                neutral(window_target.window),
+                window_target.position,
+            );
+        },
+        .workspace_edge => |position| workspace_entry.workspace.repositionWindowAtRoot(
+            neutral(drag.source),
+            position,
+        ),
+    };
+    if (!changed) return true;
     _ = workspace_entry.workspace.focus(neutral(drag.source));
     self.default_output = workspace_entry.output;
     self.relayout();
@@ -853,7 +920,7 @@ pub fn beginModifierMove(
     pointer_x: f64,
     pointer_y: f64,
 ) bool {
-    if (self.beginTilingDrag(root)) return true;
+    if (self.beginTilingDrag(root, pointer_x, pointer_y)) return true;
     const id = self.windowForSurface(root orelse return false) orelse return false;
     const window = self.windows.get(id) orelse return false;
     if (!self.isFloating(window)) return false;
@@ -2015,6 +2082,24 @@ fn tilingDropPosition(x: f64, y: f64, rect: types.Rect) layout_mod.DropPosition 
     return if (relative_y < 0.5) .top else .bottom;
 }
 
+fn tilingOutputEdgeDropPosition(
+    x: f64,
+    y: f64,
+    bounds: types.Rect,
+    threshold: f64,
+) ?layout_mod.DropPosition {
+    std.debug.assert(threshold >= 0);
+    const left: f64 = @floatFromInt(bounds.x);
+    const top: f64 = @floatFromInt(bounds.y);
+    const right: f64 = @floatFromInt(@as(i64, bounds.x) + bounds.size.width);
+    const bottom: f64 = @floatFromInt(@as(i64, bounds.y) + bounds.size.height);
+    if (x < left or x >= right or y < top or y >= bottom) return null;
+    const left_distance = x - left;
+    const right_distance = right - x;
+    if (@min(left_distance, right_distance) > threshold) return null;
+    return if (left_distance <= right_distance) .left else .right;
+}
+
 fn tilingDropPreview(rect: types.Rect, position: layout_mod.DropPosition) types.Rect {
     return switch (position) {
         .center => rect,
@@ -2543,6 +2628,29 @@ test "tiling drag drop zones select a side and preview its half" {
         types.Rect{ .x = 100, .y = 300, .size = types.Size.init(400, 100) },
         tilingDropPreview(rect, .bottom),
     );
+}
+
+test "tiling drag detects output left and right edge targets" {
+    const bounds: types.Rect = .{
+        .x = 100,
+        .y = 200,
+        .size = types.Size.init(400, 200),
+    };
+    try std.testing.expectEqual(
+        layout_mod.DropPosition.left,
+        tilingOutputEdgeDropPosition(100, 250, bounds, 32).?,
+    );
+    try std.testing.expectEqual(
+        layout_mod.DropPosition.left,
+        tilingOutputEdgeDropPosition(132, 250, bounds, 32).?,
+    );
+    try std.testing.expectEqual(
+        layout_mod.DropPosition.right,
+        tilingOutputEdgeDropPosition(499.99, 250, bounds, 32).?,
+    );
+    try std.testing.expect(tilingOutputEdgeDropPosition(133, 250, bounds, 32) == null);
+    try std.testing.expect(tilingOutputEdgeDropPosition(300, 199, bounds, 32) == null);
+    try std.testing.expect(tilingOutputEdgeDropPosition(500, 250, bounds, 32) == null);
 }
 
 test "toplevel drag preserves the grab offset and clamps coordinates" {

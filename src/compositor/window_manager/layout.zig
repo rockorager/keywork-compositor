@@ -128,6 +128,18 @@ pub const Layout = union(enum) {
         }
     }
 
+    pub fn repositionWindowAtRoot(
+        self: *Layout,
+        source: types.WindowId,
+        position: DropPosition,
+    ) void {
+        std.debug.assert(position == .left or position == .right);
+        switch (self.*) {
+            .tiled => |*layout| layout.repositionWindowAtRoot(source, position),
+            .scrolling => {},
+        }
+    }
+
     pub fn beginResize(
         self: *const Layout,
         id: types.WindowId,
@@ -271,6 +283,17 @@ pub const Tiled = union(enum) {
         switch (self.*) {
             .master_stack => {},
             .dwindle => |*policy| policy.repositionWindow(source, target, position),
+        }
+    }
+
+    fn repositionWindowAtRoot(
+        self: *Tiled,
+        source: types.WindowId,
+        position: DropPosition,
+    ) void {
+        switch (self.*) {
+            .master_stack => {},
+            .dwindle => |*policy| policy.repositionWindowAtRoot(source, position),
         }
     }
 
@@ -534,6 +557,27 @@ pub const Dwindle = struct {
         };
         const before = position == .left or position == .top;
         self.splitLeaf(target_index, source, axis, before);
+    }
+
+    fn repositionWindowAtRoot(
+        self: *Dwindle,
+        source: types.WindowId,
+        position: DropPosition,
+    ) void {
+        std.debug.assert(position == .left or position == .right);
+        self.windowRemoved(source);
+        const previous_root = self.root orelse unreachable;
+        const source_index = self.allocateNode(.{ .content = .{ .leaf = source } });
+        const root_index = self.allocateNode(.{ .content = .{ .split = .{
+            .axis = .horizontal,
+            .ratio_percent = self.split_ratio_percent,
+            .first = if (position == .left) source_index else previous_root,
+            .second = if (position == .left) previous_root else source_index,
+        } } });
+        self.nodes.items[source_index].parent = root_index;
+        self.nodes.items[previous_root].parent = root_index;
+        self.root = root_index;
+        self.refreshRects();
     }
 
     fn beginResize(
@@ -1196,6 +1240,63 @@ test "dwindle repositions a window on each side of the drop target" {
             &.{ first, second, third },
             area,
             first.id,
+        );
+        defer plans.deinit(std.testing.allocator);
+        for (plans.items, case.ids, case.rects) |plan, id, rect| {
+            try std.testing.expectEqual(id, plan.id);
+            try std.testing.expectEqual(rect, plan.rect);
+        }
+    }
+}
+
+test "dwindle repositions a window at the workspace root edge" {
+    const first = input(0, 10);
+    const second = input(1, 10);
+    const third = input(2, 10);
+    const area: types.Rect = .{
+        .x = 0,
+        .y = 0,
+        .size = types.Size.init(120, 80),
+    };
+    const cases = [_]struct {
+        position: DropPosition,
+        ids: [3]types.WindowId,
+        rects: [3]types.Rect,
+    }{
+        .{
+            .position = .left,
+            .ids = .{ third.id, first.id, second.id },
+            .rects = .{
+                .{ .x = 0, .y = 0, .size = types.Size.init(60, 80) },
+                .{ .x = 60, .y = 0, .size = types.Size.init(30, 80) },
+                .{ .x = 90, .y = 0, .size = types.Size.init(30, 80) },
+            },
+        },
+        .{
+            .position = .right,
+            .ids = .{ first.id, second.id, third.id },
+            .rects = .{
+                .{ .x = 0, .y = 0, .size = types.Size.init(30, 80) },
+                .{ .x = 30, .y = 0, .size = types.Size.init(30, 80) },
+                .{ .x = 60, .y = 0, .size = types.Size.init(60, 80) },
+            },
+        },
+    };
+
+    for (cases) |case| {
+        var layout: Layout = .{ .tiled = .{ .dwindle = .{ .outer_gap = 0, .inner_gap = 0 } } };
+        defer layout.deinit(std.testing.allocator);
+        layout.setUsableArea(area);
+        try layout.windowAdded(std.testing.allocator, first.id, null);
+        try layout.windowAdded(std.testing.allocator, second.id, first.id);
+        try layout.windowAdded(std.testing.allocator, third.id, second.id);
+        layout.repositionWindowAtRoot(third.id, case.position);
+
+        var plans = try layout.arrange(
+            std.testing.allocator,
+            &.{ first, second, third },
+            area,
+            third.id,
         );
         defer plans.deinit(std.testing.allocator);
         for (plans.items, case.ids, case.rects) |plan, id, rect| {
