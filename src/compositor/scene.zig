@@ -81,6 +81,7 @@ pub const Shadow = struct {
 pub const Effects = struct {
     corner_radius: u32 = 0,
     shadow: ?Shadow = null,
+    contact_shadow: ?Shadow = null,
 };
 
 pub const background_blur: Blur = .{
@@ -97,10 +98,16 @@ pub const background_blur: Blur = .{
 pub const default_effects: Effects = .{
     .corner_radius = 12,
     .shadow = .{
-        .offset = .{},
-        .blur_radius = 20,
+        .offset = .{ .y = 10 },
+        .blur_radius = 44,
         .spread = 0,
-        .color = render.Color.rgba(0x11, 0x11, 0x13, 0x80),
+        .color = render.Color.rgba(0, 0, 0, 0x70),
+    },
+    .contact_shadow = .{
+        .offset = .{ .y = 2 },
+        .blur_radius = 12,
+        .spread = 0,
+        .color = render.Color.rgba(0, 0, 0, 0x50),
     },
 };
 

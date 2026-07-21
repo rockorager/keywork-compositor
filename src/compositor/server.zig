@@ -3020,6 +3020,8 @@ fn applyGeneralConfiguration(self: *Self, general: Config.GeneralSettings) void 
 
 fn windowEffects(general: Config.GeneralSettings, shadow_color: Config.Color) Scene.Effects {
     const defaults = Scene.default_effects;
+    // Preserve the default 0x70:0x50 ambient-to-contact balance for configured colors.
+    const contact_alpha: u8 = @intCast((@as(u16, shadow_color.alpha) * 5 + 3) / 7);
     return .{
         .corner_radius = defaults.corner_radius,
         .shadow = if (general.shadow_enabled) .{
@@ -3031,6 +3033,17 @@ fn windowEffects(general: Config.GeneralSettings, shadow_color: Config.Color) Sc
                 shadow_color.green,
                 shadow_color.blue,
                 shadow_color.alpha,
+            ),
+        } else null,
+        .contact_shadow = if (general.shadow_enabled) .{
+            .offset = defaults.contact_shadow.?.offset,
+            .blur_radius = defaults.contact_shadow.?.blur_radius,
+            .spread = defaults.contact_shadow.?.spread,
+            .color = render.Color.rgba(
+                shadow_color.red,
+                shadow_color.green,
+                shadow_color.blue,
+                contact_alpha,
             ),
         } else null,
     };
@@ -3499,8 +3512,8 @@ fn surfaceChanged(context: *anyopaque, surface_id: Surface.Id) void {
     const offset = self.subcompositor.surfaceOffset(surface_id);
     const damage = Surface.currentDamage(surfaces, surface_id) orelse
         return requestRepaint(self);
-    const layer_shadow = if (std.meta.eql(surface_id, root) and
-        self.layer_shell.usesEffects(root)) self.layer_shell_effects.shadow else null;
+    const layer_effects = std.meta.eql(surface_id, root) and
+        self.layer_shell.usesEffects(root);
     if (damage.isEmpty()) {
         if (Logging.enabled(.debug)) {
             const resource = Surface.resourceFor(surfaces, surface_id) orelse return;
@@ -3548,8 +3561,8 @@ fn surfaceChanged(context: *anyopaque, surface_id: Surface.Id) void {
                 },
             );
         }
-        self.damageGlobalRect(if (layer_shadow) |shadow|
-            shadowDamageRect(global, shadow)
+        self.damageGlobalRect(if (layer_effects)
+            effectsDamageRect(global, self.layer_shell_effects)
         else
             global, root);
     }
@@ -6950,6 +6963,10 @@ fn expandDamageRect(rectangle: anytype, amount: u32) render.Rect {
 }
 
 fn shadowDamageRect(rectangle: render.Rect, shadow: Scene.Shadow) render.Rect {
+    return expandDamageRect(rectangle, shadowDamageExtent(shadow));
+}
+
+fn shadowDamageExtent(shadow: Scene.Shadow) u32 {
     const spread: u32 = if (shadow.spread > 0) @intCast(shadow.spread) else 0;
     const offset_x: u32 = if (shadow.offset.x < 0)
         @intCast(-@as(i64, shadow.offset.x))
@@ -6959,8 +6976,18 @@ fn shadowDamageRect(rectangle: render.Rect, shadow: Scene.Shadow) render.Rect {
         @intCast(-@as(i64, shadow.offset.y))
     else
         @intCast(shadow.offset.y);
-    const amount = render.shadowBlurExtent(shadow.blur_radius) +|
+    return render.shadowBlurExtent(shadow.blur_radius) +|
         spread +| @max(offset_x, offset_y);
+}
+
+fn effectsDamageRect(rectangle: render.Rect, effects: Scene.Effects) render.Rect {
+    var amount: u32 = 0;
+    if (effects.shadow) |shadow| {
+        amount = @max(amount, shadowDamageExtent(shadow));
+    }
+    if (effects.contact_shadow) |shadow| {
+        amount = @max(amount, shadowDamageExtent(shadow));
+    }
     return expandDamageRect(rectangle, amount);
 }
 
@@ -6974,6 +7001,27 @@ test "shadow damage includes blur spread and offset" {
                 .blur_radius = 12,
                 .spread = 3,
                 .color = render.Color.rgba(0, 0, 0, 128),
+            },
+        ),
+    );
+}
+
+test "effect damage includes every shadow layer" {
+    try std.testing.expectEqual(
+        render.Rect{ .x = -8, .y = 2, .width = 66, .height = 76 },
+        effectsDamageRect(
+            .{ .x = 10, .y = 20, .width = 30, .height = 40 },
+            .{
+                .shadow = .{
+                    .offset = .{ .y = 1 },
+                    .blur_radius = 2,
+                    .color = render.Color.rgba(0, 0, 0, 128),
+                },
+                .contact_shadow = .{
+                    .offset = .{ .y = 3 },
+                    .blur_radius = 10,
+                    .color = render.Color.rgba(0, 0, 0, 128),
+                },
             },
         ),
     );
@@ -7667,15 +7715,12 @@ fn renderLayerSurfaces(
             null;
         const capture_id = try self.renderSurfaceTreeCapture(frame, layer_surface.surface_id, layer_surface.position.x, layer_surface.position.y, rounded_clip, null);
         if (effects_rect) |rect| {
-            if (self.layer_shell_effects.shadow) |shadow| {
-                try self.renderShadow(
-                    frame,
-                    rect,
-                    self.layer_shell_effects.corner_radius,
-                    shadow,
-                    null,
-                );
-            }
+            try self.renderShadows(
+                frame,
+                rect,
+                self.layer_shell_effects,
+                null,
+            );
         }
         try self.renderSurfaceTreeContents(
             frame,
@@ -7815,6 +7860,21 @@ fn renderShadow(
     try self.renderCommands(frame, &shadow_command);
 }
 
+fn renderShadows(
+    self: *Self,
+    frame: *const OutputFrame,
+    rect: render.Rect,
+    effects: Scene.Effects,
+    clip: ?render.Rect,
+) renderer_types.Renderer.Error!void {
+    if (effects.shadow) |shadow| {
+        try self.renderShadow(frame, rect, effects.corner_radius, shadow, clip);
+    }
+    if (effects.contact_shadow) |shadow| {
+        try self.renderShadow(frame, rect, effects.corner_radius, shadow, clip);
+    }
+}
+
 fn renderWindow(
     self: *Self,
     frame: *const OutputFrame,
@@ -7866,15 +7926,7 @@ fn renderWindow(
             content_clip,
         );
     }
-    if (window.effects.shadow) |shadow| {
-        try self.renderShadow(
-            frame,
-            content_rect,
-            window.effects.corner_radius,
-            shadow,
-            shadow_clip,
-        );
-    }
+    try self.renderShadows(frame, content_rect, window.effects, shadow_clip);
     try self.renderWindowDecorations(frame, id, window, .below, window_clip);
     if (content_visible) {
         try self.renderSurfaceTreeContents(
@@ -8425,11 +8477,20 @@ test "general configuration maps window shadows" {
         render.Color.rgba(0x7a, 0xa2, 0xf7, 0x80),
         focused.shadow.?.color,
     );
+    try std.testing.expectEqual(Scene.Position{ .y = 10 }, focused.shadow.?.offset);
+    try std.testing.expectEqual(@as(u32, 44), focused.shadow.?.blur_radius);
+    try std.testing.expectEqual(Scene.Position{ .y = 2 }, focused.contact_shadow.?.offset);
+    try std.testing.expectEqual(@as(u32, 12), focused.contact_shadow.?.blur_radius);
+    try std.testing.expectEqual(
+        render.Color.rgba(0x7a, 0xa2, 0xf7, 0x5b),
+        focused.contact_shadow.?.color,
+    );
 
     var disabled = defaults;
     disabled.shadow_enabled = false;
     const effects = windowEffects(disabled, disabled.shadow_color);
     try std.testing.expect(effects.shadow == null);
+    try std.testing.expect(effects.contact_shadow == null);
 }
 
 test "general configuration maps window borders" {
