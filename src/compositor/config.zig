@@ -1235,8 +1235,11 @@ test "embedded default configuration is valid and complete" {
     defer snapshot.deinit();
     try std.testing.expectEqual(GeneralSettings{}, snapshot.general);
     try std.testing.expectEqual(@as(usize, 35), snapshot.bindings.len);
-    try std.testing.expectEqual(@as(usize, 0), snapshot.input_rules.len);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.input_rules.len);
     try std.testing.expectEqual(@as(usize, 0), snapshot.output_rules.len);
+    const input_rule = snapshot.input_rules[0];
+    try std.testing.expectEqual(InputDeviceType.touchpad, input_rule.matcher.device_type.?);
+    try std.testing.expectEqual(NativeInput.Toggle.enabled, input_rule.settings.disable_while_typing.?.value);
     try std.testing.expectEqual(Direction.left, snapshot.bindings[0].action.command.focus_direction);
     try std.testing.expectEqual(WindowTarget.focused, snapshot.bindings[8].action.command.close);
     try std.testing.expectEqual(WindowTarget.focused, snapshot.bindings[9].action.command.toggle_fullscreen);
