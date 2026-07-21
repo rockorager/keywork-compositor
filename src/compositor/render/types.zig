@@ -362,6 +362,12 @@ pub const Image = struct {
             const horizontal_scale = @as(f64, @floatFromInt(self.size.width)) / source.width;
             const vertical_scale = @as(f64, @floatFromInt(self.size.height)) / source.height;
             if (horizontal_scale < 0.5 or vertical_scale < 0.5) return .area;
+            const full_source = source.x == 0 and source.y == 0 and
+                source.width == @as(f64, @floatFromInt(transformed_size.width)) and
+                source.height == @as(f64, @floatFromInt(transformed_size.height));
+            // The linear sampler clamps at the buffer edge, so interior source crops
+            // keep reconstruction's explicit crop-edge clamping to prevent bleeding.
+            if (full_source and horizontal_scale > 1 and vertical_scale > 1) return .linear;
             return .reconstruction;
         }
         return .nearest;
@@ -370,6 +376,7 @@ pub const Image = struct {
 
 pub const SamplingFilter = enum {
     nearest,
+    linear,
     reconstruction,
     area,
 };
@@ -880,7 +887,7 @@ test "renderer conformance: image sampling preserves exact texel alignment" {
     try std.testing.expectEqual(SamplingFilter.nearest, image.samplingFilter());
 
     image.size = .{ .width = 6, .height = 4 };
-    try std.testing.expectEqual(SamplingFilter.reconstruction, image.samplingFilter());
+    try std.testing.expectEqual(SamplingFilter.linear, image.samplingFilter());
     image.size = .{ .width = 1, .height = 1 };
     try std.testing.expectEqual(SamplingFilter.area, image.samplingFilter());
 
@@ -895,8 +902,17 @@ test "renderer conformance: image sampling preserves exact texel alignment" {
     image.source.?.x = 0.5;
     try std.testing.expectEqual(SamplingFilter.reconstruction, image.samplingFilter());
 
+    image.buffer.size = .{ .width = 4, .height = 4 };
+    image.size = .{ .width = 4, .height = 4 };
+    image.source = .{ .x = 1, .y = 1, .width = 2, .height = 2 };
+    try std.testing.expectEqual(SamplingFilter.reconstruction, image.samplingFilter());
+
     image.source = null;
+    image.size = .{ .width = 8, .height = 2 };
+    try std.testing.expectEqual(SamplingFilter.reconstruction, image.samplingFilter());
+
     image.transform = .rotate_90;
+    image.buffer.size = .{ .width = 3, .height = 2 };
     image.size = .{ .width = 2, .height = 3 };
     try std.testing.expectEqual(SamplingFilter.nearest, image.samplingFilter());
 }

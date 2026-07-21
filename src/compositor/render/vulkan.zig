@@ -5859,6 +5859,7 @@ fn compileDrawRuns(
                     self.nearest_gamma22_image_pipeline
                 else
                     self.nearest_image_pipeline,
+                .linear => self.image_pipeline,
                 .reconstruction => self.reconstruction_image_pipeline,
                 .area => self.area_image_pipeline,
             };
