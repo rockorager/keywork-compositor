@@ -340,6 +340,8 @@ pub const Image = struct {
     y: i32,
     size: Size,
     buffer: PixelBuffer,
+    /// Non-rendering identity reported when this image contributes to a frame.
+    sample_tag: ?u64 = null,
     source: ?SourceRect = null,
     transform: BufferTransform = .normal,
     rounded_clip: ?RoundedClip = null,

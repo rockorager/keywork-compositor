@@ -3183,6 +3183,10 @@ fn outputStatisticsId(tag: u64) OutputLayout.Id {
     };
 }
 
+fn surfaceSampleTag(id: Surface.Id) u64 {
+    return @as(u64, id.generation) << 32 | id.index;
+}
+
 fn setControlLogLevel(_: *anyopaque, level: ControlProtocol.LogLevel) void {
     Logging.setLevel(level);
     log.info("log level set to {s}", .{@tagName(level)});
@@ -7507,7 +7511,7 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
             increment(&render_output.frame_statistics.direct_scanout_candidates);
             switch (render_output.backend.tryDirectScanout(candidate, allow_tearing)) {
                 .accepted => {
-                    self.renderer.cancelFrame();
+                    self.renderer.finishFrameDirectScanout();
                     renderer_frame_active = false;
                     direct_scanout = true;
                     const scanout_format = render.DmabufFormat.fromFourcc(
@@ -8414,6 +8418,7 @@ fn renderSurfaceTreeContents(
                     .y = y,
                     .size = buffer.logical_size,
                     .buffer = pixel_buffer,
+                    .sample_tag = surfaceSampleTag(surface_id),
                     .source = buffer.source,
                     .transform = renderBufferTransform(buffer.transform),
                     .rounded_clip = rounded_clip,
@@ -8763,7 +8768,9 @@ fn submitSurfaceTree(self: *Self, output: *Output, surface_id: Surface.Id) void 
 
     var stack = self.subcompositor.stackIterator(surface_id);
     while (stack.next()) |entry| switch (entry) {
-        .parent => if (output.containsSurface(surface_id)) {
+        .parent => if (output.containsSurface(surface_id) and
+            self.renderer.wasSampled(surfaceSampleTag(surface_id)))
+        {
             Surface.submitPresentationFor(self.compositor.surfaceStore(), surface_id, output);
         },
         .child => |child| self.submitSurfaceTree(output, child.surface_id),

@@ -11,6 +11,7 @@ pub const Renderer = struct {
     allocator: std.mem.Allocator,
     backend: Backend,
     commands: std.ArrayList(render_types.Command),
+    sampled_tags: std.ArrayList(u64),
     active_frame: ?ActiveFrame,
 
     pub const Kind = enum {
@@ -57,6 +58,7 @@ pub const Renderer = struct {
                 .vulkan => .{ .vulkan = try VulkanRenderer.init(allocator, drm_device_id) },
             },
             .commands = .empty,
+            .sampled_tags = .empty,
             .active_frame = null,
         };
     }
@@ -64,6 +66,7 @@ pub const Renderer = struct {
     pub fn deinit(self: *Renderer) void {
         std.debug.assert(self.active_frame == null);
         self.commands.deinit(self.allocator);
+        self.sampled_tags.deinit(self.allocator);
         switch (self.backend) {
             .cpu => |*renderer| renderer.deinit(),
             .vulkan => |*renderer| renderer.deinit(),
@@ -120,6 +123,7 @@ pub const Renderer = struct {
         // Damage and buffers referenced by appended commands must remain valid through finishFrame.
         std.debug.assert(self.active_frame == null);
         std.debug.assert(self.commands.items.len == 0);
+        self.sampled_tags.clearRetainingCapacity();
         try validateTarget(target);
         if (scale.numerator == 0 or scale.numerator > std.math.maxInt(i32)) {
             return error.InvalidTarget;
@@ -175,6 +179,12 @@ pub const Renderer = struct {
 
     pub fn append(self: *Renderer, commands: []const render_types.Command) Error!void {
         const active = self.active_frame orelse unreachable;
+        const command_count = std.math.add(
+            usize,
+            self.commands.items.len,
+            commands.len,
+        ) catch return error.OutOfMemory;
+        try self.sampled_tags.ensureTotalCapacity(self.allocator, command_count);
         const translated = active.origin.x != 0 or active.origin.y != 0;
         const scaled = active.scale.numerator != render_types.Scale.denominator;
         if (!translated and !scaled) {
@@ -199,6 +209,7 @@ pub const Renderer = struct {
             self.commands.items,
             active.target.size(),
         );
+        self.rememberSampledCommands(commands);
         try self.renderDirect(.{
             .size = active.target.size(),
             .commands = commands,
@@ -252,6 +263,10 @@ pub const Renderer = struct {
             unpruned_commands,
             active.target.size(),
         );
+        self.rememberSampledCommands(commands);
+        if (exclude_topmost) {
+            self.rememberSampledCommand(self.commands.getLast());
+        }
         const frame: render_types.Frame = .{
             .size = active.target.size(),
             .commands = commands,
@@ -419,6 +434,34 @@ pub const Renderer = struct {
         std.debug.assert(self.active_frame != null);
         self.active_frame = null;
         self.commands.clearRetainingCapacity();
+    }
+
+    /// Finish a frame whose topmost image is presented directly by the output.
+    pub fn finishFrameDirectScanout(self: *Renderer) void {
+        std.debug.assert(self.active_frame != null);
+        self.rememberSampledCommand(self.commands.getLast());
+        self.cancelFrame();
+    }
+
+    pub fn wasSampled(self: *const Renderer, tag: u64) bool {
+        std.debug.assert(self.active_frame == null);
+        return std.mem.indexOfScalar(u64, self.sampled_tags.items, tag) != null;
+    }
+
+    fn rememberSampledCommands(
+        self: *Renderer,
+        commands: []const render_types.Command,
+    ) void {
+        for (commands) |command| self.rememberSampledCommand(command);
+    }
+
+    fn rememberSampledCommand(self: *Renderer, command: render_types.Command) void {
+        const tag = switch (command) {
+            .image => |image| image.sample_tag orelse return,
+            else => return,
+        };
+        if (std.mem.indexOfScalar(u64, self.sampled_tags.items, tag) != null) return;
+        self.sampled_tags.appendAssumeCapacity(tag);
     }
 
     pub fn render(
@@ -624,6 +667,7 @@ fn translateCommand(
             .y = translateCoordinate(image.y, origin.y),
             .size = image.size,
             .buffer = image.buffer,
+            .sample_tag = image.sample_tag,
             .source = image.source,
             .transform = image.transform,
             .is_opaque = image.is_opaque,
@@ -704,6 +748,7 @@ fn scaleCommand(command: render_types.Command, scale: render_types.Scale) render
                 .y = rect.y,
                 .size = .{ .width = rect.width, .height = rect.height },
                 .buffer = image.buffer,
+                .sample_tag = image.sample_tag,
                 .source = image.source,
                 .transform = image.transform,
                 .is_opaque = image.is_opaque,
@@ -808,6 +853,81 @@ test "renderer prunes commands completely hidden by an opaque image" {
         @as(usize, 2),
         pruneOccludedCommands(&rounded, size).len,
     );
+}
+
+test "renderer reports only sampled image tags after occlusion pruning" {
+    const size: render_types.Size = .{ .width = 2, .height = 1 };
+    var lower_pixels = [_]u32{0xffff0000} ** 2;
+    var upper_pixels = [_]u32{0xff00ff00} ** 2;
+    const commands = [_]render_types.Command{
+        .{ .image = .{
+            .x = 0,
+            .y = 0,
+            .size = size,
+            .buffer = .{
+                .size = size,
+                .stride_pixels = size.width,
+                .pixels = &lower_pixels,
+            },
+            .sample_tag = 1,
+            .is_opaque = true,
+        } },
+        .{ .image = .{
+            .x = 0,
+            .y = 0,
+            .size = size,
+            .buffer = .{
+                .size = size,
+                .stride_pixels = size.width,
+                .pixels = &upper_pixels,
+            },
+            .sample_tag = 2,
+            .is_opaque = true,
+        } },
+    };
+    var output = try headless.init(std.testing.allocator, size);
+    defer output.deinit();
+    var renderer = try Renderer.init(std.testing.allocator, .cpu);
+    defer renderer.deinit();
+
+    try renderer.render(.{ .size = size, .commands = &commands }, output.target());
+
+    try std.testing.expect(!renderer.wasSampled(1));
+    try std.testing.expect(renderer.wasSampled(2));
+}
+
+test "renderer reports direct and overlay scanout image tags" {
+    const size: render_types.Size = .{ .width = 1, .height = 1 };
+    var source_pixel = [_]u32{0xffffffff};
+    const image: render_types.Command = .{ .image = .{
+        .x = 0,
+        .y = 0,
+        .size = size,
+        .buffer = .{
+            .size = size,
+            .stride_pixels = size.width,
+            .pixels = &source_pixel,
+        },
+        .sample_tag = 42,
+        .is_opaque = true,
+    } };
+    var output = try headless.init(std.testing.allocator, size);
+    defer output.deinit();
+    var renderer = try Renderer.init(std.testing.allocator, .cpu);
+    defer renderer.deinit();
+
+    try renderer.beginFrame(.{ .pixels = output.target() }, .{}, .{}, null, .{});
+    try renderer.append(&.{image});
+    renderer.finishFrameDirectScanout();
+    try std.testing.expect(renderer.wasSampled(42));
+
+    try renderer.beginFrame(.{ .pixels = output.target() }, .{}, .{}, null, .{});
+    try renderer.append(&.{
+        .{ .clear = render_types.Color.rgba(0, 0, 0, 255) },
+        image,
+    });
+    _ = try renderer.finishFrameScanoutWithoutTopmost(null);
+    try std.testing.expect(renderer.wasSampled(42));
 }
 
 test "renderer combines opaque coverage without pruning partial overlap" {
@@ -1309,7 +1429,7 @@ test "renderer translates global commands into an output-local target" {
     try std.testing.expectEqual(@as(u32, 0xff00ff00), output.pixel(1, 0));
 }
 
-test "fractional rendering preserves an exact-scale image" {
+test "fractional rendering preserves an exact-scale tagged image" {
     var output = try headless.init(std.testing.allocator, .{ .width = 3, .height = 3 });
     defer output.deinit();
     var source_pixels = [_]u32{
@@ -1319,14 +1439,15 @@ test "fractional rendering preserves an exact-scale image" {
     };
     const commands = [_]render_types.Command{
         .{ .image = .{
-            .x = 0,
-            .y = 0,
+            .x = 10,
+            .y = -4,
             .size = .{ .width = 2, .height = 2 },
             .buffer = .{
                 .size = .{ .width = 3, .height = 3 },
                 .stride_pixels = 3,
                 .pixels = &source_pixels,
             },
+            .sample_tag = 42,
         } },
     };
 
@@ -1337,11 +1458,13 @@ test "fractional rendering preserves an exact-scale image" {
             .size = .{ .width = 2, .height = 2 },
             .commands = &commands,
             .scale = .{ .numerator = 180 },
+            .origin = .{ .x = 10, .y = -4 },
         },
         output.target(),
     );
 
     try std.testing.expectEqualSlices(u32, &source_pixels, output.target().pixels);
+    try std.testing.expect(renderer.wasSampled(42));
 }
 
 test "fractional rendering scales rounded clips independently from images" {
