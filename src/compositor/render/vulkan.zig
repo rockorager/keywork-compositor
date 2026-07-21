@@ -47,11 +47,16 @@ pipeline_layout: vk.PipelineLayout,
 replace_pipeline: vk.Pipeline,
 blend_pipeline: vk.Pipeline,
 image_pipeline: vk.Pipeline,
+opaque_image_pipeline: vk.Pipeline,
 nearest_image_pipeline: vk.Pipeline,
+opaque_nearest_image_pipeline: vk.Pipeline,
 nearest_gamma22_image_pipeline: vk.Pipeline,
+opaque_nearest_gamma22_image_pipeline: vk.Pipeline,
 backdrop_image_pipeline: vk.Pipeline,
 reconstruction_image_pipeline: vk.Pipeline,
+opaque_reconstruction_image_pipeline: vk.Pipeline,
 area_image_pipeline: vk.Pipeline,
+opaque_area_image_pipeline: vk.Pipeline,
 shadow_pipeline: vk.Pipeline,
 downsample_pipeline: vk.Pipeline,
 blur_downsample_pipeline: vk.Pipeline,
@@ -469,11 +474,16 @@ const Graphics = struct {
     replace_pipeline: vk.Pipeline,
     blend_pipeline: vk.Pipeline,
     image_pipeline: vk.Pipeline,
+    opaque_image_pipeline: vk.Pipeline,
     nearest_image_pipeline: vk.Pipeline,
+    opaque_nearest_image_pipeline: vk.Pipeline,
     nearest_gamma22_image_pipeline: vk.Pipeline,
+    opaque_nearest_gamma22_image_pipeline: vk.Pipeline,
     backdrop_image_pipeline: vk.Pipeline,
     reconstruction_image_pipeline: vk.Pipeline,
+    opaque_reconstruction_image_pipeline: vk.Pipeline,
     area_image_pipeline: vk.Pipeline,
+    opaque_area_image_pipeline: vk.Pipeline,
     shadow_pipeline: vk.Pipeline,
     downsample_pipeline: vk.Pipeline,
     blur_downsample_pipeline: vk.Pipeline,
@@ -727,6 +737,16 @@ fn initGraphics(
         return err;
     };
     errdefer wrapper.destroyPipeline(device, image_pipeline, null);
+    const opaque_image_pipeline = try createPipeline(
+        wrapper,
+        device,
+        render_pass,
+        pipeline_layout,
+        vertex_shader,
+        image_shader,
+        false,
+    );
+    errdefer wrapper.destroyPipeline(device, opaque_image_pipeline, null);
     const nearest_image_pipeline = createPipeline(
         wrapper,
         device,
@@ -740,6 +760,16 @@ fn initGraphics(
         return err;
     };
     errdefer wrapper.destroyPipeline(device, nearest_image_pipeline, null);
+    const opaque_nearest_image_pipeline = try createPipeline(
+        wrapper,
+        device,
+        render_pass,
+        pipeline_layout,
+        vertex_shader,
+        nearest_image_shader,
+        false,
+    );
+    errdefer wrapper.destroyPipeline(device, opaque_nearest_image_pipeline, null);
     const nearest_gamma22_image_pipeline = createPipeline(
         wrapper,
         device,
@@ -753,6 +783,16 @@ fn initGraphics(
         return err;
     };
     errdefer wrapper.destroyPipeline(device, nearest_gamma22_image_pipeline, null);
+    const opaque_nearest_gamma22_image_pipeline = try createPipeline(
+        wrapper,
+        device,
+        render_pass,
+        pipeline_layout,
+        vertex_shader,
+        nearest_gamma22_image_shader,
+        false,
+    );
+    errdefer wrapper.destroyPipeline(device, opaque_nearest_gamma22_image_pipeline, null);
     const reconstruction_image_pipeline = createPipeline(
         wrapper,
         device,
@@ -766,6 +806,16 @@ fn initGraphics(
         return err;
     };
     errdefer wrapper.destroyPipeline(device, reconstruction_image_pipeline, null);
+    const opaque_reconstruction_image_pipeline = try createPipeline(
+        wrapper,
+        device,
+        render_pass,
+        pipeline_layout,
+        vertex_shader,
+        reconstruction_image_shader,
+        false,
+    );
+    errdefer wrapper.destroyPipeline(device, opaque_reconstruction_image_pipeline, null);
     const area_image_pipeline = createPipeline(
         wrapper,
         device,
@@ -779,6 +829,16 @@ fn initGraphics(
         return err;
     };
     errdefer wrapper.destroyPipeline(device, area_image_pipeline, null);
+    const opaque_area_image_pipeline = try createPipeline(
+        wrapper,
+        device,
+        render_pass,
+        pipeline_layout,
+        vertex_shader,
+        area_image_shader,
+        false,
+    );
+    errdefer wrapper.destroyPipeline(device, opaque_area_image_pipeline, null);
     const shadow_pipeline = createPipeline(
         wrapper,
         device,
@@ -869,11 +929,16 @@ fn initGraphics(
         .replace_pipeline = replace_pipeline,
         .blend_pipeline = blend_pipeline,
         .image_pipeline = image_pipeline,
+        .opaque_image_pipeline = opaque_image_pipeline,
         .nearest_image_pipeline = nearest_image_pipeline,
+        .opaque_nearest_image_pipeline = opaque_nearest_image_pipeline,
         .nearest_gamma22_image_pipeline = nearest_gamma22_image_pipeline,
+        .opaque_nearest_gamma22_image_pipeline = opaque_nearest_gamma22_image_pipeline,
         .backdrop_image_pipeline = backdrop_image_pipeline,
         .reconstruction_image_pipeline = reconstruction_image_pipeline,
+        .opaque_reconstruction_image_pipeline = opaque_reconstruction_image_pipeline,
         .area_image_pipeline = area_image_pipeline,
+        .opaque_area_image_pipeline = opaque_area_image_pipeline,
         .shadow_pipeline = shadow_pipeline,
         .downsample_pipeline = downsample_pipeline,
         .blur_downsample_pipeline = blur_downsample_pipeline,
@@ -1014,10 +1079,15 @@ fn destroyGraphics(wrapper: vk.DeviceWrapper, device: vk.Device, graphics: Graph
     wrapper.destroyPipeline(device, graphics.blur_downsample_pipeline, null);
     wrapper.destroyPipeline(device, graphics.downsample_pipeline, null);
     wrapper.destroyPipeline(device, graphics.shadow_pipeline, null);
+    wrapper.destroyPipeline(device, graphics.opaque_area_image_pipeline, null);
     wrapper.destroyPipeline(device, graphics.area_image_pipeline, null);
+    wrapper.destroyPipeline(device, graphics.opaque_reconstruction_image_pipeline, null);
     wrapper.destroyPipeline(device, graphics.reconstruction_image_pipeline, null);
+    wrapper.destroyPipeline(device, graphics.opaque_nearest_gamma22_image_pipeline, null);
     wrapper.destroyPipeline(device, graphics.nearest_gamma22_image_pipeline, null);
+    wrapper.destroyPipeline(device, graphics.opaque_nearest_image_pipeline, null);
     wrapper.destroyPipeline(device, graphics.nearest_image_pipeline, null);
+    wrapper.destroyPipeline(device, graphics.opaque_image_pipeline, null);
     wrapper.destroyPipeline(device, graphics.image_pipeline, null);
     wrapper.destroyPipeline(device, graphics.blend_pipeline, null);
     wrapper.destroyPipeline(device, graphics.replace_pipeline, null);
@@ -2247,11 +2317,16 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
         .replace_pipeline = graphics.replace_pipeline,
         .blend_pipeline = graphics.blend_pipeline,
         .image_pipeline = graphics.image_pipeline,
+        .opaque_image_pipeline = graphics.opaque_image_pipeline,
         .nearest_image_pipeline = graphics.nearest_image_pipeline,
+        .opaque_nearest_image_pipeline = graphics.opaque_nearest_image_pipeline,
         .nearest_gamma22_image_pipeline = graphics.nearest_gamma22_image_pipeline,
+        .opaque_nearest_gamma22_image_pipeline = graphics.opaque_nearest_gamma22_image_pipeline,
         .backdrop_image_pipeline = graphics.backdrop_image_pipeline,
         .reconstruction_image_pipeline = graphics.reconstruction_image_pipeline,
+        .opaque_reconstruction_image_pipeline = graphics.opaque_reconstruction_image_pipeline,
         .area_image_pipeline = graphics.area_image_pipeline,
+        .opaque_area_image_pipeline = graphics.opaque_area_image_pipeline,
         .shadow_pipeline = graphics.shadow_pipeline,
         .downsample_pipeline = graphics.downsample_pipeline,
         .blur_downsample_pipeline = graphics.blur_downsample_pipeline,
@@ -2341,11 +2416,16 @@ pub fn deinit(self: *Self) void {
         .replace_pipeline = self.replace_pipeline,
         .blend_pipeline = self.blend_pipeline,
         .image_pipeline = self.image_pipeline,
+        .opaque_image_pipeline = self.opaque_image_pipeline,
         .nearest_image_pipeline = self.nearest_image_pipeline,
+        .opaque_nearest_image_pipeline = self.opaque_nearest_image_pipeline,
         .nearest_gamma22_image_pipeline = self.nearest_gamma22_image_pipeline,
+        .opaque_nearest_gamma22_image_pipeline = self.opaque_nearest_gamma22_image_pipeline,
         .backdrop_image_pipeline = self.backdrop_image_pipeline,
         .reconstruction_image_pipeline = self.reconstruction_image_pipeline,
+        .opaque_reconstruction_image_pipeline = self.opaque_reconstruction_image_pipeline,
         .area_image_pipeline = self.area_image_pipeline,
+        .opaque_area_image_pipeline = self.opaque_area_image_pipeline,
         .shadow_pipeline = self.shadow_pipeline,
         .downsample_pipeline = self.downsample_pipeline,
         .blur_downsample_pipeline = self.blur_downsample_pipeline,
@@ -5767,6 +5847,12 @@ fn shadowVisibleRect(shadow: render.Shadow, frame_size: render.Size) ?render.Rec
     return rect;
 }
 
+fn imageCanReplace(image: render.Image) bool {
+    return image.is_opaque and
+        image.alpha_multiplier == std.math.maxInt(u32) and
+        image.rounded_clip == null;
+}
+
 fn compileDrawRuns(
     self: *Self,
     frame: render.Frame,
@@ -5850,18 +5936,27 @@ fn compileDrawRuns(
             };
             const radius = @min(rounded.radius, @min(rounded.rect.width, rounded.rect.height) / 2);
             const dmabuf = image.buffer.dmabuf;
+            const replace = imageCanReplace(image);
             const image_pipeline = if (backdrop != null)
                 self.backdrop_image_pipeline
             else if (prepared.texture.pipeline != .null_handle)
                 prepared.texture.pipeline
             else switch (image.samplingFilter()) {
                 .nearest => if (image.buffer.color_description.transfer_function == .gamma22)
-                    self.nearest_gamma22_image_pipeline
+                    if (replace)
+                        self.opaque_nearest_gamma22_image_pipeline
+                    else
+                        self.nearest_gamma22_image_pipeline
+                else if (replace)
+                    self.opaque_nearest_image_pipeline
                 else
                     self.nearest_image_pipeline,
-                .linear => self.image_pipeline,
-                .reconstruction => self.reconstruction_image_pipeline,
-                .area => self.area_image_pipeline,
+                .linear => if (replace) self.opaque_image_pipeline else self.image_pipeline,
+                .reconstruction => if (replace)
+                    self.opaque_reconstruction_image_pipeline
+                else
+                    self.reconstruction_image_pipeline,
+                .area => if (replace) self.opaque_area_image_pipeline else self.area_image_pipeline,
             };
             try self.emitDamaged(
                 frame,
@@ -7260,6 +7355,35 @@ fn transferToHostBarrier(self: *Self, command_buffer: vk.CommandBuffer) void {
         null,
         null,
     );
+}
+
+test "Vulkan disables blending only for rectangular opaque images" {
+    var pixels = [_]u32{0xffffffff};
+    var image: render.Image = .{
+        .x = 0,
+        .y = 0,
+        .size = .{ .width = 1, .height = 1 },
+        .buffer = .{
+            .size = .{ .width = 1, .height = 1 },
+            .stride_pixels = 1,
+            .pixels = &pixels,
+        },
+    };
+    try std.testing.expect(!imageCanReplace(image));
+
+    image.is_opaque = true;
+    try std.testing.expect(imageCanReplace(image));
+    image.clip = .{ .x = 0, .y = 0, .width = 1, .height = 1 };
+    try std.testing.expect(imageCanReplace(image));
+
+    image.alpha_multiplier = 0x8000_0000;
+    try std.testing.expect(!imageCanReplace(image));
+    image.alpha_multiplier = std.math.maxInt(u32);
+    image.rounded_clip = .{
+        .rect = .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+        .radius = 1,
+    };
+    try std.testing.expect(!imageCanReplace(image));
 }
 
 test "Vulkan graphics path supports images, alpha blending, and backdrop blur" {

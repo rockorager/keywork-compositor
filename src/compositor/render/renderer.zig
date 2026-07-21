@@ -4,6 +4,7 @@ const std = @import("std");
 const CpuRenderer = @import("cpu.zig");
 const VulkanRenderer = @import("vulkan.zig");
 const headless = @import("../backend/headless.zig");
+const Region = @import("../region.zig");
 const render_types = @import("types.zig");
 
 pub const Renderer = struct {
@@ -194,9 +195,13 @@ pub const Renderer = struct {
         const active = self.active_frame orelse unreachable;
         self.active_frame = null;
         defer self.commands.clearRetainingCapacity();
+        const commands = pruneOccludedCommands(
+            self.commands.items,
+            active.target.size(),
+        );
         try self.renderDirect(.{
             .size = active.target.size(),
-            .commands = self.commands.items,
+            .commands = commands,
             .damage = active.damage,
             .output_color_description = active.color_description,
             .output_calibration = active.output_calibration,
@@ -233,7 +238,7 @@ pub const Renderer = struct {
         const active = self.active_frame orelse unreachable;
         self.active_frame = null;
         defer self.commands.clearRetainingCapacity();
-        const commands = if (exclude_topmost) commands: {
+        const unpruned_commands = if (exclude_topmost) commands: {
             const last_command = self.commands.getLastOrNull() orelse unreachable;
             switch (last_command) {
                 .image => {},
@@ -241,6 +246,12 @@ pub const Renderer = struct {
             }
             break :commands self.commands.items[0 .. self.commands.items.len - 1];
         } else self.commands.items;
+        // An excluded overlay must not hide primary-plane content needed when
+        // the overlay is removed or rejected by a later atomic commit.
+        const commands = pruneOccludedCommands(
+            unpruned_commands,
+            active.target.size(),
+        );
         const frame: render_types.Frame = .{
             .size = active.target.size(),
             .commands = commands,
@@ -470,6 +481,104 @@ fn validateTarget(target: render_types.Target) Renderer.Error!void {
     if (pixels.pixels.len < required_pixels) return error.InvalidTarget;
 }
 
+/// Removes commands whose complete output is replaced by later opaque draws.
+/// Commands preceding a backdrop capture are kept relative to that capture,
+/// because the capture observes the target at its command-stream position.
+fn pruneOccludedCommands(
+    commands: []render_types.Command,
+    frame_size: render_types.Size,
+) []render_types.Command {
+    var coverage = Region.init();
+    defer coverage.deinit();
+
+    var read = commands.len;
+    var write = commands.len;
+    while (read > 0) {
+        read -= 1;
+        const command = commands[read];
+        if (std.meta.activeTag(command) == .backdrop_capture) {
+            coverage.clear();
+        } else if (commandVisibleRect(command, frame_size)) |visible| {
+            if (commandCanBePruned(command) and coverage.coversRectangle(
+                visible.x,
+                visible.y,
+                visible.width,
+                visible.height,
+            )) continue;
+        }
+
+        write -= 1;
+        commands[write] = command;
+
+        const opaque_rect = opaqueCommandRect(command, frame_size) orelse continue;
+        if (opaque_rect.width > std.math.maxInt(i32) or
+            opaque_rect.height > std.math.maxInt(i32)) continue;
+        coverage.add(
+            opaque_rect.x,
+            opaque_rect.y,
+            @intCast(opaque_rect.width),
+            @intCast(opaque_rect.height),
+        ) catch {
+            // Every command removed so far was independently covered. Keep the
+            // untouched prefix if pixman cannot extend the coverage region.
+            const start = write - read;
+            @memmove(commands[start..write], commands[0..read]);
+            return commands[start..];
+        };
+    }
+    return commands[write..];
+}
+
+fn commandCanBePruned(command: render_types.Command) bool {
+    return switch (command) {
+        .clear, .solid_rect, .image => true,
+        .shadow, .backdrop_capture, .backdrop_blur => false,
+    };
+}
+
+fn commandVisibleRect(
+    command: render_types.Command,
+    frame_size: render_types.Size,
+) ?render_types.Rect {
+    return switch (command) {
+        .clear => .{ .x = 0, .y = 0, .width = frame_size.width, .height = frame_size.height },
+        .solid_rect => |solid| clipped: {
+            var rect = solid.rect.clipTo(frame_size) orelse break :clipped null;
+            if (solid.clip) |clip| rect = rect.intersection(clip) orelse break :clipped null;
+            break :clipped rect;
+        },
+        .image => |image| clipped: {
+            var rect = (render_types.Rect{
+                .x = image.x,
+                .y = image.y,
+                .width = image.size.width,
+                .height = image.size.height,
+            }).clipTo(frame_size) orelse break :clipped null;
+            if (image.clip) |clip| rect = rect.intersection(clip) orelse break :clipped null;
+            if (image.rounded_clip) |clip| {
+                rect = rect.intersection(clip.rect) orelse break :clipped null;
+            }
+            break :clipped rect;
+        },
+        .shadow, .backdrop_capture, .backdrop_blur => null,
+    };
+}
+
+fn opaqueCommandRect(
+    command: render_types.Command,
+    frame_size: render_types.Size,
+) ?render_types.Rect {
+    switch (command) {
+        .clear => |color| if (color.alpha != std.math.maxInt(u8)) return null,
+        .solid_rect => |solid| if (solid.color.alpha != std.math.maxInt(u8)) return null,
+        .image => |image| if (!image.is_opaque or
+            image.alpha_multiplier != std.math.maxInt(u32) or
+            image.rounded_clip != null) return null,
+        .shadow, .backdrop_capture, .backdrop_blur => return null,
+    }
+    return commandVisibleRect(command, frame_size);
+}
+
 fn translateCommand(
     command: render_types.Command,
     origin: render_types.Position,
@@ -647,6 +756,110 @@ fn scaleUnsigned(value: u32, scale: render_types.Scale) u32 {
         (product + render_types.Scale.denominator / 2) / render_types.Scale.denominator,
         std.math.maxInt(u32),
     ));
+}
+
+test "renderer prunes commands completely hidden by an opaque image" {
+    const size: render_types.Size = .{ .width = 4, .height = 2 };
+    var pixels = [_]u32{0xffffffff} ** 8;
+    const image: render_types.Command = .{ .image = .{
+        .x = 0,
+        .y = 0,
+        .size = size,
+        .buffer = .{
+            .size = size,
+            .stride_pixels = size.width,
+            .pixels = &pixels,
+        },
+        .is_opaque = true,
+    } };
+    var commands = [_]render_types.Command{
+        .{ .clear = render_types.Color.rgba(0, 0, 0, 255) },
+        .{ .solid_rect = .{
+            .rect = .{ .x = 0, .y = 0, .width = 4, .height = 2 },
+            .color = render_types.Color.rgba(255, 0, 0, 128),
+        } },
+        image,
+    };
+
+    const pruned = pruneOccludedCommands(&commands, size);
+    try std.testing.expectEqual(@as(usize, 1), pruned.len);
+    try std.testing.expectEqual(.image, std.meta.activeTag(pruned[0]));
+
+    var translucent = [_]render_types.Command{ commands[0], image };
+    translucent[1].image.is_opaque = false;
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        pruneOccludedCommands(&translucent, size).len,
+    );
+
+    var multiplied = [_]render_types.Command{ commands[0], image };
+    multiplied[1].image.alpha_multiplier = 0x8000_0000;
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        pruneOccludedCommands(&multiplied, size).len,
+    );
+
+    var rounded = [_]render_types.Command{ commands[0], image };
+    rounded[1].image.rounded_clip = .{
+        .rect = .{ .x = 0, .y = 0, .width = 4, .height = 2 },
+        .radius = 1,
+    };
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        pruneOccludedCommands(&rounded, size).len,
+    );
+}
+
+test "renderer combines opaque coverage without pruning partial overlap" {
+    const size: render_types.Size = .{ .width = 4, .height = 2 };
+    const lower: render_types.Command = .{ .solid_rect = .{
+        .rect = .{ .x = 0, .y = 0, .width = 4, .height = 2 },
+        .color = render_types.Color.rgba(255, 0, 0, 128),
+    } };
+    const left: render_types.Command = .{ .solid_rect = .{
+        .rect = .{ .x = 0, .y = 0, .width = 2, .height = 2 },
+        .color = render_types.Color.rgba(0, 255, 0, 255),
+    } };
+    const right: render_types.Command = .{ .solid_rect = .{
+        .rect = .{ .x = 2, .y = 0, .width = 2, .height = 2 },
+        .color = render_types.Color.rgba(0, 0, 255, 255),
+    } };
+    var covered = [_]render_types.Command{ lower, left, right };
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        pruneOccludedCommands(&covered, size).len,
+    );
+
+    var partial = [_]render_types.Command{ lower, left, right };
+    partial[2].solid_rect.rect.width = 1;
+    try std.testing.expectEqual(
+        @as(usize, 3),
+        pruneOccludedCommands(&partial, size).len,
+    );
+}
+
+test "renderer preserves content observed by a backdrop capture" {
+    const size: render_types.Size = .{ .width = 4, .height = 2 };
+    var commands = [_]render_types.Command{
+        .{ .solid_rect = .{
+            .rect = .{ .x = 0, .y = 0, .width = 4, .height = 2 },
+            .color = render_types.Color.rgba(255, 0, 0, 255),
+        } },
+        .{ .backdrop_capture = .{
+            .id = 1,
+            .rect = .{ .x = 0, .y = 0, .width = 4, .height = 2 },
+            .radius = 4,
+        } },
+        .{ .solid_rect = .{
+            .rect = .{ .x = 0, .y = 0, .width = 4, .height = 2 },
+            .color = render_types.Color.rgba(0, 0, 255, 255),
+        } },
+    };
+
+    try std.testing.expectEqual(
+        @as(usize, 3),
+        pruneOccludedCommands(&commands, size).len,
+    );
 }
 
 test "renderer dispatches to the selected implementation" {
