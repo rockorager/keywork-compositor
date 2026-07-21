@@ -470,10 +470,15 @@ fn addXdg(self: *Self, xdg_id: XdgShell.WindowId) !WindowId {
         else
             null,
         .floating_position = if (restore) |state| state.position else null,
-        .minimized = if (restore) |state| state.minimized else false,
-        .maximized = if (restore) |state| state.maximized else false,
+        .minimized = if (restore) |state| state.minimized else info.requested_state.minimized,
+        .maximized = if (restore) |state| state.maximized else info.requested_state.maximized,
         .fullscreen_output = if (restore) |state|
             if (state.fullscreen) self.workspaces.items[workspace].output else null
+        else if (info.requested_state.fullscreen)
+            if (info.requested_state.fullscreen_output) |output|
+                if (self.outputs.get(output) != null) output else self.workspaces.items[workspace].output
+            else
+                self.workspaces.items[workspace].output
         else
             null,
     });

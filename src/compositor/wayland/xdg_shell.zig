@@ -98,6 +98,13 @@ pub const SizeHint = struct {
     height: i32 = 0,
 };
 
+pub const WindowRequestState = struct {
+    maximized: bool = false,
+    fullscreen: bool = false,
+    fullscreen_output: ?OutputLayout.Id = null,
+    minimized: bool = false,
+};
+
 const XdgSurfaceState = struct {
     surface_id: Surface.Id,
     role: ?XdgRole = null,
@@ -165,6 +172,7 @@ pub const WindowState = struct {
     committed_dimensions: ?Dimensions = null,
     mapped: bool = false,
     ready: bool = false,
+    requested_state: WindowRequestState = .{},
 
     fn deinit(self: *WindowState, allocator: std.mem.Allocator) void {
         if (self.title) |title| allocator.free(title);
@@ -206,6 +214,20 @@ pub const WindowState = struct {
         self.committed_dimensions = null;
         self.mapped = false;
         self.ready = false;
+        self.requested_state = .{};
+    }
+
+    fn requestMaximized(self: *WindowState, maximized: bool) void {
+        self.requested_state.maximized = maximized;
+    }
+
+    fn requestFullscreen(self: *WindowState, fullscreen: bool, output: ?OutputLayout.Id) void {
+        self.requested_state.fullscreen = fullscreen;
+        self.requested_state.fullscreen_output = if (fullscreen) output else null;
+    }
+
+    fn requestMinimized(self: *WindowState, minimized: bool) void {
+        self.requested_state.minimized = minimized;
     }
 };
 
@@ -340,6 +362,7 @@ pub const WindowInfo = struct {
     dimensions: ?Dimensions,
     ready: bool,
     mapped: bool,
+    requested_state: WindowRequestState,
 };
 
 pub const WindowListener = struct {
@@ -508,6 +531,7 @@ pub fn windowInfo(self: *Self, id: WindowId) ?WindowInfo {
         .dimensions = dimensions,
         .ready = window.ready,
         .mapped = window.mapped,
+        .requested_state = window.requested_state,
     };
 }
 
@@ -2470,17 +2494,35 @@ const ToplevelResource = struct {
                 if (!self.acceptsUserAction(resource, resize.seat, resize.serial)) return;
                 self.forwardRequest(.{ .pointer_resize = edges });
             },
-            .set_maximized => self.forwardRequest(.maximize),
-            .unset_maximized => self.forwardRequest(.unmaximize),
-            .set_fullscreen => |fullscreen| self.forwardRequest(.{
-                .fullscreen = fullscreen.output,
-            }),
-            .unset_fullscreen => self.forwardRequest(.exit_fullscreen),
-            .set_minimized => self.forwardRequest(.minimize),
+            .set_maximized => {
+                window.requestMaximized(true);
+                self.forwardRequest(.maximize);
+            },
+            .unset_maximized => {
+                window.requestMaximized(false);
+                self.forwardRequest(.unmaximize);
+            },
+            .set_fullscreen => |fullscreen| {
+                window.requestFullscreen(true, if (fullscreen.output) |output|
+                    if (self.shell.outputs.findResource(output)) |entry| entry.id else null
+                else
+                    null);
+                self.forwardRequest(.{ .fullscreen = fullscreen.output });
+            },
+            .unset_fullscreen => {
+                window.requestFullscreen(false, null);
+                self.forwardRequest(.exit_fullscreen);
+            },
+            .set_minimized => {
+                window.requestMinimized(true);
+                self.forwardRequest(.minimize);
+            },
         }
     }
 
     fn forwardRequest(self: *ToplevelResource, request: WindowRequest) void {
+        const window = self.shell.windows.get(self.id) orelse return;
+        if (!window.ready) return;
         self.shell.requestWindow(self.id, request);
     }
 
@@ -2876,6 +2918,28 @@ test "toplevel icon assignment is applied on commit and can be reset" {
     window.pending_icon_changed = true;
     try std.testing.expect(window.commit(allocator));
     try std.testing.expect(window.icon == null);
+}
+
+test "xdg state requests survive initial setup and reset on unmap" {
+    const allocator = std.testing.allocator;
+    var window: WindowState = .{
+        .xdg_surface_id = undefined,
+        .scene_id = undefined,
+        .unreliable_pid = 0,
+    };
+    defer window.deinit(allocator);
+
+    const output: OutputLayout.Id = .{ .index = 3, .generation = 2 };
+    window.requestMaximized(true);
+    window.requestFullscreen(true, output);
+    window.requestMinimized(true);
+    try std.testing.expect(window.requested_state.maximized);
+    try std.testing.expect(window.requested_state.fullscreen);
+    try std.testing.expectEqual(output, window.requested_state.fullscreen_output.?);
+    try std.testing.expect(window.requested_state.minimized);
+
+    window.reset(allocator);
+    try std.testing.expectEqual(WindowRequestState{}, window.requested_state);
 }
 
 test "xdg positioner derives popup geometry from anchor and gravity" {
