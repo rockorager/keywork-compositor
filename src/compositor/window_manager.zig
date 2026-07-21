@@ -1542,7 +1542,6 @@ fn relayout(self: *Self) void {
     var planned: std.ArrayList(types.LayoutPlan) = .empty;
     defer planned.deinit(self.allocator);
     for (self.workspaces.items) |*entry| {
-        if (!entry.active) continue;
         const area = self.layer_shell.usableAreaFor(entry.output) orelse continue;
         if (area.width <= 0 or area.height <= 0) continue;
         var inputs: std.ArrayList(types.WindowInput) = .empty;
@@ -1570,7 +1569,6 @@ fn relayout(self: *Self) void {
         window.placement = plan;
     }
     for (self.workspaces.items) |*entry| {
-        if (!entry.active) continue;
         for (entry.workspace.members.items) |member| {
             const window = self.windows.get(internal(member)) orelse continue;
             const fullscreen_output_id = window.fullscreen_output orelse continue;
@@ -1590,7 +1588,6 @@ fn relayout(self: *Self) void {
         }
     }
     for (self.workspaces.items) |*entry| {
-        if (!entry.active) continue;
         const area = self.layer_shell.usableAreaFor(entry.output) orelse continue;
         if (area.width <= 0 or area.height <= 0) continue;
         const bounds: types.Rect = .{
@@ -1627,7 +1624,6 @@ fn relayout(self: *Self) void {
     while (remaining > 0) : (remaining -= 1) {
         var changed = false;
         for (self.workspaces.items) |*entry| {
-            if (!entry.active) continue;
             for (entry.workspace.members.items) |member| {
                 const window = self.windows.get(internal(member)) orelse continue;
                 if (window.placement != null or window.fullscreen_output != null) continue;
@@ -1658,13 +1654,13 @@ fn relayout(self: *Self) void {
         if (!changed) break;
     }
     for (self.workspaces.items) |*entry| {
-        if (!entry.active) continue;
-        self.normalizeFocus(entry);
+        if (entry.active) self.normalizeFocus(entry);
         for (entry.workspace.members.items) |member| {
             const window = self.windows.get(internal(member)) orelse continue;
             const output = self.outputs.get(entry.output) orelse continue;
             const floating = self.isFloating(window);
             const plan = window.placement;
+            const repaint_suspended = repaintSuspended(window.minimized, entry.active, plan);
             const current_dimensions = self.currentDimensions(window);
             const dimensions: XdgShell.Dimensions = if (plan) |placement| .{
                 .width = @intCast(placement.rect.size.width),
@@ -1683,7 +1679,7 @@ fn relayout(self: *Self) void {
                 .bottom = placement.tiled_edges.bottom,
                 .left = placement.tiled_edges.left,
             } else .{};
-            window.serial = switch (window.backend) {
+            const serial = switch (window.backend) {
                 .xwayland => |id| serial: {
                     const current = self.currentDimensions(window);
                     if (!std.meta.eql(current, dimensions)) {
@@ -1705,9 +1701,10 @@ fn relayout(self: *Self) void {
                         window.fullscreen_output != null,
                     );
                     const configuration: XdgShell.ToplevelConfigure = .{
-                        .activated = !window.minimized and entry.workspace.focused != null and
+                        .activated = !repaint_suspended and entry.workspace.focused != null and
                             member.eql(entry.workspace.focused.?),
-                        .resizing = self.interactivelyResizing(internal(member)),
+                        .resizing = !repaint_suspended and
+                            self.interactivelyResizing(internal(member)),
                         .maximized = window.maximized,
                         .fullscreen = window.fullscreen_output != null,
                         .tiled = tiled,
@@ -1719,7 +1716,7 @@ fn relayout(self: *Self) void {
                             .width = @intCast(output.logicalSize().width),
                             .height = @intCast(output.logicalSize().height),
                         },
-                        .suspended = window.minimized,
+                        .suspended = repaint_suspended,
                     };
                     if (!needsXdgConfigure(
                         info.dimensions,
@@ -1735,6 +1732,8 @@ fn relayout(self: *Self) void {
                     ) catch null;
                 },
             };
+            // Suspended windows do not gate publishing because clients may stop repainting them.
+            window.serial = if (repaint_suspended) null else serial;
             if (window.serial != null) pending += 1;
         }
     }
@@ -2234,8 +2233,12 @@ fn rangesOverlap(first_start: i32, first_length: u32, second_start: i32, second_
     return @as(i64, first_start) < second_end and @as(i64, second_start) < first_end;
 }
 
+fn repaintSuspended(minimized: bool, active: bool, plan: ?types.LayoutPlan) bool {
+    return minimized or !active or plan == null or !plan.?.visible;
+}
+
 fn displayed(mapped: bool, minimized: bool, active: bool, plan: ?types.LayoutPlan) bool {
-    return mapped and !minimized and active and plan != null and plan.?.visible;
+    return mapped and !repaintSuspended(minimized, active, plan);
 }
 
 fn configureTimeout(self: *Self) c_int {
@@ -2450,13 +2453,25 @@ test "each output owns ten numbered workspaces" {
     try std.testing.expectEqual(@as(usize, 19), manager.workspaceNumber(second, 10).?);
 }
 
-test "Xwayland does not enter configure barrier and hidden workspaces are invisible" {
+test "Xwayland does not enter configure barrier" {
     var transaction: Transaction = .{};
     transaction.begin(0);
     try std.testing.expectEqual(Transaction.State.idle, transaction.state);
+}
+
+test "hidden windows are suspended and not displayed" {
     const plan: types.LayoutPlan = .{ .id = types.id(1), .rect = .{ .x = 0, .y = 0, .size = types.Size.init(1, 1) }, .visible = true };
+    try std.testing.expect(repaintSuspended(false, false, plan));
     try std.testing.expect(!displayed(true, false, false, plan));
+    try std.testing.expect(!repaintSuspended(false, true, plan));
     try std.testing.expect(displayed(true, false, true, plan));
+    try std.testing.expect(!displayed(false, false, true, plan));
+
+    var hidden = plan;
+    hidden.visible = false;
+    try std.testing.expect(repaintSuspended(false, true, hidden));
+    try std.testing.expect(repaintSuspended(false, true, null));
+    try std.testing.expect(repaintSuspended(true, true, plan));
 }
 
 test "window borders distinguish focus and exclude fullscreen windows" {
