@@ -3621,10 +3621,18 @@ fn shapeCursorForOutput(self: *Self, output: *RenderOutput, info: ?Seat.CursorIn
     };
     const bounds = self.cursorBounds(cursor) orelse return null;
     if (bounds.intersection(self.outputs.get(output.protocol_id).?.logicalRect()) == null) return null;
+    const source = shape.buffer.source_cache orelse return null;
+    const image = self.cursor_shape.outputCursorImage(
+        source,
+        output.backend.renderScale(),
+    ) orelse return null;
     const hardware: OutputBackend.ShapeCursor = .{
-        .buffer = shape.buffer,
-        .global_x = shape.x,
-        .global_y = shape.y,
+        .buffer = image.buffer,
+        .size = image.size,
+        .pointer_x = shape.x +| image.logical_hotspot_x,
+        .pointer_y = shape.y +| image.logical_hotspot_y,
+        .hotspot_x = image.hotspot_x,
+        .hotspot_y = image.hotspot_y,
     };
     return if (output.backend.canUseShapeCursor(hardware)) hardware else null;
 }

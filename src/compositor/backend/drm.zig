@@ -693,8 +693,11 @@ pub fn ready(self: *const Self) bool {
 
 pub const ShapeCursor = struct {
     buffer: render.PixelBuffer,
-    global_x: i32,
-    global_y: i32,
+    size: render.Size,
+    pointer_x: i32,
+    pointer_y: i32,
+    hotspot_x: i32,
+    hotspot_y: i32,
 };
 
 pub fn canUseShapeCursor(self: *const Self, cursor: ShapeCursor) bool {
@@ -703,9 +706,8 @@ pub fn canUseShapeCursor(self: *const Self, cursor: ShapeCursor) bool {
         !self.device_access.active(self.device_access.context)) return false;
     if (cursor.buffer.source_cache == null or cursor.buffer.dmabuf != null or
         cursor.buffer.pixels.len == 0) return false;
-    const scaled = self.scale.apply(cursor.buffer.size) catch return false;
-    return scaled.width != 0 and scaled.height != 0 and
-        scaled.width <= self.cursor_width and scaled.height <= self.cursor_height;
+    return cursor.size.width != 0 and cursor.size.height != 0 and
+        cursor.size.width <= self.cursor_width and cursor.size.height <= self.cursor_height;
 }
 
 /// Apply a built-in shape cursor, returning false when software composition is required.
@@ -714,15 +716,16 @@ pub fn setShapeCursor(self: *Self, cursor: ShapeCursor) bool {
     if (!self.canUseShapeCursor(cursor)) return false;
     const fd = self.device_access.fd(self.device_access.context) orelse return false;
     const source = cursor.buffer.source_cache.?;
-    const scaled = self.scale.apply(cursor.buffer.size) catch return false;
-    if (scaled.width == 0 or scaled.height == 0 or
-        scaled.width > self.cursor_width or scaled.height > self.cursor_height) unreachable;
+    if (cursor.size.width == 0 or cursor.size.height == 0 or
+        cursor.size.width > self.cursor_width or cursor.size.height > self.cursor_height) unreachable;
     const local = cursorLocalPosition(
-        cursor.global_x,
-        cursor.global_y,
+        cursor.pointer_x,
+        cursor.pointer_y,
         self.logical_x,
         self.logical_y,
         self.scale,
+        cursor.hotspot_x,
+        cursor.hotspot_y,
     );
     const unchanged = self.cursor_source != null and
         std.meta.eql(self.cursor_source.?, source) and std.meta.eql(self.cursor_scale, self.scale);
@@ -734,7 +737,7 @@ pub fn setShapeCursor(self: *Self, cursor: ShapeCursor) bool {
                 return false;
             };
         }
-        rescaleCursor(cursor.buffer, scaled, &self.cursor_buffers[index]);
+        rescaleCursor(cursor.buffer, cursor.size, &self.cursor_buffers[index]);
         if (c.drmModeSetCursor(fd, self.crtc_id, self.cursor_buffers[index].handle, self.cursor_width, self.cursor_height) != 0) {
             self.failCursor(error.SetCursorFailed);
             return false;
@@ -744,13 +747,15 @@ pub fn setShapeCursor(self: *Self, cursor: ShapeCursor) bool {
         self.cursor_scale = self.scale;
         self.cursor_active = true;
         log.debug(
-            "hardware cursor enabled on {s}: source={d}:{d} image={d}x{d} plane={d}x{d}",
+            "hardware cursor enabled on {s}: source={d}:{d} pixels={d}x{d} image={d}x{d} plane={d}x{d}",
             .{
                 self.name(),
                 source.id,
                 source.version,
-                scaled.width,
-                scaled.height,
+                cursor.buffer.size.width,
+                cursor.buffer.size.height,
+                cursor.size.width,
+                cursor.size.height,
                 self.cursor_width,
                 self.cursor_height,
             },
@@ -3199,10 +3204,18 @@ fn createCursorBuffer(self: *Self, fd: std.posix.fd_t, buffer: *Buffer) !void {
     @memset(buffer.pixels, 0);
 }
 
-fn cursorLocalPosition(global_x: i32, global_y: i32, output_x: i32, output_y: i32, scale: render.Scale) render.Position {
+fn cursorLocalPosition(
+    pointer_x: i32,
+    pointer_y: i32,
+    output_x: i32,
+    output_y: i32,
+    scale: render.Scale,
+    hotspot_x: i32,
+    hotspot_y: i32,
+) render.Position {
     return .{
-        .x = scaleSigned(global_x -| output_x, scale),
-        .y = scaleSigned(global_y -| output_y, scale),
+        .x = scaleSigned(pointer_x -| output_x, scale) -| hotspot_x,
+        .y = scaleSigned(pointer_y -| output_y, scale) -| hotspot_y,
     };
 }
 
@@ -3217,14 +3230,76 @@ fn scaleSigned(value: i32, scale: render.Scale) i32 {
 
 fn rescaleCursor(source: render.PixelBuffer, size: render.Size, destination: *Buffer) void {
     @memset(destination.pixels, 0);
+    if (std.meta.eql(source.size, size)) {
+        for (0..size.height) |y| {
+            @memcpy(
+                destination.pixels[y * destination.stride_pixels ..][0..size.width],
+                source.pixels[y * source.stride_pixels ..][0..size.width],
+            );
+        }
+        return;
+    }
     for (0..size.height) |y| {
-        const source_y = y * source.size.height / size.height;
+        const vertical = cursorSample(y, source.size.height, size.height);
         for (0..size.width) |x| {
-            const source_x = x * source.size.width / size.width;
+            const horizontal = cursorSample(x, source.size.width, size.width);
+            const top_left = source.pixels[vertical.first * source.stride_pixels + horizontal.first];
+            const top_right = source.pixels[vertical.first * source.stride_pixels + horizontal.second];
+            const bottom_left = source.pixels[vertical.second * source.stride_pixels + horizontal.first];
+            const bottom_right = source.pixels[vertical.second * source.stride_pixels + horizontal.second];
             destination.pixels[y * destination.stride_pixels + x] =
-                source.pixels[source_y * source.stride_pixels + source_x];
+                interpolateCursorPixel(
+                    top_left,
+                    top_right,
+                    bottom_left,
+                    bottom_right,
+                    horizontal.weight,
+                    vertical.weight,
+                );
         }
     }
+}
+
+const CursorSample = struct {
+    first: usize,
+    second: usize,
+    weight: f64,
+};
+
+fn cursorSample(destination: usize, source_size: u32, destination_size: u32) CursorSample {
+    std.debug.assert(source_size > 0 and destination_size > 0);
+    const position = (@as(f64, @floatFromInt(destination)) + 0.5) *
+        @as(f64, @floatFromInt(source_size)) / @as(f64, @floatFromInt(destination_size)) - 0.5;
+    const first_unclamped: i64 = @intFromFloat(@floor(position));
+    const maximum: i64 = source_size - 1;
+    return .{
+        .first = @intCast(std.math.clamp(first_unclamped, 0, maximum)),
+        .second = @intCast(std.math.clamp(first_unclamped + 1, 0, maximum)),
+        .weight = position - @floor(position),
+    };
+}
+
+fn interpolateCursorPixel(
+    top_left: u32,
+    top_right: u32,
+    bottom_left: u32,
+    bottom_right: u32,
+    horizontal: f64,
+    vertical: f64,
+) u32 {
+    var result: u32 = 0;
+    inline for (0..4) |component| {
+        const shift: u5 = @intCast(component * 8);
+        const top = @as(f64, @floatFromInt(@as(u8, @truncate(top_left >> shift)))) *
+            (1.0 - horizontal) +
+            @as(f64, @floatFromInt(@as(u8, @truncate(top_right >> shift)))) * horizontal;
+        const bottom = @as(f64, @floatFromInt(@as(u8, @truncate(bottom_left >> shift)))) *
+            (1.0 - horizontal) +
+            @as(f64, @floatFromInt(@as(u8, @truncate(bottom_right >> shift)))) * horizontal;
+        const value: u32 = @intFromFloat(@round(top * (1.0 - vertical) + bottom * vertical));
+        result |= value << shift;
+    }
+    return result;
 }
 
 fn disableAtomicCursorPlanes(fd: std.posix.fd_t, crtc_id: u32) bool {
@@ -4151,12 +4226,16 @@ test "cursor coordinates preserve signed fractional output-local positions" {
     const scale: render.Scale = .{ .numerator = 180 };
     try std.testing.expectEqual(
         render.Position{ .x = -2, .y = 3 },
-        cursorLocalPosition(99, 52, 100, 50, scale),
+        cursorLocalPosition(99, 52, 100, 50, scale, 0, 0),
+    );
+    try std.testing.expectEqual(
+        render.Position{ .x = 30, .y = -2 },
+        cursorLocalPosition(124, 52, 100, 50, scale, 6, 5),
     );
     try std.testing.expectEqual(@as(i32, 36), scaleSigned(24, scale));
 }
 
-test "cursor nearest rescale clears padding and duplicates nearest pixels" {
+test "cursor rescale interpolates pixels and clears plane padding" {
     const source_pixels = [_]u32{ 1, 2, 3, 4 };
     var destination_pixels = [_]u32{9} ** 12;
     var destination: Buffer = .{
@@ -4168,9 +4247,19 @@ test "cursor nearest rescale clears padding and duplicates nearest pixels" {
         .stride_pixels = 2,
         .pixels = @constCast(&source_pixels),
     }, .{ .width = 3, .height = 3 }, &destination);
-    try std.testing.expectEqualSlices(u32, &.{ 1, 1, 2, 0 }, destination_pixels[0..4]);
-    try std.testing.expectEqualSlices(u32, &.{ 1, 1, 2, 0 }, destination_pixels[4..8]);
-    try std.testing.expectEqualSlices(u32, &.{ 3, 3, 4, 0 }, destination_pixels[8..12]);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 2, 0 }, destination_pixels[0..4]);
+    try std.testing.expectEqualSlices(u32, &.{ 2, 3, 3, 0 }, destination_pixels[4..8]);
+    try std.testing.expectEqualSlices(u32, &.{ 3, 4, 4, 0 }, destination_pixels[8..12]);
+
+    @memset(&destination_pixels, 9);
+    rescaleCursor(.{
+        .size = .{ .width = 2, .height = 2 },
+        .stride_pixels = 2,
+        .pixels = @constCast(&source_pixels),
+    }, .{ .width = 2, .height = 2 }, &destination);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 0, 0 }, destination_pixels[0..4]);
+    try std.testing.expectEqualSlices(u32, &.{ 3, 4, 0, 0 }, destination_pixels[4..8]);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 0, 0, 0 }, destination_pixels[8..12]);
 }
 
 test "preferred DRM mode wins over the first mode" {

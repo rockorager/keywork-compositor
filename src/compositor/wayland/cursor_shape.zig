@@ -26,9 +26,17 @@ tablet: *Tablet,
 listener: Listener,
 images: [shape_count]?*xcursor.XcursorImage,
 source_cache_ids: [shape_count]u64,
+scaled_images: std.ArrayList(ScaledImage),
 theme: ?[*:0]u8,
 size: c_int,
 device_count: usize,
+
+const ScaledImage = struct {
+    shape: Shape,
+    requested_size: c_int,
+    image: *xcursor.XcursorImage,
+    source_cache_id: u64,
+};
 
 pub fn init(
     self: *Self,
@@ -51,6 +59,7 @@ pub fn init(
         .listener = listener,
         .images = @splat(null),
         .source_cache_ids = @splat(0),
+        .scaled_images = .empty,
         .theme = std.c.getenv("XCURSOR_THEME"),
         .size = configuredSize(),
         .device_count = 0,
@@ -62,6 +71,8 @@ pub fn deinit(self: *Self) void {
     self.listener.clear_shapes(self.listener.context);
     self.global.destroy();
     for (self.images) |image| if (image) |loaded| xcursor.XcursorImageDestroy(loaded);
+    for (self.scaled_images.items) |scaled| xcursor.XcursorImageDestroy(scaled.image);
+    self.scaled_images.deinit(self.allocator);
     self.* = undefined;
 }
 
@@ -129,35 +140,140 @@ fn cursor(self: *Self, client: *wl.Client, shape: Shape) ?Seat.ShapeCursor {
 pub fn cursorImage(self: *Self, shape: Shape) ?Seat.CursorImage {
     const index = shapeIndex(shape);
     const image = self.images[index] orelse loaded: {
-        const name = shapeName(shape);
-        const loaded_image_c = xcursor.XcursorLibraryLoadImage(
-            name,
-            if (self.theme) |theme| theme else null,
-            self.size,
-        ) orelse xcursor.XcursorLibraryLoadImage(
-            if (shape == .default) "left_ptr" else "default",
-            if (self.theme) |theme| theme else null,
-            self.size,
-        ) orelse {
-            log.warn("Xcursor theme has no image for {s}", .{name});
-            return null;
-        };
-        const loaded_image: *xcursor.XcursorImage = @ptrCast(loaded_image_c);
+        const loaded_image = self.loadImage(shape, self.size) orelse return null;
         self.images[index] = loaded_image;
         self.source_cache_ids[index] = render.allocateSourceCacheId();
         break :loaded loaded_image;
     };
+    return seatCursorImage(image, self.source_cache_ids[index]);
+}
+
+pub const OutputCursorImage = struct {
+    buffer: render.PixelBuffer,
+    size: render.Size,
+    logical_hotspot_x: i32,
+    logical_hotspot_y: i32,
+    hotspot_x: i32,
+    hotspot_y: i32,
+};
+
+/// Returns output-resolution pixels for a compositor-owned cursor image.
+/// The logical image remains the source of layout size and pointer position.
+pub fn outputCursorImage(
+    self: *Self,
+    source: render.SourceCache,
+    scale: render.Scale,
+) ?OutputCursorImage {
+    const index = for (self.source_cache_ids, 0..) |source_cache_id, candidate| {
+        if (source_cache_id == source.id) break candidate;
+    } else return null;
+    const base = self.images[index] orelse return null;
+    const shape: Shape = @enumFromInt(index + 1);
+    const target_size = scale.apply(.{
+        .width = base.width,
+        .height = base.height,
+    }) catch return null;
+    const nominal_size = scale.apply(.{
+        .width = @intCast(self.size),
+        .height = @intCast(self.size),
+    }) catch return null;
+    if (nominal_size.width > std.math.maxInt(c_int)) return null;
+    const requested_size: c_int = @intCast(nominal_size.width);
+    var selected = if (requested_size == self.size)
+        ScaledImage{
+            .shape = shape,
+            .requested_size = self.size,
+            .image = base,
+            .source_cache_id = self.source_cache_ids[index],
+        }
+    else
+        self.scaledImage(shape, requested_size) orelse return null;
+
+    // Xcursor chooses the nearest theme size. If that choice would still be
+    // enlarged, try a larger request and downsample the better source instead.
+    if (selected.image.width < target_size.width or selected.image.height < target_size.height) {
+        const oversized_size = std.math.mul(c_int, requested_size, 2) catch requested_size;
+        if (oversized_size > requested_size) {
+            if (self.scaledImage(shape, oversized_size)) |oversized| {
+                if (oversized.image.width > selected.image.width and
+                    oversized.image.height > selected.image.height) selected = oversized;
+            }
+        }
+    }
+
+    const buffer = pixelBuffer(selected.image, selected.source_cache_id) orelse return null;
+    return .{
+        .buffer = buffer,
+        .size = target_size,
+        .logical_hotspot_x = @intCast(base.xhot),
+        .logical_hotspot_y = @intCast(base.yhot),
+        .hotspot_x = scaledHotspot(selected.image.xhot, selected.image.width, target_size.width) orelse
+            return null,
+        .hotspot_y = scaledHotspot(selected.image.yhot, selected.image.height, target_size.height) orelse
+            return null,
+    };
+}
+
+fn scaledHotspot(value: u32, source_size: u32, target_size: u32) ?i32 {
+    if (source_size == 0) return null;
+    const product = std.math.mul(u64, value, target_size) catch return null;
+    const result = (product + source_size / 2) / source_size;
+    if (result > std.math.maxInt(i32)) return null;
+    return @intCast(result);
+}
+
+fn scaledImage(self: *Self, shape: Shape, requested_size: c_int) ?ScaledImage {
+    for (self.scaled_images.items) |scaled| {
+        if (scaled.shape == shape and scaled.requested_size == requested_size) return scaled;
+    }
+    const image = self.loadImage(shape, requested_size) orelse return null;
+    const scaled: ScaledImage = .{
+        .shape = shape,
+        .requested_size = requested_size,
+        .image = image,
+        .source_cache_id = render.allocateSourceCacheId(),
+    };
+    self.scaled_images.append(self.allocator, scaled) catch {
+        xcursor.XcursorImageDestroy(image);
+        return null;
+    };
+    return scaled;
+}
+
+fn loadImage(self: *Self, shape: Shape, requested_size: c_int) ?*xcursor.XcursorImage {
+    const name = shapeName(shape);
+    const image_c = xcursor.XcursorLibraryLoadImage(
+        name,
+        if (self.theme) |theme| theme else null,
+        requested_size,
+    ) orelse xcursor.XcursorLibraryLoadImage(
+        if (shape == .default) "left_ptr" else "default",
+        if (self.theme) |theme| theme else null,
+        requested_size,
+    ) orelse {
+        log.warn("Xcursor theme has no image for {s} at size {d}", .{ name, requested_size });
+        return null;
+    };
+    return @ptrCast(image_c);
+}
+
+fn seatCursorImage(image: *xcursor.XcursorImage, source_cache_id: u64) ?Seat.CursorImage {
+    const buffer = pixelBuffer(image, source_cache_id) orelse return null;
+    return .{
+        .buffer = buffer,
+        .hotspot_x = @intCast(image.xhot),
+        .hotspot_y = @intCast(image.yhot),
+    };
+}
+
+fn pixelBuffer(image: *xcursor.XcursorImage, source_cache_id: u64) ?render.PixelBuffer {
     const pixel_count = std.math.mul(usize, image.width, image.height) catch return null;
     const pixels: [*]u32 = @ptrCast(image.pixels);
     return .{
-        .buffer = .{
-            .size = .{ .width = image.width, .height = image.height },
-            .stride_pixels = image.width,
-            .pixels = pixels[0..pixel_count],
-            .source_cache = .{ .id = self.source_cache_ids[index], .version = 1 },
-        },
-        .hotspot_x = @intCast(image.xhot),
-        .hotspot_y = @intCast(image.yhot),
+        .size = .{ .width = image.width, .height = image.height },
+        .stride_pixels = image.width,
+        .pixels = pixels[0..pixel_count],
+        .source_cache = .{ .id = source_cache_id, .version = 1 },
     };
 }
 
@@ -298,4 +414,9 @@ test "shape names use the standard Xcursor spelling" {
 test "version one excludes version two cursor shapes" {
     try std.testing.expectEqual(@intFromEnum(Shape.zoom_out), maximumShape(1));
     try std.testing.expectEqual(@intFromEnum(Shape.all_resize), maximumShape(2));
+}
+
+test "cursor hotspots follow output image rescaling" {
+    try std.testing.expectEqual(@as(i32, 3), scaledHotspot(3, 30, 30));
+    try std.testing.expectEqual(@as(i32, 4), scaledHotspot(6, 48, 30));
 }
