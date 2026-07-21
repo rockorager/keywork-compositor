@@ -5898,7 +5898,11 @@ fn compileDrawRuns(
         .solid_rect => |solid| {
             var clipped = solid.rect.clipTo(frame.size) orelse continue;
             if (solid.clip) |clip| clipped = clipped.intersection(clip) orelse continue;
-            try self.emitDamaged(frame, clipped, .blend, .null_handle, .null_handle, null, .{ .width = 1, .height = 1 }, .{}, null, null, .{
+            const pipeline: PipelineKind = if (solid.color.alpha == std.math.maxInt(u8))
+                .replace
+            else
+                .blend;
+            try self.emitDamaged(frame, clipped, pipeline, .null_handle, .null_handle, null, .{ .width = 1, .height = 1 }, .{}, null, null, .{
                 .destination = rectFloats(clipped),
                 .source = .{ 0, 0, 1, 1 },
                 .clip = undefined,
@@ -7384,6 +7388,36 @@ test "Vulkan disables blending only for rectangular opaque images" {
         .radius = 1,
     };
     try std.testing.expect(!imageCanReplace(image));
+}
+
+test "Vulkan disables blending for opaque solid rectangles" {
+    var renderer: Self = undefined;
+    renderer.allocator = std.testing.allocator;
+    renderer.instances = .empty;
+    defer renderer.instances.deinit(std.testing.allocator);
+    renderer.draw_runs = .empty;
+    defer renderer.draw_runs.deinit(std.testing.allocator);
+    renderer.blur_ops = .empty;
+    defer renderer.blur_ops.deinit(std.testing.allocator);
+
+    const commands = [_]render.Command{
+        .{ .solid_rect = .{
+            .rect = .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+            .color = render.Color.rgba(1, 2, 3, 255),
+        } },
+        .{ .solid_rect = .{
+            .rect = .{ .x = 1, .y = 0, .width = 1, .height = 1 },
+            .color = render.Color.rgba(1, 2, 3, 128),
+        } },
+    };
+    try renderer.compileDrawRuns(.{
+        .size = .{ .width = 2, .height = 1 },
+        .commands = &commands,
+    }, &.{}, .{});
+
+    try std.testing.expectEqual(@as(usize, 2), renderer.draw_runs.items.len);
+    try std.testing.expectEqual(PipelineKind.replace, renderer.draw_runs.items[0].pipeline);
+    try std.testing.expectEqual(PipelineKind.blend, renderer.draw_runs.items[1].pipeline);
 }
 
 test "Vulkan graphics path supports images, alpha blending, and backdrop blur" {
