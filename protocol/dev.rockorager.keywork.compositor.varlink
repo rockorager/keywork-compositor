@@ -137,7 +137,11 @@ type OutputStatistics (
     request_to_presentation: LatencyStatistics,
     request_to_render: LatencyStatistics,
     render_to_commit: LatencyStatistics,
-    commit_to_presentation: LatencyStatistics
+    commit_to_presentation: LatencyStatistics,
+    render_fence_samples: int,
+    render_fences_signaled_before_commit: int,
+    render_to_gpu_completion: LatencyStatistics,
+    gpu_completion_to_presentation: LatencyStatistics
 )
 
 # Change focus within the active workspace.

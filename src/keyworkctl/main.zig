@@ -226,6 +226,16 @@ fn writeStatistics(writer: *std.Io.Writer, outputs: []const control.OutputStatis
         try writeLatency(writer, "request -> render", output.request_to_render);
         try writeLatency(writer, "render -> commit", output.render_to_commit);
         try writeLatency(writer, "commit -> presentation", output.commit_to_presentation);
+        try writer.print("  render fences signaled before commit: {d}/{d}\n", .{
+            output.render_fences_signaled_before_commit,
+            output.render_fence_samples,
+        });
+        try writeLatency(writer, "render -> GPU completion", output.render_to_gpu_completion);
+        try writeLatency(
+            writer,
+            "GPU completion -> presentation",
+            output.gpu_completion_to_presentation,
+        );
     }
 }
 
@@ -646,6 +656,9 @@ test "performance statistics decode and render human-readable output" {
         \\  request -> render: p50 1000us, p95 1200us, p99 1400us, max 1600us (8 samples)
         \\  render -> commit: p50 1100us, p95 2800us, p99 5600us, max 7000us (8 samples)
         \\  commit -> presentation: p50 6800us, p95 8000us, p99 14900us, max 18000us (8 samples)
+        \\  render fences signaled before commit: 0/0
+        \\  render -> GPU completion: p50 0us, p95 0us, p99 0us, max 0us (0 samples)
+        \\  GPU completion -> presentation: p50 0us, p95 0us, p99 0us, max 0us (0 samples)
         \\
     , writer.written());
 }

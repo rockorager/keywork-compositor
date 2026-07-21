@@ -91,6 +91,11 @@ const Control = @import("control.zig");
 const ControlProtocol = @import("keywork-control");
 const WindowManager = @import("window_manager.zig");
 
+const c = @cImport({
+    @cInclude("fcntl.h");
+    @cInclude("linux/sync_file.h");
+    @cInclude("sys/ioctl.h");
+});
 const wl = wayland.server.wl;
 const log = std.log.scoped(.server);
 const linux_button_left = 0x110;
@@ -266,11 +271,13 @@ const RenderOutput = struct {
         path: FramePath,
         damage: *const Region,
         scanout_format: ?render.DmabufFormat,
+        render_fence_fd: ?std.posix.fd_t,
     ) void {
         const pending = if (self.pending_frame) |*frame| frame else unreachable;
         std.debug.assert(pending.commit_nanoseconds == null);
         std.debug.assert(path == .composited or scanout_format != null);
         pending.commit_nanoseconds = nowNanoseconds(self.server.io);
+        pending.trackRenderFence(render_fence_fd);
         self.consecutive_output_busy_retries = 0;
         self.frame_statistics.recordFrame(path, scanout_format, damage);
         if (self.cursor_state == .activating or self.cursor_state == .deactivating) {
@@ -296,14 +303,18 @@ const RenderOutput = struct {
     }
 
     fn presentFrame(self: *RenderOutput, info: presentation.Info) void {
-        const pending = self.pending_frame orelse return;
+        var pending = self.pending_frame orelse return;
         self.pending_frame = null;
+        defer pending.deinit();
         const dispatched_nanoseconds = nowNanoseconds(self.server.io);
         const presented_nanoseconds = if (self.backend.presentationClockId() ==
             presentation.monotonic_clock_id)
             info.timestamp.toNanoseconds()
         else
             dispatched_nanoseconds;
+        if (pending.render_fence_fd) |fd| {
+            pending.render_completion_nanoseconds = syncFileSignalNanoseconds(fd);
+        }
         self.frame_statistics.recordPresentation(
             pending,
             presented_nanoseconds,
@@ -313,8 +324,13 @@ const RenderOutput = struct {
 
     fn discardFrame(self: *RenderOutput) void {
         if (self.pending_frame == null) return;
-        self.pending_frame = null;
+        self.clearPendingFrame();
         increment(&self.frame_statistics.frames_discarded);
+    }
+
+    fn clearPendingFrame(self: *RenderOutput) void {
+        if (self.pending_frame) |*pending| pending.deinit();
+        self.pending_frame = null;
     }
 
     fn globalPoint(self: *RenderOutput, x: f64, y: f64) Point {
@@ -338,6 +354,26 @@ const PendingFrame = struct {
     request_nanoseconds: i96,
     render_nanoseconds: i96,
     commit_nanoseconds: ?i96 = null,
+    render_fence_fd: ?std.posix.fd_t = null,
+    render_completion_nanoseconds: ?i96 = null,
+
+    fn trackRenderFence(self: *PendingFrame, render_fence_fd: ?std.posix.fd_t) void {
+        const fd = render_fence_fd orelse return;
+        std.debug.assert(self.render_fence_fd == null);
+        const duplicate = c.fcntl(fd, c.F_DUPFD_CLOEXEC, @as(c_int, 0));
+        if (duplicate < 0) {
+            log.warn("failed to retain render fence for presentation timing: {t}", .{
+                std.posix.errno(duplicate),
+            });
+            return;
+        }
+        self.render_fence_fd = duplicate;
+    }
+
+    fn deinit(self: *PendingFrame) void {
+        if (self.render_fence_fd) |fd| _ = std.c.close(fd);
+        self.render_fence_fd = null;
+    }
 };
 
 const FrameLatency = struct {
@@ -345,6 +381,8 @@ const FrameLatency = struct {
     request_to_render_microseconds: u64,
     render_to_commit_microseconds: u64,
     commit_to_presentation_microseconds: u64,
+    render_to_gpu_completion_microseconds: ?u64 = null,
+    gpu_completion_to_presentation_microseconds: ?u64 = null,
 };
 
 const LatencyKind = enum {
@@ -352,6 +390,8 @@ const LatencyKind = enum {
     request_to_render,
     render_to_commit,
     commit_to_presentation,
+    render_to_gpu_completion,
+    gpu_completion_to_presentation,
 };
 
 const GpuExecution = struct {
@@ -408,6 +448,8 @@ const FrameStatistics = struct {
     cpu_uploads: u64 = 0,
     dmabuf_imports: u64 = 0,
     frames_over_budget: u64 = 0,
+    render_fence_samples: u64 = 0,
+    render_fences_signaled_before_commit: u64 = 0,
     latency_samples: [frame_latency_capacity]FrameLatency = undefined,
     latency_count: usize = 0,
     latency_next: usize = 0,
@@ -430,7 +472,7 @@ const FrameStatistics = struct {
             pending.request_nanoseconds,
             presented_nanoseconds,
         );
-        self.addLatency(.{
+        var latency: FrameLatency = .{
             .request_to_presentation_microseconds = nanosecondsToMicroseconds(request_to_presentation),
             .request_to_render_microseconds = nanosecondsToMicroseconds(elapsedNanoseconds(
                 pending.request_nanoseconds,
@@ -444,7 +486,27 @@ const FrameStatistics = struct {
                 commit_nanoseconds,
                 presented_nanoseconds,
             )),
-        });
+        };
+        if (pending.render_completion_nanoseconds) |completion_nanoseconds| {
+            // DMA-fence and DRM vblank timestamps are both monotonic. Reject
+            // out-of-range values so an unexpected clock domain cannot skew
+            // the rolling latency distributions.
+            if (completion_nanoseconds >= pending.render_nanoseconds and
+                completion_nanoseconds <= presented_nanoseconds)
+            {
+                latency.render_to_gpu_completion_microseconds = nanosecondsToMicroseconds(
+                    elapsedNanoseconds(pending.render_nanoseconds, completion_nanoseconds),
+                );
+                latency.gpu_completion_to_presentation_microseconds = nanosecondsToMicroseconds(
+                    elapsedNanoseconds(completion_nanoseconds, presented_nanoseconds),
+                );
+                increment(&self.render_fence_samples);
+                if (completion_nanoseconds <= commit_nanoseconds) {
+                    increment(&self.render_fences_signaled_before_commit);
+                }
+            }
+        }
+        self.addLatency(latency);
         increment(&self.frames_presented);
         if (request_to_presentation > refresh_nanoseconds +| frame_budget_tolerance_nanoseconds) {
             increment(&self.frames_over_budget);
@@ -595,6 +657,10 @@ const FrameStatistics = struct {
             .cpu_uploads = wireInteger(self.cpu_uploads),
             .dmabuf_imports = wireInteger(self.dmabuf_imports),
             .frames_over_budget = wireInteger(self.frames_over_budget),
+            .render_fence_samples = wireInteger(self.render_fence_samples),
+            .render_fences_signaled_before_commit = wireInteger(
+                self.render_fences_signaled_before_commit,
+            ),
             .gpu_execution = self.gpuExecutionSummary(.total),
             .gpu_composition = self.gpuExecutionSummary(.composition),
             .gpu_preparation = self.gpuExecutionSummary(.preparation),
@@ -611,6 +677,10 @@ const FrameStatistics = struct {
             .request_to_render = self.latencySummary(.request_to_render),
             .render_to_commit = self.latencySummary(.render_to_commit),
             .commit_to_presentation = self.latencySummary(.commit_to_presentation),
+            .render_to_gpu_completion = self.latencySummary(.render_to_gpu_completion),
+            .gpu_completion_to_presentation = self.latencySummary(
+                .gpu_completion_to_presentation,
+            ),
         };
     }
 
@@ -632,23 +702,22 @@ const FrameStatistics = struct {
         self: *const FrameStatistics,
         comptime kind: LatencyKind,
     ) ControlProtocol.LatencyStatistics {
-        if (self.latency_count == 0) return .{
-            .samples = 0,
-            .p50_microseconds = 0,
-            .p95_microseconds = 0,
-            .p99_microseconds = 0,
-            .maximum_microseconds = 0,
-        };
         var values: [frame_latency_capacity]u64 = undefined;
-        for (self.latency_samples[0..self.latency_count], 0..) |sample, index| {
-            values[index] = switch (kind) {
+        var value_count: usize = 0;
+        for (self.latency_samples[0..self.latency_count]) |sample| {
+            const value: ?u64 = switch (kind) {
                 .request_to_presentation => sample.request_to_presentation_microseconds,
                 .request_to_render => sample.request_to_render_microseconds,
                 .render_to_commit => sample.render_to_commit_microseconds,
                 .commit_to_presentation => sample.commit_to_presentation_microseconds,
+                .render_to_gpu_completion => sample.render_to_gpu_completion_microseconds,
+                .gpu_completion_to_presentation => sample.gpu_completion_to_presentation_microseconds,
             };
+            values[value_count] = value orelse continue;
+            value_count += 1;
         }
-        const sorted = values[0..self.latency_count];
+        if (value_count == 0) return .{};
+        const sorted = values[0..value_count];
         std.mem.sort(u64, sorted, {}, std.sort.asc(u64));
         return .{
             .samples = @intCast(sorted.len),
@@ -719,6 +788,34 @@ fn elapsedNanoseconds(start: i96, end: i96) u64 {
 
 fn nanosecondsToMicroseconds(nanoseconds: u64) u64 {
     return nanoseconds / std.time.ns_per_us;
+}
+
+fn syncFileSignalNanoseconds(fd: std.posix.fd_t) ?i96 {
+    var info: c.sync_file_info = std.mem.zeroes(c.sync_file_info);
+    if (!readSyncFileInfo(fd, &info) or info.status != 1 or info.num_fences == 0) return null;
+
+    var fences: [16]c.sync_fence_info = undefined;
+    if (info.num_fences > fences.len) return null;
+    const fence_count = info.num_fences;
+    info = std.mem.zeroes(c.sync_file_info);
+    info.num_fences = fence_count;
+    info.sync_fence_info = @intFromPtr(&fences);
+    if (!readSyncFileInfo(fd, &info) or info.status != 1 or info.num_fences > fence_count) return null;
+
+    var signal_nanoseconds: u64 = 0;
+    for (fences[0..info.num_fences]) |fence| {
+        if (fence.status != 1 or fence.timestamp_ns == 0) return null;
+        signal_nanoseconds = @max(signal_nanoseconds, fence.timestamp_ns);
+    }
+    return signal_nanoseconds;
+}
+
+fn readSyncFileInfo(fd: std.posix.fd_t, info: *c.sync_file_info) bool {
+    while (true) {
+        const result = c.ioctl(fd, c.SYNC_IOC_FILE_INFO, info);
+        if (result == 0) return true;
+        if (std.posix.errno(result) != .INTR) return false;
+    }
 }
 
 fn presentationRefreshNanoseconds(info: presentation.Info, refresh_millihertz: i32) u64 {
@@ -995,6 +1092,23 @@ test "frame statistics summarize rolling latency and classify over-budget frames
     try std.testing.expectEqual(@as(u64, 1), statistics.frames_presented);
     try std.testing.expectEqual(@as(u64, 1), statistics.frames_over_budget);
 
+    statistics.recordPresentation(.{
+        .request_nanoseconds = 20 * std.time.ns_per_ms,
+        .render_nanoseconds = 21 * std.time.ns_per_ms,
+        .commit_nanoseconds = 24 * std.time.ns_per_ms,
+        .render_completion_nanoseconds = 23 * std.time.ns_per_ms,
+    }, 30 * std.time.ns_per_ms, 10 * std.time.ns_per_ms);
+    try std.testing.expectEqual(
+        @as(i64, 2_000),
+        statistics.latencySummary(.render_to_gpu_completion).p50_microseconds,
+    );
+    try std.testing.expectEqual(
+        @as(i64, 7_000),
+        statistics.latencySummary(.gpu_completion_to_presentation).p50_microseconds,
+    );
+    try std.testing.expectEqual(@as(u64, 1), statistics.render_fence_samples);
+    try std.testing.expectEqual(@as(u64, 1), statistics.render_fences_signaled_before_commit);
+
     statistics.reset();
     try std.testing.expectEqual(@as(usize, 0), statistics.latency_count);
     try std.testing.expectEqual(@as(usize, 0), statistics.gpu_execution_count);
@@ -1003,6 +1117,8 @@ test "frame statistics summarize rolling latency and classify over-budget frames
     try std.testing.expectEqual(@as(i64, 0), statistics.overlayScanoutRejection(.atomic_test_failed));
     try std.testing.expectEqual(@as(u64, 0), statistics.cpu_uploads);
     try std.testing.expectEqual(@as(u64, 0), statistics.dmabuf_imports);
+    try std.testing.expectEqual(@as(u64, 0), statistics.render_fence_samples);
+    try std.testing.expectEqual(@as(u64, 0), statistics.render_fences_signaled_before_commit);
 
     for (0..frame_latency_capacity + 1) |value| statistics.addLatency(.{
         .request_to_presentation_microseconds = value,
@@ -2343,6 +2459,7 @@ fn removeRenderOutput(self: *Self, id: RenderOutputId) bool {
         self.session_lock.outputRemoved(render_output.protocol_id);
         self.session_lock.refreshOutputs();
     }
+    render_output.clearPendingFrame();
     render_output.backend.deinit();
     render_output.damage.deinit();
     render_output.damage_rectangles.deinit(self.allocator);
@@ -7283,7 +7400,7 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
     };
     errdefer render_output.backend.cancel();
     render_output.beginFrame();
-    errdefer render_output.pending_frame = null;
+    errdefer render_output.clearPendingFrame();
     const output = self.outputs.get(render_output.protocol_id).?;
     output.beginFrame();
     errdefer output.cancelFrame();
@@ -7393,7 +7510,12 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
                     const scanout_format = render.DmabufFormat.fromFourcc(
                         candidate.dmabuf.?.format,
                     ) orelse unreachable;
-                    render_output.commitFrame(.direct_scanout, &frame_damage, scanout_format);
+                    render_output.commitFrame(
+                        .direct_scanout,
+                        &frame_damage,
+                        scanout_format,
+                        null,
+                    );
                 },
                 .rejected => |reason| render_output.frame_statistics.rejectDirectScanout(reason),
             }
@@ -7500,6 +7622,7 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
             if (overlay_destination != null) .overlay_scanout else .composited,
             &frame_damage,
             render_output.backend.compositedScanoutFormat(),
+            render_fence_fd,
         );
     }
     output.endFrame();
@@ -7735,6 +7858,7 @@ fn presentSessionLockFrame(
         .composited,
         frame.presentation_damage.?,
         frame.render_output.backend.compositedScanoutFormat(),
+        render_fence_fd,
     );
     frame.render_output.lock_frame_pending = true;
     frame.output.endFrame();

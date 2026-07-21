@@ -769,6 +769,10 @@ const Recorder = struct {
             .request_to_render = latency,
             .render_to_commit = latency,
             .commit_to_presentation = latency,
+            .render_fence_samples = 4,
+            .render_fences_signaled_before_commit = 2,
+            .render_to_gpu_completion = latency,
+            .gpu_completion_to_presentation = latency,
         };
         return result;
     }
@@ -1030,6 +1034,10 @@ test "performance statistics return typed output snapshots and forward reset" {
     try std.testing.expectEqual(@as(i64, 308), statistics.gpu_composition_overhead.p99_microseconds);
     try std.testing.expectEqual(@as(i64, 309), statistics.gpu_frame_finish.p99_microseconds);
     try std.testing.expectEqual(@as(i64, 300), statistics.request_to_presentation.p99_microseconds);
+    try std.testing.expectEqual(@as(i64, 4), statistics.render_fence_samples);
+    try std.testing.expectEqual(@as(i64, 2), statistics.render_fences_signaled_before_commit);
+    try std.testing.expectEqual(@as(i64, 300), statistics.render_to_gpu_completion.p99_microseconds);
+    try std.testing.expectEqual(@as(i64, 300), statistics.gpu_completion_to_presentation.p99_microseconds);
 }
 
 test "standard service introspection returns the control interface" {

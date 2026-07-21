@@ -22,11 +22,11 @@ pub const Border = struct {
 };
 
 pub const LatencyStatistics = struct {
-    samples: i64,
-    p50_microseconds: i64,
-    p95_microseconds: i64,
-    p99_microseconds: i64,
-    maximum_microseconds: i64,
+    samples: i64 = 0,
+    p50_microseconds: i64 = 0,
+    p95_microseconds: i64 = 0,
+    p99_microseconds: i64 = 0,
+    maximum_microseconds: i64 = 0,
 };
 
 pub const DirectScanoutRejections = struct {
@@ -130,6 +130,10 @@ pub const OutputStatistics = struct {
     request_to_render: LatencyStatistics,
     render_to_commit: LatencyStatistics,
     commit_to_presentation: LatencyStatistics,
+    render_fence_samples: i64 = 0,
+    render_fences_signaled_before_commit: i64 = 0,
+    render_to_gpu_completion: LatencyStatistics = .{},
+    gpu_completion_to_presentation: LatencyStatistics = .{},
 };
 
 pub const focus_method = interface_name ++ ".Focus";
