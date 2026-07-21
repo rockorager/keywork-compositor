@@ -9,6 +9,14 @@ pub const Kind = enum {
     scrolling,
 };
 
+pub const DropPosition = enum {
+    center,
+    top,
+    right,
+    bottom,
+    left,
+};
+
 pub const Layout = union(enum) {
     tiled: Tiled,
     scrolling: Scrolling,
@@ -100,6 +108,22 @@ pub const Layout = union(enum) {
     pub fn swapWindows(self: *Layout, first: types.WindowId, second: types.WindowId) void {
         switch (self.*) {
             .tiled => |*layout| layout.swapWindows(first, second),
+            .scrolling => {},
+        }
+    }
+
+    pub fn repositionWindow(
+        self: *Layout,
+        source: types.WindowId,
+        target: types.WindowId,
+        position: DropPosition,
+    ) void {
+        if (position == .center) {
+            self.swapWindows(source, target);
+            return;
+        }
+        switch (self.*) {
+            .tiled => |*layout| layout.repositionWindow(source, target, position),
             .scrolling => {},
         }
     }
@@ -235,6 +259,18 @@ pub const Tiled = union(enum) {
         switch (self.*) {
             .master_stack => {},
             .dwindle => |*policy| policy.swapWindows(first, second),
+        }
+    }
+
+    fn repositionWindow(
+        self: *Tiled,
+        source: types.WindowId,
+        target: types.WindowId,
+        position: DropPosition,
+    ) void {
+        switch (self.*) {
+            .master_stack => {},
+            .dwindle => |*policy| policy.repositionWindow(source, target, position),
         }
     }
 
@@ -382,24 +418,35 @@ pub const Dwindle = struct {
             self.findLeaf(focused_id) orelse unreachable
         else
             self.extremeLeaf(self.root.?, true);
-        const old_id = switch (self.nodes.items[target_index].content) {
-            .leaf => |old_id| old_id,
-            .split => unreachable,
-        };
-        const old_rect = self.nodes.items[target_index].rect;
-        const target_rect = old_rect orelse self.last_usable;
+        const target_rect = self.nodes.items[target_index].rect orelse self.last_usable;
         const axis: Axis = if (target_rect) |rect|
             if (rect.size.width >= rect.size.height) .horizontal else .vertical
         else
             .horizontal;
+        self.splitLeaf(target_index, id, axis, false);
+    }
+
+    fn splitLeaf(
+        self: *Dwindle,
+        target_index: NodeIndex,
+        id: types.WindowId,
+        axis: Axis,
+        before: bool,
+    ) void {
+        const old_id = switch (self.nodes.items[target_index].content) {
+            .leaf => |value| value,
+            .split => unreachable,
+        };
+        const old_rect = self.nodes.items[target_index].rect;
         const first = self.allocateNode(.{
             .parent = target_index,
-            .rect = old_rect,
-            .content = .{ .leaf = old_id },
+            .rect = if (before) null else old_rect,
+            .content = .{ .leaf = if (before) id else old_id },
         });
         const second = self.allocateNode(.{
             .parent = target_index,
-            .content = .{ .leaf = id },
+            .rect = if (before) old_rect else null,
+            .content = .{ .leaf = if (before) old_id else id },
         });
         const target = &self.nodes.items[target_index];
         target.rect = null;
@@ -468,6 +515,25 @@ pub const Dwindle = struct {
         const second_index = self.findLeaf(second) orelse unreachable;
         self.nodes.items[first_index].content.leaf = second;
         self.nodes.items[second_index].content.leaf = first;
+    }
+
+    fn repositionWindow(
+        self: *Dwindle,
+        source: types.WindowId,
+        target: types.WindowId,
+        position: DropPosition,
+    ) void {
+        std.debug.assert(!source.eql(target));
+        std.debug.assert(position != .center);
+        self.windowRemoved(source);
+        const target_index = self.findLeaf(target) orelse unreachable;
+        const axis: Axis = switch (position) {
+            .left, .right => .horizontal,
+            .top, .bottom => .vertical,
+            .center => unreachable,
+        };
+        const before = position == .left or position == .top;
+        self.splitLeaf(target_index, source, axis, before);
     }
 
     fn beginResize(
@@ -1061,6 +1127,82 @@ test "dwindle tree traversal swaps leaves and collapses removed branches" {
     }, first.id);
     defer plans.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 3), plans.items.len);
+}
+
+test "dwindle repositions a window on each side of the drop target" {
+    const first = input(0, 10);
+    const second = input(1, 10);
+    const third = input(2, 10);
+    const area: types.Rect = .{
+        .x = 0,
+        .y = 0,
+        .size = types.Size.init(120, 80),
+    };
+    const Case = struct {
+        position: DropPosition,
+        ids: [3]types.WindowId,
+        rects: [3]types.Rect,
+    };
+    const cases = [_]Case{
+        .{
+            .position = .left,
+            .ids = .{ second.id, first.id, third.id },
+            .rects = .{
+                .{ .x = 0, .y = 0, .size = types.Size.init(120, 40) },
+                .{ .x = 0, .y = 40, .size = types.Size.init(60, 40) },
+                .{ .x = 60, .y = 40, .size = types.Size.init(60, 40) },
+            },
+        },
+        .{
+            .position = .right,
+            .ids = .{ second.id, third.id, first.id },
+            .rects = .{
+                .{ .x = 0, .y = 0, .size = types.Size.init(120, 40) },
+                .{ .x = 0, .y = 40, .size = types.Size.init(60, 40) },
+                .{ .x = 60, .y = 40, .size = types.Size.init(60, 40) },
+            },
+        },
+        .{
+            .position = .top,
+            .ids = .{ second.id, first.id, third.id },
+            .rects = .{
+                .{ .x = 0, .y = 0, .size = types.Size.init(120, 40) },
+                .{ .x = 0, .y = 40, .size = types.Size.init(120, 20) },
+                .{ .x = 0, .y = 60, .size = types.Size.init(120, 20) },
+            },
+        },
+        .{
+            .position = .bottom,
+            .ids = .{ second.id, third.id, first.id },
+            .rects = .{
+                .{ .x = 0, .y = 0, .size = types.Size.init(120, 40) },
+                .{ .x = 0, .y = 40, .size = types.Size.init(120, 20) },
+                .{ .x = 0, .y = 60, .size = types.Size.init(120, 20) },
+            },
+        },
+    };
+
+    for (cases) |case| {
+        var layout: Layout = .{ .tiled = .{ .dwindle = .{ .outer_gap = 0, .inner_gap = 0 } } };
+        defer layout.deinit(std.testing.allocator);
+        layout.setUsableArea(area);
+        try layout.windowAdded(std.testing.allocator, first.id, null);
+        try layout.windowAdded(std.testing.allocator, second.id, first.id);
+        try layout.windowAdded(std.testing.allocator, third.id, second.id);
+        layout.repositionWindow(first.id, third.id, case.position);
+
+        var plans = try layout.arrange(
+            std.testing.allocator,
+            &.{ first, second, third },
+            area,
+            first.id,
+        );
+        defer plans.deinit(std.testing.allocator);
+        for (plans.items, case.ids, case.rects) |plan, id, rect| {
+            try std.testing.expectEqual(id, plan.id);
+            try std.testing.expectEqual(rect, plan.rect);
+        }
+    }
 }
 
 test "dwindle pointer resize adjusts the nearest bordering split" {

@@ -137,6 +137,25 @@ pub const Workspace = struct {
         return true;
     }
 
+    pub fn repositionWindow(
+        self: *Workspace,
+        source: types.WindowId,
+        target: types.WindowId,
+        position: layout_mod.DropPosition,
+    ) bool {
+        if (source.eql(target)) return false;
+        const source_index = self.indexOf(source) orelse return false;
+        if (!self.contains(target)) return false;
+        if (position == .center) return self.swapWindows(source, target);
+
+        self.layout.repositionWindow(source, target, position);
+        const moved = self.members.orderedRemove(source_index);
+        const target_index = self.indexOf(target) orelse unreachable;
+        const after = position == .right or position == .bottom;
+        self.members.insertAssumeCapacity(target_index + @intFromBool(after), moved);
+        return true;
+    }
+
     fn indexOf(self: *const Workspace, id: types.WindowId) ?usize {
         for (self.members.items, 0..) |candidate, index| if (candidate.eql(id)) return index;
         return null;
@@ -223,4 +242,28 @@ test "switching to dwindle reconstructs tree order and tracks membership" {
     try std.testing.expect(workspace.remove(first));
     try std.testing.expectEqual(third, workspace.focused.?);
     try std.testing.expectEqual(second, workspace.nextWindow(third, false).?);
+}
+
+test "workspace reposition keeps membership in drop order" {
+    var workspace: Workspace = .{};
+    defer workspace.deinit(std.testing.allocator);
+    const first = types.id(1);
+    const second = types.id(2);
+    const third = types.id(3);
+    try std.testing.expect(try workspace.insert(std.testing.allocator, first));
+    try std.testing.expect(try workspace.insert(std.testing.allocator, second));
+    try std.testing.expect(try workspace.insert(std.testing.allocator, third));
+
+    try std.testing.expect(workspace.repositionWindow(first, third, .right));
+    try std.testing.expectEqualSlices(
+        types.WindowId,
+        &.{ second, third, first },
+        workspace.members.items,
+    );
+    try std.testing.expect(workspace.repositionWindow(first, second, .center));
+    try std.testing.expectEqualSlices(
+        types.WindowId,
+        &.{ first, third, second },
+        workspace.members.items,
+    );
 }
