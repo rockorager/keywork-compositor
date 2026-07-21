@@ -212,7 +212,16 @@ fn writeStatistics(writer: *std.Io.Writer, outputs: []const control.OutputStatis
         });
         try writeLatency(writer, "GPU total", output.gpu_execution);
         try writeLatency(writer, "GPU composition/effects", output.gpu_composition);
+        try writeLatency(writer, "GPU preparation/uploads", output.gpu_preparation);
+        try writeLatency(writer, "GPU solid composition", output.gpu_solid_composition);
+        try writeLatency(writer, "GPU image composition", output.gpu_image_composition);
+        try writeLatency(writer, "GPU shadows", output.gpu_shadow);
+        try writeLatency(writer, "GPU blur downsample", output.gpu_blur_downsample);
+        try writeLatency(writer, "GPU blur upsample", output.gpu_blur_upsample);
+        try writeLatency(writer, "GPU blur composite", output.gpu_blur_composite);
+        try writeLatency(writer, "GPU composition overhead", output.gpu_composition_overhead);
         try writeLatency(writer, "GPU output encode", output.gpu_output_encode);
+        try writeLatency(writer, "GPU frame finish", output.gpu_frame_finish);
         try writeLatency(writer, "request -> presentation", output.request_to_presentation);
         try writeLatency(writer, "request -> render", output.request_to_render);
         try writeLatency(writer, "render -> commit", output.render_to_commit);
@@ -600,7 +609,7 @@ test "configuration reload errors expose their message" {
 
 test "performance statistics decode and render human-readable output" {
     var reply = try std.json.parseFromSlice(varlink.Reply, std.testing.allocator,
-        \\{"parameters":{"outputs":[{"name":"eDP-1","width":2880,"height":1800,"refresh_millihertz":120000,"last_frame":{"path":"composited","working_format":"rgba16f_linear","scanout_format":"xrgb8888","output_transform":"normal","damage_rectangles":2,"damaged_pixels":800000},"frames_requested":10,"frames_started":9,"frames_presented":8,"frames_discarded":1,"acquire_retries":2,"composited_frames":7,"direct_scanout_candidates":3,"direct_scanout_frames":1,"direct_scanout_rejections":{"no_fullscreen_surface":4,"non_opaque_surface":0,"surface_transform":0,"non_dmabuf":0,"y_inverted":0,"missing_buffer_identity":0,"color_conversion":1,"unsupported_backend":0,"output_unavailable":0,"output_busy":0,"device_inactive":0,"unsupported_format_or_modifier":0,"unsupported_layout":0,"framebuffer_import_failed":0,"page_flip_failed":2},"cpu_uploads":4,"dmabuf_imports":6,"frames_over_budget":2,"gpu_execution":{"samples":7,"p50_microseconds":2100,"p95_microseconds":4400,"p99_microseconds":6100,"maximum_microseconds":7200},"gpu_composition":{"samples":7,"p50_microseconds":1500,"p95_microseconds":3300,"p99_microseconds":4700,"maximum_microseconds":5400},"gpu_output_encode":{"samples":7,"p50_microseconds":400,"p95_microseconds":700,"p99_microseconds":900,"maximum_microseconds":1100},"request_to_presentation":{"samples":8,"p50_microseconds":8200,"p95_microseconds":9100,"p99_microseconds":16700,"maximum_microseconds":25000},"request_to_render":{"samples":8,"p50_microseconds":1000,"p95_microseconds":1200,"p99_microseconds":1400,"maximum_microseconds":1600},"render_to_commit":{"samples":8,"p50_microseconds":1100,"p95_microseconds":2800,"p99_microseconds":5600,"maximum_microseconds":7000},"commit_to_presentation":{"samples":8,"p50_microseconds":6800,"p95_microseconds":8000,"p99_microseconds":14900,"maximum_microseconds":18000}}]}}
+        \\{"parameters":{"outputs":[{"name":"eDP-1","width":2880,"height":1800,"refresh_millihertz":120000,"last_frame":{"path":"composited","working_format":"rgba16f_linear","scanout_format":"xrgb8888","output_transform":"normal","damage_rectangles":2,"damaged_pixels":800000},"frames_requested":10,"frames_started":9,"frames_presented":8,"frames_discarded":1,"acquire_retries":2,"composited_frames":7,"direct_scanout_candidates":3,"direct_scanout_frames":1,"direct_scanout_rejections":{"no_fullscreen_surface":4,"non_opaque_surface":0,"surface_transform":0,"non_dmabuf":0,"y_inverted":0,"missing_buffer_identity":0,"color_conversion":1,"unsupported_backend":0,"output_unavailable":0,"output_busy":0,"device_inactive":0,"unsupported_format_or_modifier":0,"unsupported_layout":0,"framebuffer_import_failed":0,"page_flip_failed":2},"cpu_uploads":4,"dmabuf_imports":6,"frames_over_budget":2,"gpu_execution":{"samples":7,"p50_microseconds":2100,"p95_microseconds":4400,"p99_microseconds":6100,"maximum_microseconds":7200},"gpu_composition":{"samples":7,"p50_microseconds":1500,"p95_microseconds":3300,"p99_microseconds":4700,"maximum_microseconds":5400},"gpu_preparation":{"samples":7,"p50_microseconds":100,"p95_microseconds":200,"p99_microseconds":300,"maximum_microseconds":400},"gpu_solid_composition":{"samples":7,"p50_microseconds":110,"p95_microseconds":210,"p99_microseconds":310,"maximum_microseconds":410},"gpu_image_composition":{"samples":7,"p50_microseconds":120,"p95_microseconds":220,"p99_microseconds":320,"maximum_microseconds":420},"gpu_shadow":{"samples":7,"p50_microseconds":130,"p95_microseconds":230,"p99_microseconds":330,"maximum_microseconds":430},"gpu_blur_downsample":{"samples":7,"p50_microseconds":140,"p95_microseconds":240,"p99_microseconds":340,"maximum_microseconds":440},"gpu_blur_upsample":{"samples":7,"p50_microseconds":150,"p95_microseconds":250,"p99_microseconds":350,"maximum_microseconds":450},"gpu_blur_composite":{"samples":7,"p50_microseconds":160,"p95_microseconds":260,"p99_microseconds":360,"maximum_microseconds":460},"gpu_composition_overhead":{"samples":7,"p50_microseconds":170,"p95_microseconds":270,"p99_microseconds":370,"maximum_microseconds":470},"gpu_output_encode":{"samples":7,"p50_microseconds":400,"p95_microseconds":700,"p99_microseconds":900,"maximum_microseconds":1100},"gpu_frame_finish":{"samples":7,"p50_microseconds":180,"p95_microseconds":280,"p99_microseconds":380,"maximum_microseconds":480},"request_to_presentation":{"samples":8,"p50_microseconds":8200,"p95_microseconds":9100,"p99_microseconds":16700,"maximum_microseconds":25000},"request_to_render":{"samples":8,"p50_microseconds":1000,"p95_microseconds":1200,"p99_microseconds":1400,"maximum_microseconds":1600},"render_to_commit":{"samples":8,"p50_microseconds":1100,"p95_microseconds":2800,"p99_microseconds":5600,"maximum_microseconds":7000},"commit_to_presentation":{"samples":8,"p50_microseconds":6800,"p95_microseconds":8000,"p99_microseconds":14900,"maximum_microseconds":18000}}]}}
     , .{});
     defer reply.deinit();
     const parsed = try parseStatisticsParameters(std.testing.allocator, reply.value.parameters);
@@ -623,7 +632,16 @@ test "performance statistics decode and render human-readable output" {
         \\  acquire retries: 2, frames over budget: 2
         \\  GPU total: p50 2100us, p95 4400us, p99 6100us, max 7200us (7 samples)
         \\  GPU composition/effects: p50 1500us, p95 3300us, p99 4700us, max 5400us (7 samples)
+        \\  GPU preparation/uploads: p50 100us, p95 200us, p99 300us, max 400us (7 samples)
+        \\  GPU solid composition: p50 110us, p95 210us, p99 310us, max 410us (7 samples)
+        \\  GPU image composition: p50 120us, p95 220us, p99 320us, max 420us (7 samples)
+        \\  GPU shadows: p50 130us, p95 230us, p99 330us, max 430us (7 samples)
+        \\  GPU blur downsample: p50 140us, p95 240us, p99 340us, max 440us (7 samples)
+        \\  GPU blur upsample: p50 150us, p95 250us, p99 350us, max 450us (7 samples)
+        \\  GPU blur composite: p50 160us, p95 260us, p99 360us, max 460us (7 samples)
+        \\  GPU composition overhead: p50 170us, p95 270us, p99 370us, max 470us (7 samples)
         \\  GPU output encode: p50 400us, p95 700us, p99 900us, max 1100us (7 samples)
+        \\  GPU frame finish: p50 180us, p95 280us, p99 380us, max 480us (7 samples)
         \\  request -> presentation: p50 8200us, p95 9100us, p99 16700us, max 25000us (8 samples)
         \\  request -> render: p50 1000us, p95 1200us, p99 1400us, max 1600us (8 samples)
         \\  render -> commit: p50 1100us, p95 2800us, p99 5600us, max 7000us (8 samples)

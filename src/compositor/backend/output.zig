@@ -39,6 +39,7 @@ pub fn init(
     display: *wl.Server,
     output_size: render.Size,
     output_scale: render.Scale,
+    output_refresh_millihertz: i32,
     kind: Kind,
     drm_output: ?*DrmOutput,
     listener: Listener,
@@ -56,6 +57,7 @@ pub fn init(
             allocator,
             output_size,
             output_scale,
+            output_refresh_millihertz,
             offscreen_renderer,
         ) },
         .nested => {
@@ -184,7 +186,8 @@ pub fn modePreferred(self: *const Self) bool {
 pub fn refreshMillihertz(self: *const Self) i32 {
     return switch (self.backend) {
         .drm => |output| output.refreshMillihertz(),
-        .headless, .nested => 60_000,
+        .headless => |output| output.refreshMillihertz(),
+        .nested => 60_000,
     };
 }
 
@@ -264,11 +267,11 @@ pub fn shapeCursorActive(self: *const Self) bool {
     };
 }
 
-pub fn repaintDelayMilliseconds(self: *const Self) ?i32 {
+pub fn repaintIntervalNanoseconds(self: *const Self) ?u32 {
     return switch (self.backend) {
         // Presentation-backed outputs only defer until the current event batch is complete.
         .drm, .nested => null,
-        .headless => 16,
+        .headless => |output| output.refreshNanoseconds(),
     };
 }
 
@@ -311,9 +314,11 @@ pub fn present(
 ) !?presentation.Info {
     return switch (self.backend) {
         .drm => |output| output.present(damage, render_fence_fd, allow_tearing),
-        .headless => blk: {
+        .headless => |output| blk: {
             std.debug.assert(render_fence_fd == null);
-            break :blk presentation.Info.now(self.io);
+            var info = presentation.Info.now(self.io);
+            info.refresh_nanoseconds = output.refreshNanoseconds();
+            break :blk info;
         },
         .nested => |*output| blk: {
             std.debug.assert(render_fence_fd == null);

@@ -203,9 +203,11 @@ pub const Renderer = struct {
         }, active.target);
     }
 
-    /// Returns the frame's buffer-path statistics and an owned sync-file
-    /// descriptor when rendering can complete asynchronously. The caller must
-    /// close the descriptor after handing it to the display backend.
+    /// Returns the frame's buffer-path statistics and an owned sync-file when
+    /// an external display consumer needs asynchronous completion. Rendering
+    /// to a GPU-resident target without an external consumer may remain in
+    /// flight without a descriptor; the renderer synchronizes before reuse.
+    /// The caller must close a returned descriptor after handing it off.
     pub fn finishFrameScanout(
         self: *Renderer,
         gpu_sample_tag: ?u64,

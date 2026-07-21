@@ -28,6 +28,7 @@ const usage =
     \\  --renderer KIND           select cpu or vulkan rendering
     \\  --headless-size WIDTHxHEIGHT
     \\  --headless-scale SCALE
+    \\  --headless-refresh HZ
     \\  --drm-device PATH         use an explicit DRM device
     \\  --log-level LEVEL         select error, warning, info, or debug logging
     \\  --help                    show this help
@@ -41,6 +42,7 @@ const StartupOptions = struct {
     renderer: ?Renderer.Kind = null,
     headless_size: ?render.Size = null,
     headless_scale: ?render.Scale = null,
+    headless_refresh_millihertz: ?i32 = null,
     drm_device: ?[]const u8 = null,
     log_level: ?ControlProtocol.LogLevel = null,
 
@@ -100,6 +102,9 @@ pub fn main(init: std.process.Init) !void {
     var virtual_output: Server.VirtualOutputConfig = .{};
     if (options.headless_size) |size| virtual_output.size = size;
     if (options.headless_scale) |scale| virtual_output.scale = scale;
+    if (options.headless_refresh_millihertz) |refresh| {
+        virtual_output.refresh_millihertz = refresh;
+    }
     try ensureCursorSize(init.environ_map);
     const server = try Server.createWithVirtualOutput(
         init.gpa,
@@ -209,6 +214,11 @@ fn parseArguments(arguments: anytype) !StartupOptions {
             const value = arguments.next() orelse return error.MissingArgument;
             options.headless_scale = parseHeadlessScale(value) catch
                 return error.InvalidHeadlessScale;
+        } else if (std.mem.eql(u8, argument, "--headless-refresh")) {
+            if (options.headless_refresh_millihertz != null) return error.DuplicateArgument;
+            const value = arguments.next() orelse return error.MissingArgument;
+            options.headless_refresh_millihertz = parseHeadlessRefresh(value) catch
+                return error.InvalidHeadlessRefresh;
         } else if (std.mem.eql(u8, argument, "--drm-device")) {
             if (options.drm_device != null) return error.DuplicateArgument;
             const value = arguments.next() orelse return error.MissingArgument;
@@ -228,7 +238,8 @@ fn parseArguments(arguments: anytype) !StartupOptions {
     if (options.help) return options;
     const output = options.outputKind();
     if (output != .headless and
-        (options.headless_size != null or options.headless_scale != null))
+        (options.headless_size != null or options.headless_scale != null or
+            options.headless_refresh_millihertz != null))
     {
         return error.HeadlessOptionRequiresHeadlessOutput;
     }
@@ -293,6 +304,19 @@ fn parseHeadlessScale(value: []const u8) !render.Scale {
     return .{ .numerator = @intFromFloat(scaled) };
 }
 
+fn parseHeadlessRefresh(value: []const u8) !i32 {
+    var source = value;
+    if (std.mem.endsWith(u8, source, "Hz")) source = source[0 .. source.len - 2];
+    const refresh = std.fmt.parseFloat(f64, source) catch return error.InvalidHeadlessRefresh;
+    const millihertz = @round(refresh * 1000.0);
+    if (!std.math.isFinite(millihertz) or millihertz < 1 or
+        millihertz > @as(f64, @floatFromInt(std.math.maxInt(i32))))
+    {
+        return error.InvalidHeadlessRefresh;
+    }
+    return @intFromFloat(millihertz);
+}
+
 fn terminate(_: c_int, server: *Server) c_int {
     server.terminate();
     return 0;
@@ -339,6 +363,8 @@ test "startup options replace environment backend controls" {
         "2880x1800",
         "--headless-scale",
         "1.5",
+        "--headless-refresh",
+        "120",
         "--log-level",
         "debug",
     } };
@@ -348,6 +374,7 @@ test "startup options replace environment backend controls" {
     try std.testing.expectEqual(Renderer.Kind.vulkan, options.rendererKind());
     try std.testing.expectEqual(render.Size{ .width = 2880, .height = 1800 }, options.headless_size.?);
     try std.testing.expectEqual(@as(u32, 180), options.headless_scale.?.numerator);
+    try std.testing.expectEqual(@as(i32, 120_000), options.headless_refresh_millihertz.?);
     try std.testing.expectEqual(ControlProtocol.LogLevel.debug, options.log_level.?);
 
     var drm: TestArguments = .{ .values = &.{ "--drm-device", "/dev/dri/card1" } };
@@ -389,14 +416,17 @@ test "startup options reject duplicates and backend-specific misuse" {
     );
 }
 
-test "headless output configuration parses physical size and fractional scale" {
+test "headless output configuration parses size, scale, and refresh" {
     try std.testing.expectEqual(
         render.Size{ .width = 2880, .height = 1800 },
         try parseHeadlessSize("2880x1800"),
     );
     try std.testing.expectEqual(@as(u32, 180), (try parseHeadlessScale("1.5")).numerator);
+    try std.testing.expectEqual(@as(i32, 120_000), try parseHeadlessRefresh("120"));
+    try std.testing.expectEqual(@as(i32, 59_940), try parseHeadlessRefresh("59.94Hz"));
     try std.testing.expectError(error.InvalidHeadlessSize, parseHeadlessSize("2880"));
     try std.testing.expectError(error.InvalidHeadlessScale, parseHeadlessScale("0"));
+    try std.testing.expectError(error.InvalidHeadlessRefresh, parseHeadlessRefresh("0"));
 }
 
 test "cursor size defaults when missing or empty" {

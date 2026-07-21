@@ -235,7 +235,8 @@ const RenderOutput = struct {
     consecutive_output_busy_retries: u8,
     frame_statistics: FrameStatistics,
     request_started_nanoseconds: ?i96,
-    last_frame_callback_nanoseconds: ?i96,
+    frame_callback_deadline_nanoseconds: ?i96,
+    repaint_deadline_nanoseconds: ?i96,
     pending_frame: ?PendingFrame,
     cursor_state: enum { software, activating, hardware, deactivating },
     cursor_transition_committed: bool,
@@ -356,10 +357,40 @@ const LatencyKind = enum {
 const GpuExecution = struct {
     total_microseconds: u64,
     composition_microseconds: u64,
+    preparation_microseconds: u64,
+    solid_composition_microseconds: u64,
+    image_composition_microseconds: u64,
+    shadow_microseconds: u64,
+    blur_downsample_microseconds: u64,
+    blur_upsample_microseconds: u64,
+    blur_composite_microseconds: u64,
+    composition_overhead_microseconds: u64,
     output_encode_microseconds: u64,
+    frame_finish_microseconds: u64,
+    pass_timings_available: bool,
 };
 
-const GpuExecutionKind = enum { total, composition, output_encode };
+const GpuExecutionKind = enum {
+    total,
+    composition,
+    preparation,
+    solid_composition,
+    image_composition,
+    shadow,
+    blur_downsample,
+    blur_upsample,
+    blur_composite,
+    composition_overhead,
+    output_encode,
+    frame_finish,
+
+    fn requiresPassTimings(kind: GpuExecutionKind) bool {
+        return switch (kind) {
+            .total, .composition, .output_encode, .frame_finish => false,
+            else => true,
+        };
+    }
+};
 
 const FrameStatistics = struct {
     frames_requested: u64 = 0,
@@ -433,7 +464,17 @@ const FrameStatistics = struct {
         self.gpu_execution_samples[self.gpu_execution_next] = .{
             .total_microseconds = nanosecondsToMicroseconds(timing.total_nanoseconds),
             .composition_microseconds = nanosecondsToMicroseconds(timing.composition_nanoseconds),
+            .preparation_microseconds = nanosecondsToMicroseconds(timing.preparation_nanoseconds),
+            .solid_composition_microseconds = nanosecondsToMicroseconds(timing.solid_composition_nanoseconds),
+            .image_composition_microseconds = nanosecondsToMicroseconds(timing.image_composition_nanoseconds),
+            .shadow_microseconds = nanosecondsToMicroseconds(timing.shadow_nanoseconds),
+            .blur_downsample_microseconds = nanosecondsToMicroseconds(timing.blur_downsample_nanoseconds),
+            .blur_upsample_microseconds = nanosecondsToMicroseconds(timing.blur_upsample_nanoseconds),
+            .blur_composite_microseconds = nanosecondsToMicroseconds(timing.blur_composite_nanoseconds),
+            .composition_overhead_microseconds = nanosecondsToMicroseconds(timing.composition_overhead_nanoseconds),
             .output_encode_microseconds = nanosecondsToMicroseconds(timing.output_encode_nanoseconds),
+            .frame_finish_microseconds = nanosecondsToMicroseconds(timing.frame_finish_nanoseconds),
+            .pass_timings_available = timing.pass_timings_available,
         };
         self.gpu_execution_next = (self.gpu_execution_next + 1) % frame_latency_capacity;
         self.gpu_execution_count = @min(self.gpu_execution_count + 1, frame_latency_capacity);
@@ -556,7 +597,16 @@ const FrameStatistics = struct {
             .frames_over_budget = wireInteger(self.frames_over_budget),
             .gpu_execution = self.gpuExecutionSummary(.total),
             .gpu_composition = self.gpuExecutionSummary(.composition),
+            .gpu_preparation = self.gpuExecutionSummary(.preparation),
+            .gpu_solid_composition = self.gpuExecutionSummary(.solid_composition),
+            .gpu_image_composition = self.gpuExecutionSummary(.image_composition),
+            .gpu_shadow = self.gpuExecutionSummary(.shadow),
+            .gpu_blur_downsample = self.gpuExecutionSummary(.blur_downsample),
+            .gpu_blur_upsample = self.gpuExecutionSummary(.blur_upsample),
+            .gpu_blur_composite = self.gpuExecutionSummary(.blur_composite),
+            .gpu_composition_overhead = self.gpuExecutionSummary(.composition_overhead),
             .gpu_output_encode = self.gpuExecutionSummary(.output_encode),
+            .gpu_frame_finish = self.gpuExecutionSummary(.frame_finish),
             .request_to_presentation = self.latencySummary(.request_to_presentation),
             .request_to_render = self.latencySummary(.request_to_render),
             .render_to_commit = self.latencySummary(.render_to_commit),
@@ -613,22 +663,36 @@ const FrameStatistics = struct {
         self: *const FrameStatistics,
         comptime kind: GpuExecutionKind,
     ) ControlProtocol.LatencyStatistics {
-        if (self.gpu_execution_count == 0) return .{
+        const no_samples: ControlProtocol.LatencyStatistics = .{
             .samples = 0,
             .p50_microseconds = 0,
             .p95_microseconds = 0,
             .p99_microseconds = 0,
             .maximum_microseconds = 0,
         };
+        if (self.gpu_execution_count == 0) return no_samples;
         var values: [frame_latency_capacity]u64 = undefined;
-        for (self.gpu_execution_samples[0..self.gpu_execution_count], 0..) |sample, index| {
-            values[index] = switch (kind) {
+        var value_count: usize = 0;
+        for (self.gpu_execution_samples[0..self.gpu_execution_count]) |sample| {
+            if (kind.requiresPassTimings() and !sample.pass_timings_available) continue;
+            values[value_count] = switch (kind) {
                 .total => sample.total_microseconds,
                 .composition => sample.composition_microseconds,
+                .preparation => sample.preparation_microseconds,
+                .solid_composition => sample.solid_composition_microseconds,
+                .image_composition => sample.image_composition_microseconds,
+                .shadow => sample.shadow_microseconds,
+                .blur_downsample => sample.blur_downsample_microseconds,
+                .blur_upsample => sample.blur_upsample_microseconds,
+                .blur_composite => sample.blur_composite_microseconds,
+                .composition_overhead => sample.composition_overhead_microseconds,
                 .output_encode => sample.output_encode_microseconds,
+                .frame_finish => sample.frame_finish_microseconds,
             };
+            value_count += 1;
         }
-        const sorted = values[0..self.gpu_execution_count];
+        if (value_count == 0) return no_samples;
+        const sorted = values[0..value_count];
         std.mem.sort(u64, sorted, {}, std.sort.asc(u64));
         return .{
             .samples = @intCast(sorted.len),
@@ -668,17 +732,31 @@ fn outputRefreshNanoseconds(refresh_millihertz: i32) u64 {
     return (std.time.ns_per_s * 1000 + frequency / 2) / frequency;
 }
 
-fn frameCallbackDelayMilliseconds(
+const PeriodicTimerSchedule = struct {
+    deadline_nanoseconds: i96,
+    delay_milliseconds: i32,
+};
+
+fn periodicTimerSchedule(
     now_nanoseconds: i96,
-    last_callback_nanoseconds: ?i96,
-    refresh_millihertz: i32,
-) i32 {
-    const last = last_callback_nanoseconds orelse return 1;
-    const deadline = last + @as(i96, @intCast(outputRefreshNanoseconds(refresh_millihertz)));
-    if (deadline <= now_nanoseconds) return 1;
+    previous_deadline_nanoseconds: ?i96,
+    interval_nanoseconds: u64,
+) PeriodicTimerSchedule {
+    std.debug.assert(interval_nanoseconds > 0);
+    const interval: i96 = interval_nanoseconds;
+    // Advance the prior target instead of adding a full interval after damage or
+    // callback processing, which would make client time lower the output rate.
+    var deadline = previous_deadline_nanoseconds orelse now_nanoseconds + interval;
+    if (deadline <= now_nanoseconds) {
+        const elapsed = now_nanoseconds - deadline;
+        deadline += (@divTrunc(elapsed, interval) + 1) * interval;
+    }
     const remaining = deadline - now_nanoseconds;
     const delay = @divTrunc(remaining + std.time.ns_per_ms - 1, std.time.ns_per_ms);
-    return @intCast(@min(delay, std.math.maxInt(i32)));
+    return .{
+        .deadline_nanoseconds = deadline,
+        .delay_milliseconds = @intCast(@min(delay, std.math.maxInt(i32))),
+    };
 }
 
 fn percentile(sorted: []const u64, percentage: u8) u64 {
@@ -723,24 +801,19 @@ fn increment(value: *u64) void {
     value.* +|= 1;
 }
 
-test "callback-only frames remain refresh paced without a repaint" {
-    const last: i96 = 100 * std.time.ns_per_ms;
-    try std.testing.expectEqual(
-        @as(i32, 9),
-        frameCallbackDelayMilliseconds(last, last, 120_000),
-    );
-    try std.testing.expectEqual(
-        @as(i32, 8),
-        frameCallbackDelayMilliseconds(last + std.time.ns_per_ms, last, 120_000),
-    );
-    try std.testing.expectEqual(
-        @as(i32, 1),
-        frameCallbackDelayMilliseconds(last + 9 * std.time.ns_per_ms, last, 120_000),
-    );
-    try std.testing.expectEqual(
-        @as(i32, 1),
-        frameCallbackDelayMilliseconds(last, null, 120_000),
-    );
+test "periodic output timer preserves fractional refresh phase" {
+    const interval = 8_333_333;
+    const first = periodicTimerSchedule(0, null, interval);
+    try std.testing.expectEqual(@as(i96, 8_333_333), first.deadline_nanoseconds);
+    try std.testing.expectEqual(@as(i32, 9), first.delay_milliseconds);
+
+    const second = periodicTimerSchedule(9 * std.time.ns_per_ms, first.deadline_nanoseconds, interval);
+    try std.testing.expectEqual(@as(i96, 16_666_666), second.deadline_nanoseconds);
+    try std.testing.expectEqual(@as(i32, 8), second.delay_milliseconds);
+
+    const third = periodicTimerSchedule(17 * std.time.ns_per_ms, second.deadline_nanoseconds, interval);
+    try std.testing.expectEqual(@as(i96, 24_999_999), third.deadline_nanoseconds);
+    try std.testing.expectEqual(@as(i32, 8), third.delay_milliseconds);
 }
 
 test "frame statistics summarize rolling latency and classify over-budget frames" {
@@ -797,19 +870,49 @@ test "frame statistics summarize rolling latency and classify over-budget frames
         .tag = 0,
         .total_nanoseconds = 1_100 * std.time.ns_per_us,
         .composition_nanoseconds = 700 * std.time.ns_per_us,
+        .preparation_nanoseconds = 100 * std.time.ns_per_us,
+        .solid_composition_nanoseconds = 100 * std.time.ns_per_us,
+        .image_composition_nanoseconds = 200 * std.time.ns_per_us,
+        .shadow_nanoseconds = 50 * std.time.ns_per_us,
+        .blur_downsample_nanoseconds = 50 * std.time.ns_per_us,
+        .blur_upsample_nanoseconds = 50 * std.time.ns_per_us,
+        .blur_composite_nanoseconds = 50 * std.time.ns_per_us,
+        .composition_overhead_nanoseconds = 100 * std.time.ns_per_us,
         .output_encode_nanoseconds = 300 * std.time.ns_per_us,
+        .frame_finish_nanoseconds = 100 * std.time.ns_per_us,
+        .pass_timings_available = true,
     });
     statistics.addGpuExecution(.{
         .tag = 0,
         .total_nanoseconds = 2_200 * std.time.ns_per_us,
         .composition_nanoseconds = 1_400 * std.time.ns_per_us,
+        .preparation_nanoseconds = 200 * std.time.ns_per_us,
+        .solid_composition_nanoseconds = 200 * std.time.ns_per_us,
+        .image_composition_nanoseconds = 400 * std.time.ns_per_us,
+        .shadow_nanoseconds = 100 * std.time.ns_per_us,
+        .blur_downsample_nanoseconds = 100 * std.time.ns_per_us,
+        .blur_upsample_nanoseconds = 100 * std.time.ns_per_us,
+        .blur_composite_nanoseconds = 100 * std.time.ns_per_us,
+        .composition_overhead_nanoseconds = 200 * std.time.ns_per_us,
         .output_encode_nanoseconds = 600 * std.time.ns_per_us,
+        .frame_finish_nanoseconds = 200 * std.time.ns_per_us,
+        .pass_timings_available = true,
     });
     statistics.addGpuExecution(.{
         .tag = 0,
         .total_nanoseconds = 3_300 * std.time.ns_per_us,
         .composition_nanoseconds = 2_100 * std.time.ns_per_us,
+        .preparation_nanoseconds = 300 * std.time.ns_per_us,
+        .solid_composition_nanoseconds = 300 * std.time.ns_per_us,
+        .image_composition_nanoseconds = 600 * std.time.ns_per_us,
+        .shadow_nanoseconds = 150 * std.time.ns_per_us,
+        .blur_downsample_nanoseconds = 150 * std.time.ns_per_us,
+        .blur_upsample_nanoseconds = 150 * std.time.ns_per_us,
+        .blur_composite_nanoseconds = 150 * std.time.ns_per_us,
+        .composition_overhead_nanoseconds = 300 * std.time.ns_per_us,
         .output_encode_nanoseconds = 900 * std.time.ns_per_us,
+        .frame_finish_nanoseconds = 300 * std.time.ns_per_us,
+        .pass_timings_available = true,
     });
     const gpu_summary = statistics.gpuExecutionSummary(.total);
     try std.testing.expectEqual(@as(i64, 3), gpu_summary.samples);
@@ -823,6 +926,37 @@ test "frame statistics summarize rolling latency and classify over-budget frames
     try std.testing.expectEqual(
         @as(i64, 600),
         statistics.gpuExecutionSummary(.output_encode).p50_microseconds,
+    );
+    try std.testing.expectEqual(
+        @as(i64, 200),
+        statistics.gpuExecutionSummary(.preparation).p50_microseconds,
+    );
+    try std.testing.expectEqual(
+        @as(i64, 400),
+        statistics.gpuExecutionSummary(.image_composition).p50_microseconds,
+    );
+    try std.testing.expectEqual(
+        @as(i64, 200),
+        statistics.gpuExecutionSummary(.frame_finish).p50_microseconds,
+    );
+    statistics.addGpuExecution(.{
+        .tag = 0,
+        .total_nanoseconds = 4_400 * std.time.ns_per_us,
+        .composition_nanoseconds = 2_800 * std.time.ns_per_us,
+        .output_encode_nanoseconds = 1_200 * std.time.ns_per_us,
+        .frame_finish_nanoseconds = 400 * std.time.ns_per_us,
+    });
+    try std.testing.expectEqual(
+        @as(i64, 4),
+        statistics.gpuExecutionSummary(.total).samples,
+    );
+    try std.testing.expectEqual(
+        @as(i64, 3),
+        statistics.gpuExecutionSummary(.preparation).samples,
+    );
+    try std.testing.expectEqual(
+        @as(i64, 4),
+        statistics.gpuExecutionSummary(.frame_finish).samples,
     );
 
     var damage = Region.init();
@@ -930,6 +1064,7 @@ const RenderOutputConfig = struct {
     kind: OutputBackend.Kind,
     size: render.Size,
     scale: render.Scale = .{},
+    refresh_millihertz: i32 = 60_000,
     position: Output.Position = .{},
     name: []const u8,
     description: []const u8,
@@ -956,6 +1091,7 @@ const PreparedIccProfile = struct {
 pub const VirtualOutputConfig = struct {
     size: render.Size = .{ .width = 1280, .height = 720 },
     scale: render.Scale = .{},
+    refresh_millihertz: i32 = 60_000,
 };
 
 const OutputFrame = struct {
@@ -1209,6 +1345,7 @@ pub fn createWithVirtualOutput(
         .kind = output_kind,
         .size = virtual_output.size,
         .scale = virtual_output.scale,
+        .refresh_millihertz = virtual_output.refresh_millihertz,
         .name = if (output_kind == .headless) "HEADLESS-1" else "NESTED-1",
         .description = if (output_kind == .headless) "Keywork headless output" else "Keywork nested output",
         .model = if (output_kind == .headless) "headless" else "nested-wayland",
@@ -1932,7 +2069,8 @@ fn addRenderOutput(
         .consecutive_output_busy_retries = 0,
         .frame_statistics = .{},
         .request_started_nanoseconds = null,
-        .last_frame_callback_nanoseconds = null,
+        .frame_callback_deadline_nanoseconds = null,
+        .repaint_deadline_nanoseconds = null,
         .pending_frame = null,
         .cursor_state = .software,
         .cursor_transition_committed = false,
@@ -1945,6 +2083,7 @@ fn addRenderOutput(
         self.display,
         config.size,
         config.scale,
+        config.refresh_millihertz,
         config.kind,
         config.drm_output,
         backendListener(render_output),
@@ -1977,7 +2116,7 @@ fn addRenderOutput(
     });
     errdefer std.debug.assert(self.outputs.remove(render_output.protocol_id));
     errdefer stopRenderOutput(render_output);
-    if (render_output.backend.repaintDelayMilliseconds() != null) {
+    if (render_output.backend.repaintIntervalNanoseconds() != null) {
         render_output.timer = try self.display.getEventLoop().addTimer(
             *RenderOutput,
             handleRenderTimer,
@@ -3847,9 +3986,15 @@ fn primaryRenderOutput(self: *Self) *RenderOutput {
 
 fn scheduleRepaint(self: *Self, output: *RenderOutput) void {
     if (!output.repaint_needed or output.render_scheduled or !output.backend.ready()) return;
-    if (output.backend.repaintDelayMilliseconds()) |delay| {
+    if (output.backend.repaintIntervalNanoseconds()) |interval| {
+        const schedule = periodicTimerSchedule(
+            nowNanoseconds(self.io),
+            output.repaint_deadline_nanoseconds,
+            interval,
+        );
+        output.repaint_deadline_nanoseconds = schedule.deadline_nanoseconds;
         const timer = output.timer orelse unreachable;
-        timer.timerUpdate(delay) catch |err| {
+        timer.timerUpdate(schedule.delay_milliseconds) catch |err| {
             log.err("failed to schedule repaint: {t}", .{err});
             self.terminate();
             return;
@@ -3871,13 +4016,14 @@ fn scheduleRepaint(self: *Self, output: *RenderOutput) void {
 
 fn scheduleFrameCallback(self: *Self, output: *RenderOutput) void {
     if (!output.backend.powered()) return;
-    const timer = output.frame_callback_timer orelse unreachable;
-    const delay = frameCallbackDelayMilliseconds(
+    const schedule = periodicTimerSchedule(
         nowNanoseconds(self.io),
-        output.last_frame_callback_nanoseconds,
-        output.backend.refreshMillihertz(),
+        output.frame_callback_deadline_nanoseconds,
+        outputRefreshNanoseconds(output.backend.refreshMillihertz()),
     );
-    timer.timerUpdate(delay) catch |err| {
+    output.frame_callback_deadline_nanoseconds = schedule.deadline_nanoseconds;
+    const timer = output.frame_callback_timer orelse unreachable;
+    timer.timerUpdate(schedule.delay_milliseconds) catch |err| {
         log.err("failed to schedule frame callback: {t}", .{err});
         self.terminate();
         return;
@@ -3923,7 +4069,7 @@ fn outputPresented(context: *anyopaque, info: presentation.Info) void {
     const protocol_output = self.outputs.get(output.protocol_id).?;
     protocol_output.setRefresh(info);
     Surface.finishPresentation(self.compositor.surfaceStore(), protocol_output, info);
-    output.last_frame_callback_nanoseconds = nowNanoseconds(self.io);
+    output.frame_callback_deadline_nanoseconds = nowNanoseconds(self.io);
     if (protocol_output.hasCallbackOnlyFrameCallbacks()) self.scheduleFrameCallback(output);
     if (output.lock_frame_pending) {
         output.lock_frame_pending = false;
@@ -5460,12 +5606,15 @@ fn topFullscreenAtPoint(self: *Self, x: f64, y: f64) ?Scene.Id {
     var outputs = self.outputs.iterator();
     while (outputs.next()) |entry| {
         const output_rect = entry.output.logicalRect();
-        if (pointInRect(x, y, output_rect)) return self.topFullscreenForOutput(output_rect);
+        if (pointInRect(x, y, output_rect)) {
+            const fullscreen = self.topFullscreenForOutput(output_rect) orelse return null;
+            return fullscreen.id;
+        }
     }
     return null;
 }
 
-fn topFullscreenForOutput(self: *Self, output_rect: render.Rect) ?Scene.Id {
+fn topFullscreenForOutput(self: *Self, output_rect: render.Rect) ?Scene.Iterator.Entry {
     var nodes = self.scene.reverseNodeIterator();
     while (nodes.next()) |entry| switch (entry) {
         .window => |window_entry| {
@@ -5475,7 +5624,7 @@ fn topFullscreenForOutput(self: *Self, output_rect: render.Rect) ?Scene.Id {
                 const global_clip = clip_box.translated(window.position.x, window.position.y);
                 if (global_clip.intersection(output_rect) == null) continue;
             }
-            return window_entry.id;
+            return window_entry;
         },
         .shell_surface => {},
     };
@@ -6842,7 +6991,6 @@ fn handleFrameCallbackTimer(output_context: *RenderOutput) c_int {
     const timestamp = presentation.Timestamp.fromNanoseconds(now);
     const output = output_context.server.outputs.get(output_context.protocol_id).?;
     if (output.sendCallbackOnlyFrameCallbacks(timestamp.milliseconds())) {
-        output_context.last_frame_callback_nanoseconds = now;
         log.debug("completed callback-only frame callbacks for {s}", .{output.name()});
     }
     return 0;
@@ -7208,10 +7356,11 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
         return self.presentSessionLockFrame(&frame, render_fence_fd);
     }
 
-    const top_fullscreen = self.renderDesktopContents(&frame, paint_primary_cursor, true) catch |err| {
+    const desktop_contents = self.renderDesktopContents(&frame, paint_primary_cursor, true) catch |err| {
         log.err("desktop frame assembly failed: {t}", .{err});
         return err;
     };
+    const top_fullscreen = desktop_contents.top_fullscreen;
     try self.selectFrameOutputColorDescription(
         render_output,
         self.renderer.preferredOutputTransfer(),
@@ -7357,9 +7506,11 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
     self.color_management.refreshPreferred();
     self.foreign_toplevel_list.syncOutput(render_output.protocol_id);
 
-    self.submitLayerSurfaces(output, .background);
-    self.submitLayerSurfaces(output, .bottom);
-    if (top_fullscreen != null) self.submitLayerSurfaces(output, .top);
+    if (!desktop_contents.lower_layers_occluded) {
+        self.submitLayerSurfaces(output, .background);
+        self.submitLayerSurfaces(output, .bottom);
+        if (top_fullscreen != null) self.submitLayerSurfaces(output, .top);
+    }
     var fullscreen_reached = top_fullscreen == null;
     var nodes = self.scene.nodeIterator();
     while (nodes.next()) |entry| switch (entry) {
@@ -7405,28 +7556,40 @@ fn selectFrameOutputColorDescription(
     self.renderer.setOutputCalibration(render_output.output_calibration);
 }
 
+const DesktopContents = struct {
+    top_fullscreen: ?Scene.Id,
+    lower_layers_occluded: bool,
+};
+
 fn renderDesktopContents(
     self: *Self,
     frame: *const OutputFrame,
     paint_primary_cursor: bool,
     paint_tablet_cursors: bool,
-) renderer_types.Renderer.Error!?Scene.Id {
-    try self.renderLayerSurfaces(frame, .background);
-    if (self.hasBackgroundEffect()) {
-        const blur = Scene.background_blur;
-        const cache_command = [_]render.Command{.{ .backdrop_capture = .{
-            .id = try allocateBackdropCaptureId(frame),
-            .rect = frame.visible_rect,
-            .radius = blur.radius,
-            .downsample_level = blur.downsample_level,
-            .finish = blur.finish,
-            .base = true,
-        } }};
-        try self.renderCommands(frame, &cache_command);
+) renderer_types.Renderer.Error!DesktopContents {
+    const fullscreen_entry = self.topFullscreenForOutput(frame.visible_rect);
+    const top_fullscreen = if (fullscreen_entry) |entry| entry.id else null;
+    const lower_layers_occluded = if (fullscreen_entry) |entry|
+        self.fullscreenOccludesLowerLayers(entry.window, frame.visible_rect)
+    else
+        false;
+    if (!lower_layers_occluded) {
+        try self.renderLayerSurfaces(frame, .background);
+        if (self.hasBackgroundEffect()) {
+            const blur = Scene.background_blur;
+            const cache_command = [_]render.Command{.{ .backdrop_capture = .{
+                .id = try allocateBackdropCaptureId(frame),
+                .rect = frame.visible_rect,
+                .radius = blur.radius,
+                .downsample_level = blur.downsample_level,
+                .finish = blur.finish,
+                .base = true,
+            } }};
+            try self.renderCommands(frame, &cache_command);
+        }
+        try self.renderLayerSurfaces(frame, .bottom);
+        if (top_fullscreen != null) try self.renderLayerSurfaces(frame, .top);
     }
-    try self.renderLayerSurfaces(frame, .bottom);
-    const top_fullscreen = self.topFullscreenForOutput(frame.visible_rect);
-    if (top_fullscreen != null) try self.renderLayerSurfaces(frame, .top);
     var fullscreen_reached = top_fullscreen == null;
     var nodes = self.scene.nodeIterator();
     while (nodes.next()) |entry| switch (entry) {
@@ -7484,7 +7647,46 @@ fn renderDesktopContents(
 
     if (paint_primary_cursor) try self.renderSeatCursor(frame, &self.seat, false);
     if (paint_tablet_cursors) try self.renderTabletCursors(frame, false);
-    return top_fullscreen;
+    return .{
+        .top_fullscreen = top_fullscreen,
+        .lower_layers_occluded = lower_layers_occluded,
+    };
+}
+
+fn fullscreenOccludesLowerLayers(
+    self: *Self,
+    window: *const Scene.Window,
+    output_rect: render.Rect,
+) bool {
+    const surfaces = self.compositor.surfaceStore();
+    const buffer = Surface.currentBuffer(surfaces, window.surface_id) orelse return false;
+    return fullscreenRootOccludesOutput(
+        window,
+        buffer.logical_size,
+        surfaceFullyOpaque(surfaces, window.surface_id, buffer),
+        output_rect,
+    );
+}
+
+fn fullscreenRootOccludesOutput(
+    window: *const Scene.Window,
+    root_size: render.Size,
+    root_opaque: bool,
+    output_rect: render.Rect,
+) bool {
+    if (!window.mapped or !window.fullscreen or !root_opaque or
+        window.effects.corner_radius != 0 or window.clip_box != null or
+        window.content_clip_box != null)
+    {
+        return false;
+    }
+    const offset = if (window.content_geometry) |geometry| geometry.offset else Scene.Position{};
+    return std.meta.eql(output_rect, render.Rect{
+        .x = window.position.x -| offset.x,
+        .y = window.position.y -| offset.y,
+        .width = root_size.width,
+        .height = root_size.height,
+    });
 }
 
 fn hasBackgroundEffect(self: *Self) bool {
@@ -8603,13 +8805,64 @@ test "fullscreen selection is isolated to each output" {
         .y = 0,
         .width = 1280,
         .height = 720,
-    }).?);
+    }).?.id);
     try std.testing.expectEqual(second, server.topFullscreenForOutput(.{
         .x = 1280,
         .y = 0,
         .width = 640,
         .height = 480,
-    }).?);
+    }).?.id);
+}
+
+test "only an opaque fullscreen root exactly covering the output occludes lower layers" {
+    const output_rect: render.Rect = .{ .x = 1280, .y = 0, .width = 1920, .height = 1200 };
+    var window: Scene.Window = .{
+        .surface_id = .{ .index = 100, .generation = 1 },
+        .position = .{ .x = 1280 },
+        .mapped = true,
+        .fullscreen = true,
+        .effects = .{},
+    };
+    try std.testing.expect(fullscreenRootOccludesOutput(
+        &window,
+        .{ .width = 1920, .height = 1200 },
+        true,
+        output_rect,
+    ));
+    try std.testing.expect(!fullscreenRootOccludesOutput(
+        &window,
+        .{ .width = 1920, .height = 1200 },
+        false,
+        output_rect,
+    ));
+
+    window.position.x += 10;
+    window.content_geometry = .{
+        .offset = .{ .x = 10 },
+        .size = .{ .width = 1920, .height = 1200 },
+    };
+    try std.testing.expect(fullscreenRootOccludesOutput(
+        &window,
+        .{ .width = 1920, .height = 1200 },
+        true,
+        output_rect,
+    ));
+
+    window.content_clip_box = output_rect;
+    try std.testing.expect(!fullscreenRootOccludesOutput(
+        &window,
+        .{ .width = 1920, .height = 1200 },
+        true,
+        output_rect,
+    ));
+    window.content_clip_box = null;
+    window.effects.corner_radius = 1;
+    try std.testing.expect(!fullscreenRootOccludesOutput(
+        &window,
+        .{ .width = 1920, .height = 1200 },
+        true,
+        output_rect,
+    ));
 }
 
 test "window borders occupy only requested exterior edges and corners" {

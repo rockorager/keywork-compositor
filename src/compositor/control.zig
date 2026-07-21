@@ -755,7 +755,16 @@ const Recorder = struct {
             .frames_over_budget = 1,
             .gpu_execution = latency,
             .gpu_composition = latency,
+            .gpu_preparation = .{ .samples = 4, .p50_microseconds = 101, .p95_microseconds = 201, .p99_microseconds = 301, .maximum_microseconds = 401 },
+            .gpu_solid_composition = .{ .samples = 4, .p50_microseconds = 102, .p95_microseconds = 202, .p99_microseconds = 302, .maximum_microseconds = 402 },
+            .gpu_image_composition = .{ .samples = 4, .p50_microseconds = 103, .p95_microseconds = 203, .p99_microseconds = 303, .maximum_microseconds = 403 },
+            .gpu_shadow = .{ .samples = 4, .p50_microseconds = 104, .p95_microseconds = 204, .p99_microseconds = 304, .maximum_microseconds = 404 },
+            .gpu_blur_downsample = .{ .samples = 4, .p50_microseconds = 105, .p95_microseconds = 205, .p99_microseconds = 305, .maximum_microseconds = 405 },
+            .gpu_blur_upsample = .{ .samples = 4, .p50_microseconds = 106, .p95_microseconds = 206, .p99_microseconds = 306, .maximum_microseconds = 406 },
+            .gpu_blur_composite = .{ .samples = 4, .p50_microseconds = 107, .p95_microseconds = 207, .p99_microseconds = 307, .maximum_microseconds = 407 },
+            .gpu_composition_overhead = .{ .samples = 4, .p50_microseconds = 108, .p95_microseconds = 208, .p99_microseconds = 308, .maximum_microseconds = 408 },
             .gpu_output_encode = latency,
+            .gpu_frame_finish = .{ .samples = 4, .p50_microseconds = 109, .p95_microseconds = 209, .p99_microseconds = 309, .maximum_microseconds = 409 },
             .request_to_presentation = latency,
             .request_to_render = latency,
             .render_to_commit = latency,
@@ -1011,6 +1020,15 @@ test "performance statistics return typed output snapshots and forward reset" {
     try std.testing.expectEqual(@as(i64, 3), statistics.overlay_scanout_candidates);
     try std.testing.expectEqual(@as(i64, 2), statistics.overlay_scanout_frames);
     try std.testing.expectEqual(@as(i64, 1), statistics.overlay_scanout_rejections.no_topmost_surface);
+    try std.testing.expectEqual(@as(i64, 301), statistics.gpu_preparation.p99_microseconds);
+    try std.testing.expectEqual(@as(i64, 302), statistics.gpu_solid_composition.p99_microseconds);
+    try std.testing.expectEqual(@as(i64, 303), statistics.gpu_image_composition.p99_microseconds);
+    try std.testing.expectEqual(@as(i64, 304), statistics.gpu_shadow.p99_microseconds);
+    try std.testing.expectEqual(@as(i64, 305), statistics.gpu_blur_downsample.p99_microseconds);
+    try std.testing.expectEqual(@as(i64, 306), statistics.gpu_blur_upsample.p99_microseconds);
+    try std.testing.expectEqual(@as(i64, 307), statistics.gpu_blur_composite.p99_microseconds);
+    try std.testing.expectEqual(@as(i64, 308), statistics.gpu_composition_overhead.p99_microseconds);
+    try std.testing.expectEqual(@as(i64, 309), statistics.gpu_frame_finish.p99_microseconds);
     try std.testing.expectEqual(@as(i64, 300), statistics.request_to_presentation.p99_microseconds);
 }
 

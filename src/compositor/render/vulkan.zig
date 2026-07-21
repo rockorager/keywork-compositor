@@ -32,6 +32,7 @@ timestamp_query_pool: vk.QueryPool,
 timestamp_valid_bits: u32,
 timestamp_period: f32,
 pending_gpu_sample_tag: ?u64,
+pending_gpu_timing_plan: GpuTimingPlan,
 completed_gpu_timings: [2]GpuTiming,
 completed_gpu_timing_count: usize,
 format: vk.Format,
@@ -95,11 +96,10 @@ fallback: CpuRenderer,
 const max_cached_textures = 4096;
 const descriptor_set_capacity = max_cached_textures + 512;
 const stale_frame_count = 120;
-const timestamp_query_count = 4;
+const max_gpu_timing_segments = 256;
+const timestamp_query_count = max_gpu_timing_segments + 4;
 const timestamp_frame_start = 0;
-const timestamp_composition_end = 1;
-const timestamp_output_encode_end = 2;
-const timestamp_frame_end = 3;
+const timestamp_composition_start = 1;
 
 const TargetKey = union(enum) {
     pixels: struct {
@@ -271,6 +271,77 @@ const PipelineKind = enum {
     blur_composite,
 };
 
+const GpuTimingCategory = enum {
+    composition_overhead,
+    solid_composition,
+    image_composition,
+    shadow,
+    blur_downsample,
+    blur_upsample,
+    blur_composite,
+};
+
+const GpuTimingPlan = struct {
+    pass_timings_available: bool = true,
+    segment_count: u16 = 0,
+    segments: [max_gpu_timing_segments]GpuTimingCategory = undefined,
+
+    fn append(self: *GpuTimingPlan, category: GpuTimingCategory) void {
+        if (!self.pass_timings_available) return;
+        if (self.segment_count > 0 and self.segments[self.segment_count - 1] == category) return;
+        if (self.segment_count == max_gpu_timing_segments) {
+            self.pass_timings_available = false;
+            self.segment_count = 1;
+            self.segments[0] = .composition_overhead;
+            return;
+        }
+        self.segments[self.segment_count] = category;
+        self.segment_count += 1;
+    }
+
+    fn compositionEndQuery(self: GpuTimingPlan) u32 {
+        std.debug.assert(self.segment_count > 0);
+        return @as(u32, self.segment_count) + 1;
+    }
+
+    fn outputEncodeEndQuery(self: GpuTimingPlan) u32 {
+        return self.compositionEndQuery() + 1;
+    }
+
+    fn frameEndQuery(self: GpuTimingPlan) u32 {
+        return self.outputEncodeEndQuery() + 1;
+    }
+
+    fn queryCount(self: GpuTimingPlan) u32 {
+        return self.frameEndQuery() + 1;
+    }
+};
+
+const GpuTimingRecorder = struct {
+    plan: GpuTimingPlan,
+    segment_index: u16 = 0,
+
+    fn switchTo(
+        self: *GpuTimingRecorder,
+        renderer: *Self,
+        command_buffer: vk.CommandBuffer,
+        category: GpuTimingCategory,
+    ) void {
+        if (!self.plan.pass_timings_available) return;
+        std.debug.assert(self.segment_index < self.plan.segment_count);
+        if (self.plan.segments[self.segment_index] == category) return;
+        std.debug.assert(self.segment_index + 1 < self.plan.segment_count);
+        std.debug.assert(self.plan.segments[self.segment_index + 1] == category);
+        renderer.writeGpuTimestamp(command_buffer, @as(u32, self.segment_index) + 2);
+        self.segment_index += 1;
+    }
+
+    fn finish(self: GpuTimingRecorder) void {
+        if (!self.plan.pass_timings_available) return;
+        std.debug.assert(self.segment_index + 1 == self.plan.segment_count);
+    }
+};
+
 const BlurOp = struct {
     run_index: u32,
     cache_index: u32 = 0,
@@ -375,6 +446,16 @@ pub const GpuTiming = struct {
     total_nanoseconds: u64,
     composition_nanoseconds: u64,
     output_encode_nanoseconds: u64,
+    frame_finish_nanoseconds: u64 = 0,
+    pass_timings_available: bool = false,
+    preparation_nanoseconds: u64 = 0,
+    solid_composition_nanoseconds: u64 = 0,
+    image_composition_nanoseconds: u64 = 0,
+    shadow_nanoseconds: u64 = 0,
+    blur_downsample_nanoseconds: u64 = 0,
+    blur_upsample_nanoseconds: u64 = 0,
+    blur_composite_nanoseconds: u64 = 0,
+    composition_overhead_nanoseconds: u64 = 0,
 };
 
 const Graphics = struct {
@@ -2151,6 +2232,7 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
         .timestamp_valid_bits = timestamp_valid_bits,
         .timestamp_period = timestamp_period,
         .pending_gpu_sample_tag = null,
+        .pending_gpu_timing_plan = .{},
         .completed_gpu_timings = undefined,
         .completed_gpu_timing_count = 0,
         .format = format,
@@ -2684,17 +2766,30 @@ fn drainPending(self: *Self) Error!void {
     self.releasePendingResources();
 }
 
+fn writeGpuTimestamp(self: *Self, command_buffer: vk.CommandBuffer, query: u32) void {
+    std.debug.assert(query < timestamp_query_count);
+    if (self.timestamp_query_pool == .null_handle) return;
+    self.device_wrapper.cmdWriteTimestamp(
+        command_buffer,
+        .{ .bottom_of_pipe_bit = true },
+        self.timestamp_query_pool,
+        query,
+    );
+}
+
 fn finishPendingGpuTiming(self: *Self) void {
     const tag = self.pending_gpu_sample_tag orelse return;
     self.pending_gpu_sample_tag = null;
     std.debug.assert(self.timestamp_query_pool != .null_handle);
+    const plan = self.pending_gpu_timing_plan;
+    const query_count = plan.queryCount();
     var timestamps: [timestamp_query_count]u64 = undefined;
     const result = self.device_wrapper.getQueryPoolResults(
         self.device,
         self.timestamp_query_pool,
         0,
-        timestamps.len,
-        @sizeOf(@TypeOf(timestamps)),
+        query_count,
+        query_count * @sizeOf(u64),
         &timestamps,
         @sizeOf(u64),
         .{ .@"64_bit" = true },
@@ -2712,7 +2807,8 @@ fn finishPendingGpuTiming(self: *Self) void {
     }
     self.completed_gpu_timings[self.completed_gpu_timing_count] = gpuTimingFromTimestamps(
         tag,
-        timestamps,
+        timestamps[0..query_count],
+        plan,
         self.timestamp_valid_bits,
         self.timestamp_period,
     );
@@ -2749,28 +2845,62 @@ fn timestampNanoseconds(ticks: u64, period: f32) u64 {
 
 fn gpuTimingFromTimestamps(
     tag: u64,
-    timestamps: [timestamp_query_count]u64,
+    timestamps: []const u64,
+    plan: GpuTimingPlan,
     valid_bits: u32,
     period: f32,
 ) GpuTiming {
-    return .{
+    std.debug.assert(timestamps.len == plan.queryCount());
+    var timing: GpuTiming = .{
         .tag = tag,
         .total_nanoseconds = timestampNanoseconds(timestampTickDelta(
             timestamps[timestamp_frame_start],
-            timestamps[timestamp_frame_end],
+            timestamps[plan.frameEndQuery()],
             valid_bits,
         ), period),
         .composition_nanoseconds = timestampNanoseconds(timestampTickDelta(
             timestamps[timestamp_frame_start],
-            timestamps[timestamp_composition_end],
+            timestamps[plan.compositionEndQuery()],
             valid_bits,
         ), period),
         .output_encode_nanoseconds = timestampNanoseconds(timestampTickDelta(
-            timestamps[timestamp_composition_end],
-            timestamps[timestamp_output_encode_end],
+            timestamps[plan.compositionEndQuery()],
+            timestamps[plan.outputEncodeEndQuery()],
             valid_bits,
         ), period),
+        .frame_finish_nanoseconds = timestampNanoseconds(timestampTickDelta(
+            timestamps[plan.outputEncodeEndQuery()],
+            timestamps[plan.frameEndQuery()],
+            valid_bits,
+        ), period),
+        .pass_timings_available = plan.pass_timings_available,
+        .preparation_nanoseconds = if (plan.pass_timings_available)
+            timestampNanoseconds(timestampTickDelta(
+                timestamps[timestamp_frame_start],
+                timestamps[timestamp_composition_start],
+                valid_bits,
+            ), period)
+        else
+            0,
     };
+    if (!plan.pass_timings_available) return timing;
+    for (plan.segments[0..plan.segment_count], 0..) |category, index| {
+        const nanoseconds = timestampNanoseconds(timestampTickDelta(
+            timestamps[timestamp_composition_start + index],
+            timestamps[timestamp_composition_start + index + 1],
+            valid_bits,
+        ), period);
+        switch (category) {
+            .composition_overhead => timing.composition_overhead_nanoseconds +|= nanoseconds,
+            .solid_composition => timing.solid_composition_nanoseconds +|= nanoseconds,
+            .image_composition => timing.image_composition_nanoseconds +|= nanoseconds,
+            .shadow => timing.shadow_nanoseconds +|= nanoseconds,
+            .blur_downsample => timing.blur_downsample_nanoseconds +|= nanoseconds,
+            .blur_upsample => timing.blur_upsample_nanoseconds +|= nanoseconds,
+            .blur_composite => timing.blur_composite_nanoseconds +|= nanoseconds,
+        }
+    }
+    return timing;
 }
 
 fn releasePendingResources(self: *Self) void {
@@ -3035,6 +3165,8 @@ fn renderFrameWithCompletion(
         return error.VulkanFailure;
     const reusable = output.kind != .pixels;
     const frame_render_area = damageBounds(compiled_frame.damage, full_output) orelse full_output;
+    const gpu_timing_plan = buildGpuTimingPlan(self.draw_runs.items, self.blur_ops.items);
+    std.debug.assert(gpu_timing_plan.queryCount() <= timestamp_query_count);
     const cache_hit = reusable and self.recordedFrameMatches(
         &output.recorded_frame,
         output.initialized,
@@ -3045,6 +3177,7 @@ fn renderFrameWithCompletion(
     std.debug.assert(!reusable or output.command_buffer != .null_handle);
     const command_buffer = if (reusable) output.command_buffer else self.command_buffer;
     if (!cache_hit) {
+        var gpu_timing_recorder: GpuTimingRecorder = .{ .plan = gpu_timing_plan };
         self.device_wrapper.beginCommandBuffer(command_buffer, &.{
             .flags = if (reusable) .{} else .{ .one_time_submit_bit = true },
         }) catch return error.VulkanFailure;
@@ -3220,6 +3353,8 @@ fn renderFrameWithCompletion(
             );
         }
 
+        self.writeGpuTimestamp(command_buffer, timestamp_composition_start);
+
         const render_pass_info: vk.RenderPassBeginInfo = .{
             .render_pass = self.render_pass,
             .framebuffer = output.linear.framebuffer,
@@ -3259,6 +3394,7 @@ fn renderFrameWithCompletion(
                 const backdrop_cache = output.backdrop_cache.items[blur_op.cache_index];
                 if (!blur_op.cache_hit) {
                     const scratch = output.blur.?;
+                    gpu_timing_recorder.switchTo(self, command_buffer, .blur_downsample);
                     self.device_wrapper.cmdEndRenderPass(command_buffer);
                     self.transitionImage(command_buffer, output.linear.image, .color_attachment_optimal, .shader_read_only_optimal, .{ .color_attachment_write_bit = true }, .{ .shader_read_bit = true }, .{ .color_attachment_output_bit = true }, .{ .fragment_shader_bit = true });
 
@@ -3289,6 +3425,7 @@ fn renderFrameWithCompletion(
                         }
                     }
 
+                    gpu_timing_recorder.switchTo(self, command_buffer, .blur_upsample);
                     const final_level = scratch.levels[blur_op.level].?;
                     if (blur_op.level == 0) {
                         self.transitionScratchForWrite(command_buffer, backdrop_cache.image.image, backdrop_cache.initialized, .color_attachment_optimal, .{ .color_attachment_write_bit = true }, .{ .color_attachment_output_bit = true });
@@ -3314,6 +3451,7 @@ fn renderFrameWithCompletion(
                             if (!destination_is_cache) blur_initialized |= destination_bit;
                         }
                     }
+                    gpu_timing_recorder.switchTo(self, command_buffer, gpuTimingCategory(run.pipeline));
                     self.transitionImage(command_buffer, output.linear.image, .shader_read_only_optimal, .color_attachment_optimal, .{ .shader_read_bit = true }, .{ .color_attachment_read_bit = true, .color_attachment_write_bit = true }, .{ .fragment_shader_bit = true }, .{ .color_attachment_output_bit = true });
                     self.device_wrapper.cmdBeginRenderPass(command_buffer, &render_pass_info, .@"inline");
                     self.setViewportAndScissor(command_buffer, frame.size);
@@ -3322,6 +3460,7 @@ fn renderFrameWithCompletion(
                     bound_descriptors = @splat(null);
                 }
             }
+            gpu_timing_recorder.switchTo(self, command_buffer, gpuTimingCategory(run.pipeline));
             const run_pipeline = if (run.pipeline_handle != .null_handle)
                 run.pipeline_handle
             else
@@ -3422,17 +3561,12 @@ fn renderFrameWithCompletion(
                 run.first_instance,
             );
         }
+        gpu_timing_recorder.switchTo(self, command_buffer, .composition_overhead);
         self.device_wrapper.cmdEndRenderPass(command_buffer);
 
         self.transitionImage(command_buffer, output.linear.image, .color_attachment_optimal, .shader_read_only_optimal, .{ .color_attachment_write_bit = true }, .{ .shader_read_bit = true }, .{ .color_attachment_output_bit = true }, .{ .fragment_shader_bit = true });
-        if (self.timestamp_query_pool != .null_handle) {
-            self.device_wrapper.cmdWriteTimestamp(
-                command_buffer,
-                .{ .bottom_of_pipe_bit = true },
-                self.timestamp_query_pool,
-                timestamp_composition_end,
-            );
-        }
+        gpu_timing_recorder.finish();
+        self.writeGpuTimestamp(command_buffer, gpu_timing_plan.compositionEndQuery());
         if (output.kind == .dmabuf) {
             self.transitionExternalToRender(command_buffer, output.*);
         } else if (!output.initialized) {
@@ -3493,14 +3627,7 @@ fn renderFrameWithCompletion(
         self.device_wrapper.cmdPushConstants(command_buffer, self.pipeline_layout, .{ .vertex_bit = true, .fragment_bit = true }, 0, @sizeOf(FramePush), &output_push);
         self.device_wrapper.cmdDraw(command_buffer, 4, 1, 0, encode_instance);
         self.device_wrapper.cmdEndRenderPass(command_buffer);
-        if (self.timestamp_query_pool != .null_handle) {
-            self.device_wrapper.cmdWriteTimestamp(
-                command_buffer,
-                .{ .bottom_of_pipe_bit = true },
-                self.timestamp_query_pool,
-                timestamp_output_encode_end,
-            );
-        }
+        self.writeGpuTimestamp(command_buffer, gpu_timing_plan.outputEncodeEndQuery());
 
         for (self.prepared_images.items, 0..) |prepared, index| {
             if (!prepared.texture.imported or
@@ -3537,14 +3664,7 @@ fn renderFrameWithCompletion(
             .{ .color_attachment_output_bit = true },
         );
         if (output.kind == .pixels) self.transferToHostBarrier(command_buffer);
-        if (self.timestamp_query_pool != .null_handle) {
-            self.device_wrapper.cmdWriteTimestamp(
-                command_buffer,
-                .{ .bottom_of_pipe_bit = true },
-                self.timestamp_query_pool,
-                timestamp_frame_end,
-            );
-        }
+        self.writeGpuTimestamp(command_buffer, gpu_timing_plan.frameEndQuery());
         self.device_wrapper.endCommandBuffer(command_buffer) catch return error.VulkanFailure;
         if (reusable) {
             const uploaded_calibration = if (prepared_calibration) |prepared|
@@ -3617,8 +3737,13 @@ fn renderFrameWithCompletion(
         }
     }
 
-    const async_submission = completion_mode == .sync_fd and
+    const export_completion = completion_mode == .sync_fd and
         output.kind == .dmabuf and self.scanout_semaphore != .null_handle;
+    // A GPU-resident offscreen output has no external consumer to synchronize.
+    // Keep its work in flight and drain before the target is reused instead of
+    // delaying headless presentation and frame callbacks on GPU completion.
+    const async_submission = completion_mode == .sync_fd and
+        (output.kind == .offscreen or export_completion);
     // Queue submission makes prior coherent mapped writes visible to every
     // device access in the submission; no host pipeline barrier is needed.
     const submit_info: vk.SubmitInfo = .{
@@ -3627,8 +3752,8 @@ fn renderFrameWithCompletion(
         .p_wait_dst_stage_mask = wait_stages.items.ptr,
         .command_buffer_count = 1,
         .p_command_buffers = @ptrCast(&command_buffer),
-        .signal_semaphore_count = @intFromBool(async_submission),
-        .p_signal_semaphores = if (async_submission)
+        .signal_semaphore_count = @intFromBool(export_completion),
+        .p_signal_semaphores = if (export_completion)
             @ptrCast(&self.scanout_semaphore)
         else
             null,
@@ -3639,6 +3764,7 @@ fn renderFrameWithCompletion(
     std.debug.assert(self.pending_gpu_sample_tag == null);
     if (self.timestamp_query_pool != .null_handle) {
         self.pending_gpu_sample_tag = gpu_sample_tag;
+        self.pending_gpu_timing_plan = gpu_timing_plan;
     }
     for (self.prepared_images.items) |prepared| {
         if (prepared.cache_id == null) {
@@ -3671,7 +3797,7 @@ fn renderFrameWithCompletion(
     }
     var completion = frameCompletion(self.prepared_images.items);
 
-    if (async_submission) {
+    if (export_completion) {
         const completion_fd = self.device_wrapper.getSemaphoreFdKHR(self.device, &.{
             .semaphore = self.scanout_semaphore,
             .handle_type = .{ .sync_fd_bit = true },
@@ -3711,6 +3837,11 @@ fn renderFrameWithCompletion(
         frame_succeeded = true;
         completion_fd_owned = false;
         completion.sync_file_fd = completion_fd;
+        return completion;
+    }
+
+    if (async_submission) {
+        frame_succeeded = true;
         return completion;
     }
 
@@ -6299,6 +6430,17 @@ fn pipelineForKind(self: *const Self, kind: PipelineKind) vk.Pipeline {
     };
 }
 
+fn gpuTimingCategory(kind: PipelineKind) GpuTimingCategory {
+    return switch (kind) {
+        .replace, .blend => .solid_composition,
+        .image, .backdrop_image, .downsample => .image_composition,
+        .shadow => .shadow,
+        .blur_downsample => .blur_downsample,
+        .blur_upsample => .blur_upsample,
+        .blur_composite => .blur_composite,
+    };
+}
+
 fn blurLevel(radius: u32) u8 {
     var level: u8 = 0;
     while (level < blur_level_count - 1 and ceilDiv(radius, @as(u32, 1) << @intCast(level)) > 2) level += 1;
@@ -6416,9 +6558,30 @@ fn expandRectWithin(rect: render.Rect, amount: u32, bounds: render.Rect) render.
     return .{ .x = @intCast(left), .y = @intCast(top), .width = @intCast(right - left), .height = @intCast(bottom - top) };
 }
 
-fn blurOpAt(self: *const Self, run_index: usize) ?BlurOp {
-    for (self.blur_ops.items) |op| if (op.run_index == run_index) return op;
+fn buildGpuTimingPlan(draw_runs: []const DrawRun, blur_ops: []const BlurOp) GpuTimingPlan {
+    var plan: GpuTimingPlan = .{};
+    plan.append(.composition_overhead);
+    for (draw_runs, 0..) |run, run_index| {
+        if (blurOpAtSlice(blur_ops, run_index)) |blur_op| {
+            if (!blur_op.used) continue;
+            if (!blur_op.cache_hit) {
+                plan.append(.blur_downsample);
+                plan.append(.blur_upsample);
+            }
+        }
+        plan.append(gpuTimingCategory(run.pipeline));
+    }
+    plan.append(.composition_overhead);
+    return plan;
+}
+
+fn blurOpAtSlice(blur_ops: []const BlurOp, run_index: usize) ?BlurOp {
+    for (blur_ops) |op| if (op.run_index == run_index) return op;
     return null;
+}
+
+fn blurOpAt(self: *const Self, run_index: usize) ?BlurOp {
+    return blurOpAtSlice(self.blur_ops.items, run_index);
 }
 
 fn drawScratchPass(self: *Self, command_buffer: vk.CommandBuffer, framebuffer: vk.Framebuffer, size: render.Size, area: render.Rect, kind: PipelineKind, descriptor: vk.DescriptorSet, texture_size: render.Size, instance: u32) void {
@@ -9370,9 +9533,15 @@ test "Vulkan renderer reports tagged GPU timestamps for cached frames" {
         .commands = &.{.{ .clear = render.Color.rgba(1, 2, 3, 255) }},
     };
     _ = try renderer.renderFrameScanout(frame, .{ .offscreen = target }, 17);
+    try std.testing.expect(renderer.takeGpuTiming() == null);
     _ = try renderer.renderFrameScanout(frame, .{ .offscreen = target }, 18);
-    try std.testing.expectEqual(@as(u64, 17), renderer.takeGpuTiming().?.tag);
-    try std.testing.expectEqual(@as(u64, 18), renderer.takeGpuTiming().?.tag);
+    const first_timing = renderer.takeGpuTiming().?;
+    try std.testing.expectEqual(@as(u64, 17), first_timing.tag);
+    try std.testing.expect(first_timing.pass_timings_available);
+    try renderer.renderFrame(frame, .{ .offscreen = target });
+    const cached_timing = renderer.takeGpuTiming().?;
+    try std.testing.expectEqual(@as(u64, 18), cached_timing.tag);
+    try std.testing.expect(cached_timing.pass_timings_available);
     try std.testing.expect(renderer.takeGpuTiming() == null);
 }
 
@@ -9384,9 +9553,75 @@ test "timestamp durations handle device counter wraparound" {
     );
     try std.testing.expectEqual(@as(u64, 16), timestampNanoseconds(11, 1.5));
 
-    const timing = gpuTimingFromTimestamps(7, .{ 250, 2, 5, 9 }, 8, 2);
+    var plan: GpuTimingPlan = .{};
+    plan.append(.composition_overhead);
+    plan.append(.image_composition);
+    plan.append(.composition_overhead);
+    const timing = gpuTimingFromTimestamps(7, &.{ 250, 2, 4, 7, 9, 12, 15 }, plan, 8, 2);
     try std.testing.expectEqual(@as(u64, 7), timing.tag);
-    try std.testing.expectEqual(@as(u64, 30), timing.total_nanoseconds);
-    try std.testing.expectEqual(@as(u64, 16), timing.composition_nanoseconds);
+    try std.testing.expectEqual(@as(u64, 42), timing.total_nanoseconds);
+    try std.testing.expectEqual(@as(u64, 30), timing.composition_nanoseconds);
     try std.testing.expectEqual(@as(u64, 6), timing.output_encode_nanoseconds);
+    try std.testing.expectEqual(@as(u64, 6), timing.frame_finish_nanoseconds);
+    try std.testing.expectEqual(@as(u64, 16), timing.preparation_nanoseconds);
+    try std.testing.expectEqual(@as(u64, 6), timing.image_composition_nanoseconds);
+    try std.testing.expectEqual(@as(u64, 8), timing.composition_overhead_nanoseconds);
+}
+
+test "GPU timing plan falls back to coarse timestamps when segment capacity is exceeded" {
+    var plan: GpuTimingPlan = .{};
+    for (0..max_gpu_timing_segments + 1) |index| {
+        plan.append(if (index % 2 == 0) .solid_composition else .image_composition);
+    }
+    try std.testing.expect(!plan.pass_timings_available);
+    try std.testing.expectEqual(@as(u16, 1), plan.segment_count);
+    try std.testing.expectEqual(@as(u32, 5), plan.queryCount());
+
+    const timing = gpuTimingFromTimestamps(9, &.{ 10, 20, 30, 40, 50 }, plan, 64, 1);
+    try std.testing.expectEqual(@as(u64, 40), timing.total_nanoseconds);
+    try std.testing.expectEqual(@as(u64, 20), timing.composition_nanoseconds);
+    try std.testing.expectEqual(@as(u64, 10), timing.output_encode_nanoseconds);
+    try std.testing.expectEqual(@as(u64, 10), timing.frame_finish_nanoseconds);
+    try std.testing.expect(!timing.pass_timings_available);
+    try std.testing.expectEqual(@as(u64, 0), timing.preparation_nanoseconds);
+}
+
+test "GPU timing plan includes only executed backdrop blur passes" {
+    const run: DrawRun = .{
+        .pipeline = .blur_composite,
+        .descriptor_set = null,
+        .texture_size = .{ .width = 10, .height = 10 },
+        .first_instance = 0,
+        .instance_count = 1,
+    };
+    var blur: BlurOp = .{
+        .run_index = 0,
+        .used = true,
+        .sample_rect = .{ .x = 0, .y = 0, .width = 10, .height = 10 },
+    };
+
+    const rendered = buildGpuTimingPlan(&.{run}, &.{blur});
+    try std.testing.expectEqualSlices(GpuTimingCategory, &.{
+        .composition_overhead,
+        .blur_downsample,
+        .blur_upsample,
+        .blur_composite,
+        .composition_overhead,
+    }, rendered.segments[0..rendered.segment_count]);
+
+    blur.cache_hit = true;
+    const cached = buildGpuTimingPlan(&.{run}, &.{blur});
+    try std.testing.expectEqualSlices(GpuTimingCategory, &.{
+        .composition_overhead,
+        .blur_composite,
+        .composition_overhead,
+    }, cached.segments[0..cached.segment_count]);
+
+    blur.used = false;
+    const unused = buildGpuTimingPlan(&.{run}, &.{blur});
+    try std.testing.expectEqualSlices(
+        GpuTimingCategory,
+        &.{.composition_overhead},
+        unused.segments[0..unused.segment_count],
+    );
 }

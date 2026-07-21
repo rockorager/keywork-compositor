@@ -9,6 +9,7 @@ const log = std.log.scoped(.headless);
 allocator: std.mem.Allocator,
 size: render.Size,
 scale: render.Scale,
+refresh_millihertz: i32,
 pixels: []u32,
 offscreen_renderer: ?render.OffscreenRenderer,
 offscreen_target: ?render.OffscreenTarget,
@@ -20,7 +21,7 @@ pub const Error = error{
 };
 
 pub fn init(allocator: std.mem.Allocator, size: render.Size) Error!Self {
-    return initForRenderer(allocator, size, .{}, null) catch |err| switch (err) {
+    return initForRenderer(allocator, size, .{}, 60_000, null) catch |err| switch (err) {
         error.InvalidDimensions, error.Overflow, error.OutOfMemory => |known| return known,
         else => unreachable,
     };
@@ -30,9 +31,11 @@ pub fn initForRenderer(
     allocator: std.mem.Allocator,
     size: render.Size,
     scale: render.Scale,
+    refresh_millihertz: i32,
     offscreen_renderer: ?render.OffscreenRenderer,
 ) !Self {
     if (size.width == 0 or size.height == 0) return error.InvalidDimensions;
+    if (refresh_millihertz <= 0) return error.InvalidRefresh;
     _ = scale.logicalSize(size) catch return error.InvalidDimensions;
 
     if (offscreen_renderer) |renderer| {
@@ -43,6 +46,7 @@ pub fn initForRenderer(
             .allocator = allocator,
             .size = size,
             .scale = scale,
+            .refresh_millihertz = refresh_millihertz,
             .pixels = &.{},
             .offscreen_renderer = renderer,
             .offscreen_target = offscreen,
@@ -58,6 +62,7 @@ pub fn initForRenderer(
         .allocator = allocator,
         .size = size,
         .scale = scale,
+        .refresh_millihertz = refresh_millihertz,
         .pixels = pixels,
         .offscreen_renderer = null,
         .offscreen_target = null,
@@ -76,6 +81,16 @@ pub fn deinit(self: *Self) void {
 
 pub fn logicalSize(self: *const Self) render.Size {
     return self.scale.logicalSize(self.size) catch unreachable;
+}
+
+pub fn refreshMillihertz(self: *const Self) i32 {
+    return self.refresh_millihertz;
+}
+
+pub fn refreshNanoseconds(self: *const Self) u32 {
+    const frequency: u64 = @intCast(self.refresh_millihertz);
+    const period = (std.time.ns_per_s * 1000 + frequency / 2) / frequency;
+    return @intCast(@min(period, std.math.maxInt(u32)));
 }
 
 pub fn renderTarget(self: *Self) render.Target {
@@ -106,4 +121,19 @@ test "headless output starts transparent" {
 
     try std.testing.expectEqual(@as(usize, 6), output.pixels.len);
     try std.testing.expectEqual(@as(u32, 0), output.pixel(1, 2));
+    try std.testing.expectEqual(@as(i32, 60_000), output.refreshMillihertz());
+}
+
+test "headless output uses configured refresh timing" {
+    var output = try initForRenderer(
+        std.testing.allocator,
+        .{ .width = 2, .height = 3 },
+        .{},
+        120_000,
+        null,
+    );
+    defer output.deinit();
+
+    try std.testing.expectEqual(@as(i32, 120_000), output.refreshMillihertz());
+    try std.testing.expectEqual(@as(u32, 8_333_333), output.refreshNanoseconds());
 }
