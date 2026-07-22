@@ -19,6 +19,7 @@ security_context: *SecurityContext,
 outputs: *OutputLayout,
 linux_dmabuf: *LinuxDmabuf,
 listener: Listener,
+managers: std.ArrayList(*Manager),
 frames: std.ArrayList(*Frame),
 
 pub const Target = struct {
@@ -32,6 +33,7 @@ pub const CaptureError = error{ Stopped, Failed };
 pub const Listener = struct {
     context: *anyopaque,
     constraints: *const fn (*anyopaque, Target) ?render.Size,
+    schedule: *const fn (*anyopaque, Target, bool) bool,
     capture: *const fn (
         *anyopaque,
         Target,
@@ -43,27 +45,113 @@ pub const Listener = struct {
 const Destination = union(enum) {
     shm: *wl.shm.Buffer,
     dmabuf: *LinuxDmabuf.Buffer,
+
+    fn retain(self: Destination) void {
+        switch (self) {
+            .shm => |buffer| _ = wl_shm_buffer_ref(buffer),
+            .dmabuf => |buffer| buffer.reference(),
+        }
+    }
+
+    fn release(self: Destination) void {
+        switch (self) {
+            .shm => |buffer| wl_shm_buffer_unref(buffer),
+            .dmabuf => |buffer| buffer.unreference(),
+        }
+    }
+};
+
+const Manager = struct {
+    owner: *Self,
+    resource: ?*zwlr.ScreencopyManagerV1,
+    reference_count: usize = 1,
+    captured: bool = false,
+
+    fn create(owner: *Self, client: *wl.Client, version: u32, id: u32) !void {
+        const resource = try zwlr.ScreencopyManagerV1.create(client, version, id);
+        errdefer resource.destroy();
+        const self = try owner.allocator.create(Manager);
+        errdefer owner.allocator.destroy(self);
+        self.* = .{ .owner = owner, .resource = resource };
+        try owner.managers.append(owner.allocator, self);
+        resource.setHandler(*Manager, handleRequest, handleDestroy, self);
+    }
+
+    fn handleRequest(
+        resource: *zwlr.ScreencopyManagerV1,
+        request: zwlr.ScreencopyManagerV1.Request,
+        self: *Manager,
+    ) void {
+        switch (request) {
+            .destroy => resource.destroy(),
+            .capture_output => |capture| Frame.create(
+                self,
+                capture.frame,
+                if (self.owner.outputs.findResource(capture.output)) |entry|
+                    .{ .output = entry.id }
+                else
+                    null,
+                capture.overlay_cursor != 0,
+            ) catch resource.postNoMemory(),
+            .capture_output_region => |capture| Frame.create(
+                self,
+                capture.frame,
+                self.owner.regionTarget(capture.output, .{
+                    .x = capture.x,
+                    .y = capture.y,
+                    .width = capture.width,
+                    .height = capture.height,
+                }),
+                capture.overlay_cursor != 0,
+            ) catch resource.postNoMemory(),
+        }
+    }
+
+    fn handleDestroy(_: *zwlr.ScreencopyManagerV1, self: *Manager) void {
+        for (self.owner.managers.items, 0..) |manager, index| {
+            if (manager != self) continue;
+            _ = self.owner.managers.swapRemove(index);
+            break;
+        }
+        self.resource = null;
+        self.unreference();
+    }
+
+    fn reference(self: *Manager) void {
+        std.debug.assert(self.reference_count > 0);
+        self.reference_count += 1;
+    }
+
+    fn unreference(self: *Manager) void {
+        std.debug.assert(self.reference_count > 0);
+        self.reference_count -= 1;
+        if (self.reference_count == 0) self.owner.allocator.destroy(self);
+    }
 };
 
 const Frame = struct {
     owner: *Self,
+    manager: *Manager,
     resource: *zwlr.ScreencopyFrameV1,
     target: ?Target,
     size: ?render.Size,
     overlay_cursor: bool,
     used: bool = false,
     finished: bool = false,
+    destination: ?Destination = null,
+    with_damage: bool = false,
 
     fn create(
-        owner: *Self,
-        manager: *zwlr.ScreencopyManagerV1,
+        manager: *Manager,
         id: u32,
         target: ?Target,
         overlay_cursor: bool,
     ) !void {
+        const owner = manager.owner;
+        const manager_resource = manager.resource orelse unreachable;
         const resource = try zwlr.ScreencopyFrameV1.create(
-            manager.getClient(),
-            manager.getVersion(),
+            manager_resource.getClient(),
+            manager_resource.getVersion(),
             id,
         );
         errdefer resource.destroy();
@@ -73,8 +161,11 @@ const Frame = struct {
             owner.listener.context,
             value,
         ) else null;
+        manager.reference();
+        errdefer manager.unreference();
         self.* = .{
             .owner = owner,
+            .manager = manager,
             .resource = resource,
             .target = target,
             .size = size,
@@ -117,6 +208,8 @@ const Frame = struct {
             _ = self.owner.frames.swapRemove(index);
             break;
         }
+        self.releaseDestination();
+        self.manager.unreference();
         self.owner.allocator.destroy(self);
     }
 
@@ -127,17 +220,32 @@ const Frame = struct {
             return;
         }
         const size = self.size orelse return self.fail();
-        const destination_value = self.destination(buffer_resource, size) orelse {
+        const destination = self.destinationForBuffer(buffer_resource, size) orelse {
             self.resource.postError(.invalid_buffer, "buffer does not match screencopy constraints");
             return;
         };
+        destination.retain();
+        self.destination = destination;
+        self.with_damage = with_damage;
         self.used = true;
         const target = self.target orelse return self.fail();
-        const result = switch (destination_value) {
+        if (!self.owner.listener.schedule(
+            self.owner.listener.context,
+            target,
+            with_damage and self.manager.captured,
+        )) self.fail();
+    }
+
+    fn capture(self: *Frame) void {
+        if (self.finished or !self.used) return;
+        const size = self.size orelse return self.fail();
+        const target = self.target orelse return self.fail();
+        const destination = self.destination orelse return self.fail();
+        const result = switch (destination) {
             .shm => |shm| capture: {
                 shm.beginAccess();
                 defer shm.endAccess();
-                const pixels = shmPixelBuffer(shm, size) orelse unreachable;
+                const pixels = shmPixelBuffer(shm, size) orelse break :capture error.Failed;
                 break :capture self.owner.listener.capture(
                     self.owner.listener.context,
                     target,
@@ -169,12 +277,12 @@ const Frame = struct {
         } catch return self.fail();
 
         self.resource.sendFlags(.{
-            .y_invert = switch (destination_value) {
+            .y_invert = switch (destination) {
                 .shm => false,
                 .dmabuf => |dmabuf| dmabuf.yInverted(),
             },
         });
-        if (with_damage and self.resource.getVersion() >= 2) {
+        if (self.with_damage and self.resource.getVersion() >= 2) {
             self.resource.sendDamage(0, 0, size.width, size.height);
         }
         self.resource.sendReady(
@@ -183,9 +291,11 @@ const Frame = struct {
             result.nanoseconds,
         );
         self.finished = true;
+        self.manager.captured = true;
+        self.releaseDestination();
     }
 
-    fn destination(
+    fn destinationForBuffer(
         self: *Frame,
         resource: *wl.Buffer,
         size: render.Size,
@@ -205,6 +315,12 @@ const Frame = struct {
         self.resource.sendFailed();
         self.finished = true;
         self.target = null;
+        self.releaseDestination();
+    }
+
+    fn releaseDestination(self: *Frame) void {
+        if (self.destination) |destination| destination.release();
+        self.destination = null;
     }
 };
 
@@ -224,8 +340,10 @@ pub fn init(
         .outputs = outputs,
         .linux_dmabuf = linux_dmabuf,
         .listener = listener,
+        .managers = .empty,
         .frames = .empty,
     };
+    errdefer self.managers.deinit(allocator);
     errdefer self.frames.deinit(allocator);
     self.global = try wl.Global.create(
         display,
@@ -242,8 +360,10 @@ pub fn init(
 pub fn deinit(self: *Self) void {
     self.security_context.unrestrictGlobal(self.global);
     self.global.destroy();
+    std.debug.assert(self.managers.items.len == 0);
     std.debug.assert(self.frames.items.len == 0);
     self.frames.deinit(self.allocator);
+    self.managers.deinit(self.allocator);
     self.* = undefined;
 }
 
@@ -254,44 +374,19 @@ pub fn removeOutput(self: *Self, output: OutputLayout.Id) void {
     }
 }
 
+pub fn captureOutput(self: *Self, output: OutputLayout.Id) void {
+    for (self.frames.items) |frame| {
+        const target = frame.target orelse continue;
+        if (!std.meta.eql(target.output, output)) continue;
+        frame.capture();
+    }
+}
+
 fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
-    const resource = zwlr.ScreencopyManagerV1.create(client, version, id) catch {
+    Manager.create(self, client, version, id) catch {
         client.postNoMemory();
         return;
     };
-    resource.setHandler(*Self, handleManagerRequest, null, self);
-}
-
-fn handleManagerRequest(
-    resource: *zwlr.ScreencopyManagerV1,
-    request: zwlr.ScreencopyManagerV1.Request,
-    self: *Self,
-) void {
-    switch (request) {
-        .destroy => resource.destroy(),
-        .capture_output => |capture| Frame.create(
-            self,
-            resource,
-            capture.frame,
-            if (self.outputs.findResource(capture.output)) |entry|
-                .{ .output = entry.id }
-            else
-                null,
-            capture.overlay_cursor != 0,
-        ) catch resource.postNoMemory(),
-        .capture_output_region => |capture| Frame.create(
-            self,
-            resource,
-            capture.frame,
-            self.regionTarget(capture.output, .{
-                .x = capture.x,
-                .y = capture.y,
-                .width = capture.width,
-                .height = capture.height,
-            }),
-            capture.overlay_cursor != 0,
-        ) catch resource.postNoMemory(),
-    }
 }
 
 const RequestedRegion = struct {
@@ -348,6 +443,9 @@ fn validShmBuffer(buffer: *wl.shm.Buffer, expected: render.Size) bool {
     return stride == expected_stride and
         buffer.getFormat() == @intFromEnum(wl.Shm.Format.argb8888);
 }
+
+extern fn wl_shm_buffer_ref(buffer: *wl.shm.Buffer) *wl.shm.Buffer;
+extern fn wl_shm_buffer_unref(buffer: *wl.shm.Buffer) void;
 
 test "screencopy regions reject empty geometry" {
     const invalid: RequestedRegion = .{ .x = 0, .y = 0, .width = 0, .height = 10 };

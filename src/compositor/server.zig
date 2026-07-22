@@ -1880,6 +1880,7 @@ pub fn createWithVirtualOutput(
         .{
             .context = self,
             .constraints = captureConstraints,
+            .schedule = scheduleImageCapture,
             .capture = captureImage,
             .cursor_info = captureCursorInfo,
         },
@@ -1898,6 +1899,7 @@ pub fn createWithVirtualOutput(
         .{
             .context = self,
             .constraints = screencopyConstraints,
+            .schedule = scheduleScreencopy,
             .capture = captureScreencopy,
         },
     );
@@ -2452,6 +2454,9 @@ fn removeRenderOutput(self: *Self, id: RenderOutputId) bool {
     }
     if (self.image_capture_source_initialized) {
         self.image_capture_source.removeOutput(render_output.protocol_id);
+    }
+    if (self.image_copy_capture_initialized) {
+        self.image_copy_capture.removeOutput(render_output.protocol_id);
     }
     if (self.screencopy_initialized) self.screencopy.removeOutput(render_output.protocol_id);
     if (self.output_power_initialized) self.output_power.removeOutput(render_output.protocol_id);
@@ -6071,6 +6076,48 @@ fn screencopyConstraints(context: *anyopaque, target: Screencopy.Target) ?render
     return render_output.backend.modeSize();
 }
 
+fn scheduleImageCapture(
+    context: *anyopaque,
+    target: ImageCopyCapture.Target,
+    wait_for_damage: bool,
+) ?OutputLayout.Id {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const output_id = switch (target) {
+        .source => |source| switch (source) {
+            .output => |output| output,
+            .toplevel => (self.firstRenderOutput() orelse return null).protocol_id,
+        },
+        .cursor => return null,
+    };
+    return if (self.scheduleCaptureFrame(output_id, wait_for_damage)) output_id else null;
+}
+
+fn scheduleScreencopy(
+    context: *anyopaque,
+    target: Screencopy.Target,
+    wait_for_damage: bool,
+) bool {
+    const self: *Self = @ptrCast(@alignCast(context));
+    return self.scheduleCaptureFrame(target.output, wait_for_damage);
+}
+
+fn scheduleCaptureFrame(
+    self: *Self,
+    output_id: OutputLayout.Id,
+    wait_for_damage: bool,
+) bool {
+    const output = self.renderOutputForProtocol(output_id) orelse return false;
+    if (!output.backend.powered()) return true;
+    if (!wait_for_damage and output.damage.isEmpty()) {
+        output.damage.setRectangle(0, 0, 1, 1);
+    }
+    if (!output.damage.isEmpty()) {
+        output.requestFrame();
+        self.scheduleRepaint(output);
+    }
+    return true;
+}
+
 fn xwaylandSurfaceAssociated(context: *anyopaque, serial: u64, surface_id: Surface.Id) void {
     const self: *Self = @ptrCast(@alignCast(context));
     if (self.xwm_initialized) _ = self.xwm.associateSurface(serial, surface_id);
@@ -7759,7 +7806,13 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
     Surface.clearFifoBarriersForOutput(self.compositor.surfaceStore(), output);
     self.finishRepaintIfIdle();
     if (presented) |info| outputPresented(render_output, info);
+    self.captureOutputFrame(render_output.protocol_id);
     self.refreshKeyboardFocus();
+}
+
+fn captureOutputFrame(self: *Self, output_id: OutputLayout.Id) void {
+    if (self.image_copy_capture_initialized) self.image_copy_capture.captureOutput(output_id);
+    if (self.screencopy_initialized) self.screencopy.captureOutput(output_id);
 }
 
 fn selectFrameOutputColorDescription(
@@ -7972,6 +8025,7 @@ fn presentSessionLockFrame(
     Surface.clearFifoBarriersForOutput(self.compositor.surfaceStore(), frame.output);
     self.finishRepaintIfIdle();
     if (presented) |info| outputPresented(frame.render_output, info);
+    self.captureOutputFrame(frame.render_output.protocol_id);
     self.refreshKeyboardFocus();
 }
 

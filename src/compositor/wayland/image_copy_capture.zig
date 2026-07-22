@@ -8,6 +8,7 @@ const presentation = @import("../presentation.zig");
 const render = @import("../render/types.zig");
 const ImageCaptureSource = @import("image_capture_source.zig");
 const LinuxDmabuf = @import("linux_dmabuf.zig");
+const OutputLayout = @import("output_layout.zig");
 const SecurityContext = @import("security_context.zig");
 const Seat = @import("seat.zig");
 
@@ -50,6 +51,7 @@ pub const CaptureError = error{ Stopped, Failed };
 pub const Listener = struct {
     context: *anyopaque,
     constraints: *const fn (*anyopaque, Target) ?Constraints,
+    schedule: *const fn (*anyopaque, Target, bool) ?OutputLayout.Id,
     capture: *const fn (
         *anyopaque,
         Target,
@@ -107,6 +109,7 @@ const Session = struct {
     frame: ?*Frame = null,
     paint_cursors: bool,
     stopped: bool = false,
+    captured: bool = false,
 
     fn create(
         owner: *Self,
@@ -226,6 +229,8 @@ const Frame = struct {
     destination: Destination = .{},
     capture_requested: bool = false,
     finished: bool = false,
+    scheduled_output: ?OutputLayout.Id = null,
+    wait_for_damage: bool,
 
     fn create(session: *Session, id: u32) !void {
         const resource = try ext.ImageCopyCaptureFrameV1.create(
@@ -243,6 +248,7 @@ const Frame = struct {
             .target = session.target,
             .constraints = session.constraints,
             .paint_cursors = session.paint_cursors,
+            .wait_for_damage = session.captured,
         };
         try session.owner.frames.append(session.owner.allocator, self);
         session.frame = self;
@@ -286,7 +292,7 @@ const Frame = struct {
                     return;
                 }
                 self.capture_requested = true;
-                if (!self.finished) self.capture();
+                if (!self.finished) self.requestCapture();
             },
         }
     }
@@ -302,7 +308,30 @@ const Frame = struct {
         self.owner.allocator.destroy(self);
     }
 
+    fn requestCapture(self: *Frame) void {
+        if (!self.destination.attached()) {
+            self.resource.postError(.no_buffer, "capture requires an attached buffer");
+            return;
+        }
+        const target = self.target orelse return self.fail(.stopped);
+        switch (target) {
+            .source => {
+                self.scheduled_output = self.owner.listener.schedule(
+                    self.owner.listener.context,
+                    target,
+                    self.wait_for_damage,
+                ) orelse {
+                    self.fail(.stopped);
+                    self.stopSession();
+                    return;
+                };
+            },
+            .cursor => self.capture(),
+        }
+    }
+
     fn capture(self: *Frame) void {
+        self.scheduled_output = null;
         if (!self.destination.attached()) {
             self.resource.postError(.no_buffer, "capture requires an attached buffer");
             return;
@@ -399,6 +428,7 @@ const Frame = struct {
         );
         self.resource.sendReady();
         self.finished = true;
+        if (self.session) |session| session.captured = true;
     }
 
     fn fail(self: *Frame, reason: ext.ImageCopyCaptureFrameV1.FailureReason) void {
@@ -596,6 +626,23 @@ fn handleManagerRequest(
 pub fn refreshCursors(self: *Self) void {
     for (self.cursor_sessions.items) |session| session.refresh();
     for (self.sessions.items) |session| session.refreshCursorConstraints();
+}
+
+pub fn captureOutput(self: *Self, output: OutputLayout.Id) void {
+    for (self.frames.items) |frame| {
+        const scheduled = frame.scheduled_output orelse continue;
+        if (!std.meta.eql(scheduled, output)) continue;
+        frame.capture();
+    }
+}
+
+pub fn removeOutput(self: *Self, output: OutputLayout.Id) void {
+    for (self.frames.items) |frame| {
+        const scheduled = frame.scheduled_output orelse continue;
+        if (!std.meta.eql(scheduled, output)) continue;
+        frame.scheduled_output = null;
+        if (!frame.finished) frame.requestCapture();
+    }
 }
 
 fn sourceInvalidated(context: *anyopaque, target: ImageCaptureSource.Target) void {
