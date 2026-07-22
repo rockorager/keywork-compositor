@@ -27,6 +27,7 @@ layout(location=1) flat in vec4 dest;
 layout(location=2) flat in vec4 source;
 layout(location=4) flat in vec4 rounded;
 layout(location=5) flat in vec4 parameters;
+layout(location=6) in vec2 coordinate;
 layout(location=0) out vec4 out_color;
 
 float decodeComponent(float value) {
@@ -266,9 +267,10 @@ vec4 sampleArea(vec2 coordinate) {
 #endif
 
 void main() {
+#ifdef KEYWORK_AREA
     vec2 q=(pixel-dest.xy)/dest.zw;
     vec2 transformed=source.xy+q*source.zw;
-    vec2 coordinate=mapToTexture(transformed);
+#endif
 #ifdef KEYWORK_MANUAL_YCBCR
     vec4 color=sampleSource(coordinate);
 #else

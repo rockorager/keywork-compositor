@@ -8377,6 +8377,90 @@ test "renderer conformance: reproducible scene: Vulkan SDR and HDR transfer roun
     }
 }
 
+test "renderer conformance: Vulkan vertex texture coordinates preserve buffer transforms" {
+    var renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
+        error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+
+    const source_size: render.Size = .{ .width = 2, .height = 3 };
+    var source = [_]u32{
+        0xffff0000, 0xff00ff00,
+        0xff0000ff, 0xffffff00,
+        0xff00ffff, 0xffff00ff,
+    };
+    const Case = struct {
+        transform: render.BufferTransform,
+        expected: [6]u32,
+    };
+    const cases = [_]Case{
+        .{ .transform = .normal, .expected = .{
+            0xffff0000, 0xff00ff00,
+            0xff0000ff, 0xffffff00,
+            0xff00ffff, 0xffff00ff,
+        } },
+        .{ .transform = .rotate_90, .expected = .{
+            0xff00ffff, 0xff0000ff, 0xffff0000,
+            0xffff00ff, 0xffffff00, 0xff00ff00,
+        } },
+        .{ .transform = .rotate_180, .expected = .{
+            0xffff00ff, 0xff00ffff,
+            0xffffff00, 0xff0000ff,
+            0xff00ff00, 0xffff0000,
+        } },
+        .{ .transform = .rotate_270, .expected = .{
+            0xff00ff00, 0xffffff00, 0xffff00ff,
+            0xffff0000, 0xff0000ff, 0xff00ffff,
+        } },
+        .{ .transform = .flipped, .expected = .{
+            0xff00ff00, 0xffff0000,
+            0xffffff00, 0xff0000ff,
+            0xffff00ff, 0xff00ffff,
+        } },
+        .{ .transform = .flipped_90, .expected = .{
+            0xffff00ff, 0xffffff00, 0xff00ff00,
+            0xff00ffff, 0xff0000ff, 0xffff0000,
+        } },
+        .{ .transform = .flipped_180, .expected = .{
+            0xff00ffff, 0xffff00ff,
+            0xff0000ff, 0xffffff00,
+            0xffff0000, 0xff00ff00,
+        } },
+        .{ .transform = .flipped_270, .expected = .{
+            0xffff0000, 0xff0000ff, 0xff00ffff,
+            0xff00ff00, 0xffffff00, 0xffff00ff,
+        } },
+    };
+
+    for (cases) |case| {
+        const target_size = case.transform.applyToSize(source_size);
+        var target = [_]u32{0} ** source.len;
+        try renderer.renderFrame(.{
+            .size = target_size,
+            .commands = &.{.{ .image = .{
+                .x = 0,
+                .y = 0,
+                .size = target_size,
+                .buffer = .{
+                    .size = source_size,
+                    .stride_pixels = source_size.width,
+                    .pixels = &source,
+                },
+                .transform = case.transform,
+                .is_opaque = true,
+            } }},
+        }, .{ .pixels = .{
+            .size = target_size,
+            .stride_pixels = target_size.width,
+            .pixels = &target,
+        } });
+        for (case.expected, target) |expected, actual| {
+            try expectArgbNear(expected, actual, 1);
+        }
+    }
+}
+
 test "renderer conformance: Vulkan reconstruction preserves constant fields and source crop edges" {
     var renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
         error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
