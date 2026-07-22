@@ -25,15 +25,10 @@ queue: vk.Queue,
 queue_family_index: u32,
 command_pool: vk.CommandPool,
 command_buffer: vk.CommandBuffer,
-fence: vk.Fence,
-scanout_semaphore: vk.Semaphore,
-fence_pending: bool,
-timestamp_query_pool: vk.QueryPool,
 timestamp_valid_bits: u32,
 timestamp_period: f32,
-pending_gpu_sample_tag: ?u64,
-pending_gpu_timing_plan: GpuTimingPlan,
-completed_gpu_timings: [2]GpuTiming,
+scanout_sync_enabled: bool,
+completed_gpu_timings: [4]GpuTiming,
 completed_gpu_timing_count: usize,
 format: vk.Format,
 swap_red_blue: bool,
@@ -65,20 +60,10 @@ blur_composite_pipeline: vk.Pipeline,
 encode_pipeline: vk.Pipeline,
 encode_calibrated_pipeline: vk.Pipeline,
 sampler: vk.Sampler,
-work_buffer: vk.Buffer,
-work_memory: vk.DeviceMemory,
-work_mapped: ?[*]u8,
-work_capacity: usize,
-instance_buffer: vk.Buffer,
-instance_memory: vk.DeviceMemory,
-instance_mapped: ?[*]u8,
-instance_capacity: usize,
 instances: std.ArrayList(Instance) = .empty,
 draw_runs: std.ArrayList(DrawRun) = .empty,
 blur_ops: std.ArrayList(BlurOp) = .empty,
 prepared_images: std.ArrayList(PreparedImage) = .empty,
-pending_wait_semaphores: std.ArrayList(vk.Semaphore) = .empty,
-pending_textures: std.ArrayList(Texture) = .empty,
 dmabuf_modifiers: []u64,
 dmabuf_sampled_modifiers: []u64,
 dmabuf_10bit_modifiers: []u64,
@@ -117,6 +102,25 @@ const TargetKey = union(enum) {
     dmabuf: u64,
 };
 
+const Submission = struct {
+    fence: vk.Fence,
+    scanout_semaphore: vk.Semaphore,
+    timestamp_query_pool: vk.QueryPool,
+    fence_pending: bool = false,
+    pending_gpu_sample_tag: ?u64 = null,
+    pending_gpu_timing_plan: GpuTimingPlan = .{},
+    work_buffer: vk.Buffer = .null_handle,
+    work_memory: vk.DeviceMemory = .null_handle,
+    work_mapped: ?[*]u8 = null,
+    work_capacity: usize = 0,
+    instance_buffer: vk.Buffer = .null_handle,
+    instance_memory: vk.DeviceMemory = .null_handle,
+    instance_mapped: ?[*]u8 = null,
+    instance_capacity: usize = 0,
+    pending_wait_semaphores: std.ArrayList(vk.Semaphore) = .empty,
+    pending_textures: std.ArrayList(Texture) = .empty,
+};
+
 const OutputKind = enum {
     pixels,
     offscreen,
@@ -142,6 +146,7 @@ const Output = struct {
     blur_initialized: u16 = 0,
     backdrop_cache: std.ArrayList(BackdropCache) = .empty,
     linear: WorkingImage,
+    submission: Submission,
 };
 
 const WorkingImage = struct {
@@ -329,6 +334,7 @@ const GpuTimingRecorder = struct {
     fn switchTo(
         self: *GpuTimingRecorder,
         renderer: *Self,
+        submission: *const Submission,
         command_buffer: vk.CommandBuffer,
         category: GpuTimingCategory,
     ) void {
@@ -337,7 +343,7 @@ const GpuTimingRecorder = struct {
         if (self.plan.segments[self.segment_index] == category) return;
         std.debug.assert(self.segment_index + 1 < self.plan.segment_count);
         std.debug.assert(self.plan.segments[self.segment_index + 1] == category);
-        renderer.writeGpuTimestamp(command_buffer, @as(u32, self.segment_index) + 2);
+        renderer.writeGpuTimestamp(submission, command_buffer, @as(u32, self.segment_index) + 2);
         self.segment_index += 1;
     }
 
@@ -414,6 +420,7 @@ const RecordedFrame = struct {
     render_area: render.Rect = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
     work_buffer: vk.Buffer = .null_handle,
     instance_buffer: vk.Buffer = .null_handle,
+    timestamp_query_pool: vk.QueryPool = .null_handle,
     uploads: std.ArrayList(UploadRun) = .empty,
     upload_rectangles: std.ArrayList(render.Rect) = .empty,
     draw_runs: std.ArrayList(DrawRun) = .empty,
@@ -2009,19 +2016,6 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
         device,
         instance_wrapper.dispatch.vkGetDeviceProcAddr.?,
     );
-    const timestamp_query_pool = if (timestamp_valid_bits == 0)
-        vk.QueryPool.null_handle
-    else
-        device_wrapper.createQueryPool(device, &.{
-            .query_type = .timestamp,
-            .query_count = timestamp_query_count,
-        }, null) catch |err| pool: {
-            log.warn("failed to create Vulkan timestamp query pool: {t}", .{err});
-            break :pool vk.QueryPool.null_handle;
-        };
-    errdefer if (timestamp_query_pool != .null_handle) {
-        device_wrapper.destroyQueryPool(device, timestamp_query_pool, null);
-    };
     const command_pool = device_wrapper.createCommandPool(device, &.{
         .flags = .{ .reset_command_buffer_bit = true },
         .queue_family_index = queue_family_index,
@@ -2034,9 +2028,6 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
         .level = .primary,
         .command_buffer_count = 1,
     }, @ptrCast(&command_buffer)) catch return error.VulkanUnavailable;
-    const fence = device_wrapper.createFence(device, &.{}, null) catch
-        return error.VulkanUnavailable;
-    errdefer device_wrapper.destroyFence(device, fence, null);
 
     var sync_fd_properties: vk.ExternalSemaphoreProperties = .{
         .export_from_imported_handle_types = .{},
@@ -2050,18 +2041,6 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
     const sync_fd_capable = dmabuf_capable and
         sync_fd_properties.external_semaphore_features.exportable_bit and
         sync_fd_properties.external_semaphore_features.importable_bit;
-    var scanout_semaphore = vk.Semaphore.null_handle;
-    if (sync_fd_capable) {
-        const export_info: vk.ExportSemaphoreCreateInfo = .{
-            .handle_types = .{ .sync_fd_bit = true },
-        };
-        scanout_semaphore = device_wrapper.createSemaphore(device, &.{
-            .p_next = &export_info,
-        }, null) catch .null_handle;
-    }
-    errdefer if (scanout_semaphore != .null_handle) {
-        device_wrapper.destroySemaphore(device, scanout_semaphore, null);
-    };
 
     const format = chooseFormat(instance_wrapper, physical_device) orelse
         return error.VulkanUnavailable;
@@ -2295,14 +2274,9 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
         .queue_family_index = queue_family_index,
         .command_pool = command_pool,
         .command_buffer = command_buffer,
-        .fence = fence,
-        .scanout_semaphore = scanout_semaphore,
-        .fence_pending = false,
-        .timestamp_query_pool = timestamp_query_pool,
         .timestamp_valid_bits = timestamp_valid_bits,
         .timestamp_period = timestamp_period,
-        .pending_gpu_sample_tag = null,
-        .pending_gpu_timing_plan = .{},
+        .scanout_sync_enabled = sync_fd_capable,
         .completed_gpu_timings = undefined,
         .completed_gpu_timing_count = 0,
         .format = format,
@@ -2335,14 +2309,6 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
         .encode_pipeline = graphics.encode_pipeline,
         .encode_calibrated_pipeline = graphics.encode_calibrated_pipeline,
         .sampler = graphics.sampler,
-        .work_buffer = .null_handle,
-        .work_memory = .null_handle,
-        .work_mapped = null,
-        .work_capacity = 0,
-        .instance_buffer = .null_handle,
-        .instance_memory = .null_handle,
-        .instance_mapped = null,
-        .instance_capacity = 0,
         .dmabuf_modifiers = if (dmabuf_capable) dmabuf_modifiers else &.{},
         .dmabuf_sampled_modifiers = if (dmabuf_capable) dmabuf_sampled_modifiers else &.{},
         .dmabuf_10bit_modifiers = if (dmabuf_capable) dmabuf_10bit_modifiers else &.{},
@@ -2374,9 +2340,7 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
 
 pub fn deinit(self: *Self) void {
     self.device_wrapper.deviceWaitIdle(self.device) catch {};
-    self.fence_pending = false;
-    self.pending_gpu_sample_tag = null;
-    self.releasePendingResources();
+    self.releaseAllPendingAfterDeviceIdle();
     self.fallback.deinit();
     self.destroyCachedResources();
     if (self.dmabuf_modifiers.len != 0) self.allocator.free(self.dmabuf_modifiers);
@@ -2401,10 +2365,6 @@ pub fn deinit(self: *Self) void {
     self.draw_runs.deinit(self.allocator);
     self.blur_ops.deinit(self.allocator);
     self.prepared_images.deinit(self.allocator);
-    self.pending_wait_semaphores.deinit(self.allocator);
-    self.pending_textures.deinit(self.allocator);
-    self.destroyInstanceBuffer();
-    self.destroyWorkBuffer();
     destroyGraphics(self.device_wrapper, self.device, .{
         .render_pass = self.render_pass,
         .scratch_render_pass = self.scratch_render_pass,
@@ -2435,13 +2395,6 @@ pub fn deinit(self: *Self) void {
         .encode_calibrated_pipeline = self.encode_calibrated_pipeline,
         .sampler = self.sampler,
     });
-    if (self.scanout_semaphore != .null_handle) {
-        self.device_wrapper.destroySemaphore(self.device, self.scanout_semaphore, null);
-    }
-    if (self.timestamp_query_pool != .null_handle) {
-        self.device_wrapper.destroyQueryPool(self.device, self.timestamp_query_pool, null);
-    }
-    self.device_wrapper.destroyFence(self.device, self.fence, null);
     self.device_wrapper.destroyCommandPool(self.device, self.command_pool, null);
     self.device_wrapper.destroyDevice(self.device, null);
     self.instance_wrapper.destroyInstance(self.instance, null);
@@ -2679,6 +2632,8 @@ fn importTarget(self: *Self, descriptor: render.DmabufDescriptor) Error!void {
         self.command_pool,
         &.{command_buffer},
     );
+    const submission = try self.createSubmission();
+    errdefer self.destroySubmission(submission);
     self.outputs.put(self.allocator, .{ .dmabuf = descriptor.id }, .{
         .image = image,
         .memory = memory,
@@ -2691,6 +2646,7 @@ fn importTarget(self: *Self, descriptor: render.DmabufDescriptor) Error!void {
         .last_used = self.frame_number,
         .command_buffer = command_buffer,
         .linear = linear,
+        .submission = submission,
     }) catch return error.OutOfMemory;
 }
 
@@ -2702,6 +2658,41 @@ fn allocateCommandBuffer(self: *Self) Error!vk.CommandBuffer {
         .command_buffer_count = 1,
     }, @ptrCast(&command_buffer)) catch return error.VulkanFailure;
     return command_buffer;
+}
+
+fn createSubmission(self: *Self) Error!Submission {
+    const fence = self.device_wrapper.createFence(self.device, &.{}, null) catch
+        return error.VulkanFailure;
+    errdefer self.device_wrapper.destroyFence(self.device, fence, null);
+
+    const timestamp_query_pool = if (self.timestamp_valid_bits == 0)
+        vk.QueryPool.null_handle
+    else
+        self.device_wrapper.createQueryPool(self.device, &.{
+            .query_type = .timestamp,
+            .query_count = timestamp_query_count,
+        }, null) catch |err| pool: {
+            log.warn("failed to create Vulkan timestamp query pool: {t}", .{err});
+            break :pool vk.QueryPool.null_handle;
+        };
+    errdefer if (timestamp_query_pool != .null_handle) {
+        self.device_wrapper.destroyQueryPool(self.device, timestamp_query_pool, null);
+    };
+
+    var scanout_semaphore = vk.Semaphore.null_handle;
+    if (self.scanout_sync_enabled) {
+        const export_info: vk.ExportSemaphoreCreateInfo = .{
+            .handle_types = .{ .sync_fd_bit = true },
+        };
+        scanout_semaphore = self.device_wrapper.createSemaphore(self.device, &.{
+            .p_next = &export_info,
+        }, null) catch .null_handle;
+    }
+    return .{
+        .fence = fence,
+        .scanout_semaphore = scanout_semaphore,
+        .timestamp_query_pool = timestamp_query_pool,
+    };
 }
 
 fn supportsDmabufTarget(self: *Self, size: render.Size, format: u32, modifier: u64) bool {
@@ -2811,62 +2802,71 @@ fn releaseTarget(self: *Self, id: u64) void {
 }
 
 fn releaseOutput(self: *Self, key: TargetKey) void {
-    self.drainPending() catch {};
     if (self.outputs.fetchRemove(key)) |removed| self.destroyOutput(removed.value);
 }
 
-fn drainPending(self: *Self) Error!void {
-    if (!self.fence_pending) {
-        std.debug.assert(self.pending_wait_semaphores.items.len == 0);
-        std.debug.assert(self.pending_textures.items.len == 0);
-        std.debug.assert(self.pending_gpu_sample_tag == null);
+fn drainSubmission(self: *Self, submission: *Submission) Error!void {
+    if (!submission.fence_pending) {
+        std.debug.assert(submission.pending_wait_semaphores.items.len == 0);
+        std.debug.assert(submission.pending_textures.items.len == 0);
+        std.debug.assert(submission.pending_gpu_sample_tag == null);
         return;
     }
     const result = self.device_wrapper.waitForFences(
         self.device,
-        &.{self.fence},
+        &.{submission.fence},
         .true,
         std.math.maxInt(u64),
     ) catch {
         self.device_wrapper.deviceWaitIdle(self.device) catch {};
-        self.fence_pending = false;
-        self.pending_gpu_sample_tag = null;
-        self.releasePendingResources();
+        submission.fence_pending = false;
+        submission.pending_gpu_sample_tag = null;
+        self.releasePendingResources(submission);
         return error.VulkanFailure;
     };
     if (result != .success) {
         self.device_wrapper.deviceWaitIdle(self.device) catch {};
-        self.fence_pending = false;
-        self.pending_gpu_sample_tag = null;
-        self.releasePendingResources();
+        submission.fence_pending = false;
+        submission.pending_gpu_sample_tag = null;
+        self.releasePendingResources(submission);
         return error.VulkanFailure;
     }
-    self.fence_pending = false;
-    self.finishPendingGpuTiming();
-    self.releasePendingResources();
+    submission.fence_pending = false;
+    self.finishPendingGpuTiming(submission);
+    self.releasePendingResources(submission);
 }
 
-fn writeGpuTimestamp(self: *Self, command_buffer: vk.CommandBuffer, query: u32) void {
+fn drainAllPending(self: *Self) Error!void {
+    var iterator = self.outputs.valueIterator();
+    while (iterator.next()) |output| try self.drainSubmission(&output.submission);
+}
+
+fn writeGpuTimestamp(
+    self: *Self,
+    submission: *const Submission,
+    command_buffer: vk.CommandBuffer,
+    query: u32,
+) void {
     std.debug.assert(query < timestamp_query_count);
-    if (self.timestamp_query_pool == .null_handle) return;
+    if (submission.timestamp_query_pool == .null_handle) return;
     self.device_wrapper.cmdWriteTimestamp(
         command_buffer,
         .{ .bottom_of_pipe_bit = true },
-        self.timestamp_query_pool,
+        submission.timestamp_query_pool,
         query,
     );
 }
 
-fn finishPendingGpuTiming(self: *Self) void {
-    const tag = self.pending_gpu_sample_tag orelse return;
-    self.pending_gpu_sample_tag = null;
-    std.debug.assert(self.timestamp_query_pool != .null_handle);
-    const plan = self.pending_gpu_timing_plan;
+fn finishPendingGpuTiming(self: *Self, submission: *Submission) void {
+    const tag = submission.pending_gpu_sample_tag orelse return;
+    submission.pending_gpu_sample_tag = null;
+    std.debug.assert(submission.timestamp_query_pool != .null_handle);
+    const plan = submission.pending_gpu_timing_plan;
     const query_count = plan.queryCount();
     var timestamps: [timestamp_query_count]u64 = undefined;
     const result = self.device_wrapper.getQueryPoolResults(
         self.device,
-        self.timestamp_query_pool,
+        submission.timestamp_query_pool,
         0,
         query_count,
         query_count * @sizeOf(u64),
@@ -2899,14 +2899,18 @@ pub fn takeGpuTiming(self: *Self) ?GpuTiming {
     if (self.completed_gpu_timing_count == 0) return null;
     const timing = self.completed_gpu_timings[0];
     if (self.completed_gpu_timing_count > 1) {
-        self.completed_gpu_timings[0] = self.completed_gpu_timings[1];
+        @memmove(
+            self.completed_gpu_timings[0 .. self.completed_gpu_timing_count - 1],
+            self.completed_gpu_timings[1..self.completed_gpu_timing_count],
+        );
     }
     self.completed_gpu_timing_count -= 1;
     return timing;
 }
 
 pub fn discardGpuTimings(self: *Self) void {
-    self.pending_gpu_sample_tag = null;
+    var iterator = self.outputs.valueIterator();
+    while (iterator.next()) |output| output.submission.pending_gpu_sample_tag = null;
     self.completed_gpu_timing_count = 0;
 }
 
@@ -2983,19 +2987,54 @@ fn gpuTimingFromTimestamps(
     return timing;
 }
 
-fn releasePendingResources(self: *Self) void {
-    for (self.pending_wait_semaphores.items) |semaphore| {
+fn releasePendingResources(self: *Self, submission: *Submission) void {
+    for (submission.pending_wait_semaphores.items) |semaphore| {
         self.device_wrapper.destroySemaphore(self.device, semaphore, null);
     }
-    self.pending_wait_semaphores.clearRetainingCapacity();
-    for (self.pending_textures.items) |texture| self.destroyTexture(texture);
-    self.pending_textures.clearRetainingCapacity();
+    submission.pending_wait_semaphores.clearRetainingCapacity();
+    for (submission.pending_textures.items) |texture| self.destroyTexture(texture);
+    submission.pending_textures.clearRetainingCapacity();
 }
 
-fn disableScanoutSemaphore(self: *Self) void {
-    if (self.scanout_semaphore == .null_handle) return;
-    self.device_wrapper.destroySemaphore(self.device, self.scanout_semaphore, null);
-    self.scanout_semaphore = .null_handle;
+fn disableScanoutSynchronization(self: *Self) void {
+    self.scanout_sync_enabled = false;
+    var iterator = self.outputs.valueIterator();
+    while (iterator.next()) |output| {
+        std.debug.assert(!output.submission.fence_pending);
+        if (output.submission.scanout_semaphore == .null_handle) continue;
+        self.device_wrapper.destroySemaphore(
+            self.device,
+            output.submission.scanout_semaphore,
+            null,
+        );
+        output.submission.scanout_semaphore = .null_handle;
+    }
+}
+
+fn releaseAllPendingAfterDeviceIdle(self: *Self) void {
+    var iterator = self.outputs.valueIterator();
+    while (iterator.next()) |output| {
+        output.submission.fence_pending = false;
+        output.submission.pending_gpu_sample_tag = null;
+        self.releasePendingResources(&output.submission);
+    }
+}
+
+fn destroySubmission(self: *Self, value: Submission) void {
+    var submission = value;
+    std.debug.assert(!submission.fence_pending);
+    self.releasePendingResources(&submission);
+    submission.pending_wait_semaphores.deinit(self.allocator);
+    submission.pending_textures.deinit(self.allocator);
+    self.destroyInstanceBuffer(&submission);
+    self.destroyWorkBuffer(&submission);
+    if (submission.scanout_semaphore != .null_handle) {
+        self.device_wrapper.destroySemaphore(self.device, submission.scanout_semaphore, null);
+    }
+    if (submission.timestamp_query_pool != .null_handle) {
+        self.device_wrapper.destroyQueryPool(self.device, submission.timestamp_query_pool, null);
+    }
+    self.device_wrapper.destroyFence(self.device, submission.fence, null);
 }
 
 pub fn renderFrame(self: *Self, frame: render.Frame, target: render.Target) Error!void {
@@ -3024,7 +3063,6 @@ fn renderFrameWithCompletion(
     completion_mode: CompletionMode,
     gpu_sample_tag: ?u64,
 ) Error!render.FrameCompletion {
-    try self.drainPending();
     const required_pixels = validateTarget(frame, target) catch |err| {
         const target_size = target.size();
         log.err(
@@ -3038,6 +3076,9 @@ fn renderFrameWithCompletion(
         var completion: render.FrameCompletion = .{};
         switch (target) {
             .pixels => |pixels| {
+                if (self.outputs.getPtr(target_key)) |output| {
+                    try self.drainSubmission(&output.submission);
+                }
                 self.invalidateOutput(target_key);
                 try self.fallback.render(frame, pixels);
             },
@@ -3050,7 +3091,21 @@ fn renderFrameWithCompletion(
     }
 
     self.frame_number +%= 1;
-    self.reclaimStaleResources();
+    try self.reclaimStaleResources();
+    const output = self.getOutput(target_key) catch |err| {
+        log.err("Vulkan output target lookup failed: {t}", .{err});
+        return err;
+    };
+    const submission = &output.submission;
+    try self.drainSubmission(submission);
+    if (!std.meta.eql(output.size, frame.size)) {
+        log.err(
+            "Vulkan output target size changed: frame={d}x{d} output={d}x{d}",
+            .{ frame.size.width, frame.size.height, output.size.width, output.size.height },
+        );
+        return error.InvalidTarget;
+    }
+    output.last_used = self.frame_number;
     std.debug.assert(
         self.instances.items.len == 0 and
             self.draw_runs.items.len == 0 and
@@ -3074,9 +3129,7 @@ fn renderFrameWithCompletion(
     var new_calibration_identity: ?u64 = null;
     defer if (!frame_succeeded) {
         self.device_wrapper.deviceWaitIdle(self.device) catch {};
-        self.fence_pending = false;
-        self.pending_gpu_sample_tag = null;
-        self.releasePendingResources();
+        self.releaseAllPendingAfterDeviceIdle();
         self.resetCommandBufferForTarget(target_key);
         self.invalidateOutput(target_key);
         self.invalidatePreparedTextures(self.prepared_images.items);
@@ -3143,19 +3196,7 @@ fn renderFrameWithCompletion(
         if (prepared.upload_offset != null) new_calibration_identity = prepared.identity;
     }
 
-    try self.ensureWorkBuffer(work_size);
-    const output = self.getOutput(target_key) catch |err| {
-        log.err("Vulkan output target lookup failed: {t}", .{err});
-        return err;
-    };
-    if (!std.meta.eql(output.size, frame.size)) {
-        log.err(
-            "Vulkan output target size changed: frame={d}x{d} output={d}x{d}",
-            .{ frame.size.width, frame.size.height, output.size.width, output.size.height },
-        );
-        return error.InvalidTarget;
-    }
-    output.last_used = self.frame_number;
+    try self.ensureWorkBuffer(submission, work_size);
     var compiled_frame = frame;
     const calibration_identity = if (frame.output_calibration) |calibration|
         calibration.identity
@@ -3205,9 +3246,9 @@ fn renderFrameWithCompletion(
     const full_output: render.Rect = .{ .x = 0, .y = 0, .width = frame.size.width, .height = frame.size.height };
     try self.instances.append(self.allocator, imageInstance(full_output, full_output));
     const instance_bytes = std.mem.sliceAsBytes(self.instances.items);
-    try self.ensureInstanceBuffer(instance_bytes.len);
+    try self.ensureInstanceBuffer(submission, instance_bytes.len);
     if (instance_bytes.len > 0) {
-        @memcpy(self.instance_mapped.?[0..instance_bytes.len], instance_bytes);
+        @memcpy(submission.instance_mapped.?[0..instance_bytes.len], instance_bytes);
     }
     var blur_initialized = output.blur_initialized;
     if (!output.initialized and output.kind == .pixels) {
@@ -3215,7 +3256,7 @@ fn renderFrameWithCompletion(
             .pixels => |value| value,
             else => unreachable,
         };
-        copyPixelsToMapped(self.work_mapped.?, 0, pixels, null);
+        copyPixelsToMapped(submission.work_mapped.?, 0, pixels, null);
     }
     var prepared_index: usize = 0;
     for (frame.commands) |command| switch (command) {
@@ -3224,7 +3265,7 @@ fn renderFrameWithCompletion(
             prepared_index += 1;
             if (prepared.upload_offset) |offset| {
                 try copySourceToMapped(
-                    self.work_mapped.?,
+                    submission.work_mapped.?,
                     offset,
                     image.buffer,
                     prepared.upload_damage,
@@ -3236,18 +3277,19 @@ fn renderFrameWithCompletion(
     if (prepared_calibration) |prepared| {
         if (prepared.upload_offset) |offset| {
             const bytes = std.mem.sliceAsBytes(frame.output_calibration.?.values);
-            @memcpy(self.work_mapped.?[offset..][0..bytes.len], bytes);
+            @memcpy(submission.work_mapped.?[offset..][0..bytes.len], bytes);
         }
     }
 
-    std.debug.assert(!self.fence_pending);
-    self.device_wrapper.resetFences(self.device, &.{self.fence}) catch
+    std.debug.assert(!submission.fence_pending);
+    self.device_wrapper.resetFences(self.device, &.{submission.fence}) catch
         return error.VulkanFailure;
     const reusable = output.kind != .pixels;
     const frame_render_area = damageBounds(compiled_frame.damage, full_output) orelse full_output;
     const gpu_timing_plan = buildGpuTimingPlan(self.draw_runs.items, self.blur_ops.items);
     std.debug.assert(gpu_timing_plan.queryCount() <= timestamp_query_count);
     const cache_hit = reusable and self.recordedFrameMatches(
+        submission,
         &output.recorded_frame,
         output.initialized,
         output.blur_initialized,
@@ -3261,17 +3303,17 @@ fn renderFrameWithCompletion(
         self.device_wrapper.beginCommandBuffer(command_buffer, &.{
             .flags = if (reusable) .{} else .{ .one_time_submit_bit = true },
         }) catch return error.VulkanFailure;
-        if (self.timestamp_query_pool != .null_handle) {
+        if (submission.timestamp_query_pool != .null_handle) {
             self.device_wrapper.cmdResetQueryPool(
                 command_buffer,
-                self.timestamp_query_pool,
+                submission.timestamp_query_pool,
                 0,
                 timestamp_query_count,
             );
             self.device_wrapper.cmdWriteTimestamp(
                 command_buffer,
                 .{ .top_of_pipe_bit = true },
-                self.timestamp_query_pool,
+                submission.timestamp_query_pool,
                 timestamp_frame_start,
             );
         }
@@ -3302,7 +3344,7 @@ fn renderFrameWithCompletion(
                 };
                 self.device_wrapper.cmdCopyBufferToImage(
                     command_buffer,
-                    self.work_buffer,
+                    submission.work_buffer,
                     prepared.texture.image,
                     .transfer_dst_optimal,
                     &.{upload},
@@ -3334,7 +3376,7 @@ fn renderFrameWithCompletion(
                 .image_offset = .{ .x = 0, .y = 0, .z = 0 },
                 .image_extent = extent(pixels.size),
             };
-            self.device_wrapper.cmdCopyBufferToImage(command_buffer, self.work_buffer, output.image, .transfer_dst_optimal, &.{upload});
+            self.device_wrapper.cmdCopyBufferToImage(command_buffer, submission.work_buffer, output.image, .transfer_dst_optimal, &.{upload});
             self.transitionImage(command_buffer, output.image, .transfer_dst_optimal, .shader_read_only_optimal, .{ .transfer_write_bit = true }, .{ .shader_read_bit = true }, .{ .transfer_bit = true }, .{ .fragment_shader_bit = true });
         }
 
@@ -3360,7 +3402,7 @@ fn renderFrameWithCompletion(
             };
             self.device_wrapper.cmdBeginRenderPass(command_buffer, &initialize_pass, .@"inline");
             self.setViewportAndScissor(command_buffer, frame.size);
-            self.device_wrapper.cmdBindVertexBuffers(command_buffer, 0, &.{self.instance_buffer}, &.{0});
+            self.device_wrapper.cmdBindVertexBuffers(command_buffer, 0, &.{submission.instance_buffer}, &.{0});
             self.device_wrapper.cmdBindPipeline(command_buffer, .graphics, self.downsample_pipeline);
             self.device_wrapper.cmdBindDescriptorSets(command_buffer, .graphics, self.pipeline_layout, 0, &.{output.descriptor_set}, null);
             const initialize_push: FramePush = .{
@@ -3407,6 +3449,7 @@ fn renderFrameWithCompletion(
             const source_buffer = prepared.buffer;
             if (prepared.upload_damage) |damage| {
                 for (damage) |rect| self.copyTextureRect(
+                    submission.work_buffer,
                     command_buffer,
                     prepared.texture.image,
                     source_buffer,
@@ -3414,7 +3457,7 @@ fn renderFrameWithCompletion(
                     rect,
                 );
             } else {
-                self.copyTextureRect(command_buffer, prepared.texture.image, source_buffer, offset, .{
+                self.copyTextureRect(submission.work_buffer, command_buffer, prepared.texture.image, source_buffer, offset, .{
                     .x = 0,
                     .y = 0,
                     .width = source_buffer.size.width,
@@ -3433,7 +3476,7 @@ fn renderFrameWithCompletion(
             );
         }
 
-        self.writeGpuTimestamp(command_buffer, timestamp_composition_start);
+        self.writeGpuTimestamp(submission, command_buffer, timestamp_composition_start);
 
         const render_pass_info: vk.RenderPassBeginInfo = .{
             .render_pass = self.render_pass,
@@ -3461,7 +3504,7 @@ fn renderFrameWithCompletion(
             self.device_wrapper.cmdBindVertexBuffers(
                 command_buffer,
                 0,
-                &.{self.instance_buffer},
+                &.{submission.instance_buffer},
                 &.{0},
             );
         }
@@ -3474,7 +3517,7 @@ fn renderFrameWithCompletion(
                 const backdrop_cache = output.backdrop_cache.items[blur_op.cache_index];
                 if (!blur_op.cache_hit) {
                     const scratch = output.blur.?;
-                    gpu_timing_recorder.switchTo(self, command_buffer, .blur_downsample);
+                    gpu_timing_recorder.switchTo(self, submission, command_buffer, .blur_downsample);
                     self.device_wrapper.cmdEndRenderPass(command_buffer);
                     self.transitionImage(command_buffer, output.linear.image, .color_attachment_optimal, .shader_read_only_optimal, .{ .color_attachment_write_bit = true }, .{ .shader_read_bit = true }, .{ .color_attachment_output_bit = true }, .{ .fragment_shader_bit = true });
 
@@ -3505,7 +3548,7 @@ fn renderFrameWithCompletion(
                         }
                     }
 
-                    gpu_timing_recorder.switchTo(self, command_buffer, .blur_upsample);
+                    gpu_timing_recorder.switchTo(self, submission, command_buffer, .blur_upsample);
                     const final_level = scratch.levels[blur_op.level].?;
                     if (blur_op.level == 0) {
                         self.transitionScratchForWrite(command_buffer, backdrop_cache.image.image, backdrop_cache.initialized, .color_attachment_optimal, .{ .color_attachment_write_bit = true }, .{ .color_attachment_output_bit = true });
@@ -3531,7 +3574,7 @@ fn renderFrameWithCompletion(
                             if (!destination_is_cache) blur_initialized |= destination_bit;
                         }
                     }
-                    gpu_timing_recorder.switchTo(self, command_buffer, gpuTimingCategory(run.pipeline));
+                    gpu_timing_recorder.switchTo(self, submission, command_buffer, gpuTimingCategory(run.pipeline));
                     self.transitionImage(command_buffer, output.linear.image, .shader_read_only_optimal, .color_attachment_optimal, .{ .shader_read_bit = true }, .{ .color_attachment_read_bit = true, .color_attachment_write_bit = true }, .{ .fragment_shader_bit = true }, .{ .color_attachment_output_bit = true });
                     self.device_wrapper.cmdBeginRenderPass(command_buffer, &render_pass_info, .@"inline");
                     self.setViewportAndScissor(command_buffer, frame.size);
@@ -3540,7 +3583,7 @@ fn renderFrameWithCompletion(
                     bound_descriptors = @splat(null);
                 }
             }
-            gpu_timing_recorder.switchTo(self, command_buffer, gpuTimingCategory(run.pipeline));
+            gpu_timing_recorder.switchTo(self, submission, command_buffer, gpuTimingCategory(run.pipeline));
             const run_pipeline = if (run.pipeline_handle != .null_handle)
                 run.pipeline_handle
             else
@@ -3641,12 +3684,12 @@ fn renderFrameWithCompletion(
                 run.first_instance,
             );
         }
-        gpu_timing_recorder.switchTo(self, command_buffer, .composition_overhead);
+        gpu_timing_recorder.switchTo(self, submission, command_buffer, .composition_overhead);
         self.device_wrapper.cmdEndRenderPass(command_buffer);
 
         self.transitionImage(command_buffer, output.linear.image, .color_attachment_optimal, .shader_read_only_optimal, .{ .color_attachment_write_bit = true }, .{ .shader_read_bit = true }, .{ .color_attachment_output_bit = true }, .{ .fragment_shader_bit = true });
         gpu_timing_recorder.finish();
-        self.writeGpuTimestamp(command_buffer, gpu_timing_plan.compositionEndQuery());
+        self.writeGpuTimestamp(submission, command_buffer, gpu_timing_plan.compositionEndQuery());
         if (output.kind == .dmabuf) {
             self.transitionExternalToRender(command_buffer, output.*);
         } else if (!output.initialized) {
@@ -3707,7 +3750,7 @@ fn renderFrameWithCompletion(
         self.device_wrapper.cmdPushConstants(command_buffer, self.pipeline_layout, .{ .vertex_bit = true, .fragment_bit = true }, 0, @sizeOf(FramePush), &output_push);
         self.device_wrapper.cmdDraw(command_buffer, 4, 1, 0, encode_instance);
         self.device_wrapper.cmdEndRenderPass(command_buffer);
-        self.writeGpuTimestamp(command_buffer, gpu_timing_plan.outputEncodeEndQuery());
+        self.writeGpuTimestamp(submission, command_buffer, gpu_timing_plan.outputEncodeEndQuery());
 
         for (self.prepared_images.items, 0..) |prepared, index| {
             if (!prepared.texture.imported or
@@ -3728,6 +3771,7 @@ fn renderFrameWithCompletion(
             .{ .transfer_bit = true },
         );
         if (output.kind == .pixels) self.copyOutputDamage(
+            submission.work_buffer,
             command_buffer,
             compiled_frame,
             target.pixels,
@@ -3744,7 +3788,7 @@ fn renderFrameWithCompletion(
             .{ .color_attachment_output_bit = true },
         );
         if (output.kind == .pixels) self.transferToHostBarrier(command_buffer);
-        self.writeGpuTimestamp(command_buffer, gpu_timing_plan.frameEndQuery());
+        self.writeGpuTimestamp(submission, command_buffer, gpu_timing_plan.frameEndQuery());
         self.device_wrapper.endCommandBuffer(command_buffer) catch return error.VulkanFailure;
         if (reusable) {
             const uploaded_calibration = if (prepared_calibration) |prepared|
@@ -3756,6 +3800,7 @@ fn renderFrameWithCompletion(
                 // replayed safely after the mapped work buffer is reused.
                 output.recorded_frame.valid = false;
             } else try self.rememberRecordedFrame(
+                submission,
                 &output.recorded_frame,
                 output.initialized,
                 output.blur_initialized,
@@ -3772,7 +3817,7 @@ fn renderFrameWithCompletion(
         self.prepared_images.items.len,
         render.max_dmabuf_planes,
     ) catch return error.OutOfMemory;
-    self.pending_wait_semaphores.ensureTotalCapacity(
+    submission.pending_wait_semaphores.ensureTotalCapacity(
         self.allocator,
         maximum_waits,
     ) catch return error.OutOfMemory;
@@ -3782,7 +3827,7 @@ fn renderFrameWithCompletion(
     for (self.prepared_images.items) |prepared| {
         if (prepared.cache_id == null) temporary_texture_count += 1;
     }
-    self.pending_textures.ensureTotalCapacity(self.allocator, temporary_texture_count) catch
+    submission.pending_textures.ensureTotalCapacity(self.allocator, temporary_texture_count) catch
         return error.OutOfMemory;
     for (self.prepared_images.items, 0..) |prepared, index| {
         if (!prepared.texture.imported or
@@ -3812,13 +3857,13 @@ fn renderFrameWithCompletion(
                 if (!(source.end_cpu_read)(source.context)) return error.VulkanFailure;
                 break :plane_waits;
             };
-            self.pending_wait_semaphores.appendAssumeCapacity(semaphore);
+            submission.pending_wait_semaphores.appendAssumeCapacity(semaphore);
             wait_stages.appendAssumeCapacity(.{ .all_commands_bit = true });
         }
     }
 
     const export_completion = completion_mode == .sync_fd and
-        output.kind == .dmabuf and self.scanout_semaphore != .null_handle;
+        output.kind == .dmabuf and submission.scanout_semaphore != .null_handle;
     // A GPU-resident offscreen output has no external consumer to synchronize.
     // Keep its work in flight and drain before the target is reused instead of
     // delaying headless presentation and frame callbacks on GPU completion.
@@ -3827,28 +3872,28 @@ fn renderFrameWithCompletion(
     // Queue submission makes prior coherent mapped writes visible to every
     // device access in the submission; no host pipeline barrier is needed.
     const submit_info: vk.SubmitInfo = .{
-        .wait_semaphore_count = @intCast(self.pending_wait_semaphores.items.len),
-        .p_wait_semaphores = self.pending_wait_semaphores.items.ptr,
+        .wait_semaphore_count = @intCast(submission.pending_wait_semaphores.items.len),
+        .p_wait_semaphores = submission.pending_wait_semaphores.items.ptr,
         .p_wait_dst_stage_mask = wait_stages.items.ptr,
         .command_buffer_count = 1,
         .p_command_buffers = @ptrCast(&command_buffer),
         .signal_semaphore_count = @intFromBool(export_completion),
         .p_signal_semaphores = if (export_completion)
-            @ptrCast(&self.scanout_semaphore)
+            @ptrCast(&submission.scanout_semaphore)
         else
             null,
     };
-    self.device_wrapper.queueSubmit(self.queue, &.{submit_info}, self.fence) catch
+    self.device_wrapper.queueSubmit(self.queue, &.{submit_info}, submission.fence) catch
         return error.VulkanFailure;
-    self.fence_pending = true;
-    std.debug.assert(self.pending_gpu_sample_tag == null);
-    if (self.timestamp_query_pool != .null_handle) {
-        self.pending_gpu_sample_tag = gpu_sample_tag;
-        self.pending_gpu_timing_plan = gpu_timing_plan;
+    submission.fence_pending = true;
+    std.debug.assert(submission.pending_gpu_sample_tag == null);
+    if (submission.timestamp_query_pool != .null_handle) {
+        submission.pending_gpu_sample_tag = gpu_sample_tag;
+        submission.pending_gpu_timing_plan = gpu_timing_plan;
     }
     for (self.prepared_images.items) |prepared| {
         if (prepared.cache_id == null) {
-            self.pending_textures.appendAssumeCapacity(prepared.texture);
+            submission.pending_textures.appendAssumeCapacity(prepared.texture);
         }
     }
     temporary_textures_pending = true;
@@ -3879,17 +3924,17 @@ fn renderFrameWithCompletion(
 
     if (export_completion) {
         const completion_fd = self.device_wrapper.getSemaphoreFdKHR(self.device, &.{
-            .semaphore = self.scanout_semaphore,
+            .semaphore = submission.scanout_semaphore,
             .handle_type = .{ .sync_fd_bit = true },
         }) catch {
-            try self.drainPending();
-            self.disableScanoutSemaphore();
+            try self.drainAllPending();
+            self.disableScanoutSynchronization();
             log.warn("Vulkan sync-file export failed; using blocking scanout", .{});
             frame_succeeded = true;
             return completion;
         };
         if (completion_fd < 0) {
-            try self.drainPending();
+            try self.drainSubmission(submission);
             frame_succeeded = true;
             return completion;
         }
@@ -3906,8 +3951,8 @@ fn renderFrameWithCompletion(
                     completion_fd,
                     sync.DMA_BUF_SYNC_READ,
                 )) {
-                    try self.drainPending();
-                    self.disableScanoutSemaphore();
+                    try self.drainAllPending();
+                    self.disableScanoutSynchronization();
                     log.warn("DMA-BUF sync-file import failed; using blocking scanout", .{});
                     frame_succeeded = true;
                     return completion;
@@ -3925,9 +3970,11 @@ fn renderFrameWithCompletion(
         return completion;
     }
 
-    try self.drainPending();
+    try self.drainSubmission(submission);
     frame_succeeded = true;
-    if (output.kind == .pixels) copyDamageToTarget(compiled_frame, target.pixels, self.work_mapped.?);
+    if (output.kind == .pixels) {
+        copyDamageToTarget(compiled_frame, target.pixels, submission.work_mapped.?);
+    }
     return completion;
 }
 
@@ -3982,11 +4029,13 @@ fn supports(commands: []const render.Command) bool {
 fn renderGpuFallback(self: *Self, frame: render.Frame, key: TargetKey) Error!void {
     const output = self.outputs.getPtr(key) orelse return error.InvalidTarget;
     if (output.kind == .pixels or !std.meta.eql(output.size, frame.size)) return error.InvalidTarget;
+    const submission = &output.submission;
+    try self.drainSubmission(submission);
     const pixel_count = frame.size.pixelCount() catch return error.InvalidTarget;
     const byte_count = std.math.mul(usize, pixel_count, @sizeOf(u32)) catch
         return error.InvalidTarget;
-    try self.ensureWorkBuffer(byte_count);
-    const pixels: [*]u32 = @ptrCast(@alignCast(self.work_mapped.?));
+    try self.ensureWorkBuffer(submission, byte_count);
+    const pixels: [*]u32 = @ptrCast(@alignCast(submission.work_mapped.?));
     const cpu_target: render.PixelBuffer = .{
         .size = frame.size,
         .stride_pixels = frame.size.width,
@@ -3998,7 +4047,7 @@ fn renderGpuFallback(self: *Self, frame: render.Frame, key: TargetKey) Error!voi
     output.recorded_frame.valid = false;
     self.device_wrapper.resetCommandBuffer(output.command_buffer, .{}) catch
         return error.VulkanFailure;
-    self.device_wrapper.resetFences(self.device, &.{self.fence}) catch
+    self.device_wrapper.resetFences(self.device, &.{submission.fence}) catch
         return error.VulkanFailure;
     self.device_wrapper.beginCommandBuffer(output.command_buffer, &.{
         .flags = .{ .one_time_submit_bit = true },
@@ -4032,9 +4081,16 @@ fn renderGpuFallback(self: *Self, frame: render.Frame, key: TargetKey) Error!voi
     if (frame.damage) |damage| {
         for (damage) |rect| {
             const clipped = rect.clipTo(frame.size) orelse continue;
-            self.copyTextureRect(output.command_buffer, output.image, cpu_target, 0, clipped);
+            self.copyTextureRect(
+                submission.work_buffer,
+                output.command_buffer,
+                output.image,
+                cpu_target,
+                0,
+                clipped,
+            );
         }
-    } else self.copyTextureRect(output.command_buffer, output.image, cpu_target, 0, .{
+    } else self.copyTextureRect(submission.work_buffer, output.command_buffer, output.image, cpu_target, 0, .{
         .x = 0,
         .y = 0,
         .width = frame.size.width,
@@ -4070,21 +4126,10 @@ fn renderGpuFallback(self: *Self, frame: render.Frame, key: TargetKey) Error!voi
         .command_buffer_count = 1,
         .p_command_buffers = @ptrCast(&output.command_buffer),
     };
-    self.device_wrapper.queueSubmit(self.queue, &.{submit}, self.fence) catch
+    self.device_wrapper.queueSubmit(self.queue, &.{submit}, submission.fence) catch
         return error.VulkanFailure;
-    self.fence_pending = true;
-    const result = self.device_wrapper.waitForFences(
-        self.device,
-        &.{self.fence},
-        .true,
-        std.math.maxInt(u64),
-    ) catch {
-        self.device_wrapper.deviceWaitIdle(self.device) catch {};
-        self.fence_pending = false;
-        return error.VulkanFailure;
-    };
-    self.fence_pending = false;
-    if (result != .success) return error.VulkanFailure;
+    submission.fence_pending = true;
+    try self.drainSubmission(submission);
     output.initialized = true;
 }
 
@@ -4227,6 +4272,8 @@ fn createOutput(self: *Self, size: render.Size) Error!Output {
     errdefer self.device_wrapper.destroyFramebuffer(self.device, framebuffer, null);
     const linear = try self.createWorkingTarget(size);
     errdefer self.destroyWorkingTarget(linear);
+    const submission = try self.createSubmission();
+    errdefer self.destroySubmission(submission);
     return .{
         .image = allocation.image,
         .memory = allocation.memory,
@@ -4237,6 +4284,7 @@ fn createOutput(self: *Self, size: render.Size) Error!Output {
         .size = size,
         .last_used = self.frame_number,
         .linear = linear,
+        .submission = submission,
     };
 }
 
@@ -4269,6 +4317,8 @@ fn resetCommandBufferForTarget(self: *Self, key: TargetKey) void {
 
 fn destroyOutput(self: *Self, value: Output) void {
     var output = value;
+    self.drainSubmission(&output.submission) catch {};
+    self.destroySubmission(output.submission);
     if (output.blur) |blur| self.destroyBlurScratch(blur);
     for (output.backdrop_cache.items) |cache| self.destroyBackdropCache(cache);
     output.backdrop_cache.deinit(self.allocator);
@@ -4777,6 +4827,7 @@ fn prepareTexture(
         }
         if (self.textures.get(source.id)) |existing| {
             if (existing.imported or !std.meta.eql(existing.size, buffer.size)) {
+                try self.drainAllPending();
                 const removed = self.textures.fetchRemove(source.id).?;
                 self.destroyTexture(removed.value);
             }
@@ -4875,6 +4926,7 @@ fn prepareImportedTexture(
             !std.meta.eql(existing.size, buffer.size) or
             !std.meta.eql(existing.video_representation, video_representation))
         {
+            try self.drainAllPending();
             const removed = self.textures.fetchRemove(source.id).?;
             self.destroyTexture(removed.value);
         }
@@ -4912,6 +4964,7 @@ fn prepareImportedTexture(
 
 fn recordedFrameMatches(
     self: *const Self,
+    submission: *const Submission,
     recorded: *const RecordedFrame,
     output_initialized: bool,
     blur_initialized: u16,
@@ -4923,8 +4976,9 @@ fn recordedFrameMatches(
         recorded.output_initialized != output_initialized or
         recorded.blur_initialized != blur_initialized or
         !std.meta.eql(recorded.render_area, render_area) or
-        recorded.work_buffer != self.work_buffer or
-        recorded.instance_buffer != self.instance_buffer or
+        recorded.work_buffer != submission.work_buffer or
+        recorded.instance_buffer != submission.instance_buffer or
+        recorded.timestamp_query_pool != submission.timestamp_query_pool or
         recorded.draw_runs.items.len != self.draw_runs.items.len or
         recorded.blur_ops.items.len != self.blur_ops.items.len)
     {
@@ -4973,6 +5027,7 @@ fn recordedFrameMatches(
 
 fn rememberRecordedFrame(
     self: *Self,
+    submission: *const Submission,
     recorded: *RecordedFrame,
     output_initialized: bool,
     blur_initialized: u16,
@@ -5008,8 +5063,9 @@ fn rememberRecordedFrame(
     recorded.output_initialized = output_initialized;
     recorded.blur_initialized = blur_initialized;
     recorded.render_area = render_area;
-    recorded.work_buffer = self.work_buffer;
-    recorded.instance_buffer = self.instance_buffer;
+    recorded.work_buffer = submission.work_buffer;
+    recorded.instance_buffer = submission.instance_buffer;
+    recorded.timestamp_query_pool = submission.timestamp_query_pool;
     recorded.valid = true;
 }
 
@@ -5355,12 +5411,14 @@ fn makeTextureRoom(self: *Self) !void {
         }
     }
     const id = oldest_id orelse return error.CacheFull;
+    try self.drainAllPending();
     const removed = self.textures.fetchRemove(id).?;
     self.destroyTexture(removed.value);
 }
 
-fn reclaimStaleResources(self: *Self) void {
+fn reclaimStaleResources(self: *Self) Error!void {
     const oldest = self.frame_number -| stale_frame_count;
+    var drained = false;
     while (true) {
         var stale: ?u64 = null;
         var iterator = self.textures.iterator();
@@ -5371,6 +5429,10 @@ fn reclaimStaleResources(self: *Self) void {
             }
         }
         const id = stale orelse break;
+        if (!drained) {
+            try self.drainAllPending();
+            drained = true;
+        }
         self.destroyTexture(self.textures.fetchRemove(id).?.value);
     }
     while (true) {
@@ -5383,6 +5445,10 @@ fn reclaimStaleResources(self: *Self) void {
             }
         }
         const identity = stale orelse break;
+        if (!drained) {
+            try self.drainAllPending();
+            drained = true;
+        }
         self.destroyCalibrationTexture(self.calibrations.fetchRemove(identity).?.value);
     }
     while (true) {
@@ -5395,6 +5461,10 @@ fn reclaimStaleResources(self: *Self) void {
             }
         }
         const key = stale orelse break;
+        if (!drained) {
+            try self.drainAllPending();
+            drained = true;
+        }
         self.destroyOutput(self.outputs.fetchRemove(key).?.value);
     }
 }
@@ -5449,10 +5519,10 @@ fn deviceMemoryType(self: *Self, memory_type_bits: u32) ?u32 {
     return compatible;
 }
 
-fn ensureWorkBuffer(self: *Self, required_size: usize) Error!void {
-    if (self.work_capacity >= required_size) return;
-    std.debug.assert(!self.fence_pending);
-    self.destroyWorkBuffer();
+fn ensureWorkBuffer(self: *Self, submission: *Submission, required_size: usize) Error!void {
+    if (submission.work_capacity >= required_size) return;
+    std.debug.assert(!submission.fence_pending);
+    self.destroyWorkBuffer(submission);
 
     const buffer = self.device_wrapper.createBuffer(self.device, &.{
         .size = required_size,
@@ -5484,32 +5554,34 @@ fn ensureWorkBuffer(self: *Self, required_size: usize) Error!void {
     const mapped: [*]u8 = @ptrCast(mapped_opaque orelse return error.VulkanFailure);
     errdefer self.device_wrapper.unmapMemory(self.device, memory);
 
-    self.work_buffer = buffer;
-    self.work_memory = memory;
-    self.work_mapped = mapped;
-    self.work_capacity = required_size;
+    submission.work_buffer = buffer;
+    submission.work_memory = memory;
+    submission.work_mapped = mapped;
+    submission.work_capacity = required_size;
     self.advanceResourceEpoch();
 }
 
-fn destroyWorkBuffer(self: *Self) void {
-    std.debug.assert(!self.fence_pending);
-    if (self.work_mapped != null) self.device_wrapper.unmapMemory(self.device, self.work_memory);
-    if (self.work_buffer != .null_handle) {
-        self.device_wrapper.destroyBuffer(self.device, self.work_buffer, null);
+fn destroyWorkBuffer(self: *Self, submission: *Submission) void {
+    std.debug.assert(!submission.fence_pending);
+    if (submission.work_mapped != null) {
+        self.device_wrapper.unmapMemory(self.device, submission.work_memory);
     }
-    if (self.work_memory != .null_handle) {
-        self.device_wrapper.freeMemory(self.device, self.work_memory, null);
+    if (submission.work_buffer != .null_handle) {
+        self.device_wrapper.destroyBuffer(self.device, submission.work_buffer, null);
     }
-    self.work_buffer = .null_handle;
-    self.work_memory = .null_handle;
-    self.work_mapped = null;
-    self.work_capacity = 0;
+    if (submission.work_memory != .null_handle) {
+        self.device_wrapper.freeMemory(self.device, submission.work_memory, null);
+    }
+    submission.work_buffer = .null_handle;
+    submission.work_memory = .null_handle;
+    submission.work_mapped = null;
+    submission.work_capacity = 0;
 }
 
-fn ensureInstanceBuffer(self: *Self, required_size: usize) Error!void {
-    if (self.instance_capacity >= required_size) return;
-    std.debug.assert(!self.fence_pending);
-    self.destroyInstanceBuffer();
+fn ensureInstanceBuffer(self: *Self, submission: *Submission, required_size: usize) Error!void {
+    if (submission.instance_capacity >= required_size) return;
+    std.debug.assert(!submission.fence_pending);
+    self.destroyInstanceBuffer(submission);
 
     const buffer = self.device_wrapper.createBuffer(self.device, &.{
         .size = required_size,
@@ -5541,28 +5613,28 @@ fn ensureInstanceBuffer(self: *Self, required_size: usize) Error!void {
     const mapped: [*]u8 = @ptrCast(mapped_opaque orelse return error.VulkanFailure);
     errdefer self.device_wrapper.unmapMemory(self.device, memory);
 
-    self.instance_buffer = buffer;
-    self.instance_memory = memory;
-    self.instance_mapped = mapped;
-    self.instance_capacity = required_size;
+    submission.instance_buffer = buffer;
+    submission.instance_memory = memory;
+    submission.instance_mapped = mapped;
+    submission.instance_capacity = required_size;
     self.advanceResourceEpoch();
 }
 
-fn destroyInstanceBuffer(self: *Self) void {
-    std.debug.assert(!self.fence_pending);
-    if (self.instance_mapped != null) {
-        self.device_wrapper.unmapMemory(self.device, self.instance_memory);
+fn destroyInstanceBuffer(self: *Self, submission: *Submission) void {
+    std.debug.assert(!submission.fence_pending);
+    if (submission.instance_mapped != null) {
+        self.device_wrapper.unmapMemory(self.device, submission.instance_memory);
     }
-    if (self.instance_buffer != .null_handle) {
-        self.device_wrapper.destroyBuffer(self.device, self.instance_buffer, null);
+    if (submission.instance_buffer != .null_handle) {
+        self.device_wrapper.destroyBuffer(self.device, submission.instance_buffer, null);
     }
-    if (self.instance_memory != .null_handle) {
-        self.device_wrapper.freeMemory(self.device, self.instance_memory, null);
+    if (submission.instance_memory != .null_handle) {
+        self.device_wrapper.freeMemory(self.device, submission.instance_memory, null);
     }
-    self.instance_buffer = .null_handle;
-    self.instance_memory = .null_handle;
-    self.instance_mapped = null;
-    self.instance_capacity = 0;
+    submission.instance_buffer = .null_handle;
+    submission.instance_memory = .null_handle;
+    submission.instance_mapped = null;
+    submission.instance_capacity = 0;
 }
 
 fn hostMemoryType(self: *Self, memory_type_bits: u32) ?u32 {
@@ -6919,6 +6991,7 @@ fn colorFloats(
 
 fn copyOutputDamage(
     self: *Self,
+    work_buffer: vk.Buffer,
     command_buffer: vk.CommandBuffer,
     frame: render.Frame,
     target: render.PixelBuffer,
@@ -6927,10 +7000,10 @@ fn copyOutputDamage(
     if (frame.damage) |damage| {
         for (damage) |rect| {
             const clipped = rect.clipTo(frame.size) orelse continue;
-            self.copyOutputRect(command_buffer, target, image, clipped);
+            self.copyOutputRect(work_buffer, command_buffer, target, image, clipped);
         }
     } else {
-        self.copyOutputRect(command_buffer, target, image, .{
+        self.copyOutputRect(work_buffer, command_buffer, target, image, .{
             .x = 0,
             .y = 0,
             .width = frame.size.width,
@@ -6941,6 +7014,7 @@ fn copyOutputDamage(
 
 fn copyOutputRect(
     self: *Self,
+    work_buffer: vk.Buffer,
     command_buffer: vk.CommandBuffer,
     target: render.PixelBuffer,
     image: vk.Image,
@@ -6961,13 +7035,14 @@ fn copyOutputRect(
         command_buffer,
         image,
         .transfer_src_optimal,
-        self.work_buffer,
+        work_buffer,
         &.{copy},
     );
 }
 
 fn copyTextureRect(
     self: *Self,
+    work_buffer: vk.Buffer,
     command_buffer: vk.CommandBuffer,
     image: vk.Image,
     buffer: render.PixelBuffer,
@@ -6987,7 +7062,7 @@ fn copyTextureRect(
     };
     self.device_wrapper.cmdCopyBufferToImage(
         command_buffer,
-        self.work_buffer,
+        work_buffer,
         image,
         .transfer_dst_optimal,
         &.{upload},
@@ -7193,6 +7268,7 @@ fn transitionRenderToExternal(
         .size = .{ .width = 0, .height = 0 },
         .last_used = 0,
         .linear = undefined,
+        .submission = undefined,
     };
     self.transitionExternal(
         command_buffer,
@@ -7223,6 +7299,7 @@ fn transitionExternalSourceToSample(
         .size = .{ .width = 0, .height = 0 },
         .last_used = 0,
         .linear = undefined,
+        .submission = undefined,
     };
     self.transitionExternal(
         command_buffer,
@@ -7253,6 +7330,7 @@ fn transitionSampleToExternal(
         .size = .{ .width = 0, .height = 0 },
         .last_used = 0,
         .linear = undefined,
+        .submission = undefined,
     };
     self.transitionExternal(
         command_buffer,
@@ -7694,8 +7772,6 @@ test "recorded Vulkan frames match only identical command topology" {
     var renderer: Self = undefined;
     renderer.allocator = std.testing.allocator;
     renderer.resource_epoch = 7;
-    renderer.work_buffer = .null_handle;
-    renderer.instance_buffer = .null_handle;
     renderer.draw_runs = .empty;
     defer renderer.draw_runs.deinit(std.testing.allocator);
     renderer.blur_ops = .empty;
@@ -7741,28 +7817,32 @@ test "recorded Vulkan frames match only identical command topology" {
 
     var recorded: RecordedFrame = .{};
     defer recorded.deinit(std.testing.allocator);
+    var submission: Submission = undefined;
+    submission.work_buffer = .null_handle;
+    submission.instance_buffer = .null_handle;
+    submission.timestamp_query_pool = .null_handle;
     const render_area: render.Rect = .{ .x = 0, .y = 0, .width = 2, .height = 1 };
 
-    try renderer.rememberRecordedFrame(&recorded, true, 0, render_area, &prepared);
-    try std.testing.expect(renderer.recordedFrameMatches(&recorded, true, 0, render_area, &prepared));
-    try std.testing.expect(!renderer.recordedFrameMatches(&recorded, true, 1, render_area, &prepared));
-    try std.testing.expect(!renderer.recordedFrameMatches(&recorded, true, 0, .{ .x = 1, .y = 0, .width = 1, .height = 1 }, &prepared));
+    try renderer.rememberRecordedFrame(&submission, &recorded, true, 0, render_area, &prepared);
+    try std.testing.expect(renderer.recordedFrameMatches(&submission, &recorded, true, 0, render_area, &prepared));
+    try std.testing.expect(!renderer.recordedFrameMatches(&submission, &recorded, true, 1, render_area, &prepared));
+    try std.testing.expect(!renderer.recordedFrameMatches(&submission, &recorded, true, 0, .{ .x = 1, .y = 0, .width = 1, .height = 1 }, &prepared));
 
     try renderer.blur_ops.append(std.testing.allocator, .{
         .run_index = 0,
         .sample_rect = .{ .x = 0, .y = 0, .width = 1, .height = 1 },
     });
-    try std.testing.expect(!renderer.recordedFrameMatches(&recorded, true, 0, render_area, &prepared));
+    try std.testing.expect(!renderer.recordedFrameMatches(&submission, &recorded, true, 0, render_area, &prepared));
     renderer.blur_ops.clearRetainingCapacity();
 
     damage[0].x = 1;
-    try std.testing.expect(!renderer.recordedFrameMatches(&recorded, true, 0, render_area, &prepared));
+    try std.testing.expect(!renderer.recordedFrameMatches(&submission, &recorded, true, 0, render_area, &prepared));
     damage[0].x = 0;
     renderer.draw_runs.items[0].instance_count = 2;
-    try std.testing.expect(!renderer.recordedFrameMatches(&recorded, true, 0, render_area, &prepared));
+    try std.testing.expect(!renderer.recordedFrameMatches(&submission, &recorded, true, 0, render_area, &prepared));
     renderer.draw_runs.items[0].instance_count = 1;
     renderer.advanceResourceEpoch();
-    try std.testing.expect(!renderer.recordedFrameMatches(&recorded, true, 0, render_area, &prepared));
+    try std.testing.expect(!renderer.recordedFrameMatches(&submission, &recorded, true, 0, render_area, &prepared));
 }
 
 test "Vulkan renderer clears and clips solid rectangles" {
@@ -9715,7 +9795,7 @@ test "reproducible scene: Vulkan preserves command order in a mixed GPU frame" {
     try std.testing.expectEqualSlices(u32, &.{ untouched, 0xff00ff00 }, &target_pixels);
 }
 
-test "Vulkan renderer reuses and grows frame resources" {
+test "Vulkan renderer reuses frame resources per target" {
     var renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
         error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
         else => return err,
@@ -9732,12 +9812,16 @@ test "Vulkan renderer reuses and grows frame resources" {
         .size = small.size,
         .commands = &.{.{ .clear = render.Color.rgba(1, 2, 3, 255) }},
     }, .{ .pixels = small });
-    const initial_buffer = renderer.work_buffer;
+    const small_key = targetKey(.{ .pixels = small });
+    const initial_buffer = renderer.outputs.getPtr(small_key).?.submission.work_buffer;
     try renderer.renderFrame(.{
         .size = small.size,
         .commands = &.{.{ .clear = render.Color.rgba(4, 5, 6, 255) }},
     }, .{ .pixels = small });
-    try std.testing.expectEqual(initial_buffer, renderer.work_buffer);
+    try std.testing.expectEqual(
+        initial_buffer,
+        renderer.outputs.getPtr(small_key).?.submission.work_buffer,
+    );
     try std.testing.expectEqual(@as(u32, 0xff040506), small_pixels[0]);
 
     var large_pixels = [_]u32{0} ** 4;
@@ -9750,14 +9834,21 @@ test "Vulkan renderer reuses and grows frame resources" {
         .size = large.size,
         .commands = &.{.{ .clear = render.Color.rgba(7, 8, 9, 255) }},
     }, .{ .pixels = large });
-    try std.testing.expectEqual(@as(usize, 4 * @sizeOf(u32)), renderer.work_capacity);
+    const large_key = targetKey(.{ .pixels = large });
+    try std.testing.expectEqual(
+        @as(usize, 4 * @sizeOf(u32)),
+        renderer.outputs.getPtr(large_key).?.submission.work_capacity,
+    );
     try std.testing.expectEqualSlices(u32, &([_]u32{0xff070809} ** 4), &large_pixels);
 
     try renderer.renderFrame(.{
         .size = small.size,
         .commands = &.{.{ .clear = render.Color.rgba(10, 11, 12, 255) }},
     }, .{ .pixels = small });
-    try std.testing.expectEqual(@as(usize, 4 * @sizeOf(u32)), renderer.work_capacity);
+    try std.testing.expectEqual(
+        @as(usize, @sizeOf(u32)),
+        renderer.outputs.getPtr(small_key).?.submission.work_capacity,
+    );
     try std.testing.expectEqual(@as(u32, 0xff0a0b0c), small_pixels[0]);
 }
 
@@ -9767,10 +9858,12 @@ test "Vulkan renderer reports tagged GPU timestamps for cached frames" {
         else => return err,
     };
     defer renderer.deinit();
-    if (renderer.timestamp_query_pool == .null_handle) return error.SkipZigTest;
 
     const target = try renderer.createOffscreenTarget(.{ .width = 1, .height = 1 });
     defer renderer.releaseOutput(.{ .offscreen = target.id });
+    if (renderer.outputs.getPtr(.{ .offscreen = target.id }).?.submission.timestamp_query_pool == .null_handle) {
+        return error.SkipZigTest;
+    }
     const frame: render.Frame = .{
         .size = target.size,
         .commands = &.{.{ .clear = render.Color.rgba(1, 2, 3, 255) }},
@@ -9786,6 +9879,38 @@ test "Vulkan renderer reports tagged GPU timestamps for cached frames" {
     try std.testing.expectEqual(@as(u64, 18), cached_timing.tag);
     try std.testing.expect(cached_timing.pass_timings_available);
     try std.testing.expect(renderer.takeGpuTiming() == null);
+}
+
+test "Vulkan renderer keeps independent output submissions in flight" {
+    var renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
+        error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+
+    const first = try renderer.createOffscreenTarget(.{ .width = 1, .height = 1 });
+    defer renderer.releaseOutput(.{ .offscreen = first.id });
+    const second = try renderer.createOffscreenTarget(.{ .width = 1, .height = 1 });
+    defer renderer.releaseOutput(.{ .offscreen = second.id });
+    const frame: render.Frame = .{
+        .size = first.size,
+        .commands = &.{.{ .clear = render.Color.rgba(1, 2, 3, 255) }},
+    };
+
+    _ = try renderer.renderFrameScanout(frame, .{ .offscreen = first }, null);
+    try std.testing.expect(renderer.outputs.getPtr(.{ .offscreen = first.id }).?.submission.fence_pending);
+
+    _ = try renderer.renderFrameScanout(frame, .{ .offscreen = second }, null);
+    try std.testing.expect(renderer.outputs.getPtr(.{ .offscreen = first.id }).?.submission.fence_pending);
+    try std.testing.expect(renderer.outputs.getPtr(.{ .offscreen = second.id }).?.submission.fence_pending);
+    try std.testing.expect(
+        renderer.outputs.getPtr(.{ .offscreen = first.id }).?.submission.instance_buffer !=
+            renderer.outputs.getPtr(.{ .offscreen = second.id }).?.submission.instance_buffer,
+    );
+
+    try renderer.drainAllPending();
+    try std.testing.expect(!renderer.outputs.getPtr(.{ .offscreen = first.id }).?.submission.fence_pending);
+    try std.testing.expect(!renderer.outputs.getPtr(.{ .offscreen = second.id }).?.submission.fence_pending);
 }
 
 test "timestamp durations handle device counter wraparound" {
