@@ -4279,10 +4279,32 @@ fn nativePointerMotion(context: *anyopaque, id: NativeInput.DeviceId, time: u32,
     pointerMotionForSeat(output, output.server.seatForDevice(id), time, x, y);
 }
 fn nativePointerRelativeMotion(context: *anyopaque, id: NativeInput.DeviceId, time: u64, dx: f64, dy: f64, dx_unaccelerated: f64, dy_unaccelerated: f64) void {
-    const self = serverForOutput(context);
-    if (self.seatForDevice(id) == &self.seat) {
+    const output: *RenderOutput = @ptrCast(@alignCast(context));
+    const self = output.server;
+    const seat = self.seatForDevice(id);
+    if (seat == &self.seat) {
         self.relative_pointer.motion(time, dx, dy, dx_unaccelerated, dy_unaccelerated);
     }
+    const current: RenderOutput.Point = if (seat.pointerPosition()) |position|
+        .{ .x = position.x, .y = position.y }
+    else initial: {
+        const size = output.backend.size();
+        break :initial output.globalPoint(
+            @as(f64, @floatFromInt(size.width)) / 2,
+            @as(f64, @floatFromInt(size.height)) / 2,
+        );
+    };
+    const point = self.constrainPointerToOutputs(.{
+        .x = current.x + dx,
+        .y = current.y + dy,
+    }) orelse return;
+    self.pointerMotionGlobalForSeat(
+        self.renderOutputAt(point.x, point.y),
+        seat,
+        @truncate(time / std.time.us_per_ms),
+        point.x,
+        point.y,
+    );
 }
 fn nativePointerButton(context: *anyopaque, id: NativeInput.DeviceId, time: u32, button: u32, state: wl.Pointer.ButtonState) void {
     const self = serverForOutput(context);
@@ -5042,8 +5064,12 @@ fn pointerMotionGlobalForSeat(
     }
     const motion = self.pointer_constraints.constrainMotion(.{ .x = x, .y = y });
     if (motion.point.x != x or motion.point.y != y) {
-        if (backend_output) |output| {
-            self.synchronizeBackendPointer(output, motion.point.x, motion.point.y);
+        if (backend_output != null) {
+            self.synchronizeBackendPointer(
+                self.renderOutputAt(motion.point.x, motion.point.y),
+                motion.point.x,
+                motion.point.y,
+            );
         }
     }
     if (motion.locked) return;
@@ -5124,6 +5150,34 @@ fn renderOutputAt(self: *Self, x: f64, y: f64) *RenderOutput {
         if (pointInRect(x, y, protocol_output.logicalRect())) return output;
     }
     return self.primaryRenderOutput();
+}
+
+fn constrainPointerToOutputs(self: *Self, point: RenderOutput.Point) ?RenderOutput.Point {
+    std.debug.assert(std.math.isFinite(point.x) and std.math.isFinite(point.y));
+    var closest: ?RenderOutput.Point = null;
+    var closest_distance: ?f64 = null;
+    var outputs = self.outputs.iterator();
+    while (outputs.next()) |entry| {
+        const rect = entry.output.logicalRect();
+        std.debug.assert(rect.width > 0 and rect.height > 0);
+        const left: f64 = @floatFromInt(rect.x);
+        const top: f64 = @floatFromInt(rect.y);
+        const right = left + @as(f64, @floatFromInt(rect.width - 1));
+        const bottom = top + @as(f64, @floatFromInt(rect.height - 1));
+        const candidate: RenderOutput.Point = .{
+            .x = std.math.clamp(point.x, left, right),
+            .y = std.math.clamp(point.y, top, bottom),
+        };
+        const dx = candidate.x - point.x;
+        const dy = candidate.y - point.y;
+        const distance = dx * dx + dy * dy;
+        if (distance == 0) return point;
+        if (closest_distance == null or distance < closest_distance.?) {
+            closest = candidate;
+            closest_distance = distance;
+        }
+    }
+    return closest;
 }
 
 fn clampVirtualPointerCoordinate(value: f64, origin: f64, dimension: f64) f64 {
@@ -5235,7 +5289,7 @@ fn pointerWarp(context: *anyopaque, surface_id: Surface.Id, x: f64, y: f64) void
     const self: *Self = @ptrCast(@alignCast(context));
     const position = self.seat.warpPointer(surface_id, x, y) orelse return;
     self.synchronizeBackendPointer(
-        self.primaryRenderOutput(),
+        self.renderOutputAt(position.x, position.y),
         position.x,
         position.y,
     );
@@ -8960,6 +9014,30 @@ test "server adds and removes independent render outputs" {
     try std.testing.expectEqual(
         Output.Position{ .x = 1280 },
         server.outputs.get(second.protocol_id).?.logicalPosition(),
+    );
+}
+
+test "pointer motion crosses adjacent outputs and avoids layout gaps" {
+    const server = try Self.create(std.testing.allocator, std.testing.io, .cpu, .headless, null);
+    defer server.destroy();
+
+    const second_id = try server.addRenderOutput(std.testing.io, .{
+        .kind = .headless,
+        .size = .{ .width = 640, .height = 480 },
+        .position = .{ .x = 1280, .y = 240 },
+        .name = "HEADLESS-2",
+        .description = "Keywork test output",
+        .model = "headless",
+    });
+    defer std.debug.assert(server.removeRenderOutput(second_id));
+
+    try std.testing.expectEqual(
+        RenderOutput.Point{ .x = 1280.25, .y = 300 },
+        server.constrainPointerToOutputs(.{ .x = 1280.25, .y = 300 }).?,
+    );
+    try std.testing.expectEqual(
+        RenderOutput.Point{ .x = 1279, .y = 100 },
+        server.constrainPointerToOutputs(.{ .x = 1280.25, .y = 100 }).?,
     );
 }
 

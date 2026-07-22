@@ -1685,21 +1685,6 @@ fn pointerMotion(self: *Self, event: *c.struct_libinput_event_pointer) void {
         c.libinput_event_pointer_get_dx_unaccelerated(event),
         c.libinput_event_pointer_get_dy_unaccelerated(event),
     );
-    self.pointer_x = clampCoordinate(
-        self.pointer_x + c.libinput_event_pointer_get_dx(event),
-        self.size.width,
-    );
-    self.pointer_y = clampCoordinate(
-        self.pointer_y + c.libinput_event_pointer_get_dy(event),
-        self.size.height,
-    );
-    self.listener.pointer_motion(
-        self.listener.context,
-        device.info.id,
-        c.libinput_event_pointer_get_time(event),
-        self.pointer_x,
-        self.pointer_y,
-    );
     self.listener.pointer_frame(self.listener.context, device.info.id);
 }
 
