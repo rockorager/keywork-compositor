@@ -30,10 +30,11 @@ const OutputState = struct {
     output: OutputLayout.Id,
     active: u8 = 1,
     occupied: [workspace_count]bool = @splat(false),
+    urgent: [workspace_count]bool = @splat(false),
 
     fn isAdvertised(self: OutputState, number: u8) bool {
         std.debug.assert(number >= 1 and number <= workspace_count);
-        return self.active == number or self.occupied[number - 1];
+        return self.active == number or self.occupied[number - 1] or self.urgent[number - 1];
     }
 };
 
@@ -77,7 +78,14 @@ const Binding = struct {
         for (1..workspace_count + 1) |number| {
             const workspace_number: u8 = @intCast(number);
             if (!state.isAdvertised(workspace_number)) continue;
-            try WorkspaceResource.create(self, manager, state.output, workspace_number, state.active == number);
+            try WorkspaceResource.create(
+                self,
+                manager,
+                state.output,
+                workspace_number,
+                state.active == number,
+                state.urgent[number - 1],
+            );
         }
     }
 
@@ -249,6 +257,7 @@ const WorkspaceResource = struct {
         output_id: OutputLayout.Id,
         number: u8,
         active: bool,
+        urgent: bool,
     ) !void {
         std.debug.assert(number >= 1 and number <= workspace_count);
         const self = try binding.owner.allocator.create(WorkspaceResource);
@@ -272,7 +281,7 @@ const WorkspaceResource = struct {
             .data = @ptrCast(&coordinate),
         };
         resource.sendCoordinates(&coordinates);
-        resource.sendState(.{ .active = active });
+        resource.sendState(.{ .active = active, .urgent = urgent });
         resource.sendCapabilities(.{ .activate = true });
         if (binding.groupFor(output_id)) |group| {
             if (group.resource) |group_resource| group_resource.sendWorkspaceEnter(resource);
@@ -401,7 +410,14 @@ pub fn setOccupied(self: *Self, output: OutputLayout.Id, number: u8, occupied: b
     for (self.bindings.items) |binding| {
         const manager = binding.manager orelse continue;
         if (is_advertised) {
-            WorkspaceResource.create(binding, manager, output, number, state.active == number) catch {
+            WorkspaceResource.create(
+                binding,
+                manager,
+                output,
+                number,
+                state.active == number,
+                state.urgent[number - 1],
+            ) catch {
                 manager.postNoMemory();
                 continue;
             };
@@ -409,6 +425,36 @@ pub fn setOccupied(self: *Self, output: OutputLayout.Id, number: u8, occupied: b
             binding.removeWorkspace(output, number);
         }
         manager.sendDone();
+    }
+}
+
+pub fn setUrgent(self: *Self, output: OutputLayout.Id, number: u8, urgent: bool) void {
+    if (number == 0 or number > workspace_count) return;
+    const state = self.outputState(output) orelse return;
+    const was_advertised = state.isAdvertised(number);
+    if (!self.updateUrgent(output, number, urgent)) return;
+    const is_advertised = state.isAdvertised(number);
+    for (self.bindings.items) |binding| {
+        const manager = binding.manager orelse continue;
+        if (binding.workspaceFor(output, number)) |workspace| {
+            workspace.resource.sendState(.{
+                .active = state.active == number,
+                .urgent = urgent,
+            });
+            if (!is_advertised) binding.removeWorkspace(output, number);
+        } else if (is_advertised) {
+            WorkspaceResource.create(
+                binding,
+                manager,
+                output,
+                number,
+                state.active == number,
+                urgent,
+            ) catch manager.postNoMemory();
+        }
+        if (was_advertised != is_advertised or binding.workspaceFor(output, number) != null) {
+            manager.sendDone();
+        }
     }
 }
 
@@ -421,12 +467,25 @@ fn updateActive(self: *Self, output: OutputLayout.Id, number: u8) bool {
     for (self.bindings.items) |binding| {
         const manager = binding.manager orelse continue;
         if (binding.workspaceFor(output, number)) |workspace| {
-            workspace.resource.sendState(.{ .active = true });
+            workspace.resource.sendState(.{
+                .active = true,
+                .urgent = state.urgent[number - 1],
+            });
         } else {
-            WorkspaceResource.create(binding, manager, output, number, true) catch manager.postNoMemory();
+            WorkspaceResource.create(
+                binding,
+                manager,
+                output,
+                number,
+                true,
+                state.urgent[number - 1],
+            ) catch manager.postNoMemory();
         }
         if (binding.workspaceFor(output, previous)) |workspace| {
-            workspace.resource.sendState(.{ .active = false });
+            workspace.resource.sendState(.{
+                .active = false,
+                .urgent = state.urgent[previous - 1],
+            });
             if (!state.isAdvertised(previous)) binding.removeWorkspace(output, previous);
         }
     }
@@ -438,6 +497,14 @@ fn updateOccupied(self: *Self, output: OutputLayout.Id, number: u8, occupied: bo
     const state = self.outputState(output) orelse return false;
     if (state.occupied[number - 1] == occupied) return false;
     state.occupied[number - 1] = occupied;
+    return true;
+}
+
+fn updateUrgent(self: *Self, output: OutputLayout.Id, number: u8, urgent: bool) bool {
+    if (number == 0 or number > workspace_count) return false;
+    const state = self.outputState(output) orelse return false;
+    if (state.urgent[number - 1] == urgent) return false;
+    state.urgent[number - 1] = urgent;
     return true;
 }
 
@@ -508,6 +575,28 @@ test "workspace model tracks occupied workspaces per output" {
     try std.testing.expect(!workspace.updateOccupied(first, 10, true));
     try std.testing.expect(workspace.updateOccupied(first, 10, false));
     try std.testing.expect(!workspace.updateOccupied(first, 0, true));
+}
+
+test "workspace urgency is independent per output and keeps a workspace advertised" {
+    var workspace: Self = undefined;
+    workspace.output_states = .empty;
+    workspace.bindings = .empty;
+    defer workspace.output_states.deinit(std.testing.allocator);
+    defer workspace.bindings.deinit(std.testing.allocator);
+
+    const first: OutputLayout.Id = .{ .index = 1, .generation = 1 };
+    const second: OutputLayout.Id = .{ .index = 2, .generation = 1 };
+    try workspace.output_states.append(std.testing.allocator, .{ .output = first });
+    try workspace.output_states.append(std.testing.allocator, .{ .output = second });
+
+    try std.testing.expect(workspace.updateUrgent(first, 10, true));
+    try std.testing.expect(workspace.outputState(first).?.urgent[9]);
+    try std.testing.expect(workspace.outputState(first).?.isAdvertised(10));
+    try std.testing.expect(!workspace.outputState(second).?.urgent[9]);
+    try std.testing.expect(!workspace.updateUrgent(first, 10, true));
+    try std.testing.expect(workspace.updateUrgent(first, 10, false));
+    try std.testing.expect(!workspace.outputState(first).?.isAdvertised(10));
+    try std.testing.expect(!workspace.updateUrgent(first, 0, true));
 }
 
 test "workspace names match their numbers" {

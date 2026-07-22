@@ -1796,6 +1796,11 @@ pub fn createWithVirtualOutput(
         self.window_manager.deinit();
         self.window_manager_initialized = false;
     }
+    self.xdg_activation.setActivationListener(.{
+        .context = self,
+        .requested = xdgActivationRequested,
+    });
+    errdefer self.xdg_activation.clearActivationListener();
     try self.xdg_toplevel_drag.init(
         allocator,
         display,
@@ -2095,6 +2100,7 @@ pub fn destroy(self: *Self) void {
     self.xdg_dialog.deinit();
     self.xdg_toplevel_icon.deinit();
     self.xdg_toplevel_drag.deinit();
+    self.xdg_activation.clearActivationListener();
     self.window_manager.deinit();
     self.window_manager_initialized = false;
     self.workspace.deinit();
@@ -4070,8 +4076,20 @@ fn workspaceActivationRequested(context: *anyopaque, output: OutputLayout.Id, nu
     return self.window_manager.activateWorkspaceFromProtocol(output, number);
 }
 
+fn xdgActivationRequested(
+    context: *anyopaque,
+    surface_id: Surface.Id,
+    proven_interaction: bool,
+) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    if (!self.window_manager_initialized) return;
+    const allow_focus = proven_interaction and !self.session_lock.isLocked();
+    if (self.window_manager.activationRequested(surface_id, allow_focus)) requestRepaint(self);
+}
+
 fn sessionLockStateChanged(context: *anyopaque, locked: bool) void {
     const self: *Self = @ptrCast(@alignCast(context));
+    if (self.window_manager_initialized) self.window_manager.setSessionLocked(locked);
     self.refreshIdleInhibition();
     self.reconcileOutputCursors();
     if (locked) self.xwayland_keyboard_grab.cancelAll();

@@ -43,6 +43,7 @@ workspaces: std.ArrayList(OutputWorkspace) = .empty,
 transaction: Transaction = .{},
 configure_timer: *wl.EventSource,
 layer_focus: LayerShell.FocusClass = .none,
+session_locked: bool = false,
 focus_follows_mouse: bool = true,
 inner_gap: u32 = 16,
 outer_gap: u32 = 16,
@@ -148,6 +149,8 @@ const Window = struct {
     minimized: bool = false,
     maximized: bool = false,
     fullscreen_output: ?OutputLayout.Id = null,
+    urgent: bool = false,
+    pending_activation: bool = false,
 
     const Backend = union(enum) {
         xdg: XdgShell.WindowId,
@@ -433,6 +436,8 @@ fn syncTransientWorkspaces(self: *Self) error{OutOfMemory}!void {
             entry.value.workspace = target;
             self.reportWorkspaceOccupancy(source);
             self.reportWorkspaceOccupancy(target);
+            self.reportWorkspaceUrgency(source);
+            self.reportWorkspaceUrgency(target);
             changed = true;
         }
         if (!changed) return;
@@ -498,6 +503,7 @@ fn removeId(self: *Self, id: WindowId) void {
     var window = self.windows.remove(id).?;
     _ = self.workspaces.items[window.workspace].workspace.remove(neutral(id));
     self.reportWorkspaceOccupancy(window.workspace);
+    self.reportWorkspaceUrgency(window.workspace);
     window.tags.deinit(self.allocator);
     if (self.transaction.removed(pending)) self.publish();
     self.relayout();
@@ -533,6 +539,18 @@ fn addXwayland(self: *Self, xwayland_id: Xwm.WindowId) !?WindowId {
 fn reportWorkspaceOccupancy(self: *Self, index: usize) void {
     const entry = &self.workspaces.items[index];
     self.workspace_protocol.setOccupied(entry.output, entry.number, entry.workspace.members.items.len != 0);
+}
+
+fn reportWorkspaceUrgency(self: *Self, index: usize) void {
+    const entry = &self.workspaces.items[index];
+    for (entry.workspace.members.items) |member| {
+        const window = self.windows.get(internal(member)) orelse continue;
+        if (window.urgent) {
+            self.workspace_protocol.setUrgent(entry.output, entry.number, true);
+            return;
+        }
+    }
+    self.workspace_protocol.setUrgent(entry.output, entry.number, false);
 }
 
 fn workspaceFor(self: *Self, output: OutputLayout.Id) ?usize {
@@ -623,6 +641,7 @@ pub fn outputRemoved(self: *Self, output: OutputLayout.Id) error{OutOfMemory}!vo
             }
         }
     }
+    self.reportWorkspaceUrgency(replacement_index);
     var index = self.workspaces.items.len;
     while (index > 0) {
         index -= 1;
@@ -734,6 +753,111 @@ pub fn focusedSurface(self: *Self) ?Surface.Id {
     const window = self.windows.get(internal(focused)) orelse return null;
     if (window.minimized or !window.mapped) return null;
     return window.surface_id;
+}
+
+/// Applies xdg-activation policy to a managed surface. Requests without
+/// interaction provenance notify the shell without stealing focus.
+pub fn activationRequested(
+    self: *Self,
+    surface_id: Surface.Id,
+    proven_interaction: bool,
+) bool {
+    const id = self.windowForSurface(surface_id) orelse return false;
+    if (!proven_interaction or self.layer_focus == .exclusive) {
+        _ = self.setWindowUrgent(id, true);
+        return false;
+    }
+    const window = self.windows.get(id) orelse return false;
+    if (!window.mapped) {
+        window.pending_activation = true;
+        return false;
+    }
+    return self.activateWindow(id);
+}
+
+fn activateWindow(self: *Self, id: WindowId) bool {
+    if (self.session_locked or self.layer_focus == .exclusive) {
+        _ = self.setWindowUrgent(id, true);
+        return false;
+    }
+    const window = self.windows.get(id) orelse return false;
+    std.debug.assert(window.mapped);
+    const was_minimized = window.minimized;
+    window.minimized = false;
+    const urgency_changed = self.setWindowUrgent(id, false);
+    const workspace_index = window.workspace;
+    const workspace = &self.workspaces.items[workspace_index];
+    const target = neutral(id);
+    const focus_changed = workspace.workspace.focused == null or
+        !workspace.workspace.focused.?.eql(target);
+    if (focus_changed) {
+        const changed = workspace.workspace.focus(target);
+        std.debug.assert(changed);
+    }
+    _ = self.layer_shell.relinquishNonExclusiveFocus();
+    if (!workspace.active) {
+        const activated = self.activateWorkspace(workspace.output, workspace.number, true);
+        std.debug.assert(activated);
+        return true;
+    }
+
+    const output_changed = !std.meta.eql(self.default_output, workspace.output);
+    self.default_output = workspace.output;
+    const changed = was_minimized or urgency_changed or focus_changed or output_changed;
+    if (changed) self.relayout();
+    return changed;
+}
+
+fn setWindowUrgent(self: *Self, id: WindowId, urgent: bool) bool {
+    const window = self.windows.get(id) orelse return false;
+    const workspace = &self.workspaces.items[window.workspace];
+    if (urgent and self.selectionOwnsKeyboardFocus() and
+        window.mapped and !window.minimized and workspace.active and
+        std.meta.eql(self.default_output, workspace.output) and
+        workspace.workspace.focused != null and workspace.workspace.focused.?.eql(neutral(id)))
+    {
+        return false;
+    }
+    if (window.urgent == urgent) return false;
+    window.urgent = urgent;
+    self.reportWorkspaceUrgency(window.workspace);
+    return true;
+}
+
+pub fn setSessionLocked(self: *Self, locked: bool) void {
+    self.session_locked = locked;
+    if (!locked) self.clearFocusedUrgency();
+}
+
+fn selectionOwnsKeyboardFocus(self: *const Self) bool {
+    return !self.session_locked and self.layer_focus == .none;
+}
+
+test "workspace selection owns keyboard focus only without lock or layer focus" {
+    var manager: Self = undefined;
+    manager.session_locked = false;
+    manager.layer_focus = .none;
+    try std.testing.expect(manager.selectionOwnsKeyboardFocus());
+
+    manager.layer_focus = .non_exclusive;
+    try std.testing.expect(!manager.selectionOwnsKeyboardFocus());
+    manager.layer_focus = .exclusive;
+    try std.testing.expect(!manager.selectionOwnsKeyboardFocus());
+
+    manager.layer_focus = .none;
+    manager.session_locked = true;
+    try std.testing.expect(!manager.selectionOwnsKeyboardFocus());
+}
+
+fn clearFocusedUrgency(self: *Self) void {
+    if (!self.selectionOwnsKeyboardFocus()) return;
+    const workspace_index = self.workspaceFor(self.default_output) orelse return;
+    const workspace = &self.workspaces.items[workspace_index];
+    const focused = workspace.workspace.focused orelse return;
+    const window = self.windows.get(internal(focused)) orelse return;
+    if (!window.mapped or window.minimized or !window.urgent) return;
+    window.urgent = false;
+    self.reportWorkspaceUrgency(workspace_index);
 }
 
 pub fn setFocusFollowsMouse(self: *Self, enabled: bool) void {
@@ -1481,6 +1605,8 @@ pub fn moveFocusedToWorkspace(self: *Self, number: u8) void {
     self.windows.get(internal(id)).?.workspace = target;
     self.reportWorkspaceOccupancy(source);
     self.reportWorkspaceOccupancy(target);
+    self.reportWorkspaceUrgency(source);
+    self.reportWorkspaceUrgency(target);
     self.relayout();
 }
 pub fn addTagToFocused(self: *Self, tag: types.TagId) !void {
@@ -1781,6 +1907,7 @@ fn normalizeFocus(self: *Self, entry: *OutputWorkspace) void {
 }
 
 fn publish(self: *Self) void {
+    self.clearFocusedUrgency();
     var it = self.windows.iterator();
     while (it.next()) |entry| {
         const window = entry.value;
@@ -2277,8 +2404,11 @@ fn windowReady(context: *anyopaque, id: XdgShell.WindowId) bool {
 }
 fn windowCommitted(context: *anyopaque, id: XdgShell.WindowId, serial: ?u32) bool {
     const self: *Self = @ptrCast(@alignCast(context));
-    const window = self.windows.get(self.findXdg(id) orelse return false) orelse return false;
+    const managed = self.findXdg(id) orelse return false;
+    const window = self.windows.get(managed) orelse return false;
     window.mapped = true;
+    const pending_activation = window.pending_activation;
+    window.pending_activation = false;
     if (self.isFloating(window)) self.relayout();
     if (serial != null and window.serial == serial) {
         window.serial = null;
@@ -2286,6 +2416,7 @@ fn windowCommitted(context: *anyopaque, id: XdgShell.WindowId, serial: ?u32) boo
         // A gated commit may arrive after the configure barrier timed out.
         if (complete or self.transaction.state != .inflight) self.publish();
     }
+    if (pending_activation) _ = self.activateWindow(managed);
     return true;
 }
 fn windowUnmapped(context: *anyopaque, id: XdgShell.WindowId) void {

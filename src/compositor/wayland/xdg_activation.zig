@@ -27,6 +27,12 @@ seat: *Seat,
 tokens: std.StringHashMapUnmanaged(Token),
 expiry_timer: *wl.EventSource,
 token_resource_count: usize,
+activation_listener: ?ActivationListener,
+
+pub const ActivationListener = struct {
+    context: *anyopaque,
+    requested: *const fn (*anyopaque, Surface.Id, bool) void,
+};
 
 pub fn init(
     self: *Self,
@@ -43,6 +49,7 @@ pub fn init(
         .tokens = .empty,
         .expiry_timer = undefined,
         .token_resource_count = 0,
+        .activation_listener = null,
     };
     errdefer self.tokens.deinit(allocator);
     self.expiry_timer = try display.getEventLoop().addTimer(*Self, expireTokens, self);
@@ -52,11 +59,22 @@ pub fn init(
 
 pub fn deinit(self: *Self) void {
     std.debug.assert(self.token_resource_count == 0);
+    std.debug.assert(self.activation_listener == null);
     self.global.destroy();
     self.expiry_timer.remove();
     self.clearTokens();
     self.tokens.deinit(self.allocator);
     self.* = undefined;
+}
+
+pub fn setActivationListener(self: *Self, listener: ActivationListener) void {
+    std.debug.assert(self.activation_listener == null);
+    self.activation_listener = listener;
+}
+
+pub fn clearActivationListener(self: *Self) void {
+    std.debug.assert(self.activation_listener != null);
+    self.activation_listener = null;
 }
 
 fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
@@ -79,17 +97,19 @@ fn handleRequest(
             resource,
             get.id,
         ) catch resource.postNoMemory(),
-        .activate => |request_activate| self.activate(request_activate.token),
+        .activate => |request_activate| self.activate(
+            request_activate.token,
+            Surface.fromResource(request_activate.surface).handle(),
+        ),
     }
 }
 
-fn activate(self: *Self, token_z: [*:0]const u8) void {
+fn activate(self: *Self, token_z: [*:0]const u8, surface_id: Surface.Id) void {
     const removed = self.tokens.fetchRemove(std.mem.span(token_z)) orelse return;
     defer self.allocator.free(removed.key);
     if (removed.value.expires_at <= now(self.io)) return;
-
-    // Activation policy is not wired into the window manager yet. The stored
-    // interaction provenance must be forwarded when that boundary is added.
+    const listener = self.activation_listener orelse return;
+    listener.requested(listener.context, surface_id, removed.value.proven_interaction);
 }
 
 fn issueToken(
@@ -276,4 +296,48 @@ test "activation tokens use lowercase 128-bit hexadecimal identifiers" {
         "00112233445566778899aabbccddeeff",
         &encodeToken(bytes),
     );
+}
+
+test "valid activation tokens forward their target and interaction provenance once" {
+    const Capture = struct {
+        count: usize = 0,
+        surface_id: ?Surface.Id = null,
+        proven_interaction: bool = false,
+
+        fn requested(context: *anyopaque, surface_id: Surface.Id, proven_interaction: bool) void {
+            const capture: *@This() = @ptrCast(@alignCast(context));
+            capture.count += 1;
+            capture.surface_id = surface_id;
+            capture.proven_interaction = proven_interaction;
+        }
+    };
+
+    var capture: Capture = .{};
+    var manager: Self = undefined;
+    manager.allocator = std.testing.allocator;
+    manager.io = std.testing.io;
+    manager.tokens = .empty;
+    manager.activation_listener = .{
+        .context = &capture,
+        .requested = Capture.requested,
+    };
+    defer manager.tokens.deinit(std.testing.allocator);
+
+    const token: [:0]const u8 = "valid-token";
+    const key = try std.testing.allocator.dupe(u8, token);
+    errdefer std.testing.allocator.free(key);
+    try manager.tokens.put(std.testing.allocator, key, .{
+        .expires_at = std.math.maxInt(i96),
+        .proven_interaction = true,
+    });
+    const target: Surface.Id = .{ .index = 7, .generation = 3 };
+
+    manager.activate(token, target);
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expectEqual(target, capture.surface_id.?);
+    try std.testing.expect(capture.proven_interaction);
+    try std.testing.expectEqual(@as(usize, 0), manager.tokens.count());
+
+    manager.activate(token, target);
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
 }
