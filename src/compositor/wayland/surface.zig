@@ -882,6 +882,13 @@ pub fn currentOpaqueCoversBuffer(store: *Store, id: Id) bool {
 
 /// The returned region is borrowed until the surface's next applied commit or
 /// any store insertion that reallocates its slots.
+pub fn currentOpaque(store: *Store, id: Id) ?*const Region {
+    const surface_state = store.get(id) orelse return null;
+    return &surface_state.current_opaque;
+}
+
+/// The returned region is borrowed until the surface's next applied commit or
+/// any store insertion that reallocates its slots.
 pub fn currentDamage(store: *Store, id: Id) ?*const Region {
     const surface_state = store.get(id) orelse return null;
     return &surface_state.current_damage;

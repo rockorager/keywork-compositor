@@ -8436,6 +8436,16 @@ fn renderSurfaceTreeContents(
                         surface_id,
                         buffer,
                     ),
+                    .opaque_region = surfaceOpaqueRegion(
+                        self.compositor.surfaceStore(),
+                        surface_id,
+                        buffer,
+                        x,
+                        y,
+                        rounded_clip,
+                        clip,
+                        alpha_multiplier,
+                    ),
                     .alpha_multiplier = alpha_multiplier,
                 } },
             };
@@ -8552,6 +8562,35 @@ fn surfaceFullyOpaque(
 ) bool {
     return Surface.currentAlphaMultiplier(surfaces, surface_id) == std.math.maxInt(u32) and
         (buffer.force_opaque or Surface.currentOpaqueCoversBuffer(surfaces, surface_id));
+}
+
+fn surfaceOpaqueRegion(
+    surfaces: *Surface.Store,
+    surface_id: Surface.Id,
+    buffer: *const Surface.BufferSnapshot,
+    x: i32,
+    y: i32,
+    rounded_clip: ?render.RoundedClip,
+    clip: ?render.Rect,
+    alpha_multiplier: u32,
+) render.OpaqueRegion {
+    var result: render.OpaqueRegion = .{};
+    if (alpha_multiplier != std.math.maxInt(u32) or rounded_clip != null or
+        buffer.force_opaque or Surface.currentOpaqueCoversBuffer(surfaces, surface_id))
+    {
+        return result;
+    }
+    const region = Surface.currentOpaque(surfaces, surface_id) orelse return result;
+    var rectangles = region.rectangleIterator();
+    while (rectangles.next()) |rectangle| {
+        var opaque_rect = (surfaceEffectRect(rectangle, buffer.logical_size) orelse continue)
+            .translated(x, y);
+        if (clip) |clip_rect| {
+            opaque_rect = opaque_rect.intersection(clip_rect) orelse continue;
+        }
+        if (!result.append(opaque_rect)) break;
+    }
+    return result;
 }
 
 fn surfaceEffectRect(rectangle: Region.Rectangle, size: render.Size) ?render.Rect {

@@ -347,6 +347,9 @@ pub const Image = struct {
     rounded_clip: ?RoundedClip = null,
     clip: ?Rect = null,
     is_opaque: bool = false,
+    /// Opaque portions in the same coordinate space as x/y. This bounded hint
+    /// may omit rectangles, but every rectangle it contains must be opaque.
+    opaque_region: OpaqueRegion = .{},
     alpha_multiplier: u32 = std.math.maxInt(u32),
 
     pub fn samplingFilter(self: Image) SamplingFilter {
@@ -375,6 +378,39 @@ pub const Image = struct {
         return .nearest;
     }
 };
+
+pub const maximum_opaque_region_rectangles = 16;
+
+pub const OpaqueRegion = struct {
+    rectangles: [maximum_opaque_region_rectangles]Rect = undefined,
+    count: u8 = 0,
+
+    pub fn append(self: *OpaqueRegion, rectangle: Rect) bool {
+        if (rectangle.width == 0 or rectangle.height == 0 or
+            self.count == self.rectangles.len) return false;
+        self.rectangles[self.count] = rectangle;
+        self.count += 1;
+        return true;
+    }
+
+    pub fn slice(self: *const OpaqueRegion) []const Rect {
+        return self.rectangles[0..self.count];
+    }
+};
+
+test "opaque region bounds retained rectangle hints" {
+    var region: OpaqueRegion = .{};
+    for (0..maximum_opaque_region_rectangles) |index| {
+        try std.testing.expect(region.append(.{
+            .x = @intCast(index),
+            .y = 0,
+            .width = 1,
+            .height = 1,
+        }));
+    }
+    try std.testing.expect(!region.append(.{ .x = 20, .y = 0, .width = 1, .height = 1 }));
+    try std.testing.expectEqual(maximum_opaque_region_rectangles, region.slice().len);
+}
 
 pub const SamplingFilter = enum {
     nearest,

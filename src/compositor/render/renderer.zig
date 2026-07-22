@@ -11,6 +11,7 @@ pub const Renderer = struct {
     allocator: std.mem.Allocator,
     backend: Backend,
     commands: std.ArrayList(render_types.Command),
+    visible_commands: std.ArrayList(render_types.Command),
     sampled_tags: std.ArrayList(u64),
     active_frame: ?ActiveFrame,
 
@@ -58,6 +59,7 @@ pub const Renderer = struct {
                 .vulkan => .{ .vulkan = try VulkanRenderer.init(allocator, drm_device_id) },
             },
             .commands = .empty,
+            .visible_commands = .empty,
             .sampled_tags = .empty,
             .active_frame = null,
         };
@@ -66,6 +68,7 @@ pub const Renderer = struct {
     pub fn deinit(self: *Renderer) void {
         std.debug.assert(self.active_frame == null);
         self.commands.deinit(self.allocator);
+        self.visible_commands.deinit(self.allocator);
         self.sampled_tags.deinit(self.allocator);
         switch (self.backend) {
             .cpu => |*renderer| renderer.deinit(),
@@ -205,7 +208,9 @@ pub const Renderer = struct {
         const active = self.active_frame orelse unreachable;
         self.active_frame = null;
         defer self.commands.clearRetainingCapacity();
-        const commands = pruneOccludedCommands(
+        const commands = try pruneOccludedCommands(
+            self.allocator,
+            &self.visible_commands,
             self.commands.items,
             active.target.size(),
         );
@@ -259,7 +264,9 @@ pub const Renderer = struct {
         } else self.commands.items;
         // An excluded overlay must not hide primary-plane content needed when
         // the overlay is removed or rejected by a later atomic commit.
-        const commands = pruneOccludedCommands(
+        const commands = try pruneOccludedCommands(
+            self.allocator,
+            &self.visible_commands,
             unpruned_commands,
             active.target.size(),
         );
@@ -524,58 +531,115 @@ fn validateTarget(target: render_types.Target) Renderer.Error!void {
     if (pixels.pixels.len < required_pixels) return error.InvalidTarget;
 }
 
-/// Removes commands whose complete output is replaced by later opaque draws.
-/// Commands preceding a backdrop capture are kept relative to that capture,
+/// Removes or clips commands where later opaque draws replace their output.
+/// Commands preceding a backdrop capture are kept relative to that capture
 /// because the capture observes the target at its command-stream position.
 fn pruneOccludedCommands(
-    commands: []render_types.Command,
+    allocator: std.mem.Allocator,
+    result: *std.ArrayList(render_types.Command),
+    commands: []const render_types.Command,
     frame_size: render_types.Size,
-) []render_types.Command {
+) Renderer.Error![]const render_types.Command {
+    const maximum_command_fragments = 16;
+    result.clearRetainingCapacity();
+    try result.ensureTotalCapacity(allocator, commands.len);
+
     var coverage = Region.init();
     defer coverage.deinit();
+    var uncovered = Region.init();
+    defer uncovered.deinit();
 
     var read = commands.len;
-    var write = commands.len;
     while (read > 0) {
         read -= 1;
         const command = commands[read];
         if (std.meta.activeTag(command) == .backdrop_capture) {
             coverage.clear();
         } else if (commandVisibleRect(command, frame_size)) |visible| {
-            if (commandCanBePruned(command) and coverage.coversRectangle(
-                visible.x,
-                visible.y,
-                visible.width,
-                visible.height,
-            )) continue;
+            if (commandCanBePruned(command)) {
+                uncovered.setRectangle(visible.x, visible.y, visible.width, visible.height);
+                var covered_rectangles = coverage.rectangleIterator();
+                while (covered_rectangles.next()) |covered| {
+                    try uncovered.subtract(
+                        covered.x,
+                        covered.y,
+                        @intCast(covered.width),
+                        @intCast(covered.height),
+                    );
+                }
+                if (uncovered.isEmpty()) continue;
+
+                if (commandCanBeClipped(command)) {
+                    var rectangle_count: usize = 0;
+                    var rectangles = uncovered.rectangleIterator();
+                    while (rectangles.next() != null) rectangle_count += 1;
+                    if (rectangle_count <= maximum_command_fragments and
+                        !(rectangle_count == 1 and uncovered.coversRectangle(
+                            visible.x,
+                            visible.y,
+                            visible.width,
+                            visible.height,
+                        )))
+                    {
+                        var fragments: [maximum_command_fragments]render_types.Rect = undefined;
+                        rectangles = uncovered.rectangleIterator();
+                        var fragment_index: usize = 0;
+                        while (rectangles.next()) |rectangle| : (fragment_index += 1) {
+                            fragments[fragment_index] = .{
+                                .x = rectangle.x,
+                                .y = rectangle.y,
+                                .width = rectangle.width,
+                                .height = rectangle.height,
+                            };
+                        }
+                        while (fragment_index > 0) {
+                            fragment_index -= 1;
+                            try result.append(
+                                allocator,
+                                clipCommand(command, fragments[fragment_index]),
+                            );
+                        }
+                        try addOpaqueCommandCoverage(&coverage, command, frame_size);
+                        continue;
+                    }
+                }
+            }
         }
 
-        write -= 1;
-        commands[write] = command;
-
-        const opaque_rect = opaqueCommandRect(command, frame_size) orelse continue;
-        if (opaque_rect.width > std.math.maxInt(i32) or
-            opaque_rect.height > std.math.maxInt(i32)) continue;
-        coverage.add(
-            opaque_rect.x,
-            opaque_rect.y,
-            @intCast(opaque_rect.width),
-            @intCast(opaque_rect.height),
-        ) catch {
-            // Every command removed so far was independently covered. Keep the
-            // untouched prefix if pixman cannot extend the coverage region.
-            const start = write - read;
-            @memmove(commands[start..write], commands[0..read]);
-            return commands[start..];
-        };
+        try result.append(allocator, command);
+        try addOpaqueCommandCoverage(&coverage, command, frame_size);
     }
-    return commands[write..];
+    std.mem.reverse(render_types.Command, result.items);
+    return result.items;
 }
 
 fn commandCanBePruned(command: render_types.Command) bool {
     return switch (command) {
         .clear, .solid_rect, .image => true,
         .shadow, .backdrop_capture, .backdrop_blur => false,
+    };
+}
+
+fn commandCanBeClipped(command: render_types.Command) bool {
+    return switch (command) {
+        .solid_rect, .image => true,
+        .clear, .shadow, .backdrop_capture, .backdrop_blur => false,
+    };
+}
+
+fn clipCommand(command: render_types.Command, clip: render_types.Rect) render_types.Command {
+    return switch (command) {
+        .solid_rect => |solid| clipped: {
+            var result = solid;
+            result.clip = clip;
+            break :clipped .{ .solid_rect = result };
+        },
+        .image => |image| clipped: {
+            var result = image;
+            result.clip = clip;
+            break :clipped .{ .image = result };
+        },
+        .clear, .shadow, .backdrop_capture, .backdrop_blur => unreachable,
     };
 }
 
@@ -607,19 +671,42 @@ fn commandVisibleRect(
     };
 }
 
-fn opaqueCommandRect(
+fn addOpaqueCommandCoverage(
+    coverage: *Region,
     command: render_types.Command,
     frame_size: render_types.Size,
-) ?render_types.Rect {
+) Renderer.Error!void {
     switch (command) {
-        .clear => |color| if (color.alpha != std.math.maxInt(u8)) return null,
-        .solid_rect => |solid| if (solid.color.alpha != std.math.maxInt(u8)) return null,
-        .image => |image| if (!image.is_opaque or
-            image.alpha_multiplier != std.math.maxInt(u32) or
-            image.rounded_clip != null) return null,
-        .shadow, .backdrop_capture, .backdrop_blur => return null,
+        .clear => |color| if (color.alpha != std.math.maxInt(u8)) return,
+        .solid_rect => |solid| if (solid.color.alpha != std.math.maxInt(u8)) return,
+        .image => |image| {
+            if (image.alpha_multiplier != std.math.maxInt(u32) or
+                image.rounded_clip != null) return;
+            if (!image.is_opaque) {
+                const visible = commandVisibleRect(command, frame_size) orelse return;
+                for (image.opaque_region.slice()) |rectangle| {
+                    const clipped = rectangle.intersection(visible) orelse continue;
+                    try addCoverageRectangle(coverage, clipped);
+                }
+                return;
+            }
+        },
+        .shadow, .backdrop_capture, .backdrop_blur => return,
     }
-    return commandVisibleRect(command, frame_size);
+    if (commandVisibleRect(command, frame_size)) |rectangle| {
+        try addCoverageRectangle(coverage, rectangle);
+    }
+}
+
+fn addCoverageRectangle(coverage: *Region, rectangle: render_types.Rect) Renderer.Error!void {
+    if (rectangle.width > std.math.maxInt(i32) or
+        rectangle.height > std.math.maxInt(i32)) return;
+    try coverage.add(
+        rectangle.x,
+        rectangle.y,
+        @intCast(rectangle.width),
+        @intCast(rectangle.height),
+    );
 }
 
 fn translateCommand(
@@ -671,6 +758,7 @@ fn translateCommand(
             .source = image.source,
             .transform = image.transform,
             .is_opaque = image.is_opaque,
+            .opaque_region = translateOpaqueRegion(image.opaque_region, origin),
             .alpha_multiplier = image.alpha_multiplier,
             .rounded_clip = if (image.rounded_clip) |clip| .{
                 .rect = translateRect(clip.rect, origin),
@@ -752,6 +840,7 @@ fn scaleCommand(command: render_types.Command, scale: render_types.Scale) render
                 .source = image.source,
                 .transform = image.transform,
                 .is_opaque = image.is_opaque,
+                .opaque_region = scaleOpaqueRegion(image.opaque_region, scale),
                 .alpha_multiplier = image.alpha_multiplier,
                 .rounded_clip = if (image.rounded_clip) |clip| .{
                     .rect = scaleRect(clip.rect, scale),
@@ -761,6 +850,56 @@ fn scaleCommand(command: render_types.Command, scale: render_types.Scale) render
             } };
         },
     };
+}
+
+fn translateOpaqueRegion(
+    region: render_types.OpaqueRegion,
+    origin: render_types.Position,
+) render_types.OpaqueRegion {
+    var result: render_types.OpaqueRegion = .{};
+    for (region.slice()) |rectangle| {
+        _ = result.append(translateRect(rectangle, origin));
+    }
+    return result;
+}
+
+fn scaleOpaqueRegion(
+    region: render_types.OpaqueRegion,
+    scale: render_types.Scale,
+) render_types.OpaqueRegion {
+    var result: render_types.OpaqueRegion = .{};
+    for (region.slice()) |rectangle| {
+        const left = scaleCeil(@as(i64, rectangle.x), scale);
+        const top = scaleCeil(@as(i64, rectangle.y), scale);
+        const right = scaleFloor(@as(i64, rectangle.x) + rectangle.width, scale);
+        const bottom = scaleFloor(@as(i64, rectangle.y) + rectangle.height, scale);
+        if (left >= right or top >= bottom) continue;
+        _ = result.append(.{
+            .x = left,
+            .y = top,
+            .width = @intCast(@as(i64, right) - left),
+            .height = @intCast(@as(i64, bottom) - top),
+        });
+    }
+    return result;
+}
+
+fn scaleFloor(value: i64, scale: render_types.Scale) i32 {
+    const product = @as(i128, value) * scale.numerator;
+    return @intCast(std.math.clamp(
+        @divFloor(product, render_types.Scale.denominator),
+        std.math.minInt(i32),
+        std.math.maxInt(i32),
+    ));
+}
+
+fn scaleCeil(value: i64, scale: render_types.Scale) i32 {
+    const product = @as(i128, value) * scale.numerator;
+    return @intCast(std.math.clamp(
+        -@divFloor(-product, render_types.Scale.denominator),
+        std.math.minInt(i32),
+        std.math.maxInt(i32),
+    ));
 }
 
 fn scaleRect(rect: render_types.Rect, scale: render_types.Scale) render_types.Rect {
@@ -803,8 +942,29 @@ fn scaleUnsigned(value: u32, scale: render_types.Scale) u32 {
     ));
 }
 
+test "renderer transforms image opaque regions with their commands" {
+    var region: render_types.OpaqueRegion = .{};
+    try std.testing.expect(region.append(.{ .x = 11, .y = -3, .width = 2, .height = 4 }));
+
+    const translated = translateOpaqueRegion(region, .{ .x = 10, .y = -4 });
+    try std.testing.expectEqualSlices(
+        render_types.Rect,
+        &.{.{ .x = 1, .y = 1, .width = 2, .height = 4 }},
+        translated.slice(),
+    );
+
+    const scaled = scaleOpaqueRegion(translated, .{ .numerator = 180 });
+    try std.testing.expectEqualSlices(
+        render_types.Rect,
+        &.{.{ .x = 2, .y = 2, .width = 2, .height = 5 }},
+        scaled.slice(),
+    );
+}
+
 test "renderer prunes commands completely hidden by an opaque image" {
     const size: render_types.Size = .{ .width = 4, .height = 2 };
+    var result: std.ArrayList(render_types.Command) = .empty;
+    defer result.deinit(std.testing.allocator);
     var pixels = [_]u32{0xffffffff} ** 8;
     const image: render_types.Command = .{ .image = .{
         .x = 0,
@@ -826,7 +986,12 @@ test "renderer prunes commands completely hidden by an opaque image" {
         image,
     };
 
-    const pruned = pruneOccludedCommands(&commands, size);
+    const pruned = try pruneOccludedCommands(
+        std.testing.allocator,
+        &result,
+        &commands,
+        size,
+    );
     try std.testing.expectEqual(@as(usize, 1), pruned.len);
     try std.testing.expectEqual(.image, std.meta.activeTag(pruned[0]));
 
@@ -834,14 +999,24 @@ test "renderer prunes commands completely hidden by an opaque image" {
     translucent[1].image.is_opaque = false;
     try std.testing.expectEqual(
         @as(usize, 2),
-        pruneOccludedCommands(&translucent, size).len,
+        (try pruneOccludedCommands(
+            std.testing.allocator,
+            &result,
+            &translucent,
+            size,
+        )).len,
     );
 
     var multiplied = [_]render_types.Command{ commands[0], image };
     multiplied[1].image.alpha_multiplier = 0x8000_0000;
     try std.testing.expectEqual(
         @as(usize, 2),
-        pruneOccludedCommands(&multiplied, size).len,
+        (try pruneOccludedCommands(
+            std.testing.allocator,
+            &result,
+            &multiplied,
+            size,
+        )).len,
     );
 
     var rounded = [_]render_types.Command{ commands[0], image };
@@ -851,7 +1026,12 @@ test "renderer prunes commands completely hidden by an opaque image" {
     };
     try std.testing.expectEqual(
         @as(usize, 2),
-        pruneOccludedCommands(&rounded, size).len,
+        (try pruneOccludedCommands(
+            std.testing.allocator,
+            &result,
+            &rounded,
+            size,
+        )).len,
     );
 }
 
@@ -930,8 +1110,10 @@ test "renderer reports direct and overlay scanout image tags" {
     try std.testing.expect(renderer.wasSampled(42));
 }
 
-test "renderer combines opaque coverage without pruning partial overlap" {
+test "renderer clips lower commands around partial opaque coverage" {
     const size: render_types.Size = .{ .width = 4, .height = 2 };
+    var result: std.ArrayList(render_types.Command) = .empty;
+    defer result.deinit(std.testing.allocator);
     const lower: render_types.Command = .{ .solid_rect = .{
         .rect = .{ .x = 0, .y = 0, .width = 4, .height = 2 },
         .color = render_types.Color.rgba(255, 0, 0, 128),
@@ -947,19 +1129,81 @@ test "renderer combines opaque coverage without pruning partial overlap" {
     var covered = [_]render_types.Command{ lower, left, right };
     try std.testing.expectEqual(
         @as(usize, 2),
-        pruneOccludedCommands(&covered, size).len,
+        (try pruneOccludedCommands(
+            std.testing.allocator,
+            &result,
+            &covered,
+            size,
+        )).len,
     );
 
     var partial = [_]render_types.Command{ lower, left, right };
     partial[2].solid_rect.rect.width = 1;
-    try std.testing.expectEqual(
-        @as(usize, 3),
-        pruneOccludedCommands(&partial, size).len,
+    const clipped = try pruneOccludedCommands(
+        std.testing.allocator,
+        &result,
+        &partial,
+        size,
     );
+    try std.testing.expectEqual(@as(usize, 3), clipped.len);
+    try std.testing.expectEqual(
+        render_types.Rect{ .x = 3, .y = 0, .width = 1, .height = 2 },
+        clipped[0].solid_rect.clip.?,
+    );
+}
+
+test "renderer uses partial image opaque regions as coverage" {
+    const size: render_types.Size = .{ .width = 4, .height = 2 };
+    var result: std.ArrayList(render_types.Command) = .empty;
+    defer result.deinit(std.testing.allocator);
+    var pixels = [_]u32{0xffffffff} ** 8;
+    var opaque_region: render_types.OpaqueRegion = .{};
+    try std.testing.expect(opaque_region.append(.{
+        .x = 1,
+        .y = 0,
+        .width = 2,
+        .height = 2,
+    }));
+    const commands = [_]render_types.Command{
+        .{ .solid_rect = .{
+            .rect = .{ .x = 0, .y = 0, .width = 4, .height = 2 },
+            .color = render_types.Color.rgba(255, 0, 0, 128),
+        } },
+        .{ .image = .{
+            .x = 0,
+            .y = 0,
+            .size = size,
+            .buffer = .{
+                .size = size,
+                .stride_pixels = size.width,
+                .pixels = &pixels,
+            },
+            .opaque_region = opaque_region,
+        } },
+    };
+
+    const clipped = try pruneOccludedCommands(
+        std.testing.allocator,
+        &result,
+        &commands,
+        size,
+    );
+    try std.testing.expectEqual(@as(usize, 3), clipped.len);
+    try std.testing.expectEqual(
+        render_types.Rect{ .x = 0, .y = 0, .width = 1, .height = 2 },
+        clipped[0].solid_rect.clip.?,
+    );
+    try std.testing.expectEqual(
+        render_types.Rect{ .x = 3, .y = 0, .width = 1, .height = 2 },
+        clipped[1].solid_rect.clip.?,
+    );
+    try std.testing.expectEqual(.image, std.meta.activeTag(clipped[2]));
 }
 
 test "renderer preserves content observed by a backdrop capture" {
     const size: render_types.Size = .{ .width = 4, .height = 2 };
+    var result: std.ArrayList(render_types.Command) = .empty;
+    defer result.deinit(std.testing.allocator);
     var commands = [_]render_types.Command{
         .{ .solid_rect = .{
             .rect = .{ .x = 0, .y = 0, .width = 4, .height = 2 },
@@ -978,7 +1222,12 @@ test "renderer preserves content observed by a backdrop capture" {
 
     try std.testing.expectEqual(
         @as(usize, 3),
-        pruneOccludedCommands(&commands, size).len,
+        (try pruneOccludedCommands(
+            std.testing.allocator,
+            &result,
+            &commands,
+            size,
+        )).len,
     );
 }
 
