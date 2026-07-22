@@ -263,7 +263,7 @@ fn createSurface(self: *Self, manager: *zwlr.LayerShellV1, r: anytype) CreateErr
     const output_id = if (r.output) |resource| output: {
         const output = self.outputs.findResource(resource) orelse return error.InvalidOutput;
         break :output output.id;
-    } else self.default_output_id;
+    } else self.outputForUnspecifiedSurface();
     if (!std.unicode.utf8ValidateSlice(std.mem.span(r.namespace))) {
         return error.InvalidNamespace;
     }
@@ -291,6 +291,12 @@ fn createSurface(self: *Self, manager: *zwlr.LayerShellV1, r: anytype) CreateErr
         self.remove(id);
         return;
     };
+}
+
+fn outputForUnspecifiedSurface(self: *Self) OutputLayout.Id {
+    const position = self.seat.pointerPosition() orelse return self.default_output_id;
+    const output = self.outputs.outputAt(position.x, position.y) orelse return self.default_output_id;
+    return output.id;
 }
 
 fn surfaceRequest(resource: *zwlr.LayerSurfaceV1, request: zwlr.LayerSurfaceV1.Request, adapter: *Adapter) void {

@@ -31,6 +31,7 @@ const tiling_drag_output_edge_threshold: f64 = 32;
 
 allocator: std.mem.Allocator,
 outputs: *OutputLayout,
+seat: *Seat,
 default_output: OutputLayout.Id,
 scene: *Scene,
 xdg_shell: *XdgShell,
@@ -221,6 +222,7 @@ pub fn init(
     allocator: std.mem.Allocator,
     display: *wl.Server,
     outputs: *OutputLayout,
+    seat: *Seat,
     default_output: OutputLayout.Id,
     scene: *Scene,
     xdg_shell: *XdgShell,
@@ -231,6 +233,7 @@ pub fn init(
     self.* = .{
         .allocator = allocator,
         .outputs = outputs,
+        .seat = seat,
         .default_output = default_output,
         .scene = scene,
         .xdg_shell = xdg_shell,
@@ -453,9 +456,9 @@ fn addXdg(self: *Self, xdg_id: XdgShell.WindowId) !WindowId {
         if (self.findXdg(parent)) |parent_id|
             self.windows.get(parent_id).?.workspace
         else
-            self.workspaceFor(self.default_output) orelse 0
+            self.initialWorkspace() orelse 0
     else
-        self.workspaceFor(self.default_output) orelse 0;
+        self.initialWorkspace() orelse 0;
     const workspace = if (restore) |state|
         if (self.outputNamed(state.output_name)) |output|
             self.workspaceNumber(output, state.workspace) orelse default_workspace
@@ -518,7 +521,7 @@ fn addXwayland(self: *Self, xwayland_id: Xwm.WindowId) !?WindowId {
     const known = self.known_xwayland.get(xwayland_id) orelse return null;
     const info = self.xwayland.window_info(self.xwayland.context, xwayland_id) orelse return null;
     if (!info.participatesInWindowManagement()) return null;
-    const workspace = self.workspaceFor(self.default_output) orelse return null;
+    const workspace = self.initialWorkspace() orelse return null;
     const id = try self.windows.insert(self.allocator, .{
         .backend = .{ .xwayland = xwayland_id },
         .scene_id = known.scene_id,
@@ -574,6 +577,14 @@ fn outputNamed(self: *Self, name: []const u8) ?OutputLayout.Id {
         if (std.mem.eql(u8, entry.output.name(), name)) return entry.id;
     }
     return null;
+}
+
+fn initialWorkspace(self: *Self) ?usize {
+    const output = if (self.seat.pointerPosition()) |position|
+        if (self.outputs.outputAt(position.x, position.y)) |entry| entry.id else self.default_output
+    else
+        self.default_output;
+    return self.workspaceFor(output) orelse self.workspaceFor(self.default_output);
 }
 
 fn appendOutputWorkspaces(self: *Self, output: OutputLayout.Id) !void {

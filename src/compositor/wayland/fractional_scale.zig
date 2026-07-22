@@ -84,27 +84,27 @@ pub fn refresh(self: *Self) void {
     var fractional_scales = self.by_surface.iterator();
     while (fractional_scales.next()) |entry| {
         const fractional_scale = entry.value_ptr.*;
-        const preferred_scale = self.preferredScale(entry.key_ptr.*);
+        // Hidden workspace surfaces are temporarily on no output. Preserve
+        // their last scale until they become visible again rather than making
+        // clients resize for the default output while suspended.
+        const preferred_scale = self.preferredScale(entry.key_ptr.*) orelse continue;
         if (preferred_scale.numerator == fractional_scale.preferred_scale.numerator) continue;
         fractional_scale.preferred_scale = preferred_scale;
         fractional_scale.resource.sendPreferredScale(preferred_scale.numerator);
     }
 }
 
-fn preferredScale(self: *Self, surface_id: Surface.Id) render.Scale {
-    var preferred_scale = if (self.outputs.get(self.default_output_id)) |output|
-        output.preferredScale()
-    else
-        render.Scale{};
-    var found = false;
+fn preferredScale(self: *Self, surface_id: Surface.Id) ?render.Scale {
+    var preferred_scale: ?render.Scale = null;
     var outputs = self.outputs.iterator();
     while (outputs.next()) |entry| {
         if (!entry.output.containsSurface(surface_id)) continue;
         const output_scale = entry.output.preferredScale();
-        if (!found or output_scale.numerator > preferred_scale.numerator) {
+        if (preferred_scale == null or
+            output_scale.numerator > preferred_scale.?.numerator)
+        {
             preferred_scale = output_scale;
         }
-        found = true;
     }
     return preferred_scale;
 }
@@ -136,7 +136,11 @@ fn createFractionalScale(
         resource.destroy();
         return;
     };
-    const preferred_scale = self.preferredScale(surface_id);
+    const preferred_scale = self.preferredScale(surface_id) orelse
+        if (self.outputs.get(self.default_output_id)) |output|
+            output.preferredScale()
+        else
+            render.Scale{};
     fractional_scale.* = .{
         .manager = self,
         .surface = surface,
@@ -204,4 +208,34 @@ fn handleSurfaceDestroyed(context: *anyopaque) void {
     surface.removeCommitListener(&self.listener);
     _ = self.manager.by_surface.remove(self.surface_id);
     self.surface = null;
+}
+
+test "hidden surface has no replacement preferred scale" {
+    const display = try wl.Server.create();
+    defer display.destroy();
+
+    var surfaces: Surface.Store = .{};
+    defer surfaces.deinit(std.testing.allocator);
+
+    var outputs: OutputLayout = undefined;
+    outputs.init(std.testing.allocator, display, &surfaces);
+    defer outputs.deinit();
+
+    const output_id = try outputs.add(.{
+        .size = .{ .width = 1920, .height = 1080 },
+        .physical_size = .{ .width = 3840, .height = 2160 },
+        .scale = 2,
+        .preferred_scale = .{ .numerator = 150 },
+        .name = "HEADLESS-1",
+        .description = "Keywork headless output",
+        .model = "headless",
+    });
+    defer std.debug.assert(outputs.remove(output_id));
+
+    var manager: Self = undefined;
+    manager.outputs = &outputs;
+    try std.testing.expectEqual(
+        @as(?render.Scale, null),
+        manager.preferredScale(.{ .index = 1, .generation = 1 }),
+    );
 }

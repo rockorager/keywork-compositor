@@ -1773,6 +1773,7 @@ pub fn createWithVirtualOutput(
         allocator,
         display,
         &self.outputs,
+        &self.seat,
         render_output.protocol_id,
         &self.scene,
         &self.xdg_shell,

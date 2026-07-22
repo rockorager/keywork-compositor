@@ -98,6 +98,19 @@ pub fn findResource(self: *Self, resource: *wl.Output) ?Entry {
     return null;
 }
 
+/// Returns the output whose half-open global logical bounds contain the point.
+pub fn outputAt(self: *Self, x: f64, y: f64) ?Entry {
+    var outputs = self.iterator();
+    while (outputs.next()) |entry| {
+        const rect = entry.output.logicalRect();
+        if (x >= @as(f64, @floatFromInt(rect.x)) and
+            y >= @as(f64, @floatFromInt(rect.y)) and
+            x < @as(f64, @floatFromInt(@as(i64, rect.x) + rect.width)) and
+            y < @as(f64, @floatFromInt(@as(i64, rect.y) + rect.height))) return entry;
+    }
+    return null;
+}
+
 pub fn iterator(self: *Self) Iterator {
     return .{ .inner = self.outputs.iterator() };
 }
@@ -138,6 +151,11 @@ test "output handles are stable across additions and stale after removal" {
     try std.testing.expectEqualStrings("HEADLESS-2", layout.get(second).?.name());
     try std.testing.expectEqual(Output.Position{ .x = 1280 }, layout.get(second).?.logicalPosition());
     try std.testing.expectEqual(@as(u32, 180), layout.get(second).?.preferredScale().numerator);
+    try std.testing.expectEqual(first, layout.outputAt(0, 0).?.id);
+    try std.testing.expectEqual(first, layout.outputAt(1279.999, 719.999).?.id);
+    try std.testing.expectEqual(second, layout.outputAt(1280, 0).?.id);
+    try std.testing.expectEqual(@as(?Entry, null), layout.outputAt(-1, 0));
+    try std.testing.expectEqual(@as(?Entry, null), layout.outputAt(0, 720));
     try std.testing.expectError(error.DuplicateName, layout.add(.{
         .position = .{ .x = 3200 },
         .size = .{ .width = 1024, .height = 768 },
