@@ -88,12 +88,17 @@ const TilingDrag = struct {
 
 const TilingDragTarget = union(enum) {
     window: WindowDropTarget,
-    workspace_edge: layout_mod.DropPosition,
+    workspace: WorkspaceDropTarget,
 };
 
 const WindowDropTarget = struct {
     window: WindowId,
     position: layout_mod.DropPosition,
+};
+
+const WorkspaceDropTarget = struct {
+    output: OutputLayout.Id,
+    position: ?layout_mod.DropPosition = null,
 };
 
 const ToplevelDrag = struct {
@@ -556,6 +561,29 @@ fn reportWorkspaceUrgency(self: *Self, index: usize) void {
     self.workspace_protocol.setUrgent(entry.output, entry.number, false);
 }
 
+fn moveWindowToWorkspace(
+    self: *Self,
+    id: WindowId,
+    target: usize,
+) error{OutOfMemory}!bool {
+    const window = self.windows.get(id) orelse return false;
+    const source = window.workspace;
+    if (source == target) return false;
+    const moved = try workspace_mod.Workspace.moveWindow(
+        self.allocator,
+        &self.workspaces.items[source].workspace,
+        &self.workspaces.items[target].workspace,
+        neutral(id),
+    );
+    if (!moved) return false;
+    window.workspace = target;
+    self.reportWorkspaceOccupancy(source);
+    self.reportWorkspaceOccupancy(target);
+    self.reportWorkspaceUrgency(source);
+    self.reportWorkspaceUrgency(target);
+    return true;
+}
+
 fn workspaceFor(self: *Self, output: OutputLayout.Id) ?usize {
     for (self.workspaces.items, 0..) |entry, i| {
         if (entry.active and std.meta.eql(entry.output, output)) return i;
@@ -952,8 +980,11 @@ pub fn updateTilingDrag(self: *Self, x: f64, y: f64) bool {
     drag.target = null;
     const source = self.windows.get(drag.source) orelse return previous != null;
     if (!self.isDraggableTiledWindow(source)) return previous != null;
-    const workspace = &self.workspaces.items[source.workspace];
-    if (!workspace.active) return previous != null;
+    const source_workspace = &self.workspaces.items[source.workspace];
+    if (!source_workspace.active) return previous != null;
+    const output = self.outputs.outputAt(x, y) orelse return previous != null;
+    const workspace_index = self.workspaceFor(output.id) orelse return previous != null;
+    const workspace = &self.workspaces.items[workspace_index];
     var has_peer = false;
     for (workspace.workspace.members.items) |member| {
         const id = internal(member);
@@ -963,20 +994,21 @@ pub fn updateTilingDrag(self: *Self, x: f64, y: f64) bool {
         has_peer = true;
         break;
     }
-    if (has_peer and
-        (@abs(x - drag.initial_x) >= tiling_drag_activation_threshold or
-            @abs(y - drag.initial_y) >= tiling_drag_activation_threshold))
-    {
-        const output = self.outputs.get(workspace.output) orelse return previous != null;
-        const position = output.logicalPosition();
-        const size = output.logicalSize();
+    const activated = @abs(x - drag.initial_x) >= tiling_drag_activation_threshold or
+        @abs(y - drag.initial_y) >= tiling_drag_activation_threshold;
+    if (has_peer and activated) {
+        const position = output.output.logicalPosition();
+        const size = output.output.logicalSize();
         const bounds: types.Rect = .{
             .x = position.x,
             .y = position.y,
             .size = types.Size.init(size.width, size.height),
         };
         if (tilingOutputEdgeDropPosition(x, y, bounds, tiling_drag_output_edge_threshold)) |edge| {
-            drag.target = .{ .workspace_edge = edge };
+            drag.target = .{ .workspace = .{
+                .output = output.id,
+                .position = edge,
+            } };
             return !std.meta.eql(previous, drag.target);
         }
     }
@@ -994,6 +1026,9 @@ pub fn updateTilingDrag(self: *Self, x: f64, y: f64) bool {
         } };
         break;
     }
+    if (drag.target == null and workspace_index != source.workspace and activated) {
+        drag.target = .{ .workspace = .{ .output = output.id } };
+    }
     return !std.meta.eql(previous, drag.target);
 }
 
@@ -1007,16 +1042,21 @@ pub fn tilingDragPreview(self: *Self) ?types.Rect {
             const rect = visibleLayoutRect(target.placement orelse return null) orelse return null;
             break :preview tilingDropPreview(rect, window_target.position);
         },
-        .workspace_edge => |position| preview: {
-            const source = self.windows.get(drag.source) orelse return null;
-            const workspace = &self.workspaces.items[source.workspace];
-            const area = self.layer_shell.usableAreaFor(workspace.output) orelse return null;
+        .workspace => |workspace_target| preview: {
+            const workspace_index = self.workspaceFor(workspace_target.output) orelse return null;
+            const workspace = &self.workspaces.items[workspace_index];
+            if (!workspace.active) return null;
+            const area = self.layer_shell.usableAreaFor(workspace_target.output) orelse return null;
             if (area.width <= 0 or area.height <= 0) return null;
-            break :preview tilingDropPreview(.{
+            const rect: types.Rect = .{
                 .x = area.x,
                 .y = area.y,
                 .size = types.Size.init(@intCast(area.width), @intCast(area.height)),
-            }, position);
+            };
+            break :preview if (workspace_target.position) |position|
+                tilingDropPreview(rect, position)
+            else
+                rect;
         },
     };
 }
@@ -1029,27 +1069,44 @@ pub fn endTilingDrag(self: *Self, commit: bool) bool {
     const drag_target = drag.target orelse return true;
     const source = self.windows.get(drag.source) orelse return true;
     if (!self.isDraggableTiledWindow(source)) return true;
-    const workspace_entry = &self.workspaces.items[source.workspace];
-    if (!workspace_entry.active) return true;
+    const source_workspace = source.workspace;
+    if (!self.workspaces.items[source_workspace].active) return true;
+    var workspace_index = source_workspace;
     const changed = switch (drag_target) {
         .window => |window_target| changed: {
             const target = self.windows.get(window_target.window) orelse return true;
-            if (source.workspace != target.workspace or
-                !self.isDraggableTiledWindow(target)) return true;
-            break :changed workspace_entry.workspace.repositionWindow(
+            if (!self.isDraggableTiledWindow(target) or
+                !self.workspaces.items[target.workspace].active) return true;
+            workspace_index = target.workspace;
+            const moved = source_workspace != workspace_index and
+                (self.moveWindowToWorkspace(drag.source, workspace_index) catch return true);
+            if (source_workspace != workspace_index and !moved) return true;
+            const repositioned = self.workspaces.items[workspace_index].workspace.repositionWindow(
                 neutral(drag.source),
                 neutral(window_target.window),
                 window_target.position,
             );
+            break :changed moved or repositioned;
         },
-        .workspace_edge => |position| workspace_entry.workspace.repositionWindowAtRoot(
-            neutral(drag.source),
-            position,
-        ),
+        .workspace => |workspace_target| changed: {
+            workspace_index = self.workspaceFor(workspace_target.output) orelse return true;
+            if (!self.workspaces.items[workspace_index].active) return true;
+            const moved = source_workspace != workspace_index and
+                (self.moveWindowToWorkspace(drag.source, workspace_index) catch return true);
+            if (source_workspace != workspace_index and !moved) return true;
+            const repositioned = if (workspace_target.position) |position|
+                self.workspaces.items[workspace_index].workspace.repositionWindowAtRoot(
+                    neutral(drag.source),
+                    position,
+                )
+            else
+                false;
+            break :changed moved or repositioned;
+        },
     };
     if (!changed) return true;
-    _ = workspace_entry.workspace.focus(neutral(drag.source));
-    self.default_output = workspace_entry.output;
+    _ = self.workspaces.items[workspace_index].workspace.focus(neutral(drag.source));
+    self.default_output = self.workspaces.items[workspace_index].output;
     self.relayout();
     return true;
 }
@@ -1606,18 +1663,8 @@ pub fn moveFocusedToWorkspace(self: *Self, number: u8) void {
     const target = self.workspaceNumber(self.default_output, number) orelse return;
     if (source == target) return;
     const id = self.workspaces.items[source].workspace.focused orelse return;
-    const moved = workspace_mod.Workspace.moveWindow(
-        self.allocator,
-        &self.workspaces.items[source].workspace,
-        &self.workspaces.items[target].workspace,
-        id,
-    ) catch return;
+    const moved = self.moveWindowToWorkspace(internal(id), target) catch return;
     std.debug.assert(moved);
-    self.windows.get(internal(id)).?.workspace = target;
-    self.reportWorkspaceOccupancy(source);
-    self.reportWorkspaceOccupancy(target);
-    self.reportWorkspaceUrgency(source);
-    self.reportWorkspaceUrgency(target);
     self.relayout();
 }
 pub fn addTagToFocused(self: *Self, tag: types.TagId) !void {
