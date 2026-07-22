@@ -87,10 +87,10 @@ pub fn refresh(self: *Self) void {
         // Hidden workspace surfaces are temporarily on no output. Preserve
         // their last scale until they become visible again rather than making
         // clients resize for the default output while suspended.
-        const preferred_scale = self.preferredScale(entry.key_ptr.*) orelse continue;
-        if (preferred_scale.numerator == fractional_scale.preferred_scale.numerator) continue;
-        fractional_scale.preferred_scale = preferred_scale;
-        fractional_scale.resource.sendPreferredScale(preferred_scale.numerator);
+        const surface = fractional_scale.surface orelse continue;
+        const preferred_scale = self.preferredScale(entry.key_ptr.*) orelse
+            surface.rolePreferredScale() orelse continue;
+        fractional_scale.update(preferred_scale);
     }
 }
 
@@ -137,6 +137,7 @@ fn createFractionalScale(
         return;
     };
     const preferred_scale = self.preferredScale(surface_id) orelse
+        surface.rolePreferredScale() orelse
         if (self.outputs.get(self.default_output_id)) |output|
             output.preferredScale()
         else
@@ -179,6 +180,12 @@ const FractionalScale = struct {
     resource: *wp.FractionalScaleV1,
     preferred_scale: render.Scale,
     listener: Surface.CommitListener,
+
+    fn update(self: *FractionalScale, preferred_scale: render.Scale) void {
+        if (preferred_scale.numerator == self.preferred_scale.numerator) return;
+        self.preferred_scale = preferred_scale;
+        self.resource.sendPreferredScale(preferred_scale.numerator);
+    }
 };
 
 fn handleResourceRequest(
@@ -200,7 +207,13 @@ fn handleResourceDestroy(_: *wp.FractionalScaleV1, self: *FractionalScale) void 
     self.manager.allocator.destroy(self);
 }
 
-fn handleSurfaceApplied(_: *anyopaque) void {}
+fn handleSurfaceApplied(context: *anyopaque) void {
+    const self: *FractionalScale = @ptrCast(@alignCast(context));
+    const surface = self.surface orelse return;
+    const preferred_scale = self.manager.preferredScale(self.surface_id) orelse
+        surface.rolePreferredScale() orelse return;
+    self.update(preferred_scale);
+}
 
 fn handleSurfaceDestroyed(context: *anyopaque) void {
     const self: *FractionalScale = @ptrCast(@alignCast(context));

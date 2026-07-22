@@ -4,6 +4,7 @@ const Self = @This();
 
 const std = @import("std");
 const wayland = @import("wayland");
+const render = @import("../render/types.zig");
 const Scene = @import("../scene.zig");
 const slot_map = @import("../slot_map.zig");
 const Output = @import("output.zig");
@@ -272,7 +273,13 @@ fn createSurface(self: *Self, manager: *zwlr.LayerShellV1, r: anytype) CreateErr
     if (surface.hasBufferAttachedOrCommitted()) return error.AlreadyConstructed;
     const adapter = self.allocator.create(Adapter) catch return error.OutOfMemory;
     errdefer self.allocator.destroy(adapter);
-    surface.reserveRole(.layer_surface, .{ .context = adapter, .before_commit = beforeCommit, .after_commit = afterCommit, .surface_destroyed = surfaceDestroyed }) catch return error.Role;
+    surface.reserveRole(.layer_surface, .{
+        .context = adapter,
+        .before_commit = beforeCommit,
+        .after_commit = afterCommit,
+        .surface_destroyed = surfaceDestroyed,
+        .preferred_scale = surfacePreferredScale,
+    }) catch return error.Role;
     errdefer surface.releaseRole(adapter);
     const scene_id = self.scene.addLayerSurface(surface.handle(), sceneLayer(r.layer)) catch return error.OutOfMemory;
     errdefer self.scene.removeLayerSurface(scene_id);
@@ -297,6 +304,13 @@ fn outputForUnspecifiedSurface(self: *Self) OutputLayout.Id {
     const position = self.seat.pointerPosition() orelse return self.default_output_id;
     const output = self.outputs.outputAt(position.x, position.y) orelse return self.default_output_id;
     return output.id;
+}
+
+fn surfacePreferredScale(context: *anyopaque) ?render.Scale {
+    const adapter: *Adapter = @ptrCast(@alignCast(context));
+    const state = adapter.shell.states.get(adapter.id) orelse return null;
+    const output = adapter.shell.outputs.get(state.output_id) orelse return null;
+    return output.preferredScale();
 }
 
 fn surfaceRequest(resource: *zwlr.LayerSurfaceV1, request: zwlr.LayerSurfaceV1.Request, adapter: *Adapter) void {

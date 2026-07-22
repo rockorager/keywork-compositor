@@ -669,6 +669,7 @@ pub const RoleHandler = struct {
     after_commit: *const fn (*anyopaque, CommitInfo) void,
     tree_applied: ?*const fn (*anyopaque, CommitInfo) void = null,
     surface_destroyed: *const fn (*anyopaque) void,
+    preferred_scale: ?*const fn (*anyopaque) ?render_types.Scale = null,
     role_tag: ?RoleTag = null,
 };
 
@@ -741,6 +742,12 @@ pub fn roleIdentity(self: *Self, role: Role) ?RoleIdentity {
         .tag = handler.role_tag orelse return null,
         .context = handler.context,
     };
+}
+
+pub fn rolePreferredScale(self: *Self) ?render_types.Scale {
+    const handler = self.role_handler orelse return null;
+    const preferred_scale = handler.preferred_scale orelse return null;
+    return preferred_scale(handler.context);
 }
 
 pub fn hasBufferAttachedOrCommitted(self: *Self) bool {
