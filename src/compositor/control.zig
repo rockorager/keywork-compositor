@@ -39,6 +39,12 @@ clients: std.ArrayList(*Client),
 pub const Executor = struct {
     context: *anyopaque,
     execute: *const fn (*anyopaque, command.Command) void,
+    /// The returned slice and each window ID are allocated with the supplied
+    /// allocator; the control server releases them after encoding the reply.
+    windows: *const fn (
+        *anyopaque,
+        std.mem.Allocator,
+    ) anyerror![]control.Window,
     statistics: *const fn (
         *anyopaque,
         std.mem.Allocator,
@@ -487,6 +493,21 @@ fn handleMessage(
         if (!call.oneway) try writeSuccess(allocator, output);
         return;
     }
+    if (std.mem.eql(u8, call.method, control.get_windows_method)) {
+        if (!emptyParameters(call.parameters)) {
+            if (!call.oneway) try writeInvalidParameter(allocator, output, "parameters");
+            return;
+        }
+        const windows = try executor.windows(executor.context, allocator);
+        defer {
+            for (windows) |window| allocator.free(window.id);
+            allocator.free(windows);
+        }
+        if (!call.oneway) try writeMessage(allocator, output, .{
+            .parameters = .{ .windows = windows },
+        });
+        return;
+    }
     if (std.mem.eql(u8, call.method, control.get_performance_statistics_method)) {
         const parameters = parseParameters(struct { reset: bool }, allocator, call.parameters) catch {
             if (!call.oneway) try writeInvalidParameter(allocator, output, "reset");
@@ -641,6 +662,7 @@ fn writeMessage(
 
 const Recorder = struct {
     commands: std.ArrayList(command.Command) = .empty,
+    windows_count: usize = 0,
     statistics_count: usize = 0,
     statistics_reset: bool = false,
     unfocused_border: ?control.Border = null,
@@ -657,6 +679,7 @@ const Recorder = struct {
         return .{
             .context = self,
             .execute = execute,
+            .windows = windows,
             .statistics = statistics,
             .set_unfocused_border = setUnfocusedBorder,
             .set_log_level = setLogLevel,
@@ -668,6 +691,33 @@ const Recorder = struct {
     fn execute(context: *anyopaque, value: command.Command) void {
         const self: *Recorder = @ptrCast(@alignCast(context));
         self.commands.append(std.testing.allocator, value) catch unreachable;
+    }
+
+    fn windows(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+    ) ![]control.Window {
+        const self: *Recorder = @ptrCast(@alignCast(context));
+        self.windows_count += 1;
+        const result = try allocator.alloc(control.Window, 1);
+        errdefer allocator.free(result);
+        result[0] = .{
+            .id = try allocator.dupe(u8, "00000001:00000003"),
+            .protocol = .xdg_shell,
+            .title = "Terminal",
+            .app_id = "org.example.Terminal",
+            .pid = 8124,
+            .rect = .{ .x = 16, .y = 16, .width = 1248, .height = 688 },
+            .output = "HEADLESS-1",
+            .workspace = 1,
+            .focused = true,
+            .visible = true,
+            .floating = false,
+            .fullscreen = false,
+            .maximized = false,
+            .minimized = false,
+        };
+        return result;
     }
 
     fn statistics(
@@ -1038,6 +1088,47 @@ test "performance statistics return typed output snapshots and forward reset" {
     try std.testing.expectEqual(@as(i64, 2), statistics.render_fences_signaled_before_commit);
     try std.testing.expectEqual(@as(i64, 300), statistics.render_to_gpu_completion.p99_microseconds);
     try std.testing.expectEqual(@as(i64, 300), statistics.gpu_completion_to_presentation.p99_microseconds);
+}
+
+test "window query returns typed mapped-window snapshots" {
+    var recorder: Recorder = .{};
+    defer recorder.deinit();
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(std.testing.allocator);
+    var quit_requested = false;
+
+    try handleMessage(
+        std.testing.allocator,
+        recorder.executor(),
+        "{\"method\":\"dev.rockorager.keywork.compositor.GetWindows\",\"parameters\":{}}",
+        &output,
+        &quit_requested,
+    );
+    try std.testing.expectEqual(@as(usize, 1), recorder.windows_count);
+    const parsed = try std.json.parseFromSlice(
+        struct { parameters: struct { windows: []control.Window } },
+        std.testing.allocator,
+        output.items[0 .. output.items.len - 1],
+        .{},
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.parameters.windows.len);
+    const window = parsed.value.parameters.windows[0];
+    try std.testing.expectEqualStrings("00000001:00000003", window.id);
+    try std.testing.expectEqual(control.WindowProtocol.xdg_shell, window.protocol);
+    try std.testing.expectEqualStrings("org.example.Terminal", window.app_id.?);
+    try std.testing.expectEqualStrings("Terminal", window.title.?);
+    try std.testing.expectEqual(@as(?i64, 8124), window.pid);
+    try std.testing.expectEqual(control.Rectangle{
+        .x = 16,
+        .y = 16,
+        .width = 1248,
+        .height = 688,
+    }, window.rect.?);
+    try std.testing.expectEqualStrings("HEADLESS-1", window.output);
+    try std.testing.expect(window.focused);
+    try std.testing.expect(window.visible);
+    try std.testing.expect(!window.floating);
 }
 
 test "standard service introspection returns the control interface" {

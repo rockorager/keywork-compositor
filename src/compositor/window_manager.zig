@@ -62,6 +62,32 @@ pending_session_restores: std.AutoHashMapUnmanaged(XdgShell.WindowId, SessionSta
 const WindowStore = slot_map.SlotMap(Window, enum { builtin_window });
 pub const WindowId = WindowStore.Id;
 
+pub const WindowProtocol = enum { xdg_shell, xwayland };
+
+pub const WindowRect = struct {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+};
+
+pub const WindowSnapshot = struct {
+    id: WindowId,
+    protocol: WindowProtocol,
+    title: ?[]const u8,
+    app_id: ?[]const u8,
+    pid: ?i32,
+    rect: ?WindowRect,
+    output_name: []const u8,
+    workspace: u8,
+    focused: bool,
+    visible: bool,
+    floating: bool,
+    fullscreen: bool,
+    maximized: bool,
+    minimized: bool,
+};
+
 pub const SessionState = struct {
     output_name: []const u8,
     workspace: u8,
@@ -393,6 +419,76 @@ pub fn sessionState(self: *Self, xdg_id: XdgShell.WindowId) ?SessionState {
         .fullscreen = window.fullscreen_output != null,
         .minimized = window.minimized,
     };
+}
+
+/// Returns mapped windows at their currently published geometry. The caller
+/// owns the returned slice; string fields borrow compositor-owned metadata.
+pub fn windowSnapshots(
+    self: *Self,
+    allocator: std.mem.Allocator,
+) error{OutOfMemory}![]WindowSnapshot {
+    var result: std.ArrayList(WindowSnapshot) = .empty;
+    errdefer result.deinit(allocator);
+    try result.ensureTotalCapacity(allocator, self.windows.len());
+
+    const focused_workspace = self.workspaceFor(self.default_output);
+    var windows = self.windows.iterator();
+    while (windows.next()) |entry| {
+        const window = entry.value;
+        if (!window.mapped) continue;
+        const metadata: struct {
+            protocol: WindowProtocol,
+            title: ?[]const u8,
+            app_id: ?[]const u8,
+            pid: ?i32,
+        } = switch (window.backend) {
+            .xdg => |id| metadata: {
+                const info = self.xdg_shell.windowInfo(id) orelse continue;
+                break :metadata .{
+                    .protocol = .xdg_shell,
+                    .title = info.title,
+                    .app_id = info.app_id,
+                    .pid = info.unreliable_pid,
+                };
+            },
+            .xwayland => |id| metadata: {
+                const info = self.xwayland.window_info(self.xwayland.context, id) orelse continue;
+                break :metadata .{
+                    .protocol = .xwayland,
+                    .title = info.title,
+                    .app_id = info.app_id,
+                    .pid = info.unreliable_pid,
+                };
+            },
+        };
+        const workspace = &self.workspaces.items[window.workspace];
+        const output = self.outputs.get(workspace.output) orelse continue;
+        const focused = !window.minimized and focused_workspace != null and
+            window.workspace == focused_workspace.? and workspace.workspace.focused != null and
+            neutral(entry.id).eql(workspace.workspace.focused.?);
+        try result.append(allocator, .{
+            .id = entry.id,
+            .protocol = metadata.protocol,
+            .title = metadata.title,
+            .app_id = metadata.app_id,
+            .pid = metadata.pid,
+            .rect = if (window.published_rect) |rect| .{
+                .x = rect.x,
+                .y = rect.y,
+                .width = rect.size.width,
+                .height = rect.size.height,
+            } else null,
+            .output_name = output.name(),
+            .workspace = workspace.number,
+            .focused = focused,
+            .visible = displayed(window.mapped, window.minimized, workspace.active, window.placement),
+            .floating = self.isFloating(window),
+            .fullscreen = window.fullscreen_output != null,
+            .maximized = window.maximized,
+            .minimized = window.minimized,
+        });
+    }
+    return result.toOwnedSlice(allocator);
 }
 
 fn neutral(id: WindowId) types.WindowId {

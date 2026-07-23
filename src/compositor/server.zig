@@ -3195,6 +3195,7 @@ pub fn listenControl(self: *Self, runtime_directory: []const u8) !void {
         .{
             .context = self,
             .execute = executeControlCommand,
+            .windows = controlWindows,
             .statistics = controlPerformanceStatistics,
             .set_unfocused_border = setControlUnfocusedBorder,
             .set_log_level = setControlLogLevel,
@@ -3209,6 +3210,53 @@ pub fn listenControl(self: *Self, runtime_directory: []const u8) !void {
 fn executeControlCommand(context: *anyopaque, command: Command) void {
     const self: *Self = @ptrCast(@alignCast(context));
     self.window_manager.execute(command);
+}
+
+fn controlWindows(
+    context: *anyopaque,
+    allocator: std.mem.Allocator,
+) ![]ControlProtocol.Window {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const snapshots = try self.window_manager.windowSnapshots(allocator);
+    defer allocator.free(snapshots);
+
+    const result = try allocator.alloc(ControlProtocol.Window, snapshots.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (result[0..initialized]) |window| allocator.free(window.id);
+        allocator.free(result);
+    }
+    for (snapshots, result) |snapshot, *window| {
+        window.* = .{
+            .id = try std.fmt.allocPrint(allocator, "{x:0>8}:{x:0>8}", .{
+                snapshot.id.generation,
+                snapshot.id.index,
+            }),
+            .protocol = switch (snapshot.protocol) {
+                .xdg_shell => .xdg_shell,
+                .xwayland => .xwayland,
+            },
+            .title = snapshot.title,
+            .app_id = snapshot.app_id,
+            .pid = if (snapshot.pid) |pid| pid else null,
+            .rect = if (snapshot.rect) |rect| .{
+                .x = rect.x,
+                .y = rect.y,
+                .width = rect.width,
+                .height = rect.height,
+            } else null,
+            .output = snapshot.output_name,
+            .workspace = snapshot.workspace,
+            .focused = snapshot.focused,
+            .visible = snapshot.visible,
+            .floating = snapshot.floating,
+            .fullscreen = snapshot.fullscreen,
+            .maximized = snapshot.maximized,
+            .minimized = snapshot.minimized,
+        };
+        initialized += 1;
+    }
+    return result;
 }
 
 fn controlPerformanceStatistics(

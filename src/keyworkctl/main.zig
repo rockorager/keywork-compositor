@@ -13,7 +13,8 @@ const usage =
     \\          toggle-fullscreen TARGET | toggle-floating TARGET
     \\          switch-workspace WORKSPACE | move-focused-to-workspace WORKSPACE
     \\          set-unfocused-border WIDTH COLOR
-    \\          stats [--json] [--reset] | set-log-level LEVEL | reload | quit
+    \\          windows [--json] | stats [--json] [--reset]
+    \\          set-log-level LEVEL | reload | quit
     \\directions: next, previous, left, down, up, right
     \\targets: focused
     \\layouts: tiled
@@ -31,6 +32,7 @@ const Command = union(enum) {
     set_layout: control.Layout,
     switch_workspace: i64,
     move_to_workspace: i64,
+    windows: WindowOptions,
     stats: StatisticsOptions,
     set_unfocused_border: control.Border,
     set_log_level: control.LogLevel,
@@ -41,6 +43,14 @@ const Command = union(enum) {
 const StatisticsOptions = struct {
     reset: bool = false,
     json: bool = false,
+};
+
+const WindowOptions = struct {
+    json: bool = false,
+};
+
+const WindowParameters = struct {
+    windows: []const control.Window,
 };
 
 const StatisticsParameters = struct {
@@ -101,6 +111,7 @@ fn run(init: std.process.Init) !void {
         .set_layout => |layout| try client.call(control.set_layout_method, .{ .layout = layout }),
         .switch_workspace => |workspace| try client.call(control.switch_workspace_method, .{ .workspace = workspace }),
         .move_to_workspace => |workspace| try client.call(control.move_focused_to_workspace_method, .{ .workspace = workspace }),
+        .windows => try client.call(control.get_windows_method, Empty{}),
         .stats => |options| try client.call(control.get_performance_statistics_method, .{ .reset = options.reset }),
         .set_unfocused_border => |border| try client.call(control.set_unfocused_border_method, .{ .border = border }),
         .set_log_level => |level| try client.call(control.set_log_level_method, .{ .level = level }),
@@ -121,6 +132,12 @@ fn run(init: std.process.Init) !void {
     }
     if (reply.value.continues) return error.UnexpectedContinuation;
     switch (command) {
+        .windows => |options| try printWindows(
+            init.io,
+            init.gpa,
+            reply.value.parameters,
+            options.json,
+        ),
         .stats => |options| try printStatistics(
             init.io,
             init.gpa,
@@ -129,6 +146,75 @@ fn run(init: std.process.Init) !void {
         ),
         else => {},
     }
+}
+
+fn printWindows(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    parameters: ?std.json.Value,
+    json: bool,
+) !void {
+    const parsed = try parseWindowParameters(allocator, parameters);
+    defer parsed.deinit();
+    var buffer: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(io, &buffer);
+    defer stdout.interface.flush() catch {};
+    if (json) {
+        try writeWindowsJson(&stdout.interface, parsed.value.windows);
+    } else {
+        try writeWindows(&stdout.interface, parsed.value.windows);
+    }
+}
+
+fn parseWindowParameters(
+    allocator: std.mem.Allocator,
+    parameters: ?std.json.Value,
+) !std.json.Parsed(WindowParameters) {
+    return std.json.parseFromValue(
+        WindowParameters,
+        allocator,
+        parameters orelse return error.MissingWindows,
+        .{},
+    );
+}
+
+fn writeWindows(writer: *std.Io.Writer, windows: []const control.Window) !void {
+    if (windows.len == 0) return writer.writeAll("No windows.\n");
+    for (windows) |window| {
+        try writer.print("{s}{s}", .{ if (window.focused) "* " else "  ", window.id });
+        if (window.app_id) |app_id| try writer.print(" {s}", .{app_id});
+        if (window.title) |title| try writer.print(" \"{s}\"", .{title});
+        try writer.print("\n  {s}, {s} workspace {d}, ", .{
+            windowProtocolName(window.protocol),
+            window.output,
+            window.workspace,
+        });
+        if (window.rect) |rect| {
+            try writer.print("{d},{d} {d}x{d}", .{ rect.x, rect.y, rect.width, rect.height });
+        } else {
+            try writer.writeAll("unplaced");
+        }
+        try writer.print(", {s}, {s}", .{
+            if (window.visible) "visible" else "hidden",
+            if (window.floating) "floating" else "tiled",
+        });
+        if (window.fullscreen) try writer.writeAll(", fullscreen");
+        if (window.maximized) try writer.writeAll(", maximized");
+        if (window.minimized) try writer.writeAll(", minimized");
+        try writer.writeByte('\n');
+    }
+}
+
+fn writeWindowsJson(writer: *std.Io.Writer, windows: []const control.Window) !void {
+    try std.json.Stringify.value(WindowParameters{ .windows = windows }, .{}, writer);
+    try writer.writeByte('\n');
+}
+
+fn windowProtocolName(protocol: control.WindowProtocol) []const u8 {
+    return switch (protocol) {
+        .xdg_shell => "xdg-shell",
+        .xwayland => "xwayland",
+    };
 }
 
 fn printStatistics(
@@ -432,6 +518,13 @@ fn printUsage(io: std.Io, err: anyerror) anyerror {
 }
 
 fn parse(arguments: []const []const u8) !Command {
+    if (arguments.len > 0 and std.mem.eql(u8, arguments[0], "windows")) {
+        if (arguments.len == 1) return .{ .windows = .{} };
+        if (arguments.len == 2 and std.mem.eql(u8, arguments[1], "--json")) {
+            return .{ .windows = .{ .json = true } };
+        }
+        return error.InvalidArguments;
+    }
     if (arguments.len > 0 and std.mem.eql(u8, arguments[0], "stats")) {
         var options: StatisticsOptions = .{};
         for (arguments[1..]) |argument| {
@@ -516,6 +609,8 @@ test "CLI parsing maps wire values and validates workspaces" {
     try std.testing.expectEqual(control.Layout.tiled, (try parse(&.{ "set-layout", "tiled" })).set_layout);
     try std.testing.expectEqual(control.LogLevel.debug, (try parse(&.{ "set-log-level", "debug" })).set_log_level);
     try std.testing.expectEqual(@as(i64, 10), (try parse(&.{ "switch-workspace", "10" })).switch_workspace);
+    try std.testing.expect(!(try parse(&.{"windows"})).windows.json);
+    try std.testing.expect((try parse(&.{ "windows", "--json" })).windows.json);
     try std.testing.expect(!(try parse(&.{"stats"})).stats.reset);
     try std.testing.expect((try parse(&.{ "stats", "--reset" })).stats.reset);
     try std.testing.expect((try parse(&.{ "stats", "--json" })).stats.json);
@@ -527,6 +622,7 @@ test "CLI parsing maps wire values and validates workspaces" {
         .color = .{ .red = 0x3a, .green = 0x3a, .blue = 0x40, .alpha = 0xff },
     }, (try parse(&.{ "set-unfocused-border", "2", "#3a3a40" })).set_unfocused_border);
     try std.testing.expectError(error.InvalidArguments, parse(&.{ "stats", "--json", "--json" }));
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "windows", "--reset" }));
     try std.testing.expectEqual(Command.reload, try parse(&.{"reload"}));
     try std.testing.expectEqual(Command.quit, try parse(&.{"quit"}));
     try std.testing.expectError(error.InvalidWorkspace, parse(&.{ "switch-workspace", "11" }));
@@ -661,6 +757,52 @@ test "performance statistics decode and render human-readable output" {
         \\  GPU completion -> presentation: p50 0us, p95 0us, p99 0us, max 0us (0 samples)
         \\
     , writer.written());
+}
+
+test "window snapshots decode and render human-readable output" {
+    var reply = try std.json.parseFromSlice(varlink.Reply, std.testing.allocator,
+        \\{"parameters":{"windows":[{"id":"00000001:00000003","protocol":"xdg_shell","title":"Terminal","app_id":"org.example.Terminal","pid":8124,"rect":{"x":16,"y":16,"width":1248,"height":688},"output":"HEADLESS-1","workspace":1,"focused":true,"visible":true,"floating":false,"fullscreen":false,"maximized":false,"minimized":false},{"id":"00000001:00000004","protocol":"xwayland","app_id":"firefox","output":"HEADLESS-1","workspace":2,"focused":false,"visible":false,"floating":true,"fullscreen":false,"maximized":false,"minimized":true}]}}
+    , .{});
+    defer reply.deinit();
+    const parsed = try parseWindowParameters(std.testing.allocator, reply.value.parameters);
+    defer parsed.deinit();
+    var writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer writer.deinit();
+    try writeWindows(&writer.writer, parsed.value.windows);
+    try std.testing.expectEqualStrings(
+        \\* 00000001:00000003 org.example.Terminal "Terminal"
+        \\  xdg-shell, HEADLESS-1 workspace 1, 16,16 1248x688, visible, tiled
+        \\  00000001:00000004 firefox
+        \\  xwayland, HEADLESS-1 workspace 2, unplaced, hidden, floating, minimized
+        \\
+    , writer.written());
+}
+
+test "window snapshots render machine-readable JSON" {
+    var writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer writer.deinit();
+    const windows = [_]control.Window{.{
+        .id = "00000001:00000003",
+        .protocol = .xdg_shell,
+        .title = "Terminal",
+        .app_id = "org.example.Terminal",
+        .pid = 8124,
+        .rect = .{ .x = 16, .y = 16, .width = 1248, .height = 688 },
+        .output = "HEADLESS-1",
+        .workspace = 1,
+        .focused = true,
+        .visible = true,
+        .floating = false,
+        .fullscreen = false,
+        .maximized = false,
+        .minimized = false,
+    }};
+
+    try writeWindowsJson(&writer.writer, &windows);
+    try std.testing.expectEqualStrings(
+        "{\"windows\":[{\"id\":\"00000001:00000003\",\"protocol\":\"xdg_shell\",\"title\":\"Terminal\",\"app_id\":\"org.example.Terminal\",\"pid\":8124,\"rect\":{\"x\":16,\"y\":16,\"width\":1248,\"height\":688},\"output\":\"HEADLESS-1\",\"workspace\":1,\"focused\":true,\"visible\":true,\"floating\":false,\"fullscreen\":false,\"maximized\":false,\"minimized\":false}]}\n",
+        writer.written(),
+    );
 }
 
 test "overlay scanout rejections render nonzero reasons" {

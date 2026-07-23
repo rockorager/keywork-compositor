@@ -27,6 +27,36 @@ type Border (
     color: Color
 )
 
+# A rectangle in global logical compositor coordinates.
+type Rectangle (
+    x: int,
+    y: int,
+    width: int,
+    height: int
+)
+
+# The protocol through which a window is managed.
+type WindowProtocol (xdg_shell, xwayland)
+
+# A snapshot of a managed window. The opaque ID is unique for the compositor's lifetime.
+# The rectangle is absent when the window has no published geometry.
+type Window (
+    id: string,
+    protocol: WindowProtocol,
+    title: ?string,
+    app_id: ?string,
+    pid: ?int,
+    rect: ?Rectangle,
+    output: string,
+    workspace: int,
+    focused: bool,
+    visible: bool,
+    floating: bool,
+    fullscreen: bool,
+    maximized: bool,
+    minimized: bool
+)
+
 # Rolling latency distribution in microseconds.
 type LatencyStatistics (
     samples: int,
@@ -167,6 +197,9 @@ method SwitchWorkspace (workspace: int) -> ()
 
 # Move the focused window to a numbered workspace on the focused output.
 method MoveFocusedToWorkspace (workspace: int) -> ()
+
+# Return a snapshot of mapped windows and their published logical geometry.
+method GetWindows () -> (windows: []Window)
 
 # Return a snapshot of per-output frame statistics, then optionally reset them.
 method GetPerformanceStatistics (reset: bool) -> (outputs: []OutputStatistics)

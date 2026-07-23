@@ -21,6 +21,32 @@ pub const Border = struct {
     color: Color,
 };
 
+pub const Rectangle = struct {
+    x: i64,
+    y: i64,
+    width: i64,
+    height: i64,
+};
+
+pub const WindowProtocol = enum { xdg_shell, xwayland };
+
+pub const Window = struct {
+    id: []const u8,
+    protocol: WindowProtocol,
+    title: ?[]const u8 = null,
+    app_id: ?[]const u8 = null,
+    pid: ?i64 = null,
+    rect: ?Rectangle = null,
+    output: []const u8,
+    workspace: i64,
+    focused: bool,
+    visible: bool,
+    floating: bool,
+    fullscreen: bool,
+    maximized: bool,
+    minimized: bool,
+};
+
 pub const LatencyStatistics = struct {
     samples: i64 = 0,
     p50_microseconds: i64 = 0,
@@ -144,6 +170,7 @@ pub const toggle_floating_method = interface_name ++ ".ToggleFloating";
 pub const set_layout_method = interface_name ++ ".SetLayout";
 pub const switch_workspace_method = interface_name ++ ".SwitchWorkspace";
 pub const move_focused_to_workspace_method = interface_name ++ ".MoveFocusedToWorkspace";
+pub const get_windows_method = interface_name ++ ".GetWindows";
 pub const get_performance_statistics_method = interface_name ++ ".GetPerformanceStatistics";
 pub const set_unfocused_border_method = interface_name ++ ".SetUnfocusedBorder";
 pub const set_log_level_method = interface_name ++ ".SetLogLevel";
