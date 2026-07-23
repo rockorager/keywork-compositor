@@ -1,6 +1,7 @@
 //! Stateful, protocol-neutral workspace layouts.
 
 const std = @import("std");
+const Direction = @import("../command.zig").Direction;
 const types = @import("types.zig");
 
 pub const Kind = enum {
@@ -83,6 +84,38 @@ pub const Layout = union(enum) {
     ) ?types.WindowId {
         return switch (self.*) {
             .tiled => |*layout| layout.nextWindow(current, reverse),
+        };
+    }
+
+    /// Finds a tiled neighbor by walking split ancestors. `focus_history` is
+    /// ordered least- to most-recently focused and `eligible` contains the
+    /// tiled leaves that may receive focus.
+    pub fn directionalWindow(
+        self: *const Layout,
+        current: types.WindowId,
+        direction: Direction,
+        eligible: []const types.WindowId,
+        focus_history: []const types.WindowId,
+        wrap: bool,
+    ) ?types.WindowId {
+        return switch (self.*) {
+            .tiled => |*layout| layout.directionalWindow(
+                current,
+                direction,
+                eligible,
+                focus_history,
+                wrap,
+            ),
+        };
+    }
+
+    pub fn relativeDirection(
+        self: *const Layout,
+        current: types.WindowId,
+        reverse: bool,
+    ) ?Direction {
+        return switch (self.*) {
+            .tiled => |*layout| layout.relativeDirection(current, reverse),
         };
     }
 
@@ -337,6 +370,78 @@ pub const Tiled = struct {
         }
         const root = self.root orelse return null;
         return self.leafId(self.extremeLeaf(root, reverse));
+    }
+
+    fn directionalWindow(
+        self: *const Tiled,
+        current: types.WindowId,
+        direction: Direction,
+        eligible: []const types.WindowId,
+        focus_history: []const types.WindowId,
+        wrap: bool,
+    ) ?types.WindowId {
+        const desired_axis: Axis = switch (direction) {
+            .left, .right => .horizontal,
+            .up, .down => .vertical,
+        };
+        const forward = direction == .right or direction == .down;
+        var node_index = self.findLeaf(current) orelse return null;
+        var wrap_candidate: ?types.WindowId = null;
+        while (self.nodes.items[node_index].parent) |parent_index| {
+            const split = self.nodes.items[parent_index].content.split;
+            if (split.axis == desired_axis) {
+                const in_first = split.first == node_index;
+                std.debug.assert(in_first or split.second == node_index);
+                const adjacent: ?NodeIndex = if (forward and in_first)
+                    split.second
+                else if (!forward and !in_first)
+                    split.first
+                else
+                    null;
+                if (adjacent) |subtree| {
+                    if (self.mostRecentLeaf(subtree, eligible, focus_history)) |id| return id;
+                } else if (wrap) {
+                    const opposite = if (forward) split.first else split.second;
+                    if (self.mostRecentLeaf(opposite, eligible, focus_history)) |id| {
+                        // Keep climbing so wrapping uses the workspace's
+                        // outermost matching split rather than a nested edge.
+                        wrap_candidate = id;
+                    }
+                }
+            }
+            node_index = parent_index;
+        }
+        return wrap_candidate;
+    }
+
+    fn relativeDirection(
+        self: *const Tiled,
+        current: types.WindowId,
+        reverse: bool,
+    ) ?Direction {
+        const leaf_index = self.findLeaf(current) orelse return null;
+        const parent_index = self.nodes.items[leaf_index].parent orelse return null;
+        const axis = self.nodes.items[parent_index].content.split.axis;
+        return switch (axis) {
+            .horizontal => if (reverse) .left else .right,
+            .vertical => if (reverse) .up else .down,
+        };
+    }
+
+    fn mostRecentLeaf(
+        self: *const Tiled,
+        subtree: NodeIndex,
+        eligible: []const types.WindowId,
+        focus_history: []const types.WindowId,
+    ) ?types.WindowId {
+        var index = focus_history.len;
+        while (index > 0) {
+            index -= 1;
+            const id = focus_history[index];
+            if (!containsId(eligible, id)) continue;
+            if (self.findLeafFrom(subtree, id) != null) return id;
+        }
+        return null;
     }
 
     fn swapWindows(self: *Tiled, first: types.WindowId, second: types.WindowId) void {
@@ -670,6 +775,11 @@ fn inputFor(windows: []const types.WindowInput, id: types.WindowId) ?types.Windo
     return null;
 }
 
+fn containsId(ids: []const types.WindowId, id: types.WindowId) bool {
+    for (ids) |candidate| if (candidate.eql(id)) return true;
+    return false;
+}
+
 fn divide(
     rect: types.Rect,
     axis: Tiled.Axis,
@@ -821,6 +931,73 @@ test "tiled tree traversal swaps leaves and collapses removed branches" {
     }, first.id);
     defer plans.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 3), plans.items.len);
+}
+
+test "tiled directional navigation enters sibling branch through recent focus" {
+    const first = input(0, 10);
+    const second = input(1, 10);
+    const third = input(2, 10);
+    var layout: Layout = .{ .tiled = .{ .outer_gap = 0, .inner_gap = 0 } };
+    defer layout.deinit(std.testing.allocator);
+
+    try layout.windowAdded(std.testing.allocator, first.id, null);
+    var plans = try layout.arrange(std.testing.allocator, &.{first}, .{
+        .x = 0,
+        .y = 0,
+        .size = types.Size.init(120, 80),
+    }, first.id);
+    plans.deinit(std.testing.allocator);
+    try layout.windowAdded(std.testing.allocator, second.id, first.id);
+    plans = try layout.arrange(std.testing.allocator, &.{ first, second }, .{
+        .x = 0,
+        .y = 0,
+        .size = types.Size.init(120, 80),
+    }, second.id);
+    plans.deinit(std.testing.allocator);
+    try layout.windowAdded(std.testing.allocator, third.id, second.id);
+
+    const eligible = &.{ first.id, second.id, third.id };
+    const focus_history = &.{ first.id, second.id, third.id };
+    try std.testing.expectEqual(
+        third.id,
+        layout.directionalWindow(first.id, .right, eligible, focus_history, true).?,
+    );
+    try std.testing.expectEqual(
+        second.id,
+        layout.directionalWindow(third.id, .up, eligible, focus_history, true).?,
+    );
+    try std.testing.expectEqual(
+        first.id,
+        layout.directionalWindow(third.id, .right, eligible, focus_history, true).?,
+    );
+    try std.testing.expect(layout.directionalWindow(third.id, .right, eligible, focus_history, false) == null);
+    try std.testing.expectEqual(Direction.down, layout.relativeDirection(third.id, false).?);
+
+    try std.testing.expectEqual(
+        second.id,
+        layout.directionalWindow(first.id, .right, &.{ first.id, second.id }, focus_history, true).?,
+    );
+}
+
+test "tiled directional navigation wraps at the outermost matching split" {
+    const first = input(0, 10);
+    const second = input(1, 10);
+    const third = input(2, 10);
+    var layout: Layout = .{ .tiled = .{ .outer_gap = 0, .inner_gap = 0 } };
+    defer layout.deinit(std.testing.allocator);
+    try layout.windowAdded(std.testing.allocator, first.id, null);
+    try layout.windowAdded(std.testing.allocator, second.id, first.id);
+    try layout.windowAdded(std.testing.allocator, third.id, second.id);
+
+    const windows = &.{ first.id, second.id, third.id };
+    try std.testing.expectEqual(
+        first.id,
+        layout.directionalWindow(third.id, .right, windows, windows, true).?,
+    );
+    try std.testing.expectEqual(
+        third.id,
+        layout.directionalWindow(first.id, .left, windows, windows, true).?,
+    );
 }
 
 test "tiled layout repositions a window on each side of the drop target" {

@@ -31,11 +31,14 @@ pub const TagSet = struct {
 pub const Workspace = struct {
     layout: layout_mod.Layout = .init(.tiled),
     members: std.ArrayList(types.WindowId) = .empty,
+    /// Least- to most-recently focused member order.
+    focus_history: std.ArrayList(types.WindowId) = .empty,
     focused: ?types.WindowId = null,
 
     pub fn deinit(self: *Workspace, allocator: std.mem.Allocator) void {
         self.layout.deinit(allocator);
         self.members.deinit(allocator);
+        self.focus_history.deinit(allocator);
     }
 
     pub fn contains(self: *const Workspace, id: types.WindowId) bool {
@@ -46,25 +49,32 @@ pub const Workspace = struct {
         if (self.contains(id)) return false;
         try self.ensureInsertCapacity(allocator, 1);
         try self.layout.windowAdded(allocator, id, self.focused);
-        self.members.appendAssumeCapacity(id);
-        if (self.focused == null) self.focused = id;
+        self.addMemberAssumeCapacity(id);
         return true;
     }
 
     pub fn remove(self: *Workspace, id: types.WindowId) bool {
         const index = self.indexOf(id) orelse return false;
-        const next_focus = if (self.focused != null and self.focused.?.eql(id) and self.members.items.len > 1)
-            self.nextWindow(id, false)
+        const history_index = self.focusHistoryIndex(id) orelse unreachable;
+        const was_focused = self.focused != null and self.focused.?.eql(id);
+        _ = self.focus_history.orderedRemove(history_index);
+        const next_focus = if (was_focused and self.focus_history.items.len != 0)
+            self.focus_history.items[self.focus_history.items.len - 1]
+        else if (was_focused)
+            null
         else
             self.focused;
         self.layout.windowRemoved(id);
         _ = self.members.orderedRemove(index);
         self.focused = if (self.members.items.len == 0) null else next_focus;
+        std.debug.assert(self.members.items.len == self.focus_history.items.len);
         return true;
     }
 
     pub fn focus(self: *Workspace, id: types.WindowId) bool {
-        if (!self.contains(id)) return false;
+        const history_index = self.focusHistoryIndex(id) orelse return false;
+        const focused = self.focus_history.orderedRemove(history_index);
+        self.focus_history.appendAssumeCapacity(focused);
         self.focused = id;
         return true;
     }
@@ -82,8 +92,8 @@ pub const Workspace = struct {
         const was_focused = from.focused != null and from.focused.?.eql(id);
         try to.layout.windowAdded(allocator, id, to.focused);
         std.debug.assert(from.remove(id));
-        to.members.appendAssumeCapacity(id);
-        if (to.focused == null or was_focused) to.focused = id;
+        to.addMemberAssumeCapacity(id);
+        if (was_focused) std.debug.assert(to.focus(id));
         return true;
     }
 
@@ -93,6 +103,7 @@ pub const Workspace = struct {
         additional_count: usize,
     ) error{OutOfMemory}!void {
         try self.members.ensureUnusedCapacity(allocator, additional_count);
+        try self.focus_history.ensureUnusedCapacity(allocator, additional_count);
         try self.layout.ensureWindowCapacity(allocator, additional_count);
     }
 
@@ -178,6 +189,24 @@ pub const Workspace = struct {
         for (self.members.items, 0..) |candidate, index| if (candidate.eql(id)) return index;
         return null;
     }
+
+    fn focusHistoryIndex(self: *const Workspace, id: types.WindowId) ?usize {
+        for (self.focus_history.items, 0..) |candidate, index| if (candidate.eql(id)) return index;
+        return null;
+    }
+
+    fn addMemberAssumeCapacity(self: *Workspace, id: types.WindowId) void {
+        self.members.appendAssumeCapacity(id);
+        if (self.focused == null) {
+            self.focus_history.appendAssumeCapacity(id);
+            self.focused = id;
+        } else {
+            // An inserted but not-yet-focused member must not displace the
+            // workspace's actual last-focused window.
+            self.focus_history.insertAssumeCapacity(0, id);
+        }
+        std.debug.assert(self.members.items.len == self.focus_history.items.len);
+    }
 };
 
 test "tag set prevents duplicates and removes tags" {
@@ -203,6 +232,7 @@ test "workspace membership move focus and order have single ownership" {
     try std.testing.expect(!(try first.insert(std.testing.allocator, one)));
     try std.testing.expect(try first.insert(std.testing.allocator, two));
     try std.testing.expect(first.focus(two));
+    try std.testing.expectEqualSlices(types.WindowId, &.{ one, two }, first.focus_history.items);
     try std.testing.expect(first.raise(one));
     try std.testing.expectEqual(one, first.members.items[1]);
     try std.testing.expect(try Workspace.moveWindow(std.testing.allocator, &first, &second, two));
@@ -247,9 +277,29 @@ test "setting tiled layout reconstructs tree order and tracks membership" {
     try std.testing.expectEqual(second, workspace.nextWindow(first, false).?);
     try std.testing.expect(workspace.swapWindows(first, second));
     try std.testing.expectEqual(third, workspace.nextWindow(first, false).?);
+    try std.testing.expect(workspace.focus(third));
+    try std.testing.expect(workspace.focus(first));
     try std.testing.expect(workspace.remove(first));
     try std.testing.expectEqual(third, workspace.focused.?);
     try std.testing.expectEqual(second, workspace.nextWindow(third, false).?);
+}
+
+test "removing the focused window restores most recent surviving focus" {
+    var workspace: Workspace = .{};
+    defer workspace.deinit(std.testing.allocator);
+    const first = types.id(1);
+    const second = types.id(2);
+    const third = types.id(3);
+    try std.testing.expect(try workspace.insert(std.testing.allocator, first));
+    try std.testing.expect(try workspace.insert(std.testing.allocator, second));
+    try std.testing.expect(try workspace.insert(std.testing.allocator, third));
+    try std.testing.expect(workspace.focus(third));
+    try std.testing.expect(workspace.focus(first));
+    try std.testing.expect(workspace.focus(second));
+
+    try std.testing.expect(workspace.remove(second));
+    try std.testing.expectEqual(first, workspace.focused.?);
+    try std.testing.expectEqualSlices(types.WindowId, &.{ third, first }, workspace.focus_history.items);
 }
 
 test "workspace reposition keeps membership in drop order" {
