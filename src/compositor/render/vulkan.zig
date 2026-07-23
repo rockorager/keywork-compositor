@@ -42,6 +42,7 @@ pipeline_layout: vk.PipelineLayout,
 replace_pipeline: vk.Pipeline,
 blend_pipeline: vk.Pipeline,
 image_pipeline: vk.Pipeline,
+crossfade_pipeline: vk.Pipeline,
 opaque_image_pipeline: vk.Pipeline,
 nearest_image_pipeline: vk.Pipeline,
 opaque_nearest_image_pipeline: vk.Pipeline,
@@ -274,6 +275,7 @@ const PipelineKind = enum {
     replace,
     blend,
     image,
+    crossfade,
     backdrop_image,
     shadow,
     downsample,
@@ -393,6 +395,7 @@ const DrawRun = struct {
     pipeline_handle: vk.Pipeline = .null_handle,
     pipeline_layout: vk.PipelineLayout = .null_handle,
     descriptor_set: ?vk.DescriptorSet,
+    secondary_descriptor_set: ?vk.DescriptorSet = null,
     texture_size: render.Size,
     first_instance: u32,
     instance_count: u32,
@@ -482,6 +485,7 @@ const Graphics = struct {
     replace_pipeline: vk.Pipeline,
     blend_pipeline: vk.Pipeline,
     image_pipeline: vk.Pipeline,
+    crossfade_pipeline: vk.Pipeline,
     opaque_image_pipeline: vk.Pipeline,
     nearest_image_pipeline: vk.Pipeline,
     opaque_nearest_image_pipeline: vk.Pipeline,
@@ -656,6 +660,11 @@ fn initGraphics(
         .p_code = &shaders.image_alpha_instanced,
     }, null);
     defer wrapper.destroyShaderModule(device, image_shader, null);
+    const crossfade_shader = try wrapper.createShaderModule(device, &.{
+        .code_size = @sizeOf(@TypeOf(shaders.crossfade_instanced)),
+        .p_code = &shaders.crossfade_instanced,
+    }, null);
+    defer wrapper.destroyShaderModule(device, crossfade_shader, null);
     const nearest_image_shader = try wrapper.createShaderModule(device, &.{
         .code_size = @sizeOf(@TypeOf(shaders.image_nearest_instanced)),
         .p_code = &shaders.image_nearest_instanced,
@@ -745,6 +754,16 @@ fn initGraphics(
         return err;
     };
     errdefer wrapper.destroyPipeline(device, image_pipeline, null);
+    const crossfade_pipeline = try createPipeline(
+        wrapper,
+        device,
+        render_pass,
+        pipeline_layout,
+        vertex_shader,
+        crossfade_shader,
+        true,
+    );
+    errdefer wrapper.destroyPipeline(device, crossfade_pipeline, null);
     const opaque_image_pipeline = try createPipeline(
         wrapper,
         device,
@@ -937,6 +956,7 @@ fn initGraphics(
         .replace_pipeline = replace_pipeline,
         .blend_pipeline = blend_pipeline,
         .image_pipeline = image_pipeline,
+        .crossfade_pipeline = crossfade_pipeline,
         .opaque_image_pipeline = opaque_image_pipeline,
         .nearest_image_pipeline = nearest_image_pipeline,
         .opaque_nearest_image_pipeline = opaque_nearest_image_pipeline,
@@ -1097,6 +1117,7 @@ fn destroyGraphics(wrapper: vk.DeviceWrapper, device: vk.Device, graphics: Graph
     wrapper.destroyPipeline(device, graphics.nearest_image_pipeline, null);
     wrapper.destroyPipeline(device, graphics.opaque_image_pipeline, null);
     wrapper.destroyPipeline(device, graphics.image_pipeline, null);
+    wrapper.destroyPipeline(device, graphics.crossfade_pipeline, null);
     wrapper.destroyPipeline(device, graphics.blend_pipeline, null);
     wrapper.destroyPipeline(device, graphics.replace_pipeline, null);
     wrapper.destroySampler(device, graphics.sampler, null);
@@ -2298,6 +2319,7 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
         .replace_pipeline = graphics.replace_pipeline,
         .blend_pipeline = graphics.blend_pipeline,
         .image_pipeline = graphics.image_pipeline,
+        .crossfade_pipeline = graphics.crossfade_pipeline,
         .opaque_image_pipeline = graphics.opaque_image_pipeline,
         .nearest_image_pipeline = graphics.nearest_image_pipeline,
         .opaque_nearest_image_pipeline = graphics.opaque_nearest_image_pipeline,
@@ -2383,6 +2405,7 @@ pub fn deinit(self: *Self) void {
         .replace_pipeline = self.replace_pipeline,
         .blend_pipeline = self.blend_pipeline,
         .image_pipeline = self.image_pipeline,
+        .crossfade_pipeline = self.crossfade_pipeline,
         .opaque_image_pipeline = self.opaque_image_pipeline,
         .nearest_image_pipeline = self.nearest_image_pipeline,
         .opaque_nearest_image_pipeline = self.opaque_nearest_image_pipeline,
@@ -3480,6 +3503,27 @@ fn renderFrameWithCompletion(
         return error.InvalidTarget;
     }
     output.last_used = self.frame_number;
+    for (frame.commands) |command| switch (command) {
+        .crossfade => |fade| {
+            const sources = [_]render.ImageSource{ fade.old, fade.new };
+            for (sources) |source| {
+                const retained = switch (source) {
+                    .offscreen => |value| value,
+                    .pixels => return error.InvalidTarget,
+                };
+                const source_key: TargetKey = .{ .offscreen = retained.id };
+                if (std.meta.eql(source_key, target_key)) return error.InvalidTarget;
+                const source_output = self.outputs.getPtr(source_key) orelse return error.InvalidTarget;
+                if (source_output.kind != .offscreen or
+                    !std.meta.eql(source_output.size, retained.size) or
+                    !source_output.linear_initialized) return error.InvalidTarget;
+                try self.drainSubmission(&source_output.submission);
+                source_output.last_used = self.frame_number;
+            }
+            output.recorded_frame.valid = false;
+        },
+        else => {},
+    };
     std.debug.assert(
         self.instances.items.len == 0 and
             self.draw_runs.items.len == 0 and
@@ -4000,8 +4044,11 @@ fn renderFrameWithCompletion(
                     bound_descriptors[0] = descriptor_set;
                 }
             }
-            if (run.pipeline == .backdrop_image) {
-                const descriptor_set = backdrop_descriptor orelse return error.InvalidTarget;
+            if (run.pipeline == .backdrop_image or run.secondary_descriptor_set != null) {
+                const descriptor_set = if (run.pipeline == .backdrop_image)
+                    backdrop_descriptor orelse return error.InvalidTarget
+                else
+                    run.secondary_descriptor_set.?;
                 if (bound_descriptors[1] != descriptor_set) {
                     self.device_wrapper.cmdBindDescriptorSets(
                         command_buffer,
@@ -4021,7 +4068,7 @@ fn renderFrameWithCompletion(
                 // attachment component order already agrees on every device.
                 .swap_red_blue = if (run.manual_ycbcr) |manual|
                     @floatFromInt(@intFromEnum(manual.chroma_location))
-                else if (run.pipeline == .blur_composite)
+                else if (run.pipeline == .blur_composite or run.pipeline == .crossfade)
                     0
                 else
                     @floatFromInt(@intFromBool(self.swap_red_blue)),
@@ -4416,6 +4463,13 @@ fn supports(commands: []const render.Command) bool {
     for (commands) |command| switch (command) {
         .clear => {},
         .solid_rect, .image, .shadow, .backdrop_capture, .backdrop_blur => {},
+        .crossfade => |fade| switch (fade.old) {
+            .pixels => switch (fade.new) {
+                .pixels => return false,
+                .offscreen => {},
+            },
+            .offscreen => {},
+        },
     };
     return true;
 }
@@ -6066,6 +6120,7 @@ fn backdropCacheKey(commands: []const render.Command) ?u64 {
 
 fn hashRenderCommand(hasher: *std.hash.Wyhash, command: render.Command) bool {
     switch (command) {
+        .crossfade => return false,
         .clear => |color| {
             hashScalar(hasher, @as(u8, 0));
             hashColor(hasher, color);
@@ -6286,6 +6341,12 @@ fn commandVisibleRect(command: render.Command, frame_size: render.Size) ?render.
             }
             break :clipped rect;
         },
+        .crossfade => |fade| clipped: {
+            var rect = fade.destination.clipTo(frame_size) orelse break :clipped null;
+            if (fade.clip) |clip| rect = rect.intersection(clip) orelse break :clipped null;
+            if (fade.rounded_clip) |clip| rect = rect.intersection(clip.rect) orelse break :clipped null;
+            break :clipped rect;
+        },
         .shadow => |shadow| shadowVisibleRect(shadow, frame_size),
         .backdrop_capture => null,
         .backdrop_blur => |blur| clipped: {
@@ -6328,6 +6389,22 @@ fn imageCanReplace(image: render.Image) bool {
         image.rounded_clip == null;
 }
 
+fn validateCrossfadeSource(source: ?render.SourceRect, size: render.Size) Error!render.SourceRect {
+    const rectangle: render.SourceRect = source orelse .{
+        .x = 0,
+        .y = 0,
+        .width = @floatFromInt(size.width),
+        .height = @floatFromInt(size.height),
+    };
+    if (!std.math.isFinite(rectangle.x) or !std.math.isFinite(rectangle.y) or
+        !std.math.isFinite(rectangle.width) or !std.math.isFinite(rectangle.height) or
+        rectangle.width <= 0 or rectangle.height <= 0 or rectangle.x < 0 or rectangle.y < 0 or
+        rectangle.x + rectangle.width > @as(f64, @floatFromInt(size.width)) or
+        rectangle.y + rectangle.height > @as(f64, @floatFromInt(size.height)))
+        return error.InvalidTarget;
+    return rectangle;
+}
+
 fn compileDrawRuns(
     self: *Self,
     frame: render.Frame,
@@ -6340,6 +6417,49 @@ fn compileDrawRuns(
     var base_capture: ?CompiledBackdropCapture = null;
     var pending_backdrop: ?PendingBackdropComposite = null;
     for (frame.commands, 0..) |command, command_index| switch (command) {
+        .crossfade => |fade| {
+            const old_target = switch (fade.old) {
+                .offscreen => |target| target,
+                .pixels => return error.InvalidTarget,
+            };
+            const new_target = switch (fade.new) {
+                .offscreen => |target| target,
+                .pixels => return error.InvalidTarget,
+            };
+            const old_output = self.outputs.getPtr(.{ .offscreen = old_target.id }) orelse
+                return error.InvalidTarget;
+            const new_output = self.outputs.getPtr(.{ .offscreen = new_target.id }) orelse
+                return error.InvalidTarget;
+            if (!std.meta.eql(old_output.size, old_target.size) or
+                !std.meta.eql(new_output.size, new_target.size) or
+                !old_output.linear_initialized or !new_output.linear_initialized or
+                fade.destination.width == 0 or fade.destination.height == 0)
+                return error.InvalidTarget;
+            const destination = fade.destination;
+            var clipped = destination.clipTo(frame.size) orelse continue;
+            if (fade.clip) |clip| clipped = clipped.intersection(clip) orelse continue;
+            if (fade.rounded_clip) |rounded_clip| clipped = clipped.intersection(rounded_clip.rect) orelse continue;
+            const old_source = try validateCrossfadeSource(fade.old_source, old_target.size);
+            const new_source = try validateCrossfadeSource(fade.new_source, new_target.size);
+            const rounded = fade.rounded_clip orelse render.RoundedClip{
+                .rect = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
+                .radius = 0,
+            };
+            const radius = @min(rounded.radius, @min(rounded.rect.width, rounded.rect.height) / 2);
+            const first_run = self.draw_runs.items.len;
+            try self.emitDamaged(frame, clipped, .crossfade, self.crossfade_pipeline, .null_handle, old_output.linear.descriptor_set, old_target.size, .{}, null, null, .{
+                .destination = rectFloats(destination),
+                .source = .{ @floatCast(old_source.x), @floatCast(old_source.y), @floatCast(old_source.width), @floatCast(old_source.height) },
+                .clip = undefined,
+                .color = .{ @floatCast(new_source.x), @floatCast(new_source.y), @floatCast(new_source.width), @floatCast(new_source.height) },
+                .rounded = rectFloats(rounded.rect),
+                .parameters = .{ @floatFromInt(radius), 0, 0, @as(f32, @floatFromInt(fade.factor)) / @as(f32, @floatFromInt(std.math.maxInt(u32))) },
+            });
+            for (self.draw_runs.items[first_run..]) |*run| {
+                std.debug.assert(run.pipeline == .crossfade and run.secondary_descriptor_set == null);
+                run.secondary_descriptor_set = new_output.linear.descriptor_set;
+            }
+        },
         .backdrop_capture => |capture| {
             std.debug.assert(pending_backdrop == null);
             const compiled = try self.compileBackdropCapture(
@@ -6964,6 +7084,7 @@ fn emitInstance(
     if (self.draw_runs.items.len > 0) {
         const last = &self.draw_runs.items[self.draw_runs.items.len - 1];
         if (last.pipeline == pipeline_kind and
+            last.secondary_descriptor_set == null and
             last.pipeline_handle == pipeline_handle and
             last.pipeline_layout == pipeline_layout and
             last.descriptor_set == descriptor_set and
@@ -6996,6 +7117,7 @@ fn pipelineForKind(self: *const Self, kind: PipelineKind) vk.Pipeline {
         .replace => self.replace_pipeline,
         .blend => self.blend_pipeline,
         .image => self.image_pipeline,
+        .crossfade => self.crossfade_pipeline,
         .backdrop_image => self.backdrop_image_pipeline,
         .shadow => self.shadow_pipeline,
         .downsample => self.downsample_pipeline,
@@ -7008,7 +7130,7 @@ fn pipelineForKind(self: *const Self, kind: PipelineKind) vk.Pipeline {
 fn gpuTimingCategory(kind: PipelineKind) GpuTimingCategory {
     return switch (kind) {
         .replace, .blend => .solid_composition,
-        .image, .backdrop_image, .downsample => .image_composition,
+        .image, .crossfade, .backdrop_image, .downsample => .image_composition,
         .shadow => .shadow,
         .blur_downsample => .blur_downsample,
         .blur_upsample => .blur_upsample,
@@ -10396,6 +10518,70 @@ test "reproducible scene: Vulkan preserves command order in a mixed GPU frame" {
     } });
 
     try std.testing.expectEqualSlices(u32, &.{ untouched, 0xff00ff00 }, &target_pixels);
+}
+
+test "Vulkan crossfades retained linear offscreen targets" {
+    var renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
+        error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+    const size: render.Size = .{ .width = 1, .height = 1 };
+    const old = try renderer.createOffscreenTarget(size);
+    defer renderer.releaseOutput(.{ .offscreen = old.id });
+    const new = try renderer.createOffscreenTarget(size);
+    defer renderer.releaseOutput(.{ .offscreen = new.id });
+    try renderer.renderFrame(.{ .size = size, .commands = &.{
+        .{ .clear = render.Color.rgba(0, 0, 0, 0) },
+        .{ .solid_rect = .{ .rect = .{ .x = 0, .y = 0, .width = 1, .height = 1 }, .color = render.Color.rgba(0, 0, 0, 128) } },
+    } }, .{ .offscreen = old });
+    try renderer.renderFrame(.{ .size = size, .commands = &.{
+        .{ .clear = render.Color.rgba(0, 0, 0, 0) },
+        .{ .solid_rect = .{ .rect = .{ .x = 0, .y = 0, .width = 1, .height = 1 }, .color = render.Color.rgba(255, 255, 255, 128) } },
+    } }, .{ .offscreen = new });
+
+    const factors = [_]u32{ 0, std.math.maxInt(u32) / 2, std.math.maxInt(u32) };
+    const expected = [_]u8{ 44, 143, 191 };
+    for (factors, expected) |factor, wanted| {
+        var pixel = [_]u32{0};
+        try renderer.renderFrame(.{ .size = size, .commands = &.{
+            .{ .clear = render.Color.rgba(64, 64, 64, 255) },
+            .{ .crossfade = .{
+                .destination = .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+                .old = .{ .offscreen = old },
+                .new = .{ .offscreen = new },
+                .factor = factor,
+            } },
+        } }, .{ .pixels = .{ .size = size, .stride_pixels = 1, .pixels = &pixel } });
+        inline for (0..3) |component| {
+            const actual: u8 = @truncate(pixel[0] >> @intCast(component * 8));
+            try std.testing.expect(@abs(@as(i16, wanted) - actual) <= 3);
+        }
+    }
+
+    // A retained image outside this frame's damage must not emit or mutate a draw run.
+    var undamaged = [_]u32{0};
+    try renderer.renderFrame(.{
+        .size = size,
+        .commands = &.{.{ .crossfade = .{
+            .destination = .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+            .old = .{ .offscreen = old },
+            .new = .{ .offscreen = new },
+            .factor = std.math.maxInt(u32) / 2,
+        } }},
+        .damage = &.{.{ .x = 1, .y = 0, .width = 1, .height = 1 }},
+    }, .{ .pixels = .{ .size = size, .stride_pixels = 1, .pixels = &undamaged } });
+
+    var pixel = [_]u32{0};
+    try std.testing.expectError(error.InvalidTarget, renderer.renderFrame(.{
+        .size = size,
+        .commands = &.{.{ .crossfade = .{
+            .destination = .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+            .old = .{ .offscreen = .{ .id = old.id + new.id + 1, .size = size } },
+            .new = .{ .offscreen = new },
+            .factor = 0,
+        } }},
+    }, .{ .pixels = .{ .size = size, .stride_pixels = 1, .pixels = &pixel } }));
 }
 
 test "Vulkan renderer reuses frame resources per target" {

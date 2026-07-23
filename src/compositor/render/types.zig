@@ -379,6 +379,34 @@ pub const Image = struct {
     }
 };
 
+/// A composed image source. CPU renderers consume pixels, while Vulkan
+/// renderers consume offscreen targets created by that renderer. Retained
+/// targets remain valid only while their creating renderer owns them.
+pub const ImageSource = union(enum) {
+    pixels: PixelBuffer,
+    offscreen: OffscreenTarget,
+
+    pub fn size(self: ImageSource) Size {
+        return switch (self) {
+            .pixels => |pixels| pixels.size,
+            .offscreen => |target| target.size,
+        };
+    }
+};
+
+/// Mixes two premultiplied sources first, then composites that single result.
+pub const Crossfade = struct {
+    destination: Rect,
+    old: ImageSource,
+    new: ImageSource,
+    old_source: ?SourceRect = null,
+    new_source: ?SourceRect = null,
+    /// Normalized unsigned fixed-point factor: 0 selects old, maxInt selects new.
+    factor: u32,
+    rounded_clip: ?RoundedClip = null,
+    clip: ?Rect = null,
+};
+
 pub const maximum_opaque_region_rectangles = 16;
 
 pub const OpaqueRegion = struct {
@@ -481,6 +509,7 @@ pub const Command = union(enum) {
     backdrop_capture: BackdropCapture,
     backdrop_blur: BackdropBlur,
     image: Image,
+    crossfade: Crossfade,
 };
 
 pub const output_calibration_edge_length = 33;

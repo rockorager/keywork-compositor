@@ -66,7 +66,104 @@ pub fn render(self: *Self, frame: render_types.Frame, target: render_types.Pixel
                 backdropSnapshot(captures.items, blur.capture_id),
             ),
             .image => |image| try composite(destination, frame.size, image),
+            .crossfade => |crossfade| try self.compositeCrossfade(
+                destination,
+                frame.size,
+                crossfade,
+            ),
         }
+    }
+}
+
+fn compositeCrossfade(
+    self: *Self,
+    destination: *pixman.pixman_image_t,
+    destination_size: render_types.Size,
+    fade: render_types.Crossfade,
+) Error!void {
+    const old = switch (fade.old) {
+        .pixels => |pixels| pixels,
+        .offscreen => return error.InvalidTarget,
+    };
+    const new = switch (fade.new) {
+        .pixels => |pixels| pixels,
+        .offscreen => return error.InvalidTarget,
+    };
+    if (fade.destination.width == 0 or fade.destination.height == 0) return error.InvalidTarget;
+    var clipped = fade.destination.clipTo(destination_size) orelse return;
+    if (fade.clip) |clip| clipped = clipped.intersection(clip) orelse return;
+    if (fade.rounded_clip) |clip| clipped = clipped.intersection(clip.rect) orelse return;
+    const count = std.math.mul(usize, clipped.width, clipped.height) catch
+        return error.InvalidTarget;
+    const old_pixels = self.allocator.alloc(u32, count) catch return error.OutOfMemory;
+    defer self.allocator.free(old_pixels);
+    const new_pixels = self.allocator.alloc(u32, count) catch return error.OutOfMemory;
+    defer self.allocator.free(new_pixels);
+    @memset(old_pixels, 0);
+    @memset(new_pixels, 0);
+    const local_size: render_types.Size = .{ .width = clipped.width, .height = clipped.height };
+    const old_target = try createImage(.{ .size = local_size, .stride_pixels = local_size.width, .pixels = old_pixels }, false, false);
+    defer _ = pixman.pixman_image_unref(old_target);
+    const new_target = try createImage(.{ .size = local_size, .stride_pixels = local_size.width, .pixels = new_pixels }, false, false);
+    defer _ = pixman.pixman_image_unref(new_target);
+    const local_x = fade.destination.x -| clipped.x;
+    const local_y = fade.destination.y -| clipped.y;
+    try composite(old_target, local_size, .{
+        .x = local_x,
+        .y = local_y,
+        .size = .{ .width = fade.destination.width, .height = fade.destination.height },
+        .buffer = old,
+        .source = fade.old_source,
+    });
+    try composite(new_target, local_size, .{
+        .x = local_x,
+        .y = local_y,
+        .size = .{ .width = fade.destination.width, .height = fade.destination.height },
+        .buffer = new,
+        .source = fade.new_source,
+    });
+    const t: u64 = fade.factor;
+    for (old_pixels, new_pixels) |*a, b| {
+        var mixed: u32 = 0;
+        inline for (0..4) |component| {
+            const shift: u5 = @intCast(component * 8);
+            const av = (a.* >> shift) & 0xff;
+            const bv = (b >> shift) & 0xff;
+            const value = (@as(u64, av) * (std.math.maxInt(u32) - t) + @as(u64, bv) * t + std.math.maxInt(u32) / 2) / std.math.maxInt(u32);
+            mixed |= @as(u32, @intCast(value)) << shift;
+        }
+        a.* = mixed;
+    }
+    try compositePixels(destination, destination_size, .{
+        .x = clipped.x,
+        .y = clipped.y,
+        .size = local_size,
+        .buffer = .{ .size = local_size, .stride_pixels = local_size.width, .pixels = old_pixels },
+        .rounded_clip = fade.rounded_clip,
+    }, false, false, false);
+}
+
+test "CPU renderer crossfades premultiplied sources before source-over" {
+    var renderer = init(std.testing.allocator);
+    defer renderer.deinit();
+    const old_pixels = [_]u32{0x80800000};
+    const new_pixels = [_]u32{0x40000040};
+    const source_size: render_types.Size = .{ .width = 1, .height = 1 };
+    const factors = [_]u32{ 0, std.math.maxInt(u32) / 2, std.math.maxInt(u32) };
+    const expected = [_]u32{ 0xff902030, 0xff54285c, 0xff183088 };
+    for (factors, expected) |factor, wanted| {
+        var pixel = [_]u32{0};
+        const commands = [_]render_types.Command{
+            .{ .clear = .{ .red = 0x20, .green = 0x40, .blue = 0x60, .alpha = 0xff } },
+            .{ .crossfade = .{
+                .destination = .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+                .old = .{ .pixels = .{ .size = source_size, .stride_pixels = 1, .pixels = @constCast(&old_pixels) } },
+                .new = .{ .pixels = .{ .size = source_size, .stride_pixels = 1, .pixels = @constCast(&new_pixels) } },
+                .factor = factor,
+            } },
+        };
+        try renderer.render(.{ .size = source_size, .commands = &commands }, .{ .size = source_size, .stride_pixels = 1, .pixels = &pixel });
+        try std.testing.expectEqual(wanted, pixel[0]);
     }
 }
 

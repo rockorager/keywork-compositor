@@ -369,6 +369,7 @@ pub const WindowListener = struct {
     context: *anyopaque,
     ready: *const fn (*anyopaque, WindowId) bool,
     committed: *const fn (*anyopaque, WindowId, ?u32) bool,
+    unmapping: *const fn (*anyopaque, WindowId) void,
     unmapped: *const fn (*anyopaque, WindowId) void,
     destroyed: *const fn (*anyopaque, WindowId) void,
     metadata_changed: *const fn (*anyopaque, WindowId) bool,
@@ -1828,6 +1829,13 @@ const XdgSurfaceResource = struct {
                 "buffer committed before the initial configure was acknowledged",
             );
             return .reject;
+        }
+        if (info.had_buffer and !info.has_buffer) {
+            switch (state.role.?) {
+                .toplevel => |window_id| if (self.shell.window_listener) |listener|
+                    listener.unmapping(listener.context, window_id),
+                .popup => {},
+            }
         }
         return .apply;
     }

@@ -5,6 +5,7 @@ const std = @import("std");
 pub const quad_instanced = spirvWords(@embedFile("vulkan-quad"));
 pub const solid_instanced = spirvWords(@embedFile("vulkan-solid"));
 pub const image_alpha_instanced = spirvWords(@embedFile("vulkan-image"));
+pub const crossfade_instanced = spirvWords(@embedFile("vulkan-crossfade"));
 pub const image_nearest_instanced = spirvWords(@embedFile("vulkan-image-nearest"));
 pub const image_nearest_gamma22_instanced = spirvWords(@embedFile("vulkan-image-nearest-gamma22"));
 pub const backdrop_image_instanced = spirvWords(@embedFile("vulkan-backdrop-image"));

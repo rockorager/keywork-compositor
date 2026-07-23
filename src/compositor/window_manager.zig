@@ -42,6 +42,7 @@ windows: WindowStore = .{},
 known_xwayland: std.AutoHashMapUnmanaged(Xwm.WindowId, KnownXwaylandWindow) = .empty,
 workspaces: std.ArrayList(OutputWorkspace) = .empty,
 transaction: Transaction = .{},
+geometry_listener: ?GeometryTransitionListener = null,
 configure_timer: *wl.EventSource,
 layer_focus: LayerShell.FocusClass = .none,
 session_locked: bool = false,
@@ -77,6 +78,35 @@ pub const SessionListener = struct {
     state_for_remap: *const fn (*anyopaque, XdgShell.WindowId) ?SessionState,
     restored: *const fn (*anyopaque, XdgShell.WindowId) void,
     changed: *const fn (*anyopaque, XdgShell.WindowId) void,
+};
+
+/// Boundary between policy transactions and renderer-owned window snapshots.
+/// `prepare` runs before any configure for the transaction; `published` runs
+/// after scene positions have reached their final geometry. `appeared` reports
+/// the first mapped publication, which has no old presentation to capture;
+/// `closing` runs while the last presentation can still be captured.
+pub const GeometryTransitionListener = struct {
+    context: *anyopaque,
+    prepare: *const fn (*anyopaque, GeometryTransition) void,
+    published: *const fn (*anyopaque, Scene.Id) void,
+    appeared: *const fn (*anyopaque, GeometryAppearance) void,
+    closing: *const fn (*anyopaque, GeometryAppearance) void,
+    removed: *const fn (*anyopaque, Scene.Id) void,
+};
+
+pub const GeometryTransition = struct {
+    scene_id: Scene.Id,
+    surface_id: Surface.Id,
+    output: OutputLayout.Id,
+    old_rect: types.Rect,
+    target_rect: types.Rect,
+};
+
+pub const GeometryAppearance = struct {
+    scene_id: Scene.Id,
+    surface_id: Surface.Id,
+    output: OutputLayout.Id,
+    target_rect: types.Rect,
 };
 
 const TilingDrag = struct {
@@ -151,6 +181,10 @@ const Window = struct {
     tags: workspace_mod.TagSet = .{},
     serial: ?u32 = null,
     placement: ?types.LayoutPlan = null,
+    published_rect: ?types.Rect = null,
+    published_once: bool = false,
+    transition_prepared: bool = false,
+    closing_prepared: bool = false,
     mapped: bool = false,
     minimized: bool = false,
     maximized: bool = false,
@@ -266,6 +300,7 @@ pub fn init(
         .context = self,
         .ready = windowReady,
         .committed = windowCommitted,
+        .unmapping = windowUnmapping,
         .unmapped = windowUnmapped,
         .destroyed = windowDestroyed,
         .metadata_changed = windowMetadataChanged,
@@ -276,6 +311,7 @@ pub fn init(
 
 pub fn deinit(self: *Self) void {
     std.debug.assert(self.session_listener == null);
+    std.debug.assert(self.geometry_listener == null);
     self.layer_shell.clearPolicyListener();
     self.xdg_shell.clearWindowListener();
     self.configure_timer.remove();
@@ -291,6 +327,16 @@ pub fn deinit(self: *Self) void {
     for (self.workspaces.items) |*entry| entry.workspace.deinit(self.allocator);
     self.workspaces.deinit(self.allocator);
     self.* = undefined;
+}
+
+pub fn setGeometryTransitionListener(self: *Self, listener: GeometryTransitionListener) void {
+    std.debug.assert(self.geometry_listener == null);
+    self.geometry_listener = listener;
+}
+
+pub fn clearGeometryTransitionListener(self: *Self) void {
+    std.debug.assert(self.geometry_listener != null);
+    self.geometry_listener = null;
 }
 
 pub fn setSessionListener(self: *Self, listener: SessionListener) void {
@@ -503,12 +549,31 @@ fn addXdg(self: *Self, xdg_id: XdgShell.WindowId) !WindowId {
     return id;
 }
 
+fn prepareClosing(self: *Self, id: WindowId) void {
+    const window = self.windows.get(id) orelse return;
+    if (window.closing_prepared or !window.mapped or window.minimized or
+        window.fullscreen_output != null or self.isFloating(window) or
+        self.transientParent(window) != null) return;
+    const workspace = self.workspaces.items[window.workspace];
+    if (!workspace.active) return;
+    const rect = window.published_rect orelse return;
+    if (self.geometry_listener) |listener| listener.closing(listener.context, .{
+        .scene_id = window.scene_id,
+        .surface_id = window.surface_id,
+        .output = workspace.output,
+        .target_rect = rect,
+    });
+    window.closing_prepared = true;
+}
+
 fn removeId(self: *Self, id: WindowId) void {
+    self.prepareClosing(id);
     const pending = self.windows.get(id).?.serial != null;
     if (self.toplevel_drag) |drag| {
         if (std.meta.eql(drag.window, id)) self.toplevel_drag = null;
     }
     var window = self.windows.remove(id).?;
+    if (self.geometry_listener) |listener| listener.removed(listener.context, window.scene_id);
     _ = self.workspaces.items[window.workspace].workspace.remove(neutral(id));
     self.reportWorkspaceOccupancy(window.workspace);
     self.reportWorkspaceUrgency(window.workspace);
@@ -1862,6 +1927,26 @@ fn relayout(self: *Self) void {
                 .xdg => |id| self.xdg_shell.setWindowVisible(id, false),
                 .xwayland => {},
             };
+            window.transition_prepared = false;
+            if (self.geometry_listener) |listener| if (plan) |placement| {
+                if (window.published_rect) |old_rect| {
+                    const eligible = window.mapped and entry.active and placement.visible and
+                        !window.minimized and window.fullscreen_output == null and
+                        !floating and self.transientParent(window) == null and
+                        self.interactive_resize == null and self.tiling_drag == null and
+                        self.toplevel_drag == null and !std.meta.eql(old_rect, placement.rect);
+                    if (eligible) {
+                        listener.prepare(listener.context, .{
+                            .scene_id = window.scene_id,
+                            .surface_id = window.surface_id,
+                            .output = entry.output,
+                            .old_rect = old_rect,
+                            .target_rect = placement.rect,
+                        });
+                        window.transition_prepared = true;
+                    }
+                }
+            };
             const tiled: XdgShell.TiledEdges = if (plan) |placement| .{
                 .top = placement.tiled_edges.top,
                 .right = placement.tiled_edges.right,
@@ -1970,10 +2055,17 @@ fn publish(self: *Self) void {
     while (it.next()) |entry| {
         const window = entry.value;
         const plan = window.placement;
+        const visible = displayed(
+            window.mapped,
+            window.minimized,
+            self.workspaces.items[window.workspace].active,
+            plan,
+        );
         if (plan) |placement| switch (window.backend) {
             .xdg => |id| self.xdg_shell.setWindowPosition(id, .{ .x = placement.rect.x, .y = placement.rect.y }),
             .xwayland => |id| _ = self.xwayland.move(self.xwayland.context, id, clampI16(placement.rect.x), clampI16(placement.rect.y)),
         };
+        if (plan) |placement| window.published_rect = placement.rect else window.published_rect = null;
         const focused = !window.minimized and
             self.workspaces.items[window.workspace].workspace.focused != null and
             neutral(entry.id).eql(self.workspaces.items[window.workspace].workspace.focused.?);
@@ -2023,7 +2115,7 @@ fn publish(self: *Self) void {
             .xdg => |id| {
                 self.xdg_shell.setWindowClipBox(id, clip_box);
                 self.xdg_shell.setWindowContentClipBox(id, null);
-                self.xdg_shell.setWindowVisible(id, displayed(window.mapped, window.minimized, self.workspaces.items[window.workspace].active, plan));
+                self.xdg_shell.setWindowVisible(id, visible);
             },
             .xwayland => |id| self.xwayland.refresh_scene(self.xwayland.context, id),
         }
@@ -2031,6 +2123,26 @@ fn publish(self: *Self) void {
             self.scene.setClipBox(window.scene_id, clip_box);
             self.scene.setContentClipBox(window.scene_id, null);
         }
+        // Xwayland refreshes its Scene node above, so snapshots observe the
+        // published position and current decoration/effect state.
+        if (window.transition_prepared) {
+            if (self.geometry_listener) |listener| listener.published(listener.context, window.scene_id);
+            window.transition_prepared = false;
+        } else if (!window.published_once and visible and
+            window.fullscreen_output == null and !self.isFloating(window) and
+            self.transientParent(window) == null)
+        {
+            if (self.geometry_listener) |listener| if (plan) |placement| listener.appeared(
+                listener.context,
+                .{
+                    .scene_id = window.scene_id,
+                    .surface_id = window.surface_id,
+                    .output = self.workspaces.items[window.workspace].output,
+                    .target_rect = placement.rect,
+                },
+            );
+        }
+        window.published_once = window.published_once or visible;
     }
     self.publishStacking();
     self.xwayland.stacking_changed(self.xwayland.context);
@@ -2477,6 +2589,10 @@ fn windowCommitted(context: *anyopaque, id: XdgShell.WindowId, serial: ?u32) boo
     if (pending_activation) _ = self.activateWindow(managed);
     return true;
 }
+fn windowUnmapping(context: *anyopaque, id: XdgShell.WindowId) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.prepareClosing(self.findXdg(id) orelse return);
+}
 fn windowUnmapped(context: *anyopaque, id: XdgShell.WindowId) void {
     removeXdg(@ptrCast(@alignCast(context)), id);
 }
@@ -2544,9 +2660,16 @@ pub fn xwaylandWindowDissociated(self: *Self, id: Xwm.WindowId) void {
     _ = self.known_xwayland.remove(id);
 }
 
+pub fn xwaylandWindowClosing(self: *Self, id: Xwm.WindowId) void {
+    self.prepareClosing(self.findXwayland(id) orelse return);
+}
+
 pub fn xwaylandWindowMapped(self: *Self, id: Xwm.WindowId, mapped: bool) void {
     if (!mapped) {
-        if (self.findXwayland(id)) |managed| self.removeId(managed);
+        if (self.findXwayland(id)) |managed| {
+            self.prepareClosing(managed);
+            self.removeId(managed);
+        }
         return;
     }
     const managed = self.addXwayland(id) catch return orelse return;

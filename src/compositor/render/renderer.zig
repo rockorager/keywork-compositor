@@ -690,14 +690,14 @@ fn pruneOccludedCommands(
 
 fn commandCanBePruned(command: render_types.Command) bool {
     return switch (command) {
-        .clear, .solid_rect, .image => true,
+        .clear, .solid_rect, .image, .crossfade => true,
         .shadow, .backdrop_capture, .backdrop_blur => false,
     };
 }
 
 fn commandCanBeClipped(command: render_types.Command) bool {
     return switch (command) {
-        .solid_rect, .image => true,
+        .solid_rect, .image, .crossfade => true,
         .clear, .shadow, .backdrop_capture, .backdrop_blur => false,
     };
 }
@@ -713,6 +713,11 @@ fn clipCommand(command: render_types.Command, clip: render_types.Rect) render_ty
             var result = image;
             result.clip = clip;
             break :clipped .{ .image = result };
+        },
+        .crossfade => |fade| clipped: {
+            var result = fade;
+            result.clip = clip;
+            break :clipped .{ .crossfade = result };
         },
         .clear, .shadow, .backdrop_capture, .backdrop_blur => unreachable,
     };
@@ -742,6 +747,12 @@ fn commandVisibleRect(
             }
             break :clipped rect;
         },
+        .crossfade => |fade| clipped: {
+            var rect = fade.destination.clipTo(frame_size) orelse break :clipped null;
+            if (fade.clip) |clip| rect = rect.intersection(clip) orelse break :clipped null;
+            if (fade.rounded_clip) |clip| rect = rect.intersection(clip.rect) orelse break :clipped null;
+            break :clipped rect;
+        },
         .shadow, .backdrop_capture, .backdrop_blur => null,
     };
 }
@@ -766,7 +777,7 @@ fn addOpaqueCommandCoverage(
                 return;
             }
         },
-        .shadow, .backdrop_capture, .backdrop_blur => return,
+        .crossfade, .shadow, .backdrop_capture, .backdrop_blur => return,
     }
     if (commandVisibleRect(command, frame_size)) |rectangle| {
         try addCoverageRectangle(coverage, rectangle);
@@ -840,6 +851,16 @@ fn translateCommand(
                 .radius = clip.radius,
             } else null,
             .clip = if (image.clip) |clip| translateRect(clip, origin) else null,
+        } },
+        .crossfade => |fade| .{ .crossfade = .{
+            .destination = translateRect(fade.destination, origin),
+            .old = fade.old,
+            .new = fade.new,
+            .old_source = fade.old_source,
+            .new_source = fade.new_source,
+            .factor = fade.factor,
+            .rounded_clip = if (fade.rounded_clip) |clip| .{ .rect = translateRect(clip.rect, origin), .radius = clip.radius } else null,
+            .clip = if (fade.clip) |clip| translateRect(clip, origin) else null,
         } },
     };
 }
@@ -924,6 +945,16 @@ fn scaleCommand(command: render_types.Command, scale: render_types.Scale) render
                 .clip = if (image.clip) |clip| scaleRect(clip, scale) else null,
             } };
         },
+        .crossfade => |fade| .{ .crossfade = .{
+            .destination = scaleRect(fade.destination, scale),
+            .old = fade.old,
+            .new = fade.new,
+            .old_source = fade.old_source,
+            .new_source = fade.new_source,
+            .factor = fade.factor,
+            .rounded_clip = if (fade.rounded_clip) |clip| .{ .rect = scaleRect(clip.rect, scale), .radius = scaleUnsigned(clip.radius, scale) } else null,
+            .clip = if (fade.clip) |clip| scaleRect(clip, scale) else null,
+        } },
     };
 }
 

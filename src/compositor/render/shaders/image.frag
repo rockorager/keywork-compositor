@@ -5,6 +5,9 @@ layout(set=0,binding=1) uniform sampler2D chroma_plane;
 #else
 layout(set=0,binding=0) uniform sampler2D tex;
 #endif
+#ifdef KEYWORK_CROSSFADE
+layout(set=1,binding=0) uniform sampler2D new_tex;
+#endif
 #ifdef KEYWORK_BACKDROP
 layout(set=1,binding=0) uniform sampler2D backdrop_tex;
 #define KEYWORK_NEAREST
@@ -25,6 +28,7 @@ layout(push_constant) uniform Push {
 layout(location=0) in vec2 pixel;
 layout(location=1) flat in vec4 dest;
 layout(location=2) flat in vec4 source;
+layout(location=3) flat in vec4 instance_color;
 layout(location=4) flat in vec4 rounded;
 layout(location=5) flat in vec4 parameters;
 layout(location=6) in vec2 coordinate;
@@ -289,11 +293,18 @@ void main() {
     vec2 uv=coordinate/pc.texture_size;
     vec4 color=texture(tex,uv);
 #endif
+#ifdef KEYWORK_CROSSFADE
+    vec2 q=(pixel-dest.xy)/dest.zw;
+    vec2 new_coordinate=instance_color.xy+q*instance_color.zw;
+    color=mix(color,texture(new_tex,new_coordinate/vec2(textureSize(new_tex,0))),parameters.w);
+#endif
     if (pc.swap_rb>0.5) color=color.bgra;
 #endif
+#ifndef KEYWORK_CROSSFADE
     vec3 straight=color.a>0.0 ? color.rgb/color.a : vec3(0.0);
     color.rgb=decodeColor(straight)*color.a;
     color*=parameters.w;
+#endif
     float coverage=1.0;
     if (parameters.x>0.0) {
         vec2 center=clamp(pixel,rounded.xy+vec2(parameters.x),rounded.xy+rounded.zw-vec2(parameters.x));

@@ -463,6 +463,7 @@ test {
     _ = @import("scene.zig");
     _ = @import("slot_map.zig");
     _ = @import("window_manager.zig");
+    _ = @import("window_animation.zig");
     _ = @import("builtin_keybindings.zig");
     _ = @import("config.zig");
     _ = @import("launcher.zig");
