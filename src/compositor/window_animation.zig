@@ -1,4 +1,4 @@
-//! Renderer-independent timing and bounded snapshot lifecycle for tiling transitions.
+//! Renderer-independent geometry, timing, and snapshot lifecycle for tiling transitions.
 
 const WindowAnimation = @This();
 
@@ -21,6 +21,26 @@ pub fn progress(start: i96, now: i96, duration: u64) u32 {
     if (elapsed >= duration) return std.math.maxInt(u32);
     const linear: u32 = @intCast((elapsed * std.math.maxInt(u32)) / duration);
     return easeOutCubic(linear);
+}
+
+pub fn midpointProgress(progress_factor: u32) u32 {
+    const maximum: u64 = std.math.maxInt(u32);
+    const start = maximum * 2 / 5;
+    const end = maximum * 3 / 5;
+    if (progress_factor <= start) return 0;
+    if (progress_factor >= end) return std.math.maxInt(u32);
+    return @intCast(
+        (@as(u64, progress_factor) - start) * maximum / (end - start),
+    );
+}
+
+pub fn lateCrossfade(progress_factor: u32) u32 {
+    const maximum: u64 = std.math.maxInt(u32);
+    const start = maximum * 4 / 5;
+    if (progress_factor <= start) return 0;
+    return @intCast(
+        (@as(u64, progress_factor) - start) * maximum / (maximum - start),
+    );
 }
 
 fn easeOutCubic(linear: u32) u32 {
@@ -56,6 +76,296 @@ pub fn appearanceStart(target: Rect) Rect {
         .y = target.y +| @as(i32, @intCast(target.height / 2)),
         .width = 1,
         .height = 1,
+    };
+}
+
+pub fn overlapArea(first: Rect, second: Rect) u64 {
+    const left = @max(@as(i64, first.x), @as(i64, second.x));
+    const top = @max(@as(i64, first.y), @as(i64, second.y));
+    const right = @min(
+        @as(i64, first.x) + first.width,
+        @as(i64, second.x) + second.width,
+    );
+    const bottom = @min(
+        @as(i64, first.y) + first.height,
+        @as(i64, second.y) + second.height,
+    );
+    if (right <= left or bottom <= top) return 0;
+    return @intCast((right - left) * (bottom - top));
+}
+
+fn edgeGap(first_end: i64, second_start: i64) i32 {
+    return @intCast(@min(
+        @as(i64, std.math.maxInt(i32)),
+        @max(0, second_start - first_end),
+    ));
+}
+
+/// Collapses a split pane beyond its moving edge while preserving the gap to
+/// the pane that releases or absorbs its space.
+pub fn splitCollapsedRect(existing_target: Rect, new_target: Rect) Rect {
+    const existing_center_x = 2 * @as(i64, existing_target.x) + existing_target.width;
+    const existing_center_y = 2 * @as(i64, existing_target.y) + existing_target.height;
+    const new_center_x = 2 * @as(i64, new_target.x) + new_target.width;
+    const new_center_y = 2 * @as(i64, new_target.y) + new_target.height;
+    const horizontal_distance = @abs(new_center_x - existing_center_x);
+    const vertical_distance = @abs(new_center_y - existing_center_y);
+    if (horizontal_distance >= vertical_distance) return .{
+        .x = if (new_center_x > existing_center_x)
+            new_target.x +| @as(i32, @intCast(new_target.width)) +| edgeGap(
+                @as(i64, existing_target.x) + existing_target.width,
+                new_target.x,
+            )
+        else
+            new_target.x -| edgeGap(
+                @as(i64, new_target.x) + new_target.width,
+                existing_target.x,
+            ),
+        .y = new_target.y,
+        .width = 0,
+        .height = new_target.height,
+    };
+    return .{
+        .x = new_target.x,
+        .y = if (new_center_y > existing_center_y)
+            new_target.y +| @as(i32, @intCast(new_target.height)) +| edgeGap(
+                @as(i64, existing_target.y) + existing_target.height,
+                new_target.y,
+            )
+        else
+            new_target.y -| edgeGap(
+                @as(i64, new_target.y) + new_target.height,
+                existing_target.y,
+            ),
+        .width = new_target.width,
+        .height = 0,
+    };
+}
+
+const Range = struct {
+    start: i32,
+    length: u32,
+};
+
+fn constrainCollapsedOuterEdge(current: Range, old: Range, target: Range) Range {
+    const Split = struct { collapsed: Range, expanded: Range };
+    const split: Split = if (old.length == 0 and target.length != 0)
+        .{ .collapsed = old, .expanded = target }
+    else if (target.length == 0 and old.length != 0)
+        .{ .collapsed = target, .expanded = old }
+    else
+        return current;
+
+    if (split.collapsed.start > split.expanded.start) {
+        const outer_end = split.expanded.start +| @as(i32, @intCast(split.expanded.length));
+        if (current.start >= outer_end) return .{ .start = outer_end, .length = 0 };
+        return .{
+            .start = current.start,
+            .length = @min(current.length, @as(u32, @intCast(outer_end - current.start))),
+        };
+    }
+
+    const outer_start = split.expanded.start;
+    const current_end = current.start +| @as(i32, @intCast(current.length));
+    if (current_end <= outer_start) return .{ .start = outer_start, .length = 0 };
+    if (current.start >= outer_start) return current;
+    return .{ .start = outer_start, .length = @intCast(current_end - outer_start) };
+}
+
+pub fn constrainSplitOuterEdge(rect: Rect, old: Rect, target: Rect) Rect {
+    const horizontal = constrainCollapsedOuterEdge(
+        .{ .start = rect.x, .length = rect.width },
+        .{ .start = old.x, .length = old.width },
+        .{ .start = target.x, .length = target.width },
+    );
+    const vertical = constrainCollapsedOuterEdge(
+        .{ .start = rect.y, .length = rect.height },
+        .{ .start = old.y, .length = old.height },
+        .{ .start = target.y, .length = target.height },
+    );
+    return .{
+        .x = horizontal.start,
+        .y = vertical.start,
+        .width = horizontal.length,
+        .height = vertical.length,
+    };
+}
+
+pub const maximum_growth_slices = 14;
+
+pub const GrowthSlice = struct {
+    source_start: u32,
+    source_length: u32,
+    destination_start: i32,
+    destination_length: u32,
+};
+
+pub const GrowthSlices = struct {
+    items: [maximum_growth_slices]GrowthSlice = undefined,
+    count: usize = 0,
+
+    pub fn slice(self: *const GrowthSlices) []const GrowthSlice {
+        return self.items[0..self.count];
+    }
+};
+
+const elastic_growth_slice_count = 12;
+
+const GrowthMap = struct {
+    old_start: i32,
+    band_start: u32,
+    band_length: u32,
+    start_displacement: i64,
+    end_displacement: i64,
+
+    fn position(map: GrowthMap, source_offset: u32) i32 {
+        const displacement: f64 = if (source_offset <= map.band_start)
+            @floatFromInt(map.start_displacement)
+        else if (source_offset >= map.band_start + map.band_length)
+            @floatFromInt(map.end_displacement)
+        else smooth: {
+            const phase = @as(f64, @floatFromInt(source_offset - map.band_start)) /
+                @as(f64, @floatFromInt(map.band_length));
+            const smootherstep = phase * phase * phase *
+                (phase * (phase * 6 - 15) + 10);
+            break :smooth @as(f64, @floatFromInt(map.start_displacement)) +
+                @as(f64, @floatFromInt(map.end_displacement - map.start_displacement)) * smootherstep;
+        };
+        return @intFromFloat(@round(
+            @as(f64, @floatFromInt(map.old_start)) +
+                @as(f64, @floatFromInt(source_offset)) +
+                displacement,
+        ));
+    }
+};
+
+/// Keeps both ends native-sized while a compact smootherstep band absorbs growth.
+pub fn growthSlices(
+    old_start: i32,
+    old_length: u32,
+    animated_start: i32,
+    animated_length: u32,
+    moving_end: bool,
+) GrowthSlices {
+    std.debug.assert(old_length != 0 and animated_length >= old_length);
+    const edge_cap = @min(@as(u32, 12), old_length / 8);
+    const desired_elastic_length = @max(@as(u32, 16), old_length / 8);
+    const elastic_length = @min(
+        @as(u32, 64),
+        @min(desired_elastic_length, old_length - edge_cap),
+    );
+    const band_start = if (moving_end)
+        old_length - edge_cap - elastic_length
+    else
+        edge_cap;
+    const band_end = band_start + elastic_length;
+    const old_end = @as(i64, old_start) + old_length;
+    const animated_end = @as(i64, animated_start) + animated_length;
+    const map: GrowthMap = .{
+        .old_start = old_start,
+        .band_start = band_start,
+        .band_length = elastic_length,
+        .start_displacement = @as(i64, animated_start) - old_start,
+        .end_displacement = animated_end - old_end,
+    };
+
+    var result: GrowthSlices = .{};
+    appendGrowthSlice(&result, map, 0, band_start);
+    for (0..elastic_growth_slice_count) |index| {
+        const source_start = band_start + @as(u32, @intCast(index)) * elastic_length / elastic_growth_slice_count;
+        const source_end = band_start + @as(u32, @intCast(index + 1)) * elastic_length / elastic_growth_slice_count;
+        appendGrowthSlice(&result, map, source_start, source_end);
+    }
+    appendGrowthSlice(&result, map, band_end, old_length);
+    return result;
+}
+
+fn appendGrowthSlice(
+    result: *GrowthSlices,
+    map: GrowthMap,
+    source_start: u32,
+    source_end: u32,
+) void {
+    if (source_start == source_end) return;
+    const destination_start = map.position(source_start);
+    const destination_end = map.position(source_end);
+    std.debug.assert(destination_end > destination_start);
+    std.debug.assert(result.count < maximum_growth_slices);
+    result.items[result.count] = .{
+        .source_start = source_start,
+        .source_length = source_end - source_start,
+        .destination_start = destination_start,
+        .destination_length = @intCast(destination_end - destination_start),
+    };
+    result.count += 1;
+}
+
+pub fn targetReveal(old: Rect, target: Rect, factor: u32) Rect {
+    const width_change = @abs(@as(i64, target.width) - old.width);
+    const height_change = @abs(@as(i64, target.height) - old.height);
+    if (width_change >= height_change) {
+        const width = interpolateUnsigned(0, target.width, factor);
+        const old_right = @as(i64, old.x) + old.width;
+        const target_right = @as(i64, target.x) + target.width;
+        const left_movement = @abs(@as(i64, target.x) - old.x);
+        const right_movement = @abs(target_right - old_right);
+        return .{
+            .x = if (left_movement <= right_movement)
+                target.x
+            else
+                target.x +| @as(i32, @intCast(target.width - width)),
+            .y = target.y,
+            .width = width,
+            .height = target.height,
+        };
+    }
+
+    const height = interpolateUnsigned(0, target.height, factor);
+    const old_bottom = @as(i64, old.y) + old.height;
+    const target_bottom = @as(i64, target.y) + target.height;
+    const top_movement = @abs(@as(i64, target.y) - old.y);
+    const bottom_movement = @abs(target_bottom - old_bottom);
+    return .{
+        .x = target.x,
+        .y = if (top_movement <= bottom_movement)
+            target.y
+        else
+            target.y +| @as(i32, @intCast(target.height - height)),
+        .width = target.width,
+        .height = height,
+    };
+}
+
+/// Maps a contained logical target rectangle into the old snapshot's pixel coordinates.
+pub fn targetSourceRect(old: Rect, target: Rect, source_size: render.Size) ?render.SourceRect {
+    const old_right = @as(i64, old.x) + old.width;
+    const old_bottom = @as(i64, old.y) + old.height;
+    const target_right = @as(i64, target.x) + target.width;
+    const target_bottom = @as(i64, target.y) + target.height;
+    if (old.width == 0 or old.height == 0 or target.x < old.x or target.y < old.y or
+        target_right > old_right or target_bottom > old_bottom) return null;
+
+    const offset_x: u64 = @intCast(@as(i64, target.x) - old.x);
+    const offset_y: u64 = @intCast(@as(i64, target.y) - old.y);
+    const right: u64 = @intCast(target_right - old.x);
+    const bottom: u64 = @intCast(target_bottom - old.y);
+    const source_width: u64 = source_size.width;
+    const source_height: u64 = source_size.height;
+    const left_source = @as(f64, @floatFromInt(offset_x * source_width)) / @as(f64, @floatFromInt(old.width));
+    const top_source = @as(f64, @floatFromInt(offset_y * source_height)) / @as(f64, @floatFromInt(old.height));
+    const right_source = if (right == old.width)
+        @as(f64, @floatFromInt(source_size.width))
+    else
+        @as(f64, @floatFromInt(right * source_width)) / @as(f64, @floatFromInt(old.width));
+    const bottom_source = if (bottom == old.height)
+        @as(f64, @floatFromInt(source_size.height))
+    else
+        @as(f64, @floatFromInt(bottom * source_height)) / @as(f64, @floatFromInt(old.height));
+    return .{
+        .x = left_source,
+        .y = top_source,
+        .width = right_source - left_source,
+        .height = bottom_source - top_source,
     };
 }
 
@@ -105,6 +415,165 @@ test "progress eases out with exact endpoints" {
     try std.testing.expectEqual(
         std.math.maxInt(u32),
         progress(0, duration_nanoseconds, duration_nanoseconds),
+    );
+}
+
+test "split collapse preserves gaps while opening and closing" {
+    const full: Rect = .{ .x = 0, .y = 0, .width = 1000, .height = 800 };
+    const cases = [_]struct {
+        existing: Rect,
+        pane: Rect,
+        collapsed: Rect,
+        horizontal: bool,
+    }{
+        .{
+            .existing = .{ .x = 0, .y = 0, .width = 492, .height = 800 },
+            .pane = .{ .x = 508, .y = 0, .width = 492, .height = 800 },
+            .collapsed = .{ .x = 1016, .y = 0, .width = 0, .height = 800 },
+            .horizontal = true,
+        },
+        .{
+            .existing = .{ .x = 0, .y = 0, .width = 1000, .height = 392 },
+            .pane = .{ .x = 0, .y = 408, .width = 1000, .height = 392 },
+            .collapsed = .{ .x = 0, .y = 816, .width = 1000, .height = 0 },
+            .horizontal = false,
+        },
+    };
+    const midpoint = std.math.maxInt(u32) / 2;
+    for (cases) |case| {
+        const collapsed = splitCollapsedRect(case.existing, case.pane);
+        try std.testing.expectEqual(case.collapsed, collapsed);
+        try std.testing.expect(overlapArea(full, case.pane) > overlapArea(case.existing, case.pane));
+
+        const opening_existing = interpolate(full, case.existing, midpoint);
+        const opening_pane = constrainSplitOuterEdge(
+            interpolate(collapsed, case.pane, midpoint),
+            collapsed,
+            case.pane,
+        );
+        const closing_existing = interpolate(case.existing, full, midpoint);
+        const closing_pane = constrainSplitOuterEdge(
+            interpolate(case.pane, collapsed, midpoint),
+            case.pane,
+            collapsed,
+        );
+        if (case.horizontal) {
+            const gap = @as(i64, case.pane.x) -
+                (@as(i64, case.existing.x) + case.existing.width);
+            try std.testing.expectEqual(
+                gap,
+                @as(i64, opening_pane.x) -
+                    (@as(i64, opening_existing.x) + opening_existing.width),
+            );
+            try std.testing.expectEqual(
+                gap,
+                @as(i64, closing_pane.x) -
+                    (@as(i64, closing_existing.x) + closing_existing.width),
+            );
+            try std.testing.expectEqual(
+                @as(i64, case.pane.x) + case.pane.width,
+                @as(i64, opening_pane.x) + opening_pane.width,
+            );
+        } else {
+            const gap = @as(i64, case.pane.y) -
+                (@as(i64, case.existing.y) + case.existing.height);
+            try std.testing.expectEqual(
+                gap,
+                @as(i64, opening_pane.y) -
+                    (@as(i64, opening_existing.y) + opening_existing.height),
+            );
+            try std.testing.expectEqual(
+                gap,
+                @as(i64, closing_pane.y) -
+                    (@as(i64, closing_existing.y) + closing_existing.height),
+            );
+            try std.testing.expectEqual(
+                @as(i64, case.pane.y) + case.pane.height,
+                @as(i64, opening_pane.y) + opening_pane.height,
+            );
+        }
+    }
+}
+
+test "elastic growth keeps the stable core and moving edge native-sized" {
+    const right = growthSlices(0, 100, 0, 160, true);
+    const right_slices = right.slice();
+    try std.testing.expect(right_slices.len > 3);
+    try std.testing.expectEqual(@as(u32, 0), right_slices[0].source_start);
+    try std.testing.expectEqual(@as(i32, 0), right_slices[0].destination_start);
+    try std.testing.expectEqual(
+        right_slices[0].source_length,
+        right_slices[0].destination_length,
+    );
+    const right_edge = right_slices[right_slices.len - 1];
+    try std.testing.expectEqual(right_edge.source_length, right_edge.destination_length);
+    try std.testing.expectEqual(
+        @as(i64, 160),
+        @as(i64, right_edge.destination_start) + right_edge.destination_length,
+    );
+    for (right_slices[1..], right_slices[0 .. right_slices.len - 1]) |current, previous| {
+        try std.testing.expectEqual(
+            previous.source_start + previous.source_length,
+            current.source_start,
+        );
+        try std.testing.expectEqual(
+            @as(i64, previous.destination_start) + previous.destination_length,
+            current.destination_start,
+        );
+    }
+
+    const left = growthSlices(60, 100, 0, 160, false);
+    const left_slices = left.slice();
+    try std.testing.expect(left_slices.len > 3);
+    try std.testing.expectEqual(@as(i32, 0), left_slices[0].destination_start);
+    try std.testing.expectEqual(
+        left_slices[0].source_length,
+        left_slices[0].destination_length,
+    );
+    const left_core = left_slices[left_slices.len - 1];
+    try std.testing.expectEqual(left_core.source_length, left_core.destination_length);
+    try std.testing.expectEqual(
+        @as(i64, 160),
+        @as(i64, left_core.destination_start) + left_core.destination_length,
+    );
+}
+
+test "midpoint transition progress uses the middle fifth" {
+    const maximum: u32 = std.math.maxInt(u32);
+    const start: u32 = @intCast(@as(u64, maximum) * 2 / 5);
+    const end: u32 = @intCast(@as(u64, maximum) * 3 / 5);
+    try std.testing.expectEqual(@as(u32, 0), midpointProgress(start));
+    try std.testing.expectEqual(maximum, midpointProgress(end));
+    const midpoint = midpointProgress(maximum / 2);
+    try std.testing.expect(midpoint >= maximum / 2 - 2 and midpoint <= maximum / 2 + 2);
+}
+
+test "shrinking content crossfades only near the endpoint" {
+    const maximum: u32 = std.math.maxInt(u32);
+    const start: u32 = @intCast(@as(u64, maximum) * 4 / 5);
+    try std.testing.expectEqual(@as(u32, 0), lateCrossfade(start));
+    try std.testing.expectEqual(maximum, lateCrossfade(maximum));
+}
+
+test "target content reveal and source crop preserve stable edges" {
+    const factor = std.math.maxInt(u32) / 2;
+    const right = targetReveal(
+        .{ .x = 508, .y = 0, .width = 492, .height = 800 },
+        .{ .x = 0, .y = 0, .width = 1000, .height = 800 },
+        factor,
+    );
+    try std.testing.expectEqual(
+        @as(i64, 1000),
+        @as(i64, right.x) + right.width,
+    );
+
+    try std.testing.expectEqual(
+        render.SourceRect{ .x = 0, .y = 0, .width = 492, .height = 800 },
+        targetSourceRect(
+            .{ .x = 0, .y = 0, .width = 1000, .height = 800 },
+            .{ .x = 0, .y = 0, .width = 492, .height = 800 },
+            .{ .width = 1000, .height = 800 },
+        ).?,
     );
 }
 

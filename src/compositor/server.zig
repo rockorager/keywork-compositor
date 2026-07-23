@@ -3997,6 +3997,10 @@ fn animationRect(rect: @TypeOf(@as(WindowManager.GeometryTransition, undefined).
     return .{ .x = rect.x, .y = rect.y, .width = rect.size.width, .height = rect.size.height };
 }
 
+fn renderAnimationRect(rect: WindowAnimation.Rect) render.Rect {
+    return .{ .x = rect.x, .y = rect.y, .width = rect.width, .height = rect.height };
+}
+
 fn allocateWindowSnapshot(self: *Self, physical_size: render.Size) !WindowAnimation.Snapshot {
     if (self.renderer.offscreenAccess()) |access| {
         const target = try access.create_target(access.context, physical_size);
@@ -4134,6 +4138,7 @@ fn geometryTransitionPrepare(context: *anyopaque, transition: WindowManager.Geom
         owned.deinit(self.allocator, self.renderer.offscreenAccess());
         return;
     };
+    refreshWindowDisappearanceTargets(self, transition.output);
     requestRepaint(self);
 }
 
@@ -4166,7 +4171,6 @@ fn startWindowTransition(self: *Self, index: usize) StartWindowTransitionResult 
     entry.target = target;
     entry.target_dirty = false;
     entry.phase = .animating;
-    entry.start = nowNanoseconds(self.io);
     return .started;
 }
 
@@ -4197,49 +4201,29 @@ fn refreshWindowTransitionTarget(self: *Self, index: usize) bool {
     return true;
 }
 
-fn animationOverlapArea(first: WindowAnimation.Rect, second: WindowAnimation.Rect) u64 {
-    const left = @max(@as(i64, first.x), @as(i64, second.x));
-    const top = @max(@as(i64, first.y), @as(i64, second.y));
-    const right = @min(
-        @as(i64, first.x) + first.width,
-        @as(i64, second.x) + second.width,
-    );
-    const bottom = @min(
-        @as(i64, first.y) + first.height,
-        @as(i64, second.y) + second.height,
-    );
-    if (right <= left or bottom <= top) return 0;
-    return @intCast((right - left) * (bottom - top));
-}
+const WindowReflowMatch = enum { vacated, absorbed };
 
-fn splitAppearanceStart(
-    existing_target: WindowAnimation.Rect,
-    new_target: WindowAnimation.Rect,
-) WindowAnimation.Rect {
-    const existing_center_x = 2 * @as(i64, existing_target.x) + existing_target.width;
-    const existing_center_y = 2 * @as(i64, existing_target.y) + existing_target.height;
-    const new_center_x = 2 * @as(i64, new_target.x) + new_target.width;
-    const new_center_y = 2 * @as(i64, new_target.y) + new_target.height;
-    const horizontal_distance = @abs(new_center_x - existing_center_x);
-    const vertical_distance = @abs(new_center_y - existing_center_y);
-    if (horizontal_distance >= vertical_distance) return .{
-        .x = if (new_center_x > existing_center_x)
-            new_target.x +| @as(i32, @intCast(new_target.width))
-        else
-            new_target.x -| @as(i32, @intCast(new_target.width)),
-        .y = new_target.y,
-        .width = new_target.width,
-        .height = new_target.height,
-    };
-    return .{
-        .x = new_target.x,
-        .y = if (new_center_y > existing_center_y)
-            new_target.y +| @as(i32, @intCast(new_target.height))
-        else
-            new_target.y -| @as(i32, @intCast(new_target.height)),
-        .width = new_target.width,
-        .height = new_target.height,
-    };
+fn windowReflowIndex(
+    self: *const Self,
+    output_id: OutputLayout.Id,
+    rect: WindowAnimation.Rect,
+    match: WindowReflowMatch,
+) ?usize {
+    var result: ?usize = null;
+    var largest_area: u64 = 0;
+    for (self.window_transitions.items, 0..) |transition, index| {
+        if (transition.kind != .reflow or !std.meta.eql(transition.output_id, output_id)) continue;
+        const old_overlap = WindowAnimation.overlapArea(transition.old_rect, rect);
+        const target_overlap = WindowAnimation.overlapArea(transition.target_rect, rect);
+        const area = switch (match) {
+            .vacated => old_overlap -| target_overlap,
+            .absorbed => target_overlap -| old_overlap,
+        };
+        if (area <= largest_area) continue;
+        largest_area = area;
+        result = index;
+    }
+    return result;
 }
 
 fn windowAppearanceStart(
@@ -4247,34 +4231,38 @@ fn windowAppearanceStart(
     output_id: OutputLayout.Id,
     target_rect: WindowAnimation.Rect,
 ) WindowAnimation.Rect {
-    var start = WindowAnimation.appearanceStart(target_rect);
-    var largest_vacated_area: u64 = 0;
-    for (self.window_transitions.items) |transition| {
-        if (transition.kind != .reflow or !std.meta.eql(transition.output_id, output_id)) continue;
-        const old_overlap = animationOverlapArea(transition.old_rect, target_rect);
-        const target_overlap = animationOverlapArea(transition.target_rect, target_rect);
-        const vacated_area = old_overlap -| target_overlap;
-        if (vacated_area <= largest_vacated_area) continue;
-        largest_vacated_area = vacated_area;
-        start = splitAppearanceStart(transition.target_rect, target_rect);
-    }
-    return start;
+    const index = self.windowReflowIndex(output_id, target_rect, .vacated) orelse
+        return WindowAnimation.appearanceStart(target_rect);
+    return WindowAnimation.splitCollapsedRect(
+        self.window_transitions.items[index].target_rect,
+        target_rect,
+    );
 }
 
-test "new tiled windows slide inward from beyond the vacated split edge" {
-    const left: WindowAnimation.Rect = .{ .x = 0, .y = 0, .width = 500, .height = 800 };
-    const right: WindowAnimation.Rect = .{ .x = 500, .y = 0, .width = 500, .height = 800 };
-    try std.testing.expectEqual(
-        WindowAnimation.Rect{ .x = 1000, .y = 0, .width = 500, .height = 800 },
-        splitAppearanceStart(left, right),
+fn windowDisappearanceTarget(
+    self: *const Self,
+    output_id: OutputLayout.Id,
+    closing_rect: WindowAnimation.Rect,
+) WindowAnimation.Rect {
+    const index = self.windowReflowIndex(output_id, closing_rect, .absorbed) orelse
+        return WindowAnimation.appearanceStart(closing_rect);
+    return WindowAnimation.splitCollapsedRect(
+        self.window_transitions.items[index].old_rect,
+        closing_rect,
     );
+}
 
-    const top: WindowAnimation.Rect = .{ .x = 0, .y = 0, .width = 1000, .height = 400 };
-    const bottom: WindowAnimation.Rect = .{ .x = 0, .y = 400, .width = 1000, .height = 400 };
-    try std.testing.expectEqual(
-        WindowAnimation.Rect{ .x = 0, .y = 800, .width = 1000, .height = 400 },
-        splitAppearanceStart(top, bottom),
-    );
+fn refreshWindowDisappearanceTargets(self: *Self, output_id: OutputLayout.Id) void {
+    for (0..self.window_transitions.items.len) |index| {
+        const transition = self.window_transitions.items[index];
+        if (transition.kind != .disappearance or
+            transition.phase != .waiting or
+            !std.meta.eql(transition.output_id, output_id)) continue;
+        self.window_transitions.items[index].target_rect = self.windowDisappearanceTarget(
+            output_id,
+            transition.old_rect,
+        );
+    }
 }
 
 fn geometryTransitionAppeared(
@@ -4329,17 +4317,11 @@ fn geometryTransitionClosing(
         log.warn("failed to capture closing window: {t}", .{err});
         return;
     };
-    var target = self.captureTransparentSnapshot(closure.output, rect) catch |err| {
-        log.warn("failed to create empty closing-window snapshot: {t}", .{err});
-        old.deinit(self.allocator, self.renderer.offscreenAccess());
-        return;
-    };
     const buffer = Surface.currentBuffer(
         self.compositor.surfaceStore(),
         closure.surface_id,
     ) orelse {
         old.deinit(self.allocator, self.renderer.offscreenAccess());
-        target.deinit(self.allocator, self.renderer.offscreenAccess());
         return;
     };
     self.window_transitions.append(self.allocator, .{
@@ -4348,18 +4330,14 @@ fn geometryTransitionClosing(
         .root_id = closure.surface_id,
         .output_id = closure.output,
         .old_rect = rect,
-        .target_rect = WindowAnimation.appearanceStart(rect),
+        .target_rect = self.windowDisappearanceTarget(closure.output, rect),
         .old_source_cache = buffer.source_cache,
         .old = old,
-        .target = target,
         .detached = true,
         .effects = window.effects,
         .borders = window.borders,
-        .phase = .animating,
-        .start = nowNanoseconds(self.io),
     }) catch {
         old.deinit(self.allocator, self.renderer.offscreenAccess());
-        target.deinit(self.allocator, self.renderer.offscreenAccess());
         return;
     };
     requestRepaint(self);
@@ -8332,7 +8310,25 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
                 continue;
             }
             switch (transition.phase) {
-                .waiting => transition_index += 1,
+                .waiting => {
+                    if (transition.kind == .disappearance) {
+                        const start = if (self.windowReflowIndex(
+                            transition.output_id,
+                            transition.old_rect,
+                            .absorbed,
+                        )) |reflow_index| start: {
+                            const reflow = self.window_transitions.items[reflow_index];
+                            if (reflow.phase == .waiting) {
+                                transition_index += 1;
+                                continue;
+                            }
+                            break :start reflow.start;
+                        } else self.animation_now;
+                        self.window_transitions.items[transition_index].phase = .animating;
+                        self.window_transitions.items[transition_index].start = start;
+                    }
+                    transition_index += 1;
+                },
                 .target_pending => switch (startWindowTransition(self, transition_index)) {
                     .started => transition_index += 1,
                     .removed => {},
@@ -9249,14 +9245,112 @@ fn renderShadows(
     }
 }
 
-fn colorWithOpacity(color: render.Color, opacity: u32) render.Color {
-    const maximum: u64 = std.math.maxInt(u32);
-    return .{
-        .red = @intCast((@as(u64, color.red) * opacity + maximum / 2) / maximum),
-        .green = @intCast((@as(u64, color.green) * opacity + maximum / 2) / maximum),
-        .blue = @intCast((@as(u64, color.blue) * opacity + maximum / 2) / maximum),
-        .alpha = @intCast((@as(u64, color.alpha) * opacity + maximum / 2) / maximum),
-    };
+fn renderRetainedSnapshot(
+    self: *Self,
+    frame: *const OutputFrame,
+    source: render.ImageSource,
+    destination: render.Rect,
+    source_rect: ?render.SourceRect,
+    clip: ?render.Rect,
+    rounded_clip: ?render.RoundedClip,
+) renderer_types.Renderer.Error!void {
+    try self.renderCommands(frame, &.{.{ .crossfade = .{
+        .destination = destination,
+        .old = source,
+        .new = source,
+        .old_source = source_rect,
+        .new_source = source_rect,
+        .factor = 0,
+        .clip = clip,
+        .rounded_clip = rounded_clip,
+    } }});
+}
+
+fn renderElasticGrowthSnapshot(
+    self: *Self,
+    frame: *const OutputFrame,
+    transition: *const WindowTransition,
+    animated_destination: render.Rect,
+    rounded_clip: ?render.RoundedClip,
+) renderer_types.Renderer.Error!void {
+    const old = transition.old_rect;
+    const target = transition.target_rect;
+    const horizontal = target.width > old.width and target.height == old.height;
+    const vertical = target.height > old.height and target.width == old.width;
+    if (!horizontal and !vertical) {
+        try self.renderRetainedSnapshot(
+            frame,
+            transition.old.source,
+            animated_destination,
+            null,
+            null,
+            rounded_clip,
+        );
+        return;
+    }
+
+    const old_start = if (horizontal) old.x else old.y;
+    const old_length = if (horizontal) old.width else old.height;
+    const animated_start = if (horizontal) animated_destination.x else animated_destination.y;
+    const animated_length = if (horizontal) animated_destination.width else animated_destination.height;
+    const target_start = if (horizontal) target.x else target.y;
+    const target_length = if (horizontal) target.width else target.height;
+    const old_end = @as(i64, old_start) + old_length;
+    const target_end = @as(i64, target_start) + target_length;
+    const moving_end = @abs(target_end - old_end) >=
+        @abs(@as(i64, target_start) - old_start);
+    const slices = WindowAnimation.growthSlices(
+        old_start,
+        old_length,
+        animated_start,
+        animated_length,
+        moving_end,
+    );
+    const source_size = transition.old.source.size();
+    const source_axis_length = if (horizontal) source_size.width else source_size.height;
+    const source_scale = @as(f64, @floatFromInt(source_axis_length)) /
+        @as(f64, @floatFromInt(old_length));
+    for (slices.slice()) |slice| {
+        const source_start = if (slice.source_start == 0)
+            0
+        else
+            @as(f64, @floatFromInt(slice.source_start)) * source_scale;
+        const source_offset_end = slice.source_start + slice.source_length;
+        const source_end = if (source_offset_end == old_length)
+            @as(f64, @floatFromInt(source_axis_length))
+        else
+            @as(f64, @floatFromInt(source_offset_end)) * source_scale;
+        const source: render.SourceRect = if (horizontal) .{
+            .x = source_start,
+            .y = 0,
+            .width = source_end - source_start,
+            .height = @floatFromInt(source_size.height),
+        } else .{
+            .x = 0,
+            .y = source_start,
+            .width = @floatFromInt(source_size.width),
+            .height = source_end - source_start,
+        };
+        const destination: render.Rect = if (horizontal) .{
+            .x = slice.destination_start,
+            .y = animated_destination.y,
+            .width = slice.destination_length,
+            .height = animated_destination.height,
+        } else .{
+            .x = animated_destination.x,
+            .y = slice.destination_start,
+            .width = animated_destination.width,
+            .height = slice.destination_length,
+        };
+        try self.renderRetainedSnapshot(
+            frame,
+            transition.old.source,
+            destination,
+            source,
+            animated_destination,
+            rounded_clip,
+        );
+    }
 }
 
 fn renderWindowTransition(
@@ -9268,7 +9362,7 @@ fn renderWindowTransition(
     mark_surfaces: bool,
 ) renderer_types.Renderer.Error!void {
     if (!std.meta.eql(transition.output_id, frame.render_output.protocol_id)) return;
-    const factor = if (transition.phase == .animating)
+    const factor = if (transition.phase != .waiting)
         WindowAnimation.progress(
             transition.start,
             self.animation_now,
@@ -9276,41 +9370,111 @@ fn renderWindowTransition(
         )
     else
         0;
-    const rect = WindowAnimation.interpolate(transition.old_rect, transition.target_rect, factor);
-    const destination: render.Rect = .{
-        .x = rect.x,
-        .y = rect.y,
-        .width = rect.width,
-        .height = rect.height,
-    };
-    const opacity = switch (transition.kind) {
-        .reflow => std.math.maxInt(u32),
-        .appearance => factor,
-        .disappearance => std.math.maxInt(u32) - factor,
-    };
-    var effects = configured_effects;
-    var borders = configured_borders;
-    if (opacity != std.math.maxInt(u32)) {
-        if (effects.shadow) |*shadow| shadow.color = colorWithOpacity(shadow.color, opacity);
-        if (effects.contact_shadow) |*shadow| shadow.color = colorWithOpacity(shadow.color, opacity);
-        if (borders) |*border| border.color = colorWithOpacity(border.color, opacity);
-    }
-    try self.renderShadows(frame, destination, effects, null);
+    const animated_rect = WindowAnimation.constrainSplitOuterEdge(
+        WindowAnimation.interpolate(transition.old_rect, transition.target_rect, factor),
+        transition.old_rect,
+        transition.target_rect,
+    );
+    const animated_destination = renderAnimationRect(animated_rect);
+    if (animated_destination.width == 0 or animated_destination.height == 0) return;
+    try self.renderShadows(frame, animated_destination, configured_effects, null);
+    const rounded_clip: ?render.RoundedClip = if (configured_effects.corner_radius == 0)
+        null
+    else
+        .{ .rect = animated_destination, .radius = configured_effects.corner_radius };
     const target = if (transition.target) |snapshot| snapshot.source else transition.old.source;
-    try self.renderCommands(frame, &.{.{ .crossfade = .{
-        .destination = destination,
-        .old = transition.old.source,
-        .new = target,
-        .factor = factor,
-        .rounded_clip = if (configured_effects.corner_radius == 0) null else .{
-            .rect = destination,
-            .radius = configured_effects.corner_radius,
-        },
-    } }});
+    if (transition.kind == .reflow) {
+        const old_area = @as(u64, transition.old_rect.width) * transition.old_rect.height;
+        const target_area = @as(u64, transition.target_rect.width) * transition.target_rect.height;
+        const target_destination = renderAnimationRect(transition.target_rect);
+        const shrinking_old_source = if (target_area < old_area)
+            WindowAnimation.targetSourceRect(
+                transition.old_rect,
+                transition.target_rect,
+                transition.old.source.size(),
+            )
+        else
+            null;
+        if (target_area > old_area) {
+            try self.renderElasticGrowthSnapshot(
+                frame,
+                transition,
+                animated_destination,
+                rounded_clip,
+            );
+            if (transition.target) |target_snapshot| {
+                const reveal_rect = WindowAnimation.targetReveal(
+                    transition.old_rect,
+                    transition.target_rect,
+                    WindowAnimation.midpointProgress(factor),
+                );
+                const reveal = renderAnimationRect(reveal_rect);
+                if (animated_destination.intersection(reveal)) |target_clip| {
+                    try self.renderRetainedSnapshot(
+                        frame,
+                        target_snapshot.source,
+                        target_destination,
+                        null,
+                        target_clip,
+                        rounded_clip,
+                    );
+                }
+            }
+        } else if (shrinking_old_source) |old_source| {
+            const old_destination = renderAnimationRect(transition.old_rect);
+            try self.renderRetainedSnapshot(
+                frame,
+                transition.old.source,
+                old_destination,
+                null,
+                animated_destination,
+                rounded_clip,
+            );
+            const crossfade_factor = WindowAnimation.lateCrossfade(factor);
+            if (crossfade_factor != 0) {
+                if (transition.target) |target_snapshot| {
+                    if (animated_destination.intersection(target_destination)) |target_clip| {
+                        try self.renderCommands(frame, &.{.{ .crossfade = .{
+                            .destination = target_destination,
+                            .old = transition.old.source,
+                            .new = target_snapshot.source,
+                            .old_source = old_source,
+                            .factor = crossfade_factor,
+                            .clip = target_clip,
+                            .rounded_clip = rounded_clip,
+                        } }});
+                    }
+                }
+            }
+        } else {
+            try self.renderCommands(frame, &.{.{ .crossfade = .{
+                .destination = animated_destination,
+                .old = transition.old.source,
+                .new = target,
+                .factor = WindowAnimation.midpointProgress(factor),
+                .rounded_clip = rounded_clip,
+            } }});
+        }
+    } else {
+        const source = if (transition.kind == .appearance) target else transition.old.source;
+        const content_rect = if (transition.kind == .appearance)
+            transition.target_rect
+        else
+            transition.old_rect;
+        const content_destination = renderAnimationRect(content_rect);
+        try self.renderRetainedSnapshot(
+            frame,
+            source,
+            content_destination,
+            null,
+            animated_destination,
+            rounded_clip,
+        );
+    }
     try self.renderBorders(
         frame,
-        destination,
-        borders,
+        animated_destination,
+        configured_borders,
         configured_effects.corner_radius,
         null,
     );
