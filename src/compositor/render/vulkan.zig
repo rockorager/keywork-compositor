@@ -139,6 +139,7 @@ const Output = struct {
     calibration_identity: ?u64 = null,
     kind: OutputKind = .pixels,
     initialized: bool = false,
+    linear_initialized: bool = false,
     last_used: u64,
     command_buffer: vk.CommandBuffer = .null_handle,
     recorded_frame: RecordedFrame = .{},
@@ -1170,9 +1171,9 @@ fn videoPlaneViewFormats(format: vk.Format) ?[2]vk.Format {
 
 fn dmabufTargetVkFormat(fourcc: u32) ?vk.Format {
     return switch (render.DmabufFormat.fromFourcc(fourcc) orelse return null) {
-        .xrgb8888 => .b8g8r8a8_unorm,
+        .argb8888, .xrgb8888 => .b8g8r8a8_unorm,
         .xrgb2101010 => .a2r10g10b10_unorm_pack32,
-        .argb8888, .abgr8888, .xbgr8888, .nv12, .p010 => null,
+        .abgr8888, .xbgr8888, .nv12, .p010 => null,
     };
 }
 
@@ -2148,15 +2149,21 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
         };
         dmabuf_target_formats = try allocator.alloc(
             render.DmabufFormatModifier,
-            dmabuf_10bit_modifiers.len + dmabuf_modifiers.len,
+            dmabuf_10bit_modifiers.len + dmabuf_modifiers.len * 2,
         );
         errdefer allocator.free(dmabuf_target_formats);
         for (dmabuf_10bit_modifiers, dmabuf_target_formats[0..dmabuf_10bit_modifiers.len]) |modifier, *target| target.* = .{
             .format = @intFromEnum(render.DmabufFormat.xrgb2101010),
             .modifier = modifier,
         };
-        for (dmabuf_modifiers, dmabuf_target_formats[dmabuf_10bit_modifiers.len..]) |modifier, *target| target.* = .{
+        const xrgb_start = dmabuf_10bit_modifiers.len;
+        const argb_start = xrgb_start + dmabuf_modifiers.len;
+        for (dmabuf_modifiers, dmabuf_target_formats[xrgb_start..argb_start]) |modifier, *target| target.* = .{
             .format = @intFromEnum(render.DmabufFormat.xrgb8888),
+            .modifier = modifier,
+        };
+        for (dmabuf_modifiers, dmabuf_target_formats[argb_start..]) |modifier, *target| target.* = .{
+            .format = @intFromEnum(render.DmabufFormat.argb8888),
             .modifier = modifier,
         };
         dmabuf_source_modifiers = source_modifiers.toOwnedSlice(allocator) catch
@@ -2504,7 +2511,6 @@ fn createOffscreenTarget(self: *Self, size: render.Size) Error!render.OffscreenT
     var output = try self.createOutput(size);
     errdefer self.destroyOutput(output);
     output.kind = .offscreen;
-    output.command_buffer = try self.allocateCommandBuffer();
     self.outputs.put(self.allocator, key, output) catch return error.OutOfMemory;
     return .{ .id = id, .size = size };
 }
@@ -2802,6 +2808,11 @@ fn releaseTarget(self: *Self, id: u64) void {
 }
 
 fn releaseOutput(self: *Self, key: TargetKey) void {
+    if (!self.outputs.contains(key)) return;
+    // A composed-frame export may still be sampling this output from another
+    // output's submission. Every submission shares one queue, so draining all
+    // of them is sufficient before releasing either side of that dependency.
+    self.drainAllPending() catch {};
     if (self.outputs.fetchRemove(key)) |removed| self.destroyOutput(removed.value);
 }
 
@@ -3042,6 +3053,368 @@ pub fn renderFrame(self: *Self, frame: render.Frame, target: render.Target) Erro
     std.debug.assert(completion.sync_file_fd == null);
 }
 
+pub fn renderFrameReadback(
+    self: *Self,
+    frame: render.Frame,
+    target: render.PixelBuffer,
+) Error!render.FrameCompletion {
+    std.debug.assert(frame.damage == null);
+    return self.renderFrameWithCompletion(frame, .{ .pixels = target }, .readback, null);
+}
+
+pub fn completeFrameReadback(
+    self: *Self,
+    source: render.PixelBuffer,
+    destination: ?render.PixelBuffer,
+) Error!void {
+    const key = targetKey(.{ .pixels = source });
+    const output = self.outputs.getPtr(key) orelse return error.InvalidTarget;
+    if (output.kind != .pixels) return error.InvalidTarget;
+    try self.drainSubmission(&output.submission);
+    const target = destination orelse return;
+    if (!std.meta.eql(source.size, target.size) or
+        source.stride_pixels != target.stride_pixels) return error.InvalidTarget;
+    _ = try requiredBufferPixels(target);
+    const mapped = output.submission.work_mapped orelse return error.InvalidTarget;
+    copyMappedRect(target, mapped, .{
+        .x = 0,
+        .y = 0,
+        .width = target.size.width,
+        .height = target.size.height,
+    });
+}
+
+pub fn copyComposedFrame(
+    self: *Self,
+    source_target: render.Target,
+    source_region: ?render.Rect,
+    target: render.Target,
+    color_description: render.ColorDescription,
+) Error!?render.FrameCompletion {
+    const source_size = source_target.size();
+    const size = target.size();
+    const required_pixels = try validateTarget(.{
+        .size = size,
+        .commands = &.{},
+    }, target);
+    const source_rect = source_region orelse render.Rect{
+        .x = 0,
+        .y = 0,
+        .width = source_size.width,
+        .height = source_size.height,
+    };
+    if (source_rect.x < 0 or source_rect.y < 0 or
+        @as(i64, source_rect.x) + source_rect.width > source_size.width or
+        @as(i64, source_rect.y) + source_rect.height > source_size.height or
+        source_rect.width != size.width or source_rect.height != size.height)
+    {
+        return error.InvalidTarget;
+    }
+    if (target == .offscreen) return null;
+
+    const source_key = targetKey(source_target);
+    const target_key = targetKey(target);
+    if (std.meta.eql(source_key, target_key)) return error.InvalidTarget;
+
+    self.frame_number +%= 1;
+    try self.reclaimStaleResources();
+    _ = try self.getOutput(target_key);
+    const source = self.outputs.getPtr(source_key) orelse return null;
+    const output = self.outputs.getPtr(target_key) orelse unreachable;
+    if (!source.linear_initialized) return null;
+    const convert_color = !std.meta.eql(source.color_description, color_description);
+    if (convert_color and
+        (source.color_description.transfer_function.isHdr() or
+            color_description.transfer_function.isHdr() or
+            source.color_description.min_luminance != color_description.min_luminance or
+            source.color_description.max_luminance != color_description.max_luminance or
+            source.color_description.reference_luminance != color_description.reference_luminance))
+    {
+        return null;
+    }
+
+    const submission = &output.submission;
+    try self.drainSubmission(submission);
+    if (!std.meta.eql(output.size, size)) return error.InvalidTarget;
+    source.last_used = self.frame_number;
+    output.last_used = self.frame_number;
+    output.recorded_frame.valid = false;
+
+    const pixel_target: ?render.PixelBuffer = switch (target) {
+        .pixels => |pixels| pixels,
+        .dmabuf => null,
+        .offscreen => unreachable,
+    };
+    if (pixel_target != null) {
+        const work_size = std.math.mul(usize, required_pixels, @sizeOf(u32)) catch
+            return error.InvalidTarget;
+        try self.ensureWorkBuffer(submission, work_size);
+    }
+
+    const full_output: render.Rect = .{
+        .x = 0,
+        .y = 0,
+        .width = size.width,
+        .height = size.height,
+    };
+    const prepare_linear = source_region != null or convert_color;
+    const instances = [_]Instance{
+        imageInstance(full_output, source_rect),
+        imageInstance(full_output, full_output),
+    };
+    const instance_bytes = std.mem.sliceAsBytes(instances[0..@as(usize, if (prepare_linear) 2 else 1)]);
+    try self.ensureInstanceBuffer(submission, instance_bytes.len);
+    @memcpy(submission.instance_mapped.?[0..instance_bytes.len], instance_bytes);
+
+    var frame_succeeded = false;
+    defer if (!frame_succeeded) {
+        self.device_wrapper.deviceWaitIdle(self.device) catch {};
+        self.releaseAllPendingAfterDeviceIdle();
+        self.resetCommandBufferForTarget(target_key);
+        self.invalidateOutput(target_key);
+    };
+
+    std.debug.assert(output.command_buffer != .null_handle);
+    self.device_wrapper.resetCommandBuffer(output.command_buffer, .{}) catch
+        return error.VulkanFailure;
+    self.device_wrapper.resetFences(self.device, &.{submission.fence}) catch
+        return error.VulkanFailure;
+    self.device_wrapper.beginCommandBuffer(output.command_buffer, &.{
+        .flags = .{ .one_time_submit_bit = true },
+    }) catch return error.VulkanFailure;
+
+    const encode_descriptor = if (prepare_linear) descriptor: {
+        self.transitionImage(
+            output.command_buffer,
+            output.linear.image,
+            if (output.linear_initialized) .shader_read_only_optimal else .undefined,
+            .color_attachment_optimal,
+            if (output.linear_initialized) .{ .shader_read_bit = true } else .{},
+            .{ .color_attachment_write_bit = true },
+            if (output.linear_initialized)
+                .{ .fragment_shader_bit = true }
+            else
+                .{ .top_of_pipe_bit = true },
+            .{ .color_attachment_output_bit = true },
+        );
+        const conversion_pass: vk.RenderPassBeginInfo = .{
+            .render_pass = self.render_pass,
+            .framebuffer = output.linear.framebuffer,
+            .render_area = rect2D(full_output),
+        };
+        self.device_wrapper.cmdBeginRenderPass(
+            output.command_buffer,
+            &conversion_pass,
+            .@"inline",
+        );
+        self.setViewportAndScissor(output.command_buffer, size);
+        self.device_wrapper.cmdBindVertexBuffers(
+            output.command_buffer,
+            0,
+            &.{submission.instance_buffer},
+            &.{0},
+        );
+        self.device_wrapper.cmdBindPipeline(
+            output.command_buffer,
+            .graphics,
+            self.opaque_image_pipeline,
+        );
+        self.device_wrapper.cmdBindDescriptorSets(
+            output.command_buffer,
+            .graphics,
+            self.pipeline_layout,
+            0,
+            &.{source.linear.descriptor_set},
+            null,
+        );
+        var transform = sourceColorTransform(source.color_description, color_description);
+        transform.transfer = @splat(0);
+        const conversion_push: FramePush = .{
+            .target_size = sizeFloats(size),
+            .texture_size = sizeFloats(source_size),
+            .swap_red_blue = 0,
+            .color_matrix_0 = transform.color_matrix_0,
+            .color_matrix_1 = transform.color_matrix_1,
+            .color_matrix_2 = transform.color_matrix_2,
+            .transfer = transform.transfer,
+            .output_transfer = transform.output_transfer,
+            .transfer_aux = transform.transfer_aux,
+        };
+        self.device_wrapper.cmdPushConstants(
+            output.command_buffer,
+            self.pipeline_layout,
+            .{ .vertex_bit = true, .fragment_bit = true },
+            0,
+            @sizeOf(FramePush),
+            &conversion_push,
+        );
+        self.device_wrapper.cmdDraw(output.command_buffer, 4, 1, 0, 0);
+        self.device_wrapper.cmdEndRenderPass(output.command_buffer);
+        self.transitionImage(
+            output.command_buffer,
+            output.linear.image,
+            .color_attachment_optimal,
+            .shader_read_only_optimal,
+            .{ .color_attachment_write_bit = true },
+            .{ .shader_read_bit = true },
+            .{ .color_attachment_output_bit = true },
+            .{ .fragment_shader_bit = true },
+        );
+        break :descriptor output.linear.descriptor_set;
+    } else source.linear.descriptor_set;
+
+    if (output.kind == .dmabuf) {
+        self.transitionExternalToRender(output.command_buffer, output.*);
+    } else {
+        std.debug.assert(output.kind == .pixels);
+        self.transitionImage(
+            output.command_buffer,
+            output.image,
+            if (output.initialized) .color_attachment_optimal else .undefined,
+            .color_attachment_optimal,
+            if (output.initialized) .{ .color_attachment_write_bit = true } else .{},
+            .{ .color_attachment_write_bit = true },
+            if (output.initialized)
+                .{ .color_attachment_output_bit = true }
+            else
+                .{ .top_of_pipe_bit = true },
+            .{ .color_attachment_output_bit = true },
+        );
+    }
+
+    const output_graphics = self.outputGraphics(output.format);
+    const pass_info: vk.RenderPassBeginInfo = .{
+        .render_pass = output_graphics.render_pass,
+        .framebuffer = output.framebuffer,
+        .render_area = rect2D(full_output),
+    };
+    self.device_wrapper.cmdBeginRenderPass(output.command_buffer, &pass_info, .@"inline");
+    self.setViewportAndScissor(output.command_buffer, size);
+    self.device_wrapper.cmdBindVertexBuffers(
+        output.command_buffer,
+        0,
+        &.{submission.instance_buffer},
+        &.{0},
+    );
+    self.device_wrapper.cmdBindPipeline(
+        output.command_buffer,
+        .graphics,
+        output_graphics.encode_pipeline,
+    );
+    self.device_wrapper.cmdBindDescriptorSets(
+        output.command_buffer,
+        .graphics,
+        self.pipeline_layout,
+        0,
+        &.{encode_descriptor},
+        null,
+    );
+    const output_push: FramePush = .{
+        .target_size = sizeFloats(size),
+        .texture_size = sizeFloats(if (prepare_linear) size else source_size),
+        .swap_red_blue = @floatFromInt(@intFromBool(output.format == .r8g8b8a8_unorm)),
+        .quantization_levels = if (output.format == .a2r10g10b10_unorm_pack32) 1023 else 255,
+        .transfer = .{ 1, 80, 80, 0 },
+        .output_transfer = outputColorTransfer(color_description),
+        .transfer_aux = colorTransferAux(color_description),
+    };
+    self.device_wrapper.cmdPushConstants(
+        output.command_buffer,
+        self.pipeline_layout,
+        .{ .vertex_bit = true, .fragment_bit = true },
+        0,
+        @sizeOf(FramePush),
+        &output_push,
+    );
+    self.device_wrapper.cmdDraw(
+        output.command_buffer,
+        4,
+        1,
+        0,
+        @intFromBool(prepare_linear),
+    );
+    self.device_wrapper.cmdEndRenderPass(output.command_buffer);
+
+    if (output.kind == .dmabuf) {
+        self.transitionRenderToExternal(output.command_buffer, output.image);
+    } else {
+        self.transitionImage(
+            output.command_buffer,
+            output.image,
+            .color_attachment_optimal,
+            .transfer_src_optimal,
+            .{ .color_attachment_write_bit = true },
+            .{ .transfer_read_bit = true },
+            .{ .color_attachment_output_bit = true },
+            .{ .transfer_bit = true },
+        );
+        const copy_frame: render.Frame = .{ .size = size, .commands = &.{} };
+        self.copyOutputDamage(
+            submission.work_buffer,
+            output.command_buffer,
+            copy_frame,
+            pixel_target.?,
+            output.image,
+        );
+        self.transitionImage(
+            output.command_buffer,
+            output.image,
+            .transfer_src_optimal,
+            .color_attachment_optimal,
+            .{ .transfer_read_bit = true },
+            .{ .color_attachment_read_bit = true, .color_attachment_write_bit = true },
+            .{ .transfer_bit = true },
+            .{ .color_attachment_output_bit = true },
+        );
+        self.transferToHostBarrier(output.command_buffer);
+    }
+    self.device_wrapper.endCommandBuffer(output.command_buffer) catch
+        return error.VulkanFailure;
+
+    const export_completion = submission.scanout_semaphore != .null_handle;
+    const submit_info: vk.SubmitInfo = .{
+        .command_buffer_count = 1,
+        .p_command_buffers = @ptrCast(&output.command_buffer),
+        .signal_semaphore_count = @intFromBool(export_completion),
+        .p_signal_semaphores = if (export_completion)
+            @ptrCast(&submission.scanout_semaphore)
+        else
+            null,
+    };
+    self.device_wrapper.queueSubmit(self.queue, &.{submit_info}, submission.fence) catch
+        return error.VulkanFailure;
+    submission.fence_pending = true;
+    output.initialized = true;
+    output.linear_initialized = prepare_linear;
+    output.color_description = color_description;
+
+    if (export_completion) {
+        const completion_fd = self.device_wrapper.getSemaphoreFdKHR(self.device, &.{
+            .semaphore = submission.scanout_semaphore,
+            .handle_type = .{ .sync_fd_bit = true },
+        }) catch {
+            try self.drainAllPending();
+            self.disableScanoutSynchronization();
+            if (pixel_target) |pixels| {
+                copyMappedRect(pixels, submission.work_mapped.?, full_output);
+            }
+            frame_succeeded = true;
+            return .{};
+        };
+        if (completion_fd >= 0) {
+            frame_succeeded = true;
+            return .{ .sync_file_fd = completion_fd };
+        }
+    }
+
+    try self.drainSubmission(submission);
+    if (pixel_target) |pixels| {
+        copyMappedRect(pixels, submission.work_mapped.?, full_output);
+    }
+    frame_succeeded = true;
+    return .{};
+}
+
 pub fn renderFrameScanout(
     self: *Self,
     frame: render.Frame,
@@ -3054,6 +3427,7 @@ pub fn renderFrameScanout(
 const CompletionMode = enum {
     wait,
     sync_fd,
+    readback,
 };
 
 fn renderFrameWithCompletion(
@@ -3221,7 +3595,8 @@ fn renderFrameWithCompletion(
     // The retained linear image, rather than the scanout image, is the source
     // of truth for partial redraws. Initialize all of it from the complete
     // scene before accepting damage-limited updates.
-    if (!output.initialized and output.kind != .pixels) compiled_frame.damage = null;
+    if (!output.linear_initialized and
+        (output.kind != .pixels or output.initialized)) compiled_frame.damage = null;
     try self.compileDrawRuns(
         compiled_frame,
         self.prepared_images.items,
@@ -3297,7 +3672,7 @@ fn renderFrameWithCompletion(
         self.prepared_images.items,
     );
     std.debug.assert(!reusable or output.command_buffer != .null_handle);
-    const command_buffer = if (reusable) output.command_buffer else self.command_buffer;
+    const command_buffer = output.command_buffer;
     if (!cache_hit) {
         var gpu_timing_recorder: GpuTimingRecorder = .{ .plan = gpu_timing_plan };
         self.device_wrapper.beginCommandBuffer(command_buffer, &.{
@@ -3383,11 +3758,11 @@ fn renderFrameWithCompletion(
         self.transitionImage(
             command_buffer,
             output.linear.image,
-            if (output.initialized) .shader_read_only_optimal else .undefined,
+            if (output.linear_initialized) .shader_read_only_optimal else .undefined,
             .color_attachment_optimal,
-            if (output.initialized) .{ .shader_read_bit = true } else .{},
+            if (output.linear_initialized) .{ .shader_read_bit = true } else .{},
             .{ .color_attachment_read_bit = true, .color_attachment_write_bit = true },
-            if (output.initialized)
+            if (output.linear_initialized)
                 .{ .fragment_shader_bit = true }
             else
                 .{ .top_of_pipe_bit = true },
@@ -3795,9 +4170,11 @@ fn renderFrameWithCompletion(
                 prepared.upload_offset != null
             else
                 false;
-            if (uploaded_calibration) {
+            if (uploaded_calibration or output.initialized != output.linear_initialized) {
                 // The staging offset belongs to this frame and cannot be
-                // replayed safely after the mapped work buffer is reused.
+                // replayed safely after the mapped work buffer is reused. A
+                // direct composed-frame copy can also initialize only the
+                // encoded image, making this frame's initial layouts unique.
                 output.recorded_frame.valid = false;
             } else try self.rememberRecordedFrame(
                 submission,
@@ -3862,12 +4239,15 @@ fn renderFrameWithCompletion(
         }
     }
 
-    const export_completion = completion_mode == .sync_fd and
-        output.kind == .dmabuf and submission.scanout_semaphore != .null_handle;
+    const export_completion = submission.scanout_semaphore != .null_handle and switch (completion_mode) {
+        .wait => false,
+        .sync_fd => output.kind == .dmabuf,
+        .readback => output.kind == .pixels,
+    };
     // A GPU-resident offscreen output has no external consumer to synchronize.
     // Keep its work in flight and drain before the target is reused instead of
     // delaying headless presentation and frame callbacks on GPU completion.
-    const async_submission = completion_mode == .sync_fd and
+    const async_submission = completion_mode != .wait and
         (output.kind == .offscreen or export_completion);
     // Queue submission makes prior coherent mapped writes visible to every
     // device access in the submission; no host pipeline barrier is needed.
@@ -3898,6 +4278,7 @@ fn renderFrameWithCompletion(
     }
     temporary_textures_pending = true;
     output.initialized = true;
+    output.linear_initialized = true;
     if (new_calibration_identity) |identity| {
         self.calibrations.getPtr(identity).?.initialized = true;
     }
@@ -3930,11 +4311,17 @@ fn renderFrameWithCompletion(
             try self.drainAllPending();
             self.disableScanoutSynchronization();
             log.warn("Vulkan sync-file export failed; using blocking scanout", .{});
+            if (output.kind == .pixels) {
+                copyDamageToTarget(compiled_frame, target.pixels, submission.work_mapped.?);
+            }
             frame_succeeded = true;
             return completion;
         };
         if (completion_fd < 0) {
             try self.drainSubmission(submission);
+            if (output.kind == .pixels) {
+                copyDamageToTarget(compiled_frame, target.pixels, submission.work_mapped.?);
+            }
             frame_succeeded = true;
             return completion;
         }
@@ -3954,6 +4341,13 @@ fn renderFrameWithCompletion(
                     try self.drainAllPending();
                     self.disableScanoutSynchronization();
                     log.warn("DMA-BUF sync-file import failed; using blocking scanout", .{});
+                    if (output.kind == .pixels) {
+                        copyDamageToTarget(
+                            compiled_frame,
+                            target.pixels,
+                            submission.work_mapped.?,
+                        );
+                    }
                     frame_succeeded = true;
                     return completion;
                 }
@@ -4272,6 +4666,12 @@ fn createOutput(self: *Self, size: render.Size) Error!Output {
     errdefer self.device_wrapper.destroyFramebuffer(self.device, framebuffer, null);
     const linear = try self.createWorkingTarget(size);
     errdefer self.destroyWorkingTarget(linear);
+    const command_buffer = try self.allocateCommandBuffer();
+    errdefer self.device_wrapper.freeCommandBuffers(
+        self.device,
+        self.command_pool,
+        &.{command_buffer},
+    );
     const submission = try self.createSubmission();
     errdefer self.destroySubmission(submission);
     return .{
@@ -4283,6 +4683,7 @@ fn createOutput(self: *Self, size: render.Size) Error!Output {
         .format = self.format,
         .size = size,
         .last_used = self.frame_number,
+        .command_buffer = command_buffer,
         .linear = linear,
         .submission = submission,
     };
@@ -4292,6 +4693,7 @@ fn invalidateOutput(self: *Self, key: TargetKey) void {
     if (self.outputs.getPtr(key)) |output| {
         if (output.kind != .pixels) {
             output.initialized = false;
+            output.linear_initialized = false;
             output.blur_initialized = 0;
             for (output.backdrop_cache.items) |*cache| {
                 cache.key = null;
@@ -4306,11 +4708,9 @@ fn invalidateOutput(self: *Self, key: TargetKey) void {
 
 fn resetCommandBufferForTarget(self: *Self, key: TargetKey) void {
     if (self.outputs.getPtr(key)) |output| {
-        if (output.kind != .pixels) {
-            self.device_wrapper.resetCommandBuffer(output.command_buffer, .{}) catch {};
-            output.recorded_frame.valid = false;
-            return;
-        }
+        self.device_wrapper.resetCommandBuffer(output.command_buffer, .{}) catch {};
+        output.recorded_frame.valid = false;
+        return;
     }
     self.device_wrapper.resetCommandBuffer(self.command_buffer, .{}) catch {};
 }
@@ -5639,13 +6039,16 @@ fn destroyInstanceBuffer(self: *Self, submission: *Submission) void {
 
 fn hostMemoryType(self: *Self, memory_type_bits: u32) ?u32 {
     const properties = self.instance_wrapper.getPhysicalDeviceMemoryProperties(self.physical_device);
+    var coherent: ?u32 = null;
     for (0..properties.memory_type_count) |index| {
         const index_u5: u5 = @intCast(index);
         if (memory_type_bits & (@as(u32, 1) << index_u5) == 0) continue;
         const flags = properties.memory_types[index].property_flags;
-        if (flags.host_visible_bit and flags.host_coherent_bit) return @intCast(index);
+        if (!flags.host_visible_bit or !flags.host_coherent_bit) continue;
+        if (coherent == null) coherent = @intCast(index);
+        if (flags.host_cached_bit) return @intCast(index);
     }
-    return null;
+    return coherent;
 }
 
 fn advanceResourceEpoch(self: *Self) void {
@@ -7878,6 +8281,70 @@ test "Vulkan renderer clears and clips solid rectangles" {
     try std.testing.expectEqual(@as(u32, 0xff141e28), pixels[10]);
 }
 
+test "Vulkan renderer completes asynchronous pixel readback" {
+    var renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
+        error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+
+    var pixels = [_]u32{0} ** 16;
+    const target: render.PixelBuffer = .{
+        .size = .{ .width = 4, .height = 4 },
+        .stride_pixels = 4,
+        .pixels = &pixels,
+    };
+    const commands = [_]render.Command{.{
+        .clear = render.Color.rgba(12, 34, 56, 255),
+    }};
+    const completion = try renderer.renderFrameReadback(
+        .{ .size = target.size, .commands = &commands },
+        target,
+    );
+    var destination_pixels = [_]u32{0} ** 16;
+    const destination: render.PixelBuffer = .{
+        .size = target.size,
+        .stride_pixels = target.stride_pixels,
+        .pixels = &destination_pixels,
+    };
+    if (completion.sync_file_fd) |fd| {
+        defer _ = std.c.close(fd);
+        var poll_fds = [_]std.posix.pollfd{.{
+            .fd = fd,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        try std.testing.expectEqual(@as(usize, 1), try std.posix.poll(&poll_fds, -1));
+        try renderer.completeFrameReadback(target, destination);
+        for (destination_pixels) |pixel| {
+            try std.testing.expectEqual(@as(u32, 0xff0c2238), pixel);
+        }
+    } else {
+        for (pixels) |pixel| try std.testing.expectEqual(@as(u32, 0xff0c2238), pixel);
+    }
+}
+
+test "Vulkan pixel scanout completes before returning" {
+    var renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
+        error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+
+    var pixels = [_]u32{0} ** 16;
+    const target: render.PixelBuffer = .{
+        .size = .{ .width = 4, .height = 4 },
+        .stride_pixels = 4,
+        .pixels = &pixels,
+    };
+    const completion = try renderer.renderFrameScanout(.{
+        .size = target.size,
+        .commands = &.{.{ .clear = render.Color.rgba(12, 34, 56, 255) }},
+    }, .{ .pixels = target }, null);
+    try std.testing.expectEqual(@as(?std.posix.fd_t, null), completion.sync_file_fd);
+    for (pixels) |pixel| try std.testing.expectEqual(@as(u32, 0xff0c2238), pixel);
+}
+
 test "Vulkan renderer applies a three-dimensional output calibration LUT" {
     var renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
         error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
@@ -9180,7 +9647,126 @@ test "Vulkan renderer keeps offscreen frames GPU-resident" {
     try std.testing.expect(output.recorded_frame.valid);
 }
 
-test "Vulkan renderer imports and renders directly to a GBM dmabuf" {
+test "Vulkan renderer copies a retained composed frame without replaying commands" {
+    var renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
+        error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+
+    const size: render.Size = .{ .width = 8, .height = 4 };
+    const offscreen = try renderer.createOffscreenTarget(size);
+    defer renderer.releaseOutput(.{ .offscreen = offscreen.id });
+    try renderer.renderFrame(.{
+        .size = size,
+        .commands = &.{.{ .clear = render.Color.rgba(12, 34, 56, 255) }},
+    }, .{ .offscreen = offscreen });
+
+    var pixels = [_]u32{0} ** 32;
+    const target: render.PixelBuffer = .{
+        .size = size,
+        .stride_pixels = size.width,
+        .pixels = &pixels,
+    };
+    const completion = (try renderer.copyComposedFrame(
+        .{ .offscreen = offscreen },
+        null,
+        .{ .pixels = target },
+        .{},
+    )).?;
+    if (completion.sync_file_fd) |fd| {
+        _ = std.c.close(fd);
+        try renderer.completeFrameReadback(target, target);
+    }
+    for (pixels) |pixel| try std.testing.expectEqual(@as(u32, 0xff0c2238), pixel);
+
+    try renderer.renderFrame(.{
+        .size = size,
+        .commands = &.{
+            .{ .clear = render.Color.rgba(0, 0, 255, 255) },
+            .{ .solid_rect = .{
+                .rect = .{ .x = 4, .y = 0, .width = 4, .height = 4 },
+                .color = render.Color.rgba(255, 0, 0, 255),
+            } },
+        },
+    }, .{ .offscreen = offscreen });
+    var cropped_pixels = [_]u32{0} ** 4;
+    const cropped_target: render.PixelBuffer = .{
+        .size = .{ .width = 2, .height = 2 },
+        .stride_pixels = 2,
+        .pixels = &cropped_pixels,
+    };
+    const full_pattern = (try renderer.copyComposedFrame(
+        .{ .offscreen = offscreen },
+        null,
+        .{ .pixels = target },
+        .{},
+    )).?;
+    const cropped = (try renderer.copyComposedFrame(
+        .{ .offscreen = offscreen },
+        .{ .x = 6, .y = 2, .width = 2, .height = 2 },
+        .{ .pixels = cropped_target },
+        .{},
+    )).?;
+    if (full_pattern.sync_file_fd) |fd| {
+        _ = std.c.close(fd);
+        try renderer.completeFrameReadback(target, target);
+    }
+    if (cropped.sync_file_fd) |fd| {
+        _ = std.c.close(fd);
+        try renderer.completeFrameReadback(cropped_target, cropped_target);
+    }
+    try std.testing.expectEqual(@as(u32, 0xff0000ff), pixels[0]);
+    try std.testing.expectEqual(@as(u32, 0xffff0000), pixels[7]);
+    for (cropped_pixels) |pixel| try std.testing.expectEqual(@as(u32, 0xffff0000), pixel);
+    try std.testing.expectError(error.InvalidTarget, renderer.copyComposedFrame(
+        .{ .offscreen = offscreen },
+        .{ .x = 7, .y = 3, .width = 2, .height = 2 },
+        .{ .pixels = cropped_target },
+        .{},
+    ));
+
+    const monitor_description: render.ColorDescription = .{
+        .primaries = render.bt2020_chromaticities,
+        .named_primaries = .bt2020,
+        .transfer_function = .{ .power = 24000 },
+    };
+    try renderer.renderFrame(.{
+        .size = size,
+        .commands = &.{.{ .clear = render.Color.rgba(64, 64, 64, 255) }},
+        .output_color_description = monitor_description,
+    }, .{ .offscreen = offscreen });
+    const converted = (try renderer.copyComposedFrame(
+        .{ .offscreen = offscreen },
+        null,
+        .{ .pixels = target },
+        .{},
+    )).?;
+    if (converted.sync_file_fd) |fd| {
+        _ = std.c.close(fd);
+        try renderer.completeFrameReadback(target, target);
+    }
+    for (pixels) |pixel| {
+        try std.testing.expectEqual(@as(u8, 255), @as(u8, @truncate(pixel >> 24)));
+        try std.testing.expectApproxEqAbs(
+            @as(f32, 64),
+            @as(f32, @floatFromInt(@as(u8, @truncate(pixel >> 16)))),
+            2,
+        );
+        try std.testing.expectApproxEqAbs(
+            @as(f32, 64),
+            @as(f32, @floatFromInt(@as(u8, @truncate(pixel >> 8)))),
+            2,
+        );
+        try std.testing.expectApproxEqAbs(
+            @as(f32, 64),
+            @as(f32, @floatFromInt(@as(u8, @truncate(pixel)))),
+            2,
+        );
+    }
+}
+
+test "Vulkan renderer imports and renders a cropped frame directly to a linear ARGB GBM dmabuf" {
     const fd = std.c.open("/dev/dri/renderD128", std.c.O{
         .ACCMODE = .RDWR,
         .CLOEXEC = true,
@@ -9202,6 +9788,8 @@ test "Vulkan renderer imports and renders directly to a GBM dmabuf" {
     var imported_buffer: ?Gbm.Buffer = null;
     const id = render.allocateRenderTargetId();
     for (access.target_formats) |target_format| {
+        if (target_format.format != @intFromEnum(render.DmabufFormat.argb8888) or
+            target_format.modifier != 0) continue;
         var buffer = gbm.createBuffer(
             size,
             target_format.format,
@@ -9230,6 +9818,21 @@ test "Vulkan renderer imports and renders directly to a GBM dmabuf" {
         .size = size,
         .commands = &.{.{ .clear = render.Color.rgba(12, 34, 56, 255) }},
     }, .{ .dmabuf = .{ .id = id, .size = size } });
+
+    const source_size: render.Size = .{ .width = 128, .height = 64 };
+    const offscreen = try renderer.createOffscreenTarget(source_size);
+    defer renderer.releaseOutput(.{ .offscreen = offscreen.id });
+    try renderer.renderFrame(.{
+        .size = source_size,
+        .commands = &.{.{ .clear = render.Color.rgba(78, 90, 123, 255) }},
+    }, .{ .offscreen = offscreen });
+    const completion = (try renderer.copyComposedFrame(
+        .{ .offscreen = offscreen },
+        .{ .x = 32, .y = 0, .width = size.width, .height = size.height },
+        .{ .dmabuf = .{ .id = id, .size = size } },
+        .{},
+    )).?;
+    if (completion.sync_file_fd) |completion_fd| _ = std.c.close(completion_fd);
 }
 
 test "Vulkan renderer samples an ABGR GBM dmabuf without a CPU upload" {

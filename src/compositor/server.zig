@@ -181,6 +181,7 @@ image_copy_capture: ImageCopyCapture,
 image_copy_capture_initialized: bool,
 screencopy: Screencopy,
 screencopy_initialized: bool,
+composed_capture_source: ?ComposedCaptureSource,
 xwayland_keyboard_grab: XwaylandKeyboardGrab,
 xwayland_keyboard_grab_initialized: bool,
 xwayland_shell: XwaylandShell,
@@ -219,6 +220,13 @@ pub const XwaylandDisplayListener = struct {
     context: *anyopaque,
     available: *const fn (*anyopaque, []const u8) void,
     unavailable: *const fn (*anyopaque) void,
+};
+
+const ComposedCaptureSource = struct {
+    output: OutputLayout.Id,
+    target: render.Target,
+    primary_cursor_painted: bool,
+    tablet_cursors_painted: bool,
 };
 
 const RenderOutput = struct {
@@ -1348,6 +1356,7 @@ pub fn createWithVirtualOutput(
         .image_copy_capture_initialized = false,
         .screencopy = undefined,
         .screencopy_initialized = false,
+        .composed_capture_source = null,
         .xwayland_keyboard_grab = undefined,
         .xwayland_keyboard_grab_initialized = false,
         .xwayland_shell = undefined,
@@ -1882,6 +1891,8 @@ pub fn createWithVirtualOutput(
             .constraints = captureConstraints,
             .schedule = scheduleImageCapture,
             .capture = captureImage,
+            .capture_dmabuf = captureImageDmabuf,
+            .complete = completeCaptureReadback,
             .cursor_info = captureCursorInfo,
         },
     );
@@ -1901,6 +1912,8 @@ pub fn createWithVirtualOutput(
             .constraints = screencopyConstraints,
             .schedule = scheduleScreencopy,
             .capture = captureScreencopy,
+            .capture_dmabuf = captureScreencopyDmabuf,
+            .complete = completeCaptureReadback,
         },
     );
     self.screencopy_initialized = true;
@@ -3735,7 +3748,11 @@ fn reconcileOutputCursors(self: *Self) void {
     while (outputs.next()) |entry| self.updateOutputCursor(entry.value.*, cursor, cursor);
 }
 
-fn prepareOutputCursorFrame(self: *Self, output: *RenderOutput) void {
+fn prepareOutputCursorFrame(
+    self: *Self,
+    output: *RenderOutput,
+    force_software_cursor: bool,
+) void {
     if ((output.cursor_state == .hardware or output.cursor_state == .deactivating) and
         !output.backend.shapeCursorActive())
     {
@@ -3748,6 +3765,25 @@ fn prepareOutputCursorFrame(self: *Self, output: *RenderOutput) void {
     }
 
     const cursor = self.seatCursorInfo(&self.seat, self.session_lock.isLocked());
+    if (force_software_cursor) {
+        switch (output.cursor_state) {
+            .software, .deactivating => {},
+            .activating => {
+                output.cursor_state = if (output.backend.shapeCursorActive())
+                    .deactivating
+                else
+                    .software;
+                output.cursor_transition_committed = false;
+                _ = self.addOutputCursorDamage(output, cursor);
+            },
+            .hardware => {
+                output.cursor_state = .deactivating;
+                output.cursor_transition_committed = false;
+                _ = self.addOutputCursorDamage(output, cursor);
+            },
+        }
+        return;
+    }
     const eligible = self.shapeCursorForOutput(output, cursor);
     switch (output.cursor_state) {
         .software => {},
@@ -6714,26 +6750,29 @@ fn captureImage(
     target: ImageCopyCapture.Target,
     paint_cursors: bool,
     pixel_buffer: render.PixelBuffer,
-) ImageCopyCapture.CaptureError!presentation.Timestamp {
+) ImageCopyCapture.CaptureError!ImageCopyCapture.CaptureResult {
     const self: *Self = @ptrCast(@alignCast(context));
-    switch (target) {
+    const completion_fd = switch (target) {
         .source => |source| switch (source) {
             .output => |output_id| self.captureOutput(
                 output_id,
                 paint_cursors,
                 pixel_buffer,
             ) catch return error.Failed,
-            .toplevel => |window_id| {
+            .toplevel => |window_id| toplevel: {
                 if (self.session_lock.isLocked()) return error.Failed;
-                self.captureToplevel(window_id, pixel_buffer) catch |err| switch (err) {
+                break :toplevel self.captureToplevel(window_id, pixel_buffer) catch |err| switch (err) {
                     error.Stopped => return error.Stopped,
                     else => return error.Failed,
                 };
             },
         },
         .cursor => |cursor| self.captureCursor(cursor, pixel_buffer) catch return error.Failed,
-    }
-    return presentation.Info.now(self.io).timestamp;
+    };
+    return .{
+        .timestamp = presentation.Info.now(self.io).timestamp,
+        .completion_fd = completion_fd,
+    };
 }
 
 fn captureScreencopy(
@@ -6741,15 +6780,107 @@ fn captureScreencopy(
     target: Screencopy.Target,
     overlay_cursor: bool,
     pixel_buffer: render.PixelBuffer,
-) Screencopy.CaptureError!presentation.Timestamp {
+) Screencopy.CaptureError!Screencopy.CaptureResult {
     const self: *Self = @ptrCast(@alignCast(context));
-    self.captureOutputRegion(
+    const completion_fd = self.captureOutputRegion(
         target.output,
         target.region,
         overlay_cursor,
         pixel_buffer,
     ) catch return error.Failed;
+    return .{
+        .timestamp = presentation.Info.now(self.io).timestamp,
+        .completion_fd = completion_fd,
+    };
+}
+
+fn captureImageDmabuf(
+    context: *anyopaque,
+    target: ImageCopyCapture.Target,
+    paint_cursors: bool,
+    buffer: *LinuxDmabuf.Buffer,
+) ImageCopyCapture.CaptureError!presentation.Timestamp {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const access = self.renderer.dmabufAccess() orelse return error.Failed;
+    const capture_target = buffer.captureTarget(access) catch return error.Failed;
+    const completion = switch (target) {
+        .source => |source| switch (source) {
+            .output => |output_id| self.captureFullOutputTarget(
+                output_id,
+                paint_cursors,
+                .{ .dmabuf = capture_target },
+            ) catch return error.Failed,
+            .toplevel => |window_id| toplevel: {
+                if (self.session_lock.isLocked()) return error.Failed;
+                break :toplevel self.captureToplevelTarget(
+                    window_id,
+                    .{ .dmabuf = capture_target },
+                ) catch |err| switch (err) {
+                    error.Stopped => return error.Stopped,
+                    else => return error.Failed,
+                };
+            },
+        },
+        .cursor => |cursor| self.captureCursorTarget(
+            cursor,
+            .{ .dmabuf = capture_target },
+        ) catch return error.Failed,
+    };
+    finishDmabufCapture(buffer, completion) catch return error.Failed;
     return presentation.Info.now(self.io).timestamp;
+}
+
+fn captureScreencopyDmabuf(
+    context: *anyopaque,
+    target: Screencopy.Target,
+    overlay_cursor: bool,
+    buffer: *LinuxDmabuf.Buffer,
+) Screencopy.CaptureError!presentation.Timestamp {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const access = self.renderer.dmabufAccess() orelse return error.Failed;
+    const capture_target = buffer.captureTarget(access) catch return error.Failed;
+    const completion = self.captureOutputTarget(
+        target.output,
+        target.region,
+        overlay_cursor,
+        .{ .dmabuf = capture_target },
+    ) catch return error.Failed;
+    finishDmabufCapture(buffer, completion) catch return error.Failed;
+    return presentation.Info.now(self.io).timestamp;
+}
+
+fn finishDmabufCapture(
+    buffer: *LinuxDmabuf.Buffer,
+    completion: renderer_types.Renderer.FrameCompletion,
+) error{CaptureSyncFailed}!void {
+    const sync_file_fd = completion.sync_file_fd orelse return;
+    defer _ = std.c.close(sync_file_fd);
+    if (buffer.importWriteFence(sync_file_fd)) return;
+    var poll_fds = [_]std.posix.pollfd{.{
+        .fd = sync_file_fd,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    if ((std.posix.poll(&poll_fds, -1) catch return error.CaptureSyncFailed) != 1 or
+        poll_fds[0].revents & std.posix.POLL.IN == 0 or
+        poll_fds[0].revents &
+            (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL) != 0)
+    {
+        return error.CaptureSyncFailed;
+    }
+}
+
+fn completeCaptureReadback(
+    context: *anyopaque,
+    source: render.PixelBuffer,
+    destination: ?render.PixelBuffer,
+) bool {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.renderer.completeFrameReadback(source, destination) catch |err| {
+        log.err("screen capture readback completion failed: {t}", .{err});
+        return false;
+    };
+    return destination != null;
 }
 
 const CursorCaptureState = struct {
@@ -6803,24 +6934,7 @@ fn cursorCaptureState(
     const pointer = target.seat.pointerPosition() orelse return null;
     const pointer_x = floorToI32(pointer.x);
     const pointer_y = floorToI32(pointer.y);
-    const bounds = switch (cursor) {
-        .shape => |shape| render.Rect{
-            .x = shape.x,
-            .y = shape.y,
-            .width = shape.buffer.size.width,
-            .height = shape.buffer.size.height,
-        },
-        .surface => |surface| bounds: {
-            var value: ?render.Rect = null;
-            self.addSurfaceTreeBounds(
-                surface.surface_id,
-                surface.x,
-                surface.y,
-                &value,
-            ) catch return null;
-            break :bounds value orelse return null;
-        },
-    };
+    const bounds = self.cursorBounds(cursor) orelse return null;
     const size = scale.apply(.{ .width = bounds.width, .height = bounds.height }) catch
         return null;
     if (size.width == 0 or size.height == 0) return null;
@@ -6850,16 +6964,25 @@ fn captureCursor(
     self: *Self,
     target: ImageCopyCapture.CursorTarget,
     pixel_buffer: render.PixelBuffer,
-) renderer_types.Renderer.Error!void {
+) renderer_types.Renderer.Error!?std.posix.fd_t {
+    const completion = try self.captureCursorTarget(target, .{ .pixels = pixel_buffer });
+    return completion.sync_file_fd;
+}
+
+fn captureCursorTarget(
+    self: *Self,
+    target: ImageCopyCapture.CursorTarget,
+    render_target: render.Target,
+) renderer_types.Renderer.Error!renderer_types.Renderer.FrameCompletion {
     const state = self.cursorCaptureState(target) orelse return error.InvalidTarget;
-    if (!std.meta.eql(pixel_buffer.size, state.size)) return error.InvalidTarget;
+    if (!std.meta.eql(render_target.size(), state.size)) return error.InvalidTarget;
     const render_output = switch (target.source) {
         .output => |output_id| self.renderOutputForProtocol(output_id),
         .toplevel => self.firstRenderOutput(),
     } orelse return error.InvalidTarget;
     const output = self.outputs.get(render_output.protocol_id) orelse return error.InvalidTarget;
     try self.renderer.beginFrame(
-        .{ .pixels = pixel_buffer },
+        render_target,
         state.scale,
         .{ .x = state.bounds.x, .y = state.bounds.y },
         null,
@@ -6879,7 +7002,18 @@ fn captureCursor(
     try self.renderCommands(&frame, &clear_command);
     try self.renderCursor(&frame, state.cursor);
     renderer_frame_active = false;
-    try self.renderer.finishFrame();
+    return self.finishCaptureTarget(render_target);
+}
+
+fn finishCaptureTarget(
+    self: *Self,
+    target: render.Target,
+) renderer_types.Renderer.Error!renderer_types.Renderer.FrameCompletion {
+    return switch (target) {
+        .pixels => self.renderer.finishFrameReadback(),
+        .dmabuf => self.renderer.finishFrameScanout(null),
+        .offscreen => error.InvalidTarget,
+    };
 }
 
 fn floorToI32(value: f64) i32 {
@@ -6941,6 +7075,47 @@ test "screencopy region follows full output fractional pixel boundaries" {
             .{ .width = 6, .height = 6 },
         ).?,
     );
+    try std.testing.expectEqual(
+        render.Rect{ .x = 9, .y = 6, .width = 3, .height = 6 },
+        scaledScreencopyRegion(
+            .{ .x = 6, .y = 4, .width = 2, .height = 4 },
+            .{ .numerator = 180 },
+            .{ .width = 12, .height = 12 },
+        ).?,
+    );
+}
+
+test "capture cursor matching ignores cursors outside the selected region" {
+    const output_rect: render.Rect = .{ .x = 1000, .y = 500, .width = 800, .height = 600 };
+    const capture_rect = captureLogicalRect(output_rect, .{
+        .x = 100,
+        .y = 50,
+        .width = 200,
+        .height = 100,
+    });
+    try std.testing.expectEqual(
+        render.Rect{ .x = 1100, .y = 550, .width = 200, .height = 100 },
+        capture_rect,
+    );
+    try std.testing.expect(cursorMismatchAffectsCapture(
+        false,
+        true,
+        .{ .x = 1200, .y = 600, .width = 32, .height = 32 },
+        capture_rect,
+    ));
+    try std.testing.expect(!cursorMismatchAffectsCapture(
+        false,
+        true,
+        .{ .x = 1500, .y = 900, .width = 32, .height = 32 },
+        capture_rect,
+    ));
+    try std.testing.expect(!cursorMismatchAffectsCapture(
+        false,
+        false,
+        .{ .x = 1200, .y = 600, .width = 32, .height = 32 },
+        capture_rect,
+    ));
+    try std.testing.expect(cursorMismatchAffectsCapture(false, true, null, capture_rect));
 }
 
 test "output capture uses pixel dimensions at fractional scale" {
@@ -6968,7 +7143,7 @@ test "output capture uses pixel dimensions at fractional scale" {
     );
 
     var pixels: [18]u32 = undefined;
-    try server.captureOutput(output.protocol_id, false, .{
+    _ = try server.captureOutput(output.protocol_id, false, .{
         .size = .{ .width = 6, .height = 3 },
         .stride_pixels = 6,
         .pixels = &pixels,
@@ -7011,7 +7186,7 @@ fn captureOutput(
     output_id: OutputLayout.Id,
     paint_cursors: bool,
     pixel_buffer: render.PixelBuffer,
-) renderer_types.Renderer.Error!void {
+) renderer_types.Renderer.Error!?std.posix.fd_t {
     return self.captureOutputRegion(output_id, null, paint_cursors, pixel_buffer);
 }
 
@@ -7021,47 +7196,72 @@ fn captureOutputRegion(
     local_region: ?render.Rect,
     paint_cursors: bool,
     pixel_buffer: render.PixelBuffer,
-) renderer_types.Renderer.Error!void {
+) renderer_types.Renderer.Error!?std.posix.fd_t {
+    const completion = try self.captureOutputTarget(
+        output_id,
+        local_region,
+        paint_cursors,
+        .{ .pixels = pixel_buffer },
+    );
+    return completion.sync_file_fd;
+}
+
+fn captureFullOutputTarget(
+    self: *Self,
+    output_id: OutputLayout.Id,
+    paint_cursors: bool,
+    render_target: render.Target,
+) renderer_types.Renderer.Error!renderer_types.Renderer.FrameCompletion {
+    return self.captureOutputTarget(output_id, null, paint_cursors, render_target);
+}
+
+fn captureOutputTarget(
+    self: *Self,
+    output_id: OutputLayout.Id,
+    local_region: ?render.Rect,
+    paint_cursors: bool,
+    render_target: render.Target,
+) renderer_types.Renderer.Error!renderer_types.Renderer.FrameCompletion {
     const render_output = self.renderOutputForProtocol(output_id) orelse
         return error.InvalidTarget;
     const output = self.outputs.get(output_id) orelse return error.InvalidTarget;
-    if (local_region) |region| {
-        const physical = scaledScreencopyRegion(
-            region,
-            render_output.backend.renderScale(),
-            render_output.backend.modeSize(),
-        ) orelse return error.InvalidTarget;
-        if (!std.meta.eql(pixel_buffer.size, render.Size{
-            .width = physical.width,
-            .height = physical.height,
-        })) return error.InvalidTarget;
-        const full_size = render_output.backend.modeSize();
-        const pixel_count = full_size.pixelCount() catch return error.OutOfMemory;
-        const pixels = self.allocator.alloc(u32, pixel_count) catch return error.OutOfMemory;
-        defer self.allocator.free(pixels);
-        const full_buffer: render.PixelBuffer = .{
-            .size = full_size,
-            .stride_pixels = full_size.width,
-            .pixels = pixels,
-        };
-        try self.captureOutputRegion(output_id, null, paint_cursors, full_buffer);
-        for (0..physical.height) |y| {
-            const source_start = (@as(usize, @intCast(physical.y)) + y) * full_size.width +
-                @as(usize, @intCast(physical.x));
-            const destination_start = y * pixel_buffer.stride_pixels;
-            @memcpy(
-                pixel_buffer.pixels[destination_start..][0..physical.width],
-                full_buffer.pixels[source_start..][0..physical.width],
-            );
-        }
-        return;
-    }
     const scale = render_output.backend.renderScale();
-    const expected_size = render_output.backend.modeSize();
-    if (!std.meta.eql(pixel_buffer.size, expected_size)) return error.InvalidTarget;
-    const visible_rect = output.logicalRect();
+    const output_size = render_output.backend.modeSize();
+    const source_region = if (local_region) |region|
+        scaledScreencopyRegion(region, scale, output_size) orelse
+            return error.InvalidTarget
+    else
+        null;
+    const expected_size = if (source_region) |region|
+        render.Size{ .width = region.width, .height = region.height }
+    else
+        output_size;
+    if (!std.meta.eql(render_target.size(), expected_size)) return error.InvalidTarget;
+    if (self.composed_capture_source) |source| {
+        if (std.meta.eql(source.output, output_id) and
+            self.composedCaptureMatchesCursors(
+                source,
+                output.logicalRect(),
+                local_region,
+                paint_cursors,
+            ))
+        {
+            const copied = self.renderer.copyComposedFrame(
+                source.target,
+                source_region,
+                render_target,
+                .{},
+            ) catch |err| copied: {
+                log.warn("composed screen capture copy failed; rerendering: {t}", .{err});
+                break :copied null;
+            };
+            if (copied) |completion| return completion;
+        }
+    }
+    const output_rect = output.logicalRect();
+    const visible_rect = captureLogicalRect(output_rect, local_region);
     try self.renderer.beginFrame(
-        .{ .pixels = pixel_buffer },
+        render_target,
         scale,
         .{ .x = visible_rect.x, .y = visible_rect.y },
         null,
@@ -7088,7 +7288,62 @@ fn captureOutputRegion(
         _ = try self.renderDesktopContents(&frame, paint_cursors, paint_cursors);
     }
     renderer_frame_active = false;
-    try self.renderer.finishFrame();
+    return self.finishCaptureTarget(render_target);
+}
+
+fn composedCaptureMatchesCursors(
+    self: *Self,
+    source: ComposedCaptureSource,
+    output_rect: render.Rect,
+    local_region: ?render.Rect,
+    paint_cursors: bool,
+) bool {
+    const capture_rect = captureLogicalRect(output_rect, local_region);
+    const locked = self.session_lock.isLocked();
+    if (source.primary_cursor_painted != paint_cursors) {
+        if (self.seatCursorInfo(&self.seat, locked)) |cursor| {
+            if (cursorMismatchAffectsCapture(
+                source.primary_cursor_painted,
+                paint_cursors,
+                self.cursorBounds(cursor),
+                capture_rect,
+            )) return false;
+        }
+    }
+    if (source.tablet_cursors_painted != paint_cursors) {
+        var cursors = self.tablet.cursorIterator();
+        while (cursors.next()) |info| {
+            if (!self.tabletCursorVisible(info.focus_surface, locked)) continue;
+            if (cursorMismatchAffectsCapture(
+                source.tablet_cursors_painted,
+                paint_cursors,
+                self.cursorBounds(info.cursor),
+                capture_rect,
+            )) return false;
+        }
+    }
+    return true;
+}
+
+fn captureLogicalRect(output_rect: render.Rect, local_region: ?render.Rect) render.Rect {
+    const region = local_region orelse return output_rect;
+    return .{
+        .x = output_rect.x +| region.x,
+        .y = output_rect.y +| region.y,
+        .width = region.width,
+        .height = region.height,
+    };
+}
+
+fn cursorMismatchAffectsCapture(
+    source_painted: bool,
+    capture_paints: bool,
+    cursor_bounds: ?render.Rect,
+    capture_rect: render.Rect,
+) bool {
+    if (source_painted == capture_paints) return false;
+    const bounds = cursor_bounds orelse return true;
+    return bounds.intersection(capture_rect) != null;
 }
 
 const ToplevelCaptureError = renderer_types.Renderer.Error || error{Stopped};
@@ -7097,20 +7352,29 @@ fn captureToplevel(
     self: *Self,
     window_id: XdgShell.WindowId,
     pixel_buffer: render.PixelBuffer,
-) ToplevelCaptureError!void {
+) ToplevelCaptureError!?std.posix.fd_t {
+    const completion = try self.captureToplevelTarget(window_id, .{ .pixels = pixel_buffer });
+    return completion.sync_file_fd;
+}
+
+fn captureToplevelTarget(
+    self: *Self,
+    window_id: XdgShell.WindowId,
+    render_target: render.Target,
+) ToplevelCaptureError!renderer_types.Renderer.FrameCompletion {
     const info = self.xdg_shell.windowInfo(window_id) orelse return error.Stopped;
     if (!info.mapped) return error.Stopped;
     const surface_id = self.xdg_shell.windowSurface(window_id) orelse return error.Stopped;
     const position = self.scene.surfacePosition(surface_id) orelse return error.Stopped;
     const bounds = self.toplevelCaptureBounds(window_id) orelse return error.Stopped;
-    if (!std.meta.eql(pixel_buffer.size, render.Size{
+    if (!std.meta.eql(render_target.size(), render.Size{
         .width = bounds.width,
         .height = bounds.height,
     })) return error.InvalidTarget;
     const render_output = self.firstRenderOutput() orelse return error.InvalidTarget;
     const output = self.outputs.get(render_output.protocol_id) orelse return error.InvalidTarget;
     try self.renderer.beginFrame(
-        .{ .pixels = pixel_buffer },
+        render_target,
         .{},
         .{ .x = bounds.x, .y = bounds.y },
         null,
@@ -7137,7 +7401,7 @@ fn captureToplevel(
         null,
     );
     renderer_frame_active = false;
-    try self.renderer.finishFrame();
+    return self.finishCaptureTarget(render_target);
 }
 
 fn renderOutputForProtocol(self: *Self, output_id: OutputLayout.Id) ?*RenderOutput {
@@ -7525,7 +7789,8 @@ test "backdrop blur damage expands transitively across overlapping effects" {
 }
 
 fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Renderer.Error!void {
-    self.prepareOutputCursorFrame(render_output);
+    const force_composed_cursor = self.needsComposedCursorFrame(render_output.protocol_id);
+    self.prepareOutputCursorFrame(render_output, force_composed_cursor);
     const paint_primary_cursor = render_output.cursor_state == .software or
         render_output.cursor_state == .deactivating;
     const render_target = render_output.backend.acquire() orelse {
@@ -7605,7 +7870,16 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
         defer if (render_fence_fd) |fd| {
             _ = std.c.close(fd);
         };
-        return self.presentSessionLockFrame(&frame, render_fence_fd);
+        return self.presentSessionLockFrame(
+            &frame,
+            render_fence_fd,
+            .{
+                .output = render_output.protocol_id,
+                .target = render_target,
+                .primary_cursor_painted = paint_primary_cursor,
+                .tablet_cursors_painted = true,
+            },
+        );
     }
 
     const desktop_contents = self.renderDesktopContents(&frame, paint_primary_cursor, true) catch |err| {
@@ -7634,7 +7908,7 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
         false;
     var presented: ?presentation.Info = null;
     var direct_scanout = false;
-    switch (self.renderer.directScanoutCandidate()) {
+    if (!force_composed_cursor) switch (self.renderer.directScanoutCandidate()) {
         .candidate => |candidate| {
             increment(&render_output.frame_statistics.direct_scanout_candidates);
             switch (render_output.backend.tryDirectScanout(candidate, allow_tearing)) {
@@ -7656,10 +7930,10 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
             }
         },
         .rejected => |reason| render_output.frame_statistics.rejectDirectScanout(reason),
-    }
+    };
+    var overlay_destination: ?render.Rect = null;
     if (!direct_scanout) {
-        var overlay_destination: ?render.Rect = null;
-        switch (self.renderer.overlayScanoutCandidate()) {
+        if (!force_composed_cursor) switch (self.renderer.overlayScanoutCandidate()) {
             .candidate => |candidate| {
                 increment(&render_output.frame_statistics.overlay_scanout_candidates);
                 switch (render_output.backend.validateOverlayScanout(candidate)) {
@@ -7670,7 +7944,7 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
                 }
             },
             .rejected => |reason| render_output.frame_statistics.rejectOverlayScanout(reason),
-        }
+        };
         renderer_frame_active = false;
         const gpu_sample_tag = outputStatisticsTag(render_output.protocol_id);
         const completion = (if (overlay_destination != null)
@@ -7806,11 +8080,41 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) renderer_types.Rendere
     Surface.clearFifoBarriersForOutput(self.compositor.surfaceStore(), output);
     self.finishRepaintIfIdle();
     if (presented) |info| outputPresented(render_output, info);
-    self.captureOutputFrame(render_output.protocol_id);
+    self.captureOutputFrame(
+        render_output.protocol_id,
+        if (!direct_scanout and overlay_destination == null) .{
+            .output = render_output.protocol_id,
+            .target = render_target,
+            .primary_cursor_painted = paint_primary_cursor,
+            .tablet_cursors_painted = true,
+        } else null,
+    );
     self.refreshKeyboardFocus();
 }
 
-fn captureOutputFrame(self: *Self, output_id: OutputLayout.Id) void {
+fn needsComposedCursorFrame(self: *Self, output_id: OutputLayout.Id) bool {
+    const cursor = self.seatCursorInfo(&self.seat, self.session_lock.isLocked()) orelse
+        return false;
+    const output = self.outputs.get(output_id) orelse return false;
+    const output_rect = output.logicalRect();
+    const local_bounds = if (self.cursorBounds(cursor)) |bounds| local: {
+        const clipped = bounds.intersection(output_rect) orelse return false;
+        break :local clipped.translated(0 -| output_rect.x, 0 -| output_rect.y);
+    } else null;
+    return (self.image_copy_capture_initialized and
+        self.image_copy_capture.needsComposedCursorFrame(output_id)) or
+        (self.screencopy_initialized and
+            self.screencopy.needsComposedCursorFrame(output_id, local_bounds));
+}
+
+fn captureOutputFrame(
+    self: *Self,
+    output_id: OutputLayout.Id,
+    source: ?ComposedCaptureSource,
+) void {
+    std.debug.assert(self.composed_capture_source == null);
+    self.composed_capture_source = source;
+    defer self.composed_capture_source = null;
     if (self.image_copy_capture_initialized) self.image_copy_capture.captureOutput(output_id);
     if (self.screencopy_initialized) self.screencopy.captureOutput(output_id);
 }
@@ -7974,6 +8278,7 @@ fn presentSessionLockFrame(
     self: *Self,
     frame: *const OutputFrame,
     render_fence_fd: ?std.posix.fd_t,
+    capture_source: ?ComposedCaptureSource,
 ) renderer_types.Renderer.Error!void {
     const lock_surface = self.session_lock.surfaceForOutput(frame.render_output.protocol_id);
     const presented = frame.render_output.backend.present(
@@ -8025,7 +8330,7 @@ fn presentSessionLockFrame(
     Surface.clearFifoBarriersForOutput(self.compositor.surfaceStore(), frame.output);
     self.finishRepaintIfIdle();
     if (presented) |info| outputPresented(frame.render_output, info);
-    self.captureOutputFrame(frame.render_output.protocol_id);
+    self.captureOutputFrame(frame.render_output.protocol_id, capture_source);
     self.refreshKeyboardFocus();
 }
 

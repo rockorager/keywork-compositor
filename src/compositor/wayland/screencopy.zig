@@ -15,6 +15,7 @@ const zwlr = wayland.server.zwlr;
 
 allocator: std.mem.Allocator,
 global: *wl.Global,
+event_loop: *wl.EventLoop,
 security_context: *SecurityContext,
 outputs: *OutputLayout,
 linux_dmabuf: *LinuxDmabuf,
@@ -30,6 +31,12 @@ pub const Target = struct {
 
 pub const CaptureError = error{ Stopped, Failed };
 
+pub const CaptureResult = struct {
+    timestamp: presentation.Timestamp,
+    /// Owned by the caller when non-null.
+    completion_fd: ?std.posix.fd_t = null,
+};
+
 pub const Listener = struct {
     context: *anyopaque,
     constraints: *const fn (*anyopaque, Target) ?render.Size,
@@ -39,7 +46,14 @@ pub const Listener = struct {
         Target,
         bool,
         render.PixelBuffer,
+    ) CaptureError!CaptureResult,
+    capture_dmabuf: *const fn (
+        *anyopaque,
+        Target,
+        bool,
+        *LinuxDmabuf.Buffer,
     ) CaptureError!presentation.Timestamp,
+    complete: *const fn (*anyopaque, render.PixelBuffer, ?render.PixelBuffer) bool,
 };
 
 const Destination = union(enum) {
@@ -140,6 +154,15 @@ const Frame = struct {
     finished: bool = false,
     destination: ?Destination = null,
     with_damage: bool = false,
+    pending: ?PendingCapture = null,
+
+    const PendingCapture = struct {
+        event_source: *wl.EventSource,
+        completion_fd: std.posix.fd_t,
+        shm: *wl.shm.Buffer,
+        pixels: render.PixelBuffer,
+        timestamp: presentation.Timestamp,
+    };
 
     fn create(
         manager: *Manager,
@@ -203,6 +226,7 @@ const Frame = struct {
     }
 
     fn handleDestroy(_: *zwlr.ScreencopyFrameV1, self: *Frame) void {
+        self.cancelPendingCapture();
         for (self.owner.frames.items, 0..) |frame, index| {
             if (frame != self) continue;
             _ = self.owner.frames.swapRemove(index);
@@ -237,23 +261,61 @@ const Frame = struct {
     }
 
     fn capture(self: *Frame) void {
-        if (self.finished or !self.used) return;
+        if (self.finished or !self.used or self.pending != null) return;
         const size = self.size orelse return self.fail();
         const target = self.target orelse return self.fail();
         const destination = self.destination orelse return self.fail();
-        const result = switch (destination) {
+        const result: ?CaptureResult = switch (destination) {
             .shm => |shm| capture: {
                 shm.beginAccess();
-                defer shm.endAccess();
-                const pixels = shmPixelBuffer(shm, size) orelse break :capture error.Failed;
-                break :capture self.owner.listener.capture(
+                const pixels = shmPixelBuffer(shm, size) orelse {
+                    shm.endAccess();
+                    break :capture error.Failed;
+                };
+                const captured = self.owner.listener.capture(
                     self.owner.listener.context,
                     target,
                     self.overlay_cursor,
                     pixels,
-                );
+                ) catch |err| {
+                    shm.endAccess();
+                    break :capture err;
+                };
+                if (captured.completion_fd) |fd| {
+                    self.startPendingCapture(shm, pixels, captured) catch {
+                        _ = std.c.close(fd);
+                        const completed = self.owner.listener.complete(
+                            self.owner.listener.context,
+                            pixels,
+                            pixels,
+                        );
+                        shm.endAccess();
+                        if (!completed) break :capture error.Failed;
+                        break :capture @as(?CaptureResult, CaptureResult{
+                            .timestamp = captured.timestamp,
+                        });
+                    };
+                    // The GPU writes staging memory. Re-enter SHM access only
+                    // for the completion copy so other pools remain usable.
+                    shm.endAccess();
+                    break :capture @as(?CaptureResult, null);
+                }
+                shm.endAccess();
+                break :capture @as(?CaptureResult, captured);
             },
             .dmabuf => |dmabuf| capture: {
+                const timestamp = self.owner.listener.capture_dmabuf(
+                    self.owner.listener.context,
+                    target,
+                    self.overlay_cursor,
+                    dmabuf,
+                ) catch |err| switch (err) {
+                    error.Failed => null,
+                    error.Stopped => break :capture error.Stopped,
+                };
+                if (timestamp) |value| break :capture @as(?CaptureResult, CaptureResult{
+                    .timestamp = value,
+                });
                 const pixel_count = size.pixelCount() catch return self.fail();
                 const pixels = self.owner.allocator.alloc(u32, pixel_count) catch {
                     self.resource.postNoMemory();
@@ -265,16 +327,89 @@ const Frame = struct {
                     .stride_pixels = size.width,
                     .pixels = pixels,
                 };
-                const timestamp = self.owner.listener.capture(
+                const captured = self.owner.listener.capture(
                     self.owner.listener.context,
                     target,
                     self.overlay_cursor,
                     pixel_buffer,
                 ) catch |err| break :capture err;
+                if (captured.completion_fd) |fd| {
+                    defer _ = std.c.close(fd);
+                    if (!self.owner.listener.complete(
+                        self.owner.listener.context,
+                        pixel_buffer,
+                        pixel_buffer,
+                    )) break :capture error.Failed;
+                }
                 dmabuf.copyFromPixels(pixel_buffer) catch break :capture error.Failed;
-                break :capture timestamp;
+                break :capture @as(?CaptureResult, CaptureResult{
+                    .timestamp = captured.timestamp,
+                });
             },
         } catch return self.fail();
+
+        if (result) |captured| self.ready(captured.timestamp);
+    }
+
+    fn startPendingCapture(
+        self: *Frame,
+        shm: *wl.shm.Buffer,
+        pixels: render.PixelBuffer,
+        captured: CaptureResult,
+    ) !void {
+        const completion_fd = captured.completion_fd orelse unreachable;
+        std.debug.assert(self.pending == null);
+        self.pending = .{
+            .event_source = undefined,
+            .completion_fd = completion_fd,
+            .shm = shm,
+            .pixels = pixels,
+            .timestamp = captured.timestamp,
+        };
+        errdefer self.pending = null;
+        self.pending.?.event_source = try self.owner.event_loop.addFd(
+            *Frame,
+            completion_fd,
+            .{ .readable = true, .hangup = true, .@"error" = true },
+            handleCaptureReady,
+            self,
+        );
+    }
+
+    fn handleCaptureReady(_: c_int, _: wl.EventMask, self: *Frame) c_int {
+        self.completePendingCapture(true);
+        return 0;
+    }
+
+    fn cancelPendingCapture(self: *Frame) void {
+        if (self.pending != null) self.completePendingCapture(false);
+    }
+
+    fn completePendingCapture(self: *Frame, send_result: bool) void {
+        const pending = self.pending orelse return;
+        self.pending = null;
+        pending.event_source.remove();
+        _ = std.c.close(pending.completion_fd);
+        pending.shm.beginAccess();
+        const destination = shmPixelBuffer(pending.shm, pending.pixels.size);
+        const succeeded = self.owner.listener.complete(
+            self.owner.listener.context,
+            pending.pixels,
+            destination,
+        );
+        pending.shm.endAccess();
+        if (!send_result) return;
+        if (succeeded) {
+            self.ready(pending.timestamp);
+        } else {
+            self.fail();
+        }
+    }
+
+    fn ready(self: *Frame, timestamp: presentation.Timestamp) void {
+        if (self.finished) return;
+        const size = self.size orelse return self.fail();
+        const destination = self.destination orelse return self.fail();
 
         self.resource.sendFlags(.{
             .y_invert = switch (destination) {
@@ -286,9 +421,9 @@ const Frame = struct {
             self.resource.sendDamage(0, 0, size.width, size.height);
         }
         self.resource.sendReady(
-            result.highSeconds(),
-            result.lowSeconds(),
-            result.nanoseconds,
+            timestamp.highSeconds(),
+            timestamp.lowSeconds(),
+            timestamp.nanoseconds,
         );
         self.finished = true;
         self.manager.captured = true;
@@ -311,6 +446,7 @@ const Frame = struct {
     }
 
     fn fail(self: *Frame) void {
+        self.cancelPendingCapture();
         if (self.finished) return;
         self.resource.sendFailed();
         self.finished = true;
@@ -336,6 +472,7 @@ pub fn init(
     self.* = .{
         .allocator = allocator,
         .global = undefined,
+        .event_loop = display.getEventLoop(),
         .security_context = security_context,
         .outputs = outputs,
         .linux_dmabuf = linux_dmabuf,
@@ -380,6 +517,32 @@ pub fn captureOutput(self: *Self, output: OutputLayout.Id) void {
         if (!std.meta.eql(target.output, output)) continue;
         frame.capture();
     }
+}
+
+pub fn needsComposedCursorFrame(
+    self: *const Self,
+    output: OutputLayout.Id,
+    cursor_bounds: ?render.Rect,
+) bool {
+    for (self.frames.items) |frame| {
+        if (frame.finished or !frame.used or frame.pending != null or !frame.overlay_cursor) {
+            continue;
+        }
+        const target = frame.target orelse continue;
+        if (!std.meta.eql(target.output, output)) continue;
+        if (!captureRegionIntersectsCursor(target.region, cursor_bounds)) continue;
+        return true;
+    }
+    return false;
+}
+
+fn captureRegionIntersectsCursor(
+    region: ?render.Rect,
+    cursor_bounds: ?render.Rect,
+) bool {
+    const capture = region orelse return true;
+    const cursor = cursor_bounds orelse return true;
+    return capture.intersection(cursor) != null;
 }
 
 fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
@@ -450,4 +613,27 @@ extern fn wl_shm_buffer_unref(buffer: *wl.shm.Buffer) void;
 test "screencopy regions reject empty geometry" {
     const invalid: RequestedRegion = .{ .x = 0, .y = 0, .width = 0, .height = 10 };
     try std.testing.expect(invalid.width <= 0 or invalid.height <= 0);
+}
+
+test "screencopy region only forces cursor composition when cursor intersects" {
+    const region: render.Rect = .{ .x = 100, .y = 100, .width = 200, .height = 100 };
+    try std.testing.expect(captureRegionIntersectsCursor(region, .{
+        .x = 250,
+        .y = 150,
+        .width = 32,
+        .height = 32,
+    }));
+    try std.testing.expect(!captureRegionIntersectsCursor(region, .{
+        .x = 20,
+        .y = 20,
+        .width = 32,
+        .height = 32,
+    }));
+    try std.testing.expect(captureRegionIntersectsCursor(null, .{
+        .x = 20,
+        .y = 20,
+        .width = 32,
+        .height = 32,
+    }));
+    try std.testing.expect(captureRegionIntersectsCursor(region, null));
 }

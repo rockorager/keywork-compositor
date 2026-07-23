@@ -728,6 +728,12 @@ pub const Buffer = struct {
     snapshot_count: usize,
     source_cache_id: u64,
     next_source_version: u64,
+    render_target: ?ImportedRenderTarget,
+
+    const ImportedRenderTarget = struct {
+        renderer: render.DmabufRenderer,
+        target: render.DmabufTarget,
+    };
 
     // Optimized builds may merge identical wl_buffer request handlers, so the
     // implementation address cannot also serve as the resource type identity.
@@ -755,6 +761,7 @@ pub const Buffer = struct {
             .snapshot_count = 0,
             .source_cache_id = render.allocateSourceCacheId(),
             .next_source_version = 1,
+            .render_target = null,
         };
         manager.buffer_count += 1;
         const raw_resource: *wl.Resource = @ptrCast(resource);
@@ -798,6 +805,12 @@ pub const Buffer = struct {
         std.debug.assert(self.reference_count > 0);
         self.reference_count -= 1;
         if (self.reference_count != 0) return;
+        if (self.render_target) |imported| {
+            imported.renderer.release_target(
+                imported.renderer.context,
+                imported.target.id,
+            );
+        }
         for (self.descriptor.planes[0..self.descriptor.plane_count]) |plane| plane.plane.close();
         self.manager.buffer_count -= 1;
         self.manager.allocator.destroy(self);
@@ -845,6 +858,62 @@ pub const Buffer = struct {
             .end_cpu_read = endCpuReadCallback,
             .export_read_fence = exportReadFenceCallback,
         };
+    }
+
+    pub fn captureTarget(
+        self: *Buffer,
+        renderer: render.DmabufRenderer,
+    ) CopyError!render.DmabufTarget {
+        if (self.render_target) |imported| {
+            if (imported.renderer.context != renderer.context) return error.ImportFailed;
+            return imported.target;
+        }
+        const descriptor = self.descriptor;
+        if (descriptor.y_inverted or descriptor.plane_count != 1 or
+            !renderer.supports_target(
+                renderer.context,
+                descriptor.size,
+                descriptor.format,
+                descriptor.modifier,
+            )) return error.ImportFailed;
+        const plane = descriptor.planes[0].plane;
+        const target: render.DmabufTarget = .{
+            .id = render.allocateRenderTargetId(),
+            .size = descriptor.size,
+        };
+        renderer.import_target(renderer.context, .{
+            .id = target.id,
+            .size = target.size,
+            .fd = plane.fd,
+            .format = descriptor.format,
+            .modifier = descriptor.modifier,
+            .stride = plane.stride,
+            .offset = plane.offset,
+        }) catch return error.ImportFailed;
+        self.render_target = .{ .renderer = renderer, .target = target };
+        return target;
+    }
+
+    pub fn importWriteFence(self: *const Buffer, sync_file_fd: std.posix.fd_t) bool {
+        for (self.descriptor.planes[0..self.descriptor.plane_count]) |plane| {
+            var import_sync_file: linux.dma_buf_import_sync_file = .{
+                .flags = linux.DMA_BUF_SYNC_WRITE,
+                .fd = sync_file_fd,
+            };
+            while (true) {
+                const result = linux.ioctl(
+                    plane.plane.fd,
+                    linux.DMA_BUF_IOCTL_IMPORT_SYNC_FILE,
+                    &import_sync_file,
+                );
+                if (result >= 0) break;
+                switch (std.posix.errno(result)) {
+                    .INTR, .AGAIN => continue,
+                    else => return false,
+                }
+            }
+        }
+        return true;
     }
 
     pub fn copyPixels(

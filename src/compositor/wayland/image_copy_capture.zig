@@ -17,6 +17,7 @@ const ext = wayland.server.ext;
 
 allocator: std.mem.Allocator,
 global: *wl.Global,
+event_loop: *wl.EventLoop,
 security_context: *SecurityContext,
 sources: *ImageCaptureSource,
 linux_dmabuf: *LinuxDmabuf,
@@ -48,6 +49,12 @@ pub const CursorInfo = struct {
 
 pub const CaptureError = error{ Stopped, Failed };
 
+pub const CaptureResult = struct {
+    timestamp: presentation.Timestamp,
+    /// Owned by the caller when non-null.
+    completion_fd: ?std.posix.fd_t = null,
+};
+
 pub const Listener = struct {
     context: *anyopaque,
     constraints: *const fn (*anyopaque, Target) ?Constraints,
@@ -57,7 +64,14 @@ pub const Listener = struct {
         Target,
         bool,
         render.PixelBuffer,
+    ) CaptureError!CaptureResult,
+    capture_dmabuf: *const fn (
+        *anyopaque,
+        Target,
+        bool,
+        *LinuxDmabuf.Buffer,
     ) CaptureError!presentation.Timestamp,
+    complete: *const fn (*anyopaque, render.PixelBuffer, ?render.PixelBuffer) bool,
     cursor_info: *const fn (*anyopaque, CursorTarget) ?CursorInfo,
 };
 
@@ -231,6 +245,16 @@ const Frame = struct {
     finished: bool = false,
     scheduled_output: ?OutputLayout.Id = null,
     wait_for_damage: bool,
+    pending: ?PendingCapture = null,
+
+    const PendingCapture = struct {
+        event_source: *wl.EventSource,
+        completion_fd: std.posix.fd_t,
+        shm: *wl.shm.Buffer,
+        pixels: render.PixelBuffer,
+        constraints: Constraints,
+        timestamp: presentation.Timestamp,
+    };
 
     fn create(session: *Session, id: u32) !void {
         const resource = try ext.ImageCopyCaptureFrameV1.create(
@@ -298,6 +322,7 @@ const Frame = struct {
     }
 
     fn handleDestroy(_: *ext.ImageCopyCaptureFrameV1, self: *Frame) void {
+        self.cancelPendingCapture();
         if (self.session) |session| session.frame = null;
         for (self.owner.frames.items, 0..) |frame, index| {
             if (frame != self) continue;
@@ -331,6 +356,7 @@ const Frame = struct {
     }
 
     fn capture(self: *Frame) void {
+        if (self.pending != null) return;
         self.scheduled_output = null;
         if (!self.destination.attached()) {
             self.resource.postError(.no_buffer, "capture requires an attached buffer");
@@ -358,15 +384,53 @@ const Frame = struct {
             }
             return self.fail(.buffer_constraints);
         }
-        const timestamp = if (self.destination.shm) |shm| timestamp: {
+        if (self.destination.shm) |shm| {
             shm.beginAccess();
-            defer shm.endAccess();
-            const pixel_buffer = shmPixelBuffer(shm, expected.size) orelse
+            const pixel_buffer = shmPixelBuffer(shm, expected.size) orelse {
+                shm.endAccess();
                 return self.fail(.buffer_constraints);
-            break :timestamp self.performCapture(target, pixel_buffer) orelse return;
-        } else if (self.destination.dmabuf) |dmabuf| timestamp: {
+            };
+            const captured = self.performCapture(target, pixel_buffer) orelse {
+                shm.endAccess();
+                return;
+            };
+            if (captured.completion_fd) |fd| {
+                self.startPendingCapture(shm, pixel_buffer, expected, captured) catch {
+                    _ = std.c.close(fd);
+                    const completed = self.owner.listener.complete(
+                        self.owner.listener.context,
+                        pixel_buffer,
+                        pixel_buffer,
+                    );
+                    shm.endAccess();
+                    if (!completed) return self.fail(.unknown);
+                    return self.ready(expected, captured.timestamp);
+                };
+                // The GPU writes staging memory. Re-enter SHM access only for
+                // the completion copy so other pools remain usable.
+                shm.endAccess();
+                return;
+            }
+            shm.endAccess();
+            return self.ready(expected, captured.timestamp);
+        } else if (self.destination.dmabuf) |dmabuf| {
             if (self.owner.linux_dmabuf.allocationDevice() == null or
                 !std.meta.eql(dmabuf.size(), expected.size)) return self.fail(.buffer_constraints);
+            const timestamp = self.owner.listener.capture_dmabuf(
+                self.owner.listener.context,
+                target,
+                self.paint_cursors,
+                dmabuf,
+            ) catch |err| switch (err) {
+                error.Stopped => {
+                    self.fail(.stopped);
+                    self.stopSession();
+                    return;
+                },
+                error.Failed => null,
+            };
+            if (timestamp) |value| return self.ready(expected, value);
+
             const pixel_count = expected.size.pixelCount() catch
                 return self.fail(.buffer_constraints);
             const pixels = self.owner.allocator.alloc(u32, pixel_count) catch {
@@ -379,18 +443,25 @@ const Frame = struct {
                 .stride_pixels = expected.size.width,
                 .pixels = pixels,
             };
-            const value = self.performCapture(target, pixel_buffer) orelse return;
+            const captured = self.performCapture(target, pixel_buffer) orelse return;
+            if (captured.completion_fd) |fd| {
+                defer _ = std.c.close(fd);
+                if (!self.owner.listener.complete(
+                    self.owner.listener.context,
+                    pixel_buffer,
+                    pixel_buffer,
+                )) return self.fail(.unknown);
+            }
             dmabuf.copyFromPixels(pixel_buffer) catch return self.fail(.unknown);
-            break :timestamp value;
+            return self.ready(expected, captured.timestamp);
         } else return self.fail(.buffer_constraints);
-        self.ready(expected, timestamp);
     }
 
     fn performCapture(
         self: *Frame,
         target: Target,
         pixel_buffer: render.PixelBuffer,
-    ) ?presentation.Timestamp {
+    ) ?CaptureResult {
         return self.owner.listener.capture(
             self.owner.listener.context,
             target,
@@ -407,6 +478,63 @@ const Frame = struct {
                 return null;
             },
         };
+    }
+
+    fn startPendingCapture(
+        self: *Frame,
+        shm: *wl.shm.Buffer,
+        pixels: render.PixelBuffer,
+        constraints: Constraints,
+        captured: CaptureResult,
+    ) !void {
+        const completion_fd = captured.completion_fd orelse unreachable;
+        std.debug.assert(self.pending == null);
+        self.pending = .{
+            .event_source = undefined,
+            .completion_fd = completion_fd,
+            .shm = shm,
+            .pixels = pixels,
+            .constraints = constraints,
+            .timestamp = captured.timestamp,
+        };
+        errdefer self.pending = null;
+        self.pending.?.event_source = try self.owner.event_loop.addFd(
+            *Frame,
+            completion_fd,
+            .{ .readable = true, .hangup = true, .@"error" = true },
+            handleCaptureReady,
+            self,
+        );
+    }
+
+    fn handleCaptureReady(_: c_int, _: wl.EventMask, self: *Frame) c_int {
+        self.completePendingCapture(true);
+        return 0;
+    }
+
+    fn cancelPendingCapture(self: *Frame) void {
+        if (self.pending != null) self.completePendingCapture(false);
+    }
+
+    fn completePendingCapture(self: *Frame, send_result: bool) void {
+        const pending = self.pending orelse return;
+        self.pending = null;
+        pending.event_source.remove();
+        _ = std.c.close(pending.completion_fd);
+        pending.shm.beginAccess();
+        const destination = shmPixelBuffer(pending.shm, pending.pixels.size);
+        const succeeded = self.owner.listener.complete(
+            self.owner.listener.context,
+            pending.pixels,
+            destination,
+        );
+        pending.shm.endAccess();
+        if (!send_result) return;
+        if (succeeded) {
+            self.ready(pending.constraints, pending.timestamp);
+        } else {
+            self.fail(.unknown);
+        }
     }
 
     fn ready(
@@ -432,6 +560,7 @@ const Frame = struct {
     }
 
     fn fail(self: *Frame, reason: ext.ImageCopyCaptureFrameV1.FailureReason) void {
+        self.cancelPendingCapture();
         if (self.finished) return;
         self.finished = true;
         self.resource.sendFailed(reason);
@@ -539,6 +668,7 @@ pub fn init(
     self.* = .{
         .allocator = allocator,
         .global = undefined,
+        .event_loop = display.getEventLoop(),
         .security_context = security_context,
         .sources = sources,
         .linux_dmabuf = linux_dmabuf,
@@ -634,6 +764,20 @@ pub fn captureOutput(self: *Self, output: OutputLayout.Id) void {
         if (!std.meta.eql(scheduled, output)) continue;
         frame.capture();
     }
+}
+
+pub fn needsComposedCursorFrame(self: *const Self, output: OutputLayout.Id) bool {
+    for (self.frames.items) |frame| {
+        if (frame.finished or frame.pending != null or !frame.paint_cursors) continue;
+        const scheduled = frame.scheduled_output orelse continue;
+        if (!std.meta.eql(scheduled, output)) continue;
+        const target = frame.target orelse continue;
+        if (target != .source) continue;
+        const source = target.source;
+        if (source != .output) continue;
+        if (std.meta.eql(source.output, output)) return true;
+    }
+    return false;
 }
 
 pub fn removeOutput(self: *Self, output: OutputLayout.Id) void {

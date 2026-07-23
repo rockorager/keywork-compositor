@@ -224,6 +224,81 @@ pub const Renderer = struct {
         }, active.target);
     }
 
+    /// Finish a frame whose CPU pixel target may be populated asynchronously.
+    /// A returned sync-file remains owned by the caller. When it becomes
+    /// readable, the caller must invoke completeFrameReadback with this target
+    /// as the submission source and the current destination storage. A null
+    /// descriptor means the target was populated before this function returned.
+    pub fn finishFrameReadback(self: *Renderer) Error!FrameCompletion {
+        const active = self.active_frame orelse unreachable;
+        const target = switch (active.target) {
+            .pixels => |pixels| pixels,
+            .offscreen, .dmabuf => return error.InvalidTarget,
+        };
+        if (active.damage != null) return error.InvalidTarget;
+        self.active_frame = null;
+        defer self.commands.clearRetainingCapacity();
+        const commands = try pruneOccludedCommands(
+            self.allocator,
+            &self.visible_commands,
+            self.commands.items,
+            target.size,
+        );
+        self.rememberSampledCommands(commands);
+        const frame: render_types.Frame = .{
+            .size = target.size,
+            .commands = commands,
+            .output_color_description = active.color_description,
+            .output_calibration = active.output_calibration,
+        };
+        return switch (self.backend) {
+            .cpu => |*renderer| completed: {
+                try renderer.render(frame, target);
+                break :completed .{};
+            },
+            .vulkan => |*renderer| renderer.renderFrameReadback(frame, target),
+        };
+    }
+
+    /// Wait for a readback submitted with source and optionally copy it into
+    /// destination. Source storage only identifies the pending submission and
+    /// is not accessed.
+    pub fn completeFrameReadback(
+        self: *Renderer,
+        source: render_types.PixelBuffer,
+        destination: ?render_types.PixelBuffer,
+    ) Error!void {
+        return switch (self.backend) {
+            .cpu => {},
+            .vulkan => |*renderer| renderer.completeFrameReadback(source, destination),
+        };
+    }
+
+    /// Export all or part of a retained, fully composed frame without replaying
+    /// its scene commands. Source region is in source pixel coordinates and its
+    /// size must match the target. Returns null when the selected backend or color
+    /// conversion cannot use the retained frame directly.
+    pub fn copyComposedFrame(
+        self: *Renderer,
+        source: render_types.Target,
+        source_region: ?render_types.Rect,
+        target: render_types.Target,
+        color_description: render_types.ColorDescription,
+    ) Error!?FrameCompletion {
+        std.debug.assert(self.active_frame == null);
+        try validateTarget(source);
+        try validateTarget(target);
+        return switch (self.backend) {
+            .cpu => null,
+            .vulkan => |*renderer| try renderer.copyComposedFrame(
+                source,
+                source_region,
+                target,
+                color_description,
+            ),
+        };
+    }
+
     /// Returns the frame's buffer-path statistics and an owned sync-file when
     /// an external display consumer needs asynchronous completion. Rendering
     /// to a GPU-resident target without an external consumer may remain in
