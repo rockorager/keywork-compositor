@@ -162,6 +162,33 @@ pub const OutputStatistics = struct {
     gpu_completion_to_presentation: LatencyStatistics = .{},
 };
 
+pub const ResourceStatistics = struct {
+    renderer_targets: i64 = 0,
+    pixel_renderer_targets: i64 = 0,
+    offscreen_renderer_targets: i64 = 0,
+    dmabuf_renderer_targets: i64 = 0,
+    cached_textures: i64 = 0,
+    imported_textures: i64 = 0,
+    pending_textures: i64 = 0,
+    pending_gpu_submissions: i64 = 0,
+    calibration_textures: i64 = 0,
+    video_graphics_pipelines: i64 = 0,
+    blur_scratch_images: i64 = 0,
+    backdrop_cache_images: i64 = 0,
+    mapped_buffer_capacity_bytes: i64 = 0,
+    linux_dmabuf_buffers: i64 = 0,
+    screencopy_frames: i64 = 0,
+    image_copy_capture_sessions: i64 = 0,
+    image_copy_capture_frames: i64 = 0,
+    capture_buffers: i64 = 0,
+};
+
+pub const PerformanceStatistics = struct {
+    outputs: []const OutputStatistics,
+    /// Null when decoding a reply from a compositor predating resource telemetry.
+    resources: ?ResourceStatistics = null,
+};
+
 pub const focus_method = interface_name ++ ".Focus";
 pub const move_focused_method = interface_name ++ ".MoveFocused";
 pub const close_method = interface_name ++ ".Close";

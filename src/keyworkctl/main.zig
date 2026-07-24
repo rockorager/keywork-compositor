@@ -53,9 +53,7 @@ const WindowParameters = struct {
     windows: []const control.Window,
 };
 
-const StatisticsParameters = struct {
-    outputs: []const control.OutputStatistics,
-};
+const StatisticsParameters = control.PerformanceStatistics;
 
 pub fn main(init: std.process.Init) void {
     run(init) catch |err| {
@@ -229,9 +227,9 @@ fn printStatistics(
     var stdout = std.Io.File.stdout().writer(io, &buffer);
     defer stdout.interface.flush() catch {};
     if (json) {
-        try writeStatisticsJson(&stdout.interface, parsed.value.outputs);
+        try writeStatisticsJson(&stdout.interface, parsed.value);
     } else {
-        try writeStatistics(&stdout.interface, parsed.value.outputs);
+        try writeStatistics(&stdout.interface, parsed.value);
     }
 }
 
@@ -247,9 +245,11 @@ fn parseStatisticsParameters(
     );
 }
 
-fn writeStatistics(writer: *std.Io.Writer, outputs: []const control.OutputStatistics) !void {
-    if (outputs.len == 0) return writer.writeAll("No active outputs.\n");
-    for (outputs, 0..) |output, index| {
+fn writeStatistics(writer: *std.Io.Writer, statistics: StatisticsParameters) !void {
+    if (statistics.outputs.len == 0) {
+        try writer.writeAll("No active outputs.\n\n");
+    }
+    for (statistics.outputs, 0..) |output, index| {
         if (index != 0) try writer.writeByte('\n');
         try writer.print("{s} {d}x{d} ({d}.", .{
             output.name,
@@ -323,10 +323,49 @@ fn writeStatistics(writer: *std.Io.Writer, outputs: []const control.OutputStatis
             output.gpu_completion_to_presentation,
         );
     }
+    if (statistics.outputs.len != 0) try writer.writeByte('\n');
+    if (statistics.resources) |resources| {
+        try writeResourceStatistics(writer, resources);
+    } else {
+        try writer.writeAll("resources: unavailable (compositor does not expose resource telemetry)\n");
+    }
 }
 
-fn writeStatisticsJson(writer: *std.Io.Writer, outputs: []const control.OutputStatistics) !void {
-    try std.json.Stringify.value(StatisticsParameters{ .outputs = outputs }, .{}, writer);
+fn writeResourceStatistics(writer: *std.Io.Writer, resources: control.ResourceStatistics) !void {
+    try writer.print(
+        "resources:\n" ++
+            "  renderer targets: {d} (pixel {d}, offscreen {d}, DMA-BUF {d})\n" ++
+            "  textures: cached {d} (imported {d}), pending {d}\n" ++
+            "  GPU submissions pending: {d}\n" ++
+            "  effects: calibration textures {d}, video pipelines {d}, blur images {d}, backdrop images {d}\n" ++
+            "  mapped buffer capacity: {d} bytes\n" ++
+            "  Wayland DMA-BUF buffers: {d}\n" ++
+            "  capture: {d} buffers, {d} screencopy frames, {d} image-copy sessions, {d} image-copy frames\n",
+        .{
+            resources.renderer_targets,
+            resources.pixel_renderer_targets,
+            resources.offscreen_renderer_targets,
+            resources.dmabuf_renderer_targets,
+            resources.cached_textures,
+            resources.imported_textures,
+            resources.pending_textures,
+            resources.pending_gpu_submissions,
+            resources.calibration_textures,
+            resources.video_graphics_pipelines,
+            resources.blur_scratch_images,
+            resources.backdrop_cache_images,
+            resources.mapped_buffer_capacity_bytes,
+            resources.linux_dmabuf_buffers,
+            resources.capture_buffers,
+            resources.screencopy_frames,
+            resources.image_copy_capture_sessions,
+            resources.image_copy_capture_frames,
+        },
+    );
+}
+
+fn writeStatisticsJson(writer: *std.Io.Writer, statistics: StatisticsParameters) !void {
+    try std.json.Stringify.value(statistics, .{}, writer);
     try writer.writeByte('\n');
 }
 
@@ -722,7 +761,7 @@ test "performance statistics decode and render human-readable output" {
     defer parsed.deinit();
     var writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer writer.deinit();
-    try writeStatistics(&writer.writer, parsed.value.outputs);
+    try writeStatistics(&writer.writer, parsed.value);
     try std.testing.expectEqualStrings(
         \\eDP-1 2880x1800 (120.000 Hz)
         \\  last frame: composited, working RGBA16F linear, scanout XRGB8888, transform normal
@@ -755,6 +794,8 @@ test "performance statistics decode and render human-readable output" {
         \\  render fences signaled before commit: 0/0
         \\  render -> GPU completion: p50 0us, p95 0us, p99 0us, max 0us (0 samples)
         \\  GPU completion -> presentation: p50 0us, p95 0us, p99 0us, max 0us (0 samples)
+        \\
+        \\resources: unavailable (compositor does not expose resource telemetry)
         \\
     , writer.written());
 }
@@ -826,6 +867,18 @@ test "performance statistics render machine-readable JSON" {
     var writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer writer.deinit();
 
-    try writeStatisticsJson(&writer.writer, &.{});
-    try std.testing.expectEqualStrings("{\"outputs\":[]}\n", writer.written());
+    try writeStatisticsJson(&writer.writer, .{
+        .outputs = &.{},
+        .resources = .{ .cached_textures = 12, .capture_buffers = 2 },
+    });
+    const parsed = try std.json.parseFromSlice(
+        control.PerformanceStatistics,
+        std.testing.allocator,
+        writer.written(),
+        .{},
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.outputs.len);
+    try std.testing.expectEqual(@as(i64, 12), parsed.value.resources.?.cached_textures);
+    try std.testing.expectEqual(@as(i64, 2), parsed.value.resources.?.capture_buffers);
 }

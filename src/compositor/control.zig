@@ -49,7 +49,7 @@ pub const Executor = struct {
         *anyopaque,
         std.mem.Allocator,
         bool,
-    ) anyerror![]control.OutputStatistics,
+    ) anyerror!control.PerformanceStatistics,
     set_unfocused_border: *const fn (*anyopaque, control.Border) void,
     set_log_level: *const fn (*anyopaque, control.LogLevel) void,
     reload: *const fn (*anyopaque) ?[]const u8,
@@ -519,9 +519,9 @@ fn handleMessage(
             allocator,
             parameters.value.reset,
         );
-        defer allocator.free(statistics);
+        defer allocator.free(statistics.outputs);
         if (!call.oneway) try writeMessage(allocator, output, .{
-            .parameters = .{ .outputs = statistics },
+            .parameters = statistics,
         });
         return;
     }
@@ -724,7 +724,7 @@ const Recorder = struct {
         context: *anyopaque,
         allocator: std.mem.Allocator,
         reset: bool,
-    ) ![]control.OutputStatistics {
+    ) !control.PerformanceStatistics {
         const self: *Recorder = @ptrCast(@alignCast(context));
         self.statistics_count += 1;
         self.statistics_reset = reset;
@@ -824,7 +824,29 @@ const Recorder = struct {
             .render_to_gpu_completion = latency,
             .gpu_completion_to_presentation = latency,
         };
-        return result;
+        return .{
+            .outputs = result,
+            .resources = .{
+                .renderer_targets = 3,
+                .pixel_renderer_targets = 1,
+                .offscreen_renderer_targets = 1,
+                .dmabuf_renderer_targets = 1,
+                .cached_textures = 12,
+                .imported_textures = 4,
+                .pending_textures = 2,
+                .pending_gpu_submissions = 1,
+                .calibration_textures = 1,
+                .video_graphics_pipelines = 2,
+                .blur_scratch_images = 6,
+                .backdrop_cache_images = 2,
+                .mapped_buffer_capacity_bytes = 65_536,
+                .linux_dmabuf_buffers = 9,
+                .screencopy_frames = 1,
+                .image_copy_capture_sessions = 2,
+                .image_copy_capture_frames = 1,
+                .capture_buffers = 2,
+            },
+        };
     }
 
     fn setUnfocusedBorder(context: *anyopaque, border: control.Border) void {
@@ -1059,7 +1081,7 @@ test "performance statistics return typed output snapshots and forward reset" {
     try std.testing.expectEqual(@as(usize, 1), recorder.statistics_count);
     try std.testing.expect(recorder.statistics_reset);
     const parsed = try std.json.parseFromSlice(
-        struct { parameters: struct { outputs: []control.OutputStatistics } },
+        struct { parameters: control.PerformanceStatistics },
         std.testing.allocator,
         output.items[0 .. output.items.len - 1],
         .{},
@@ -1088,6 +1110,8 @@ test "performance statistics return typed output snapshots and forward reset" {
     try std.testing.expectEqual(@as(i64, 2), statistics.render_fences_signaled_before_commit);
     try std.testing.expectEqual(@as(i64, 300), statistics.render_to_gpu_completion.p99_microseconds);
     try std.testing.expectEqual(@as(i64, 300), statistics.gpu_completion_to_presentation.p99_microseconds);
+    try std.testing.expectEqual(@as(i64, 12), parsed.value.parameters.resources.?.cached_textures);
+    try std.testing.expectEqual(@as(i64, 2), parsed.value.parameters.resources.?.capture_buffers);
 }
 
 test "window query returns typed mapped-window snapshots" {

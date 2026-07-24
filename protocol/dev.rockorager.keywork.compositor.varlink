@@ -174,6 +174,30 @@ type OutputStatistics (
     gpu_completion_to_presentation: LatencyStatistics
 )
 
+# Instantaneous compositor-owned resource state. Mapped buffer capacity is the
+# usable capacity of retained renderer staging and instance buffers; it excludes
+# Vulkan image allocations, client-owned buffers, and process memory.
+type ResourceStatistics (
+    renderer_targets: int,
+    pixel_renderer_targets: int,
+    offscreen_renderer_targets: int,
+    dmabuf_renderer_targets: int,
+    cached_textures: int,
+    imported_textures: int,
+    pending_textures: int,
+    pending_gpu_submissions: int,
+    calibration_textures: int,
+    video_graphics_pipelines: int,
+    blur_scratch_images: int,
+    backdrop_cache_images: int,
+    mapped_buffer_capacity_bytes: int,
+    linux_dmabuf_buffers: int,
+    screencopy_frames: int,
+    image_copy_capture_sessions: int,
+    image_copy_capture_frames: int,
+    capture_buffers: int
+)
+
 # Change focus within the active workspace.
 method Focus (direction: Direction) -> ()
 
@@ -201,8 +225,9 @@ method MoveFocusedToWorkspace (workspace: int) -> ()
 # Return a snapshot of mapped windows and their published logical geometry.
 method GetWindows () -> (windows: []Window)
 
-# Return a snapshot of per-output frame statistics, then optionally reset them.
-method GetPerformanceStatistics (reset: bool) -> (outputs: []OutputStatistics)
+# Return per-output performance counters and instantaneous resource state, then
+# optionally reset only the performance counters.
+method GetPerformanceStatistics (reset: bool) -> (outputs: []OutputStatistics, resources: ?ResourceStatistics)
 
 # Change the border rendered around unfocused windows and window-like layer surfaces.
 method SetUnfocusedBorder (border: Border) -> ()

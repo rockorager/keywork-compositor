@@ -3263,7 +3263,7 @@ fn controlPerformanceStatistics(
     context: *anyopaque,
     allocator: std.mem.Allocator,
     reset: bool,
-) ![]ControlProtocol.OutputStatistics {
+) !ControlProtocol.PerformanceStatistics {
     const self: *Self = @ptrCast(@alignCast(context));
     self.collectGpuTimings();
     const result = try allocator.alloc(ControlProtocol.OutputStatistics, self.render_outputs.count);
@@ -3281,7 +3281,32 @@ fn controlPerformanceStatistics(
         if (reset) render_output.frame_statistics.reset();
     }
     if (reset) self.renderer.discardGpuTimings();
-    return result;
+    const renderer_statistics = self.renderer.resourceStatistics();
+    const screencopy_buffers = self.screencopy.destinationBufferCount();
+    const image_copy_buffers = self.image_copy_capture.destinationBufferCount();
+    return .{
+        .outputs = result,
+        .resources = .{
+            .renderer_targets = wireInteger(@intCast(renderer_statistics.targets)),
+            .pixel_renderer_targets = wireInteger(@intCast(renderer_statistics.pixel_targets)),
+            .offscreen_renderer_targets = wireInteger(@intCast(renderer_statistics.offscreen_targets)),
+            .dmabuf_renderer_targets = wireInteger(@intCast(renderer_statistics.dmabuf_targets)),
+            .cached_textures = wireInteger(@intCast(renderer_statistics.cached_textures)),
+            .imported_textures = wireInteger(@intCast(renderer_statistics.imported_textures)),
+            .pending_textures = wireInteger(@intCast(renderer_statistics.pending_textures)),
+            .pending_gpu_submissions = wireInteger(@intCast(renderer_statistics.pending_gpu_submissions)),
+            .calibration_textures = wireInteger(@intCast(renderer_statistics.calibration_textures)),
+            .video_graphics_pipelines = wireInteger(@intCast(renderer_statistics.video_graphics_pipelines)),
+            .blur_scratch_images = wireInteger(@intCast(renderer_statistics.blur_scratch_images)),
+            .backdrop_cache_images = wireInteger(@intCast(renderer_statistics.backdrop_cache_images)),
+            .mapped_buffer_capacity_bytes = wireInteger(@intCast(renderer_statistics.mapped_buffer_capacity_bytes)),
+            .linux_dmabuf_buffers = wireInteger(@intCast(self.linux_dmabuf.bufferCount())),
+            .screencopy_frames = wireInteger(@intCast(self.screencopy.frameCount())),
+            .image_copy_capture_sessions = wireInteger(@intCast(self.image_copy_capture.sessionCount())),
+            .image_copy_capture_frames = wireInteger(@intCast(self.image_copy_capture.frameCount())),
+            .capture_buffers = wireInteger(@intCast(screencopy_buffers +| image_copy_buffers)),
+        },
+    };
 }
 
 fn outputStatisticsTag(id: OutputLayout.Id) u64 {
